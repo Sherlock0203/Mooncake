@@ -239,6 +239,47 @@ func NewStoreEtcdClient(endpoints *C.char, errMsg **C.char) int {
 	return 0
 }
 
+//export EtcdStoreResetClientWrapper
+func EtcdStoreResetClientWrapper(endpoints *C.char, errMsg **C.char) int {
+	storeMutex.Lock()
+	defer storeMutex.Unlock()
+
+	if storeClient != nil {
+		storeClient.Close()
+		storeClient = nil
+	}
+
+	endpointStr := C.GoString(endpoints)
+	endpointStr = strings.ReplaceAll(endpointStr, ",", ";")
+	endpointList := strings.Split(endpointStr, ";")
+
+	var validEndpoints []string
+	for _, ep := range endpointList {
+		ep = strings.TrimSpace(ep)
+		if ep != "" {
+			validEndpoints = append(validEndpoints, ep)
+		}
+	}
+
+	if len(validEndpoints) == 0 {
+		*errMsg = C.CString("no valid endpoints provided")
+		return -1
+	}
+
+	cli, err := clientv3.New(clientv3.Config{
+		Endpoints:   validEndpoints,
+		DialTimeout: 5 * time.Second,
+	})
+
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+
+	storeClient = cli
+	return 0
+}
+
 //export NewSnapshotEtcdClient
 func NewSnapshotEtcdClient(endpoints *C.char, errMsg **C.char) int {
 	snapshotMutex.Lock()
