@@ -45,3 +45,8 @@ add_executable(batch_evict_bench batch_evict_bench.cpp)
 target_link_libraries(
   batch_evict_bench PRIVATE mooncake_store cachelib_memory_allocator
                             gflags::gflags glog::glog pthread)
+
+add_executable(stress_cluster_bench stress_cluster_bench.cpp)
+target_link_libraries(
+        stress_cluster_bench PRIVATE mooncake_store transfer_engine asio_shared
+        gflags::gflags glog::glog pthread)
