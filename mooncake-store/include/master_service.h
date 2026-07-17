@@ -50,6 +50,8 @@ class MasterSnapshotCodecTest;  // test fixture, needs private state access
 }  // namespace ha
 
 class EtcdOpLogStore;
+class OpLogManager;
+class OpLogStore;
 
 // Forward declarations
 class AllocationStrategy;
@@ -2113,6 +2115,11 @@ class MasterService {
         drain_jobs_ GUARDED_BY(job_mutex_);
 
     std::unique_ptr<KvEventPublisher> kv_event_publisher_;
+
+#ifdef STORE_USE_ETCD
+    std::unique_ptr<OpLogManager> oplog_manager_;
+    mutable std::mutex oplog_mutex_;
+#endif
 
     static KvEventConfig BuildKvEventConfig(const MasterServiceConfig& config);
     static std::string MediumForReplicaType(ReplicaType replica_type);

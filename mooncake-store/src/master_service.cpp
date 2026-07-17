@@ -34,6 +34,10 @@
 #ifdef STORE_USE_ETCD
 #include "etcd_helper.h"
 #include "ha/oplog/etcd_oplog_store.h"
+#include "ha/oplog/oplog_manager.h"
+#include "ha/oplog/oplog_store_factory.h"
+#include "ha_metric_manager.h"
+#include "metadata_store.h"
 #endif
 #include "ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store.h"
 #include "ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.h"
@@ -242,6 +246,25 @@ MasterService::MasterService(const MasterServiceConfig& config)
       offloading_queue_limit_(config.offloading_queue_limit),
       offload_cap_ratio_(config.offload_cap_ratio),
       task_manager_(config.task_manager_config) {
+#ifdef STORE_USE_ETCD
+    if (enable_ha_) {
+        oplog_manager_ = std::make_unique<OpLogManager>();
+        auto oplog_store = OpLogStoreFactory::Create(
+            OpLogStoreType::ETCD,
+            cluster_id_,
+            OpLogStoreRole::WRITER,
+            "",
+            100);
+        if (oplog_store) {
+            oplog_manager_->SetOpLogStore(std::move(oplog_store));
+            LOG(INFO) << "OpLogManager initialized with WRITER OpLogStore";
+        } else {
+            LOG(WARNING) << "Failed to create WRITER OpLogStore, OpLog "
+                            "will not be persisted";
+        }
+    }
+#endif
+
     // Initialize HTTP metadata key prefix (read env var once at startup)
     const char* custom_prefix = std::getenv("MC_METADATA_CLUSTER_ID");
     if (custom_prefix && std::strlen(custom_prefix) > 0) {
@@ -3319,6 +3342,26 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
     // pinned.
     metadata.GrantLease(0, default_kv_soft_pin_ttl_);
     PublishKvStored(key, replica_type, metadata, tenant_id);
+
+#ifdef STORE_USE_ETCD
+    if (oplog_manager_) {
+        std::lock_guard<std::mutex> lock(oplog_mutex_);
+        MetadataPayload payload;
+        payload.client_id = client_id;
+        payload.size = metadata.size;
+        std::vector<Replica::Descriptor> replica_descriptors;
+        for (const auto& replica : metadata.GetAllReplicas()) {
+            replica_descriptors.push_back(replica.get_descriptor());
+        }
+        payload.replicas = std::move(replica_descriptors);
+        auto serialized = struct_pack::serialize(payload);
+        std::string serialized_str(serialized.begin(), serialized.end());
+        oplog_manager_->Append(OpType::PUT_END, key, serialized_str);
+        HAMetricManager::instance().set_oplog_last_sequence_id(
+            oplog_manager_->GetLastSequenceId());
+    }
+#endif
+
     return {};
 }
 
@@ -4530,6 +4573,16 @@ auto MasterService::Remove(const std::string& key, const std::string& tenant_id,
     PublishKvRemoved(key, metadata, tenant_id);
     auto& tenant_state [[maybe_unused]] = accessor.GetTenantState();
     accessor.Erase();
+
+#ifdef STORE_USE_ETCD
+    if (oplog_manager_) {
+        std::lock_guard<std::mutex> lock(oplog_mutex_);
+        oplog_manager_->Append(OpType::REMOVE, key, "");
+        HAMetricManager::instance().set_oplog_last_sequence_id(
+            oplog_manager_->GetLastSequenceId());
+    }
+#endif
+
     return {};
 }
 
@@ -4591,6 +4644,12 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
 
                 VLOG(1) << "key=" << it->first
                         << " matched by regex. Removing.";
+                std::string key_to_remove = it->first;
+#ifdef STORE_USE_ETCD
+                if (oplog_manager_) {
+                    oplog_manager_->Append(OpType::REMOVE, key_to_remove, "");
+                }
+#endif
                 it = EraseMetadata(tenant_state, it, normalized_tenant,
                                    QuotaEraseMode::kFull, &shard);
                 removed_count++;
@@ -4605,6 +4664,15 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
 
     VLOG(1) << "action=remove_by_regex, pattern=" << regex_pattern
             << ", removed_count=" << removed_count;
+
+#ifdef STORE_USE_ETCD
+    if (oplog_manager_ && removed_count > 0) {
+        std::lock_guard<std::mutex> lock(oplog_mutex_);
+        HAMetricManager::instance().set_oplog_last_sequence_id(
+            oplog_manager_->GetLastSequenceId());
+    }
+#endif
+
     return removed_count;
 }
 
@@ -4627,6 +4695,12 @@ long MasterService::RemoveAll(bool force) {
                     auto mem_rep_count = it->second.CountReplicas(
                         &Replica::fn_is_memory_replica);
                     total_freed_size += it->second.size * mem_rep_count;
+                    std::string key_to_remove = it->first;
+#ifdef STORE_USE_ETCD
+                    if (oplog_manager_) {
+                        oplog_manager_->Append(OpType::REMOVE, key_to_remove, "");
+                    }
+#endif
                     it = EraseMetadata(tenant_state, it, tenant_it->first,
                                        QuotaEraseMode::kFull, &shard);
                     removed_count++;
@@ -4672,6 +4746,12 @@ long MasterService::RemoveAll(const std::string& tenant_id, bool force) {
                 auto mem_rep_count =
                     it->second.CountReplicas(&Replica::fn_is_memory_replica);
                 total_freed_size += it->second.size * mem_rep_count;
+                std::string key_to_remove = it->first;
+#ifdef STORE_USE_ETCD
+                if (oplog_manager_) {
+                    oplog_manager_->Append(OpType::REMOVE, key_to_remove, "");
+                }
+#endif
                 it = EraseMetadata(tenant_state, it, normalized_tenant,
                                    QuotaEraseMode::kFull, &shard);
                 removed_count++;
@@ -4784,6 +4864,11 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
             // Remove object metadata
             EraseMetadata(tenant_state, it, normalized_tenant,
                           QuotaEraseMode::kFull, &shard);
+#ifdef STORE_USE_ETCD
+            if (oplog_manager_) {
+                oplog_manager_->Append(OpType::REMOVE, key, "");
+            }
+#endif
             if (tenant_state.Empty()) {
                 shard->tenants.erase(tenant_it);
             }

@@ -189,7 +189,7 @@ DEFINE_string(ssd_offload_path, "", "SSD offload directory path");
 
 DEFINE_string(scenario, "local_memory",
               "Benchmark scenario: local_memory, remote_memory, local_disk, "
-              "remote_disk, segment_write, segment_read");
+              "remote_disk, segment_write, segment_read, segment_delete");
 DEFINE_string(role, "writer",
               "Node role: writer (prefill data) or reader (benchmark reads)");
 DEFINE_uint64(value_size, 4 * MB, "Size of each value in bytes");
@@ -781,6 +781,49 @@ class StressBenchmark {
         return (total_failed > 0) ? -1 : 0;
     }
 
+    int RunSegmentDelete() {
+        auto segments = DiscoverSegmentsIfNeeded(
+            "--segments not specified, auto-discovering");
+        if (segments.empty()) {
+            return -1;
+        }
+        LOG(INFO) << "Discovered " << segments.size()
+                  << " segments from master";
+
+        LOG(INFO) << "=== SEGMENT DELETE MODE ===";
+        LOG(INFO) << "Deleting from " << segments.size() << " segments, "
+                  << FLAGS_num_keys << " keys per segment";
+
+        size_t total_deleted = 0;
+        size_t total_failed = 0;
+
+        for (size_t i = 0; i < FLAGS_num_keys; ++i) {
+            for (size_t s = 0; s < segments.size(); ++s) {
+                const auto& segment = segments[s];
+                std::string key = MakeSegmentKey(segment, i);
+
+                int ret = client_->remove(key);
+                if (ret != 0) {
+                    LOG(ERROR) << "Remove failed for key=" << key
+                               << " segment=" << segment << " ret=" << ret;
+                    ++total_failed;
+                    continue;
+                }
+                ++total_deleted;
+            }
+
+            if ((i + 1) % 10 == 0 || i == FLAGS_num_keys - 1) {
+                LOG(INFO) << "  Deleted " << (i + 1) << "/" << FLAGS_num_keys
+                          << " keys from all " << segments.size() << " segments";
+            }
+        }
+
+        LOG(INFO) << "All segments delete complete: " << total_deleted
+                  << " succeeded, " << total_failed << " failed";
+
+        return (total_failed > 0) ? -1 : 0;
+    }
+
     int RunSegmentRead() {
         auto segments = DiscoverSegmentsIfNeeded(
             "--segments not specified, auto-discovering");
@@ -1284,6 +1327,8 @@ class StressBenchmark {
             return RunSegmentWrite();
         } else if (FLAGS_scenario == "segment_read") {
             return RunSegmentRead();
+        } else if (FLAGS_scenario == "segment_delete") {
+            return RunSegmentDelete();
         } else if (FLAGS_scenario == "list_segments") {
             return RunListSegments();
         } else if (FLAGS_scenario == "remote_memory" ||
