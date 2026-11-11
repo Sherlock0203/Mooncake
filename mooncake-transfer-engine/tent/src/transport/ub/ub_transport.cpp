@@ -261,7 +261,6 @@ struct UbTransport::Impl {
                         std::min<uint64_t>(safe_slice_size, limit));
                 }
             };
-            clamp_slice(device_caps.max_message_size);
             clamp_slice(device_caps.max_read_size);
             clamp_slice(device_caps.max_write_size);
             if (device_caps.max_jetty_depth != 0) {
