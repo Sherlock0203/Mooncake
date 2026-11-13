@@ -9,6 +9,7 @@
 
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/transport.h"
+#include "tent/transport/ub/probe_resources.h"
 
 namespace mooncake::tent {
 
@@ -29,7 +30,14 @@ struct UbSubBatch final : public Transport::SubBatch {
 // types or calls the Classic UbTransport/UbWorkerPool data path.
 class UbTransport final : public Transport {
    public:
-    explicit UbTransport(std::shared_ptr<ub::UrmaAdapter> adapter = nullptr);
+    // probe_provider/probe_poster are the W1 seam for the pooling-side
+    // resources. They are only required when transports/ub/probe/enabled is
+    // set; without them, enabling probing fails installation instead of
+    // silently degrading to "no probing" (design §12.3).
+    explicit UbTransport(
+        std::shared_ptr<ub::UrmaAdapter> adapter = nullptr,
+        std::shared_ptr<ub::ProbeResourceProvider> probe_provider = nullptr,
+        std::shared_ptr<ub::ProbePoster> probe_poster = nullptr);
     ~UbTransport() override;
 
     UbTransport(const UbTransport&) = delete;

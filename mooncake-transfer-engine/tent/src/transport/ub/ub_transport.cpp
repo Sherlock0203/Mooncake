@@ -1,6 +1,8 @@
 // Copyright 2026 KVCache.AI
 // SPDX-License-Identifier: Apache-2.0
 
+#include "tent/transport/ub/probe_link_manager.h"
+#include "tent/transport/ub/probe_scheduler.h"
 #include "tent/transport/ub/ub_transport.h"
 
 #include <algorithm>
@@ -88,9 +90,13 @@ std::string encodeDeviceMetadata(Topology::NicID topology_id,
 }  // namespace
 
 struct UbTransport::Impl {
-    explicit Impl(std::shared_ptr<ub::UrmaAdapter> injected)
+    Impl(std::shared_ptr<ub::UrmaAdapter> injected,
+         std::shared_ptr<ub::ProbeResourceProvider> injected_probe_provider,
+         std::shared_ptr<ub::ProbePoster> injected_probe_poster)
         : adapter(injected ? std::move(injected)
-                           : ub::createDefaultUrmaAdapter()) {}
+                           : ub::createDefaultUrmaAdapter()),
+          probe_provider(std::move(injected_probe_provider)),
+          probe_poster(std::move(injected_probe_poster)) {}
 
     Status install(const std::string& segment_name,
                    std::shared_ptr<ControlService> control,
@@ -326,6 +332,39 @@ struct UbTransport::Impl {
             });
         callback_installed = true;
 
+        // Probe assembly (design §13.3). Probing is disabled by default; when
+        // enabled, the pooling side must supply a complete graph and a poster,
+        // otherwise installation fails fast instead of degrading silently.
+        std::vector<ub::ProbeJfcSlot> probe_jfcs;
+        if (params.probe.enabled) {
+            if (!probe_provider || !probe_poster) {
+                return failInstall(Status::InvalidArgument(
+                    "UB probe is enabled but no probe provider/poster is "
+                    "installed" LOC_MARK));
+            }
+            ub::ProbeGraph graph;
+            status = probe_provider->snapshot(graph);
+            if (!status.ok()) return failInstall(status);
+            probe_manager =
+                std::make_unique<ub::ProbeLinkManager>(params.probe);
+            probe_manager->setReportSink(probe_provider.get());
+            status = probe_manager->initialize(graph);
+            if (!status.ok()) return failInstall(status);
+            for (const auto& supply : graph.ports) {
+                if (context_by_topology_id.find(supply.local_nic) ==
+                    context_by_topology_id.end()) {
+                    return failInstall(
+                        Status::InvalidArgument("UB probe port has no matching "
+                                                "local context" LOC_MARK));
+                }
+                // nullptr means shared mode: probe completions land on the
+                // business JFC and are routed by token namespace.
+                if (!supply.probe_jfc) continue;
+                probe_jfcs.push_back(
+                    ub::ProbeJfcSlot{supply.local_nic, supply.probe_jfc});
+            }
+        }
+
         workers = std::make_unique<ub::UbWorkers>(
             adapter, contexts, local_topology, &metadata->segmentManager(),
             buffers.get(), rails.get(), quota.get(), params,
@@ -343,9 +382,24 @@ struct UbTransport::Impl {
                         "failure cleanup" LOC_MARK);
                 }
                 return endpoints->retireLocalDevice(local_topology_id);
-            });
+            },
+            probe_manager.get(), std::move(probe_jfcs));
         status = workers->start();
         if (!status.ok()) return failInstall(status);
+
+        // Pollers run before the scheduler so a probe completion can always be
+        // consumed (design §13.3).
+        if (probe_manager) {
+            try {
+                probe_scheduler = std::make_unique<ub::ProbeScheduler>(
+                    *probe_manager, *probe_poster);
+                probe_scheduler->start();
+            } catch (const std::exception& error) {
+                return failInstall(Status::InternalError(
+                    std::string("Cannot start the UB probe scheduler: ") +
+                    error.what() + LOC_MARK));
+            }
+        }
 
         installed.store(true, std::memory_order_release);
         return Status::OK();
@@ -392,6 +446,10 @@ struct UbTransport::Impl {
             }
             workers.reset();
         }
+        // Workers joined the scheduler through drainBeforePollStop(); destroy
+        // the PLM only after the workers that reference it are gone.
+        probe_scheduler.reset();
+        probe_manager.reset();
         if (endpoints) {
             auto status = endpoints->clear();
             if (!status.ok()) return status;
@@ -609,11 +667,22 @@ struct UbTransport::Impl {
     std::unique_ptr<ub::EndpointStore> endpoints;
     std::unique_ptr<ub::RailMonitor> rails;
     std::unique_ptr<ub::QuotaManager> quota;
+    // Declared before `workers` so destruction runs workers -> scheduler ->
+    // manager -> provider/poster (the workers hold a raw manager pointer).
+    std::shared_ptr<ub::ProbeResourceProvider> probe_provider;
+    std::shared_ptr<ub::ProbePoster> probe_poster;
+    std::unique_ptr<ub::ProbeLinkManager> probe_manager;
+    std::unique_ptr<ub::ProbeScheduler> probe_scheduler;
     std::unique_ptr<ub::UbWorkers> workers;
 };
 
-UbTransport::UbTransport(std::shared_ptr<ub::UrmaAdapter> adapter)
-    : impl_(std::make_unique<Impl>(std::move(adapter))) {}
+UbTransport::UbTransport(
+    std::shared_ptr<ub::UrmaAdapter> adapter,
+    std::shared_ptr<ub::ProbeResourceProvider> probe_provider,
+    std::shared_ptr<ub::ProbePoster> probe_poster)
+    : impl_(std::make_unique<Impl>(std::move(adapter),
+                                   std::move(probe_provider),
+                                   std::move(probe_poster))) {}
 
 UbTransport::~UbTransport() {
     auto status = uninstall();
