@@ -24,6 +24,7 @@
 
 #include "tent/common/config.h"
 #include "tent/common/status.h"
+#include "tent/transport/ub/probe_types.h"
 
 namespace mooncake {
 namespace tent {
@@ -47,6 +48,11 @@ struct UbParams {
 
     bool enable_bandwidth_estimation = true;
     bool enable_notifications = false;
+
+    // Probe-link parameters. W1c only reads `enabled`; parsing the
+    // transports/ub/probe/* keys into this struct is the W1d configuration
+    // milestone.
+    ProbeParams probe;
 
     // Reads every UB setting from transports/ub/*. Numeric settings are
     // deliberately read as signed JSON integers first so a negative value is
@@ -103,6 +109,12 @@ struct UbParams {
         CHECK_STATUS(readBool(config, "transports/ub/enable_notifications",
                               parsed.enable_notifications,
                               parsed.enable_notifications));
+
+        // W1c only needs the probe on/off switch for assembly. The remaining
+        // transports/ub/probe/* keys and their cross-key validation are added
+        // by the W1d configuration milestone.
+        CHECK_STATUS(readBool(config, "transports/ub/probe/enabled",
+                              parsed.probe.enabled, parsed.probe.enabled));
 
         output = std::move(parsed);
         return Status::OK();

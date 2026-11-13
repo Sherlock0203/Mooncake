@@ -74,7 +74,9 @@ UbWorkers::UbWorkers(std::shared_ptr<UrmaAdapter> adapter,
                      RailMonitor* rail_monitor, QuotaManager* quota,
                      UbParams params, EndpointResolver endpoint_resolver,
                      EndpointRetirer endpoint_retirer,
-                     LocalDeviceFailureHandler local_device_failure_handler)
+                     LocalDeviceFailureHandler local_device_failure_handler,
+                     ProbeLinkManager* probe_manager,
+                     std::vector<ProbeJfcSlot> probe_jfcs)
     : adapter_(std::move(adapter)),
       contexts_(std::move(contexts)),
       local_topology_(std::move(local_topology)),
@@ -85,16 +87,25 @@ UbWorkers::UbWorkers(std::shared_ptr<UrmaAdapter> adapter,
       params_(std::move(params)),
       endpoint_resolver_(std::move(endpoint_resolver)),
       endpoint_retirer_(std::move(endpoint_retirer)),
-      local_device_failure_handler_(std::move(local_device_failure_handler)) {
+      local_device_failure_handler_(std::move(local_device_failure_handler)),
+      probe_manager_(probe_manager) {
     for (const auto& context : contexts_) {
         if (!context) continue;
         context_by_topology_id_[context->topologyId()] = context;
         for (const auto& jfc : context->jfcs()) {
-            if (jfc) {
-                all_jfcs_.push_back(jfc);
-                context_by_jfc_[jfc.get()] = context;
-            }
+            if (jfc) business_slots_.push_back(BusinessSlot{jfc, context});
         }
+    }
+    for (auto& slot : probe_jfcs) {
+        if (!slot.jfc) continue;
+        auto context = context_by_topology_id_.find(slot.local_nic);
+        if (context == context_by_topology_id_.end() || !context->second) {
+            LOG(WARNING) << "UB probe JFC for local NIC " << slot.local_nic
+                         << " has no matching context; its completions will "
+                            "not be polled";
+            continue;
+        }
+        probe_slots_.push_back(ProbeSlot{std::move(slot.jfc), context->second});
     }
 }
 
@@ -106,7 +117,7 @@ Status UbWorkers::start() {
                                             std::memory_order_acq_rel)) {
         return Status::InvalidArgument("UB workers already started" LOC_MARK);
     }
-    if (!adapter_ || contexts_.empty() || all_jfcs_.empty() ||
+    if (!adapter_ || contexts_.empty() || business_slots_.empty() ||
         !segment_manager_ || !buffers_ || !rail_monitor_ || !quota_ ||
         !endpoint_resolver_ || params_.worker_count == 0 ||
         params_.poller_count == 0) {
@@ -124,7 +135,7 @@ Status UbWorkers::start() {
             posting_threads_.emplace_back(&UbWorkers::postingLoop, this, i);
         }
         const size_t poller_count =
-            std::min<size_t>(params_.poller_count, all_jfcs_.size());
+            std::min<size_t>(params_.poller_count, business_slots_.size());
         polling_threads_.reserve(poller_count);
         for (size_t i = 0; i < poller_count; ++i) {
             polling_threads_.emplace_back(&UbWorkers::pollingLoop, this, i);
@@ -157,6 +168,9 @@ Status UbWorkers::stop() {
     posting_.store(false, std::memory_order_release);
     timeout_scans_enabled_.store(false, std::memory_order_release);
     queue_cv_.notify_all();
+    // No new probe may be posted once the posting side is closed (design
+    // §11.4). Timeout scans continue until the scheduler is joined below.
+    if (probe_manager_ != nullptr) probe_manager_->stopPosting();
 
     std::vector<PendingSlice> abandoned;
     {
@@ -218,9 +232,7 @@ Status UbWorkers::stop() {
         }
         std::vector<Completion> drained;
         auto status = endpoint->quiesce(params_.slice_timeout_ms, drained);
-        for (const auto& completion : drained) {
-            if (completion.token != 0) handleCompletion(completion);
-        }
+        for (const auto& completion : drained) dispatchCompletion(completion);
         if (!status.ok()) {
             rememberEndpointDrain(endpoint);
             if (fence_error.ok()) fence_error = status;
@@ -237,6 +249,19 @@ Status UbWorkers::stop() {
         if (!draining_endpoints_.empty()) {
             return Status::InternalError(
                 "UB endpoint drain set changed during shutdown" LOC_MARK);
+        }
+    }
+
+    // Business quiesce is complete and the pollers are still running: join the
+    // probe scheduler, let outstanding probe completions settle, and hand off
+    // whatever remains (design §9.6/§11.4). The scheduler is joined before the
+    // pollers stop so no timeout scan or interface-2 report can race them.
+    if (probe_manager_ != nullptr) {
+        const auto drained = probe_manager_->drainBeforePollStop(0);
+        if (!drained.drained) {
+            LOG(WARNING) << "UB probe shutdown handed off " << drained.unproven
+                         << " unproven probe record(s) after draining "
+                         << drained.settled;
         }
     }
 
@@ -366,40 +391,23 @@ void UbWorkers::postingLoop(size_t worker_index) {
 }
 
 void UbWorkers::pollingLoop(size_t poller_index) {
+    // The poller count is unchanged by probe support: probe slots are
+    // distributed across the existing poller set (design §3.3 / §11.1).
     const size_t poller_count = std::max<size_t>(
-        1, std::min<size_t>(params_.poller_count, all_jfcs_.size()));
+        1, std::min<size_t>(params_.poller_count, business_slots_.size()));
     uint64_t last_timeout_scan = 0;
     while (polling_.load(std::memory_order_acquire)) {
         bool progressed = false;
-        for (size_t index = poller_index; index < all_jfcs_.size();
+        // Pass one: probe completion queues first, so a business flood cannot
+        // delay probe completions (design §11.1).
+        for (size_t index = poller_index; index < probe_slots_.size();
              index += poller_count) {
-            std::vector<Completion> completions;
-            auto status = all_jfcs_[index]->poll(64, completions);
-            auto context = context_by_jfc_.find(all_jfcs_[index].get());
-            if (!status.ok()) {
-                if (context != context_by_jfc_.end() && context->second) {
-                    handleLocalDeviceFailure(context->second);
-                }
-                LOG_EVERY_N(WARNING, 1000)
-                    << "UB JFC poll failed: " << status.ToString();
-                continue;
-            }
-            if (context != context_by_jfc_.end() && context->second) {
-                progressLocalDeviceFailure(context->second);
-                if (context->second->recordPollSuccess(
-                        all_jfcs_[index]->index(),
-                        static_cast<uint64_t>(params_.endpoint_cooldown_ms) *
-                            1'000'000ULL)) {
-                    LOG(INFO) << "Recovered UB device "
-                              << context->second->deviceInfo().topology_name
-                              << " after endpoint retirement and an "
-                                 "error-free JFC cooldown";
-                }
-            }
-            progressed = progressed || !completions.empty();
-            for (const auto& completion : completions) {
-                if (completion.token != 0) handleCompletion(completion);
-            }
+            progressed = pollProbeSlot(index) || progressed;
+        }
+        // Pass two: business queues by stride, exactly as before.
+        for (size_t index = poller_index; index < business_slots_.size();
+             index += poller_count) {
+            progressed = pollBusinessSlot(index) || progressed;
         }
         const uint64_t now = steadyNowNs();
         if (timeout_scans_enabled_.load(std::memory_order_acquire) &&
@@ -410,6 +418,69 @@ void UbWorkers::pollingLoop(size_t poller_index) {
         if (!progressed)
             std::this_thread::sleep_for(std::chrono::microseconds(20));
     }
+}
+
+bool UbWorkers::pollBusinessSlot(size_t slot_index) {
+    auto& slot = business_slots_[slot_index];
+    std::vector<Completion> completions;
+    auto status = slot.jfc->poll(64, completions);
+    if (!status.ok()) {
+        if (slot.context) handleLocalDeviceFailure(slot.context);
+        LOG_EVERY_N(WARNING, 1000)
+            << "UB JFC poll failed: " << status.ToString();
+        return false;
+    }
+    if (slot.context) {
+        progressLocalDeviceFailure(slot.context);
+        if (slot.context->recordPollSuccess(
+                slot.jfc->index(),
+                static_cast<uint64_t>(params_.endpoint_cooldown_ms) *
+                    1'000'000ULL)) {
+            LOG(INFO) << "Recovered UB device "
+                      << slot.context->deviceInfo().topology_name
+                      << " after endpoint retirement and an error-free JFC "
+                         "cooldown";
+        }
+    }
+    for (const auto& completion : completions) {
+        dispatchCompletion(completion);
+    }
+    return !completions.empty();
+}
+
+bool UbWorkers::pollProbeSlot(size_t slot_index) {
+    auto& slot = probe_slots_[slot_index];
+    std::vector<Completion> completions;
+    auto status = adapter_->poll(slot.jfc, 64, completions);
+    if (!status.ok()) {
+        // Probe JFC failures are treated exactly like business JFC failures
+        // (design §11.1) and also disable the probe paths on that context.
+        if (slot.context) handleLocalDeviceFailure(slot.context);
+        LOG_EVERY_N(WARNING, 1000)
+            << "UB probe JFC poll failed: " << status.ToString();
+        return false;
+    }
+    if (slot.context) progressLocalDeviceFailure(slot.context);
+    // The probe JFC is provider-owned and not part of UbContext::jfcs(), so it
+    // deliberately does not participate in the business JFC recovery epoch.
+    for (const auto& completion : completions) {
+        dispatchCompletion(completion);
+    }
+    return !completions.empty();
+}
+
+bool UbWorkers::dispatchCompletion(const Completion& completion) {
+    // Namespace first (design §11.2): a probe completion may carry an error
+    // status that the business table would silently drop.
+    if (probe_manager_ != nullptr && isProbeToken(completion.token)) {
+        (void)probe_manager_->onProbeCompletion(completion);
+        return true;
+    }
+    if (completion.token != 0) {
+        handleCompletion(completion);
+        return true;
+    }
+    return false;
 }
 
 void UbWorkers::enqueueRetry(const PendingSlice& pending) {
@@ -942,6 +1013,12 @@ void UbWorkers::handleLocalDeviceFailure(const UbContextPtr& context) {
     const bool newly_failed = context->markUnavailable();
     if (!newly_failed) return;
 
+    // The probe subsystem must stop probing this port as soon as its context
+    // fails, regardless of whether a business cleanup handler is installed.
+    if (probe_manager_ != nullptr) {
+        probe_manager_->onContextUnavailable(context->topologyId());
+    }
+
     if (!local_device_failure_handler_) {
         LOG(WARNING) << "UB device " << context->deviceInfo().topology_name
                      << " has no endpoint cleanup handler; automatic "
@@ -999,6 +1076,9 @@ void UbWorkers::handleCompletion(const Completion& completion) {
         now >= inflight->posted_ns ? now - inflight->posted_ns : 0;
     switch (completion.category) {
         case CompletionCategory::SUCCESS:
+            if (probe_manager_ != nullptr) {
+                probe_manager_->onBusinessPathSuccess(inflight->path, now);
+            }
             rail_monitor_->recordSuccess(inflight->path,
                                          inflight->pending.slice->spec().length,
                                          latency, now);
@@ -1006,6 +1086,10 @@ void UbWorkers::handleCompletion(const Completion& completion) {
                             inflight->pending.slice->spec().length, false);
             break;
         case CompletionCategory::TIMEOUT:
+            if (probe_manager_ != nullptr) {
+                probe_manager_->onBusinessPathError(
+                    inflight->path, BusinessErrorKind::kPathFault, now);
+            }
             rail_monitor_->recordTimeout(inflight->path, now);
             if (endpoint_retirer_) endpoint_retirer_(inflight->endpoint);
             resolveInflight(inflight, TIMEOUT, 0, true);
@@ -1014,18 +1098,47 @@ void UbWorkers::handleCompletion(const Completion& completion) {
             if (inflight->endpoint && inflight->endpoint->context()) {
                 handleLocalDeviceFailure(inflight->endpoint->context());
             }
+            if (probe_manager_ != nullptr) {
+                // kContextFailure disables every path on the port; the PLM fans
+                // it out to onContextUnavailable().
+                probe_manager_->onBusinessPathError(
+                    inflight->path, BusinessErrorKind::kContextFailure, now);
+            }
             rail_monitor_->recordError(inflight->path, now);
             if (endpoint_retirer_) endpoint_retirer_(inflight->endpoint);
             resolveInflight(inflight, FAILED, 0, true);
             break;
         case CompletionCategory::REMOTE_PATH_ERROR:
+            if (probe_manager_ != nullptr) {
+                probe_manager_->onBusinessPathError(
+                    inflight->path, BusinessErrorKind::kPathFault, now);
+            }
+            rail_monitor_->recordError(inflight->path, now);
+            if (endpoint_retirer_) endpoint_retirer_(inflight->endpoint);
+            resolveInflight(inflight, FAILED, 0, true);
+            break;
         case CompletionCategory::ENDPOINT_ERROR:
+            if (probe_manager_ != nullptr) {
+                probe_manager_->onBusinessPathError(
+                    inflight->path, BusinessErrorKind::kLaneError, now);
+            }
             rail_monitor_->recordError(inflight->path, now);
             if (endpoint_retirer_) endpoint_retirer_(inflight->endpoint);
             resolveInflight(inflight, FAILED, 0, true);
             break;
         case CompletionCategory::MEMORY_ERROR:
+            if (probe_manager_ != nullptr) {
+                probe_manager_->onBusinessPathError(
+                    inflight->path, BusinessErrorKind::kParamError, now);
+            }
+            rail_monitor_->recordError(inflight->path, now);
+            resolveInflight(inflight, FAILED, 0, false);
+            break;
         case CompletionCategory::UNKNOWN_ERROR:
+            if (probe_manager_ != nullptr) {
+                probe_manager_->onBusinessPathError(
+                    inflight->path, BusinessErrorKind::kUnknown, now);
+            }
             rail_monitor_->recordError(inflight->path, now);
             resolveInflight(inflight, FAILED, 0, false);
             break;
@@ -1057,9 +1170,7 @@ void UbWorkers::scanTimeouts() {
                       "Timed-out UB WR has no endpoint" LOC_MARK);
         // Even a partial/failed fence may have returned valid WR completions;
         // they must never be lost.
-        for (const auto& completion : drained) {
-            if (completion.token != 0) handleCompletion(completion);
-        }
+        for (const auto& completion : drained) dispatchCompletion(completion);
         if (!status.ok()) {
             rememberEndpointDrain(inflight->endpoint);
             LOG_EVERY_N(ERROR, 100)

@@ -23,6 +23,7 @@
 #include "tent/transport/ub/buffers.h"
 #include "tent/transport/ub/context.h"
 #include "tent/transport/ub/params.h"
+#include "tent/transport/ub/probe_link_manager.h"
 #include "tent/transport/ub/quota.h"
 #include "tent/transport/ub/rail_monitor.h"
 #include "tent/transport/ub/slice.h"
@@ -127,6 +128,13 @@ struct UbPathSelectionScore {
     return order;
 }
 
+// One dedicated probe completion queue handed over by the pooling side. The
+// handle stays owned by the provider; workers only polls it (design §11.1).
+struct ProbeJfcSlot {
+    Topology::NicID local_nic{-1};
+    JfcPtr jfc;
+};
+
 // Native UB scheduler. Posting lanes own request selection and URMA post;
 // poller lanes own completion dispatch. A monotonic numeric token, never a raw
 // UbSlice pointer, crosses the adapter boundary.
@@ -139,7 +147,9 @@ class UbWorkers final {
               RailMonitor* rail_monitor, QuotaManager* quota, UbParams params,
               EndpointResolver endpoint_resolver,
               EndpointRetirer endpoint_retirer = {},
-              LocalDeviceFailureHandler local_device_failure_handler = {});
+              LocalDeviceFailureHandler local_device_failure_handler = {},
+              ProbeLinkManager* probe_manager = nullptr,
+              std::vector<ProbeJfcSlot> probe_jfcs = {});
     ~UbWorkers();
 
     UbWorkers(const UbWorkers&) = delete;
@@ -186,6 +196,11 @@ class UbWorkers final {
                                     std::shared_ptr<UbEndpoint>& endpoint,
                                     UbPostPath& path,
                                     QuotaReservation& reservation);
+    // Namespace first: probe tokens are routed to the PLM before the business
+    // table can silently drop them (design §11.2).
+    bool dispatchCompletion(const Completion& completion);
+    bool pollBusinessSlot(size_t slot_index);
+    bool pollProbeSlot(size_t slot_index);
     void handleCompletion(const Completion& completion);
     void handleLocalDeviceFailure(const UbContextPtr& context);
     void progressLocalDeviceFailure(const UbContextPtr& context);
@@ -237,8 +252,18 @@ class UbWorkers final {
     std::unordered_map<uint64_t, std::shared_ptr<UbEndpoint>>
         draining_endpoints_;
 
-    std::vector<std::shared_ptr<UbJfc>> all_jfcs_;
-    std::unordered_map<const UbJfc*, UbContextPtr> context_by_jfc_;
+    struct BusinessSlot {
+        std::shared_ptr<UbJfc> jfc;
+        UbContextPtr context;
+    };
+    struct ProbeSlot {
+        JfcPtr jfc;
+        UbContextPtr context;
+    };
+    std::vector<BusinessSlot> business_slots_;
+    std::vector<ProbeSlot> probe_slots_;
+    ProbeLinkManager* probe_manager_{nullptr};
+
     std::vector<std::thread> posting_threads_;
     std::vector<std::thread> polling_threads_;
     std::atomic<bool> accepting_{false};
