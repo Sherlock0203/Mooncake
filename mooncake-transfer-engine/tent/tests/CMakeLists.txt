@@ -590,6 +590,19 @@ if(USE_UB)
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_ub_probe_campaign_test COMMAND tent_ub_probe_campaign_test)
 
+  # Probe-link W1b: scheduler thread, poster seam, timeout, backoff and
+  # shutdown drain (design §14.2 #4-8, #10, #16).
+  add_executable(
+    tent_ub_probe_scheduler_test
+    ub_probe_scheduler_test.cpp ../src/transport/ub/probe_link_manager.cpp
+    ../src/transport/ub/probe_scheduler.cpp)
+  target_link_libraries(tent_ub_probe_scheduler_test
+                        PRIVATE tent_common gtest gtest_main)
+  target_include_directories(tent_ub_probe_scheduler_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_probe_scheduler_test
+           COMMAND tent_ub_probe_scheduler_test)
+
   add_executable(tent_ub_native_data_path_test ub_native_data_path_test.cpp)
   target_link_libraries(tent_ub_native_data_path_test PRIVATE gtest gtest_main
                                                               tent_link_group)

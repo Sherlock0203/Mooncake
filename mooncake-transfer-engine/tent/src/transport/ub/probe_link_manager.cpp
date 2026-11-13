@@ -15,6 +15,7 @@
 #include "tent/transport/ub/probe_link_manager.h"
 
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <utility>
 
@@ -182,14 +183,41 @@ ProbeEdgeSupply* ProbeLinkManager::findEdgeLocked(const PathVersion& version) {
     return it == edges_.end() ? nullptr : &it->second;
 }
 
+void ProbeLinkManager::setReportSink(ProbeReportSink* sink) {
+    std::lock_guard<std::mutex> lock(hook_mutex_);
+    report_ = sink;
+}
+
+void ProbeLinkManager::setWakeCallback(WakeCallback callback) {
+    std::lock_guard<std::mutex> lock(hook_mutex_);
+    wake_ = std::move(callback);
+}
+
+void ProbeLinkManager::setSchedulerStopHook(std::function<void()> hook) {
+    std::lock_guard<std::mutex> lock(hook_mutex_);
+    scheduler_stop_ = std::move(hook);
+}
+
 void ProbeLinkManager::emitEffects(const Effects& effects) {
-    // Never hold the PLM mutex across a sink call (design §14.1-6).
-    if (effects.retire_lane && report_ != nullptr) {
-        report_->retireProbeLane(effects.lane, effects.generation,
-                                 effects.error_epoch, effects.path,
-                                 effects.reason);
+    // Never hold the PLM mutex across a sink call (design §14.1-6). The hooks
+    // are copied under a dedicated mutex so teardown can clear them even while
+    // a completion is being settled.
+    ProbeReportSink* report = nullptr;
+    WakeCallback wake;
+    {
+        std::lock_guard<std::mutex> lock(hook_mutex_);
+        report = report_;
+        wake = wake_;
     }
-    if ((effects.retire_lane || effects.bump) && wake_) wake_();
+    if (effects.retire_lane && report != nullptr) {
+        report->retireProbeLane(effects.lane, effects.generation,
+                                effects.error_epoch, effects.path,
+                                effects.reason);
+    }
+    // Every externally visible state change wakes the scheduler: releases of a
+    // port slot, peer budget or queue entry can make a different path due even
+    // when the health bucket did not change.
+    if (wake) wake();
 }
 
 bool ProbeLinkManager::externalGateOk(const ProbeEdgeSupply& edge) {
@@ -247,9 +275,8 @@ uint64_t ProbeLinkManager::backoffDelayLocked(
     return std::min(delay, params_.backoffMaxNs());
 }
 
-bool ProbeLinkManager::dueLocked(const PathVersion& version,
-                                 const PathRuntime& runtime,
-                                 uint64_t now_ns) const {
+bool ProbeLinkManager::timeEligibleLocked(const PathVersion& version,
+                                          const PathRuntime& runtime) const {
     if (runtime.task == TaskState::kInflight) return false;
     // DISABLED paths are not recovered by probing: they wait for a new graph
     // version (design §6.1).
@@ -270,7 +297,14 @@ bool ProbeLinkManager::dueLocked(const PathVersion& version,
         // verified as part of a campaign.
         return false;
     }
-    return now_ns >= runtime.next_probe_ns;
+    return true;
+}
+
+bool ProbeLinkManager::dueLocked(const PathVersion& version,
+                                 const PathRuntime& runtime,
+                                 uint64_t now_ns) const {
+    return timeEligibleLocked(version, runtime) &&
+           now_ns >= runtime.next_probe_ns;
 }
 
 bool ProbeLinkManager::peerBudgetAvailableLocked(
@@ -313,7 +347,7 @@ ProbeAction ProbeLinkManager::makeActionLocked(
 std::vector<ProbeAction> ProbeLinkManager::pendingActions(uint64_t now_ns) {
     std::vector<ProbeAction> actions;
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!initialized_) return actions;
+    if (!initialized_ || !accepting_.load()) return actions;
     const uint64_t now = normalizedNow(now_ns);
 
     for (auto& [local_nic, port] : ports_) {
@@ -363,7 +397,10 @@ std::shared_ptr<ProbeRecord> ProbeLinkManager::beginPost(
     const ProbeAction& action, uint64_t token, uint64_t now_ns) {
     std::lock_guard<std::mutex> lock(mutex_);
     const uint64_t now = normalizedNow(now_ns);
-    if (!initialized_ || token == 0 || !isProbeToken(token)) return nullptr;
+    if (!initialized_ || !accepting_.load() || token == 0 ||
+        !isProbeToken(token)) {
+        return nullptr;
+    }
     if (inflight_.find(token) != inflight_.end() ||
         orphans_.find(token) != orphans_.end()) {
         return nullptr;
@@ -488,6 +525,7 @@ void ProbeLinkManager::onPostResult(const std::shared_ptr<ProbeRecord>& record,
             record->state = RecordState::kRejected;
             const uint64_t token = record->token;
             inflight_.erase(token);
+            inflight_cv_.notify_all();
             PortRuntime* port =
                 findPortLocked(record->key.version.path.local_nic);
             if (port != nullptr) releaseSlotLocked(*port, *record);
@@ -527,7 +565,11 @@ uint64_t ProbeLinkManager::nextDeadline(uint64_t now_ns) const {
         for (const auto& version : port.paths) {
             auto runtime = paths_.find(version);
             if (runtime == paths_.end()) continue;
-            if (!schedulableLocked(version, runtime->second, now)) continue;
+            // Everything except the time comparison: a path that becomes due
+            // later still has to wake the scheduler at next_probe_ns.
+            if (!timeEligibleLocked(version, runtime->second)) continue;
+            if (runtime->second.pending) continue;
+            if (!peerBudgetAvailableLocked(runtime->second.peer)) continue;
             consider(std::max(runtime->second.next_probe_ns, now));
         }
     }
@@ -608,6 +650,7 @@ bool ProbeLinkManager::onProbeCompletion(const Completion& completion,
 
             source = std::move(record->source);
             area = std::move(record->area);
+            inflight_cv_.notify_all();
         }
     }
 
@@ -899,6 +942,9 @@ std::optional<PathVersion> ProbeLinkManager::resolveVersionLocked(
 void ProbeLinkManager::onBusinessPathSuccess(const UbPostPath& path,
                                              uint64_t now_ns) {
     (void)now_ns;
+    // Shutdown only settles existing responsibility: no new health evidence is
+    // published after posting has been closed (design §14.1-8).
+    if (!accepting_.load()) return;
     Effects effects;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -919,6 +965,9 @@ void ProbeLinkManager::onBusinessPathSuccess(const UbPostPath& path,
 void ProbeLinkManager::onBusinessPathError(const UbPostPath& path,
                                            BusinessErrorKind kind,
                                            uint64_t now_ns) {
+    // Shutdown only settles existing responsibility: no new campaign and no new
+    // isolation (design §14.1-8).
+    if (!accepting_.load()) return;
     const uint64_t now = normalizedNow(now_ns);
 
     if (kind == BusinessErrorKind::kParamError) {
@@ -1066,6 +1115,7 @@ void ProbeLinkManager::moveToOrphansLocked(
     inflight_.erase(token);
     orphans_[token] = record;
     ++stats_.probe_orphan_added;
+    inflight_cv_.notify_all();
     (void)now_ns;
 }
 
@@ -1371,6 +1421,174 @@ Status ProbeLinkManager::onPoolAvailabilityChange(const ProbeEvent& event) {
     }
     emitEffects(effects);
     return Status::OK();
+}
+
+void ProbeLinkManager::scanTimeouts(uint64_t now_ns) {
+    const uint64_t now = normalizedNow(now_ns);
+    Effects effects;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<std::shared_ptr<ProbeRecord>> expired;
+        for (auto& [token, record] : inflight_) {
+            if (record->settled.load(std::memory_order_acquire)) continue;
+            if (record->deadline_ns > now) continue;
+            // One-shot: a record is scanned for timeout exactly once even if
+            // the scheduler calls again before a late completion arrives.
+            if (record->timed_out.exchange(true)) continue;
+            expired.push_back(record);
+        }
+        for (auto& record : expired) {
+            // Timeout means "responsibility unknown" (L-4): never resend, keep
+            // the port slot and the references pinned, report the lane once,
+            // and let a late completion or a new handle generation resolve it.
+            ++stats_.probe_timeout_unknown;
+            PortRuntime* port =
+                findPortLocked(record->key.version.path.local_nic);
+            if (port != nullptr) {
+                laneRetireLocked(
+                    *port, now, record->key.version,
+                    Status::InternalError("probe completion timeout"), effects);
+                markPortPendingLocked(*port, PendingReason::kLaneRetired, now);
+            }
+            moveToOrphansLocked(record, OrphanReason::kTimeout, now);
+        }
+    }
+    emitEffects(effects);
+}
+
+void ProbeLinkManager::stopPosting() {
+    Effects effects;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!accepting_.exchange(false)) return;
+        // Cancel every schedulable task. In-flight records keep settling; the
+        // campaign bookkeeping converges now so no campaign survives shutdown.
+        for (auto& [peer, campaign] : campaigns_) {
+            for (auto& [version, entry] : campaign.entries) {
+                if (entry.state == EntryState::kQueued ||
+                    entry.state == EntryState::kInflight) {
+                    entry.state = EntryState::kCanceled;
+                    ++stats_.campaign_entry_canceled;
+                }
+            }
+        }
+        exitFinishedCampaignsLocked();
+        for (auto& [version, runtime] : paths_) {
+            if (runtime.task == TaskState::kQueued) {
+                runtime.task = TaskState::kIdle;
+            }
+        }
+        effects.bump = true;
+    }
+    emitEffects(effects);
+}
+
+void ProbeLinkManager::notePostBlockUs(uint64_t micros) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    stats_.probe_post_block_us = std::max(stats_.probe_post_block_us, micros);
+}
+
+ProbeDrainResult ProbeLinkManager::drainBeforePollStop(uint64_t deadline_ns) {
+    ProbeDrainResult result;
+    // Step 1: stop scheduling and join the scheduler before the pollers stop,
+    // so no timeout scan or interface-2 report can race the poller shutdown.
+    stopPosting();
+    std::function<void()> scheduler_stop;
+    {
+        std::lock_guard<std::mutex> lock(hook_mutex_);
+        scheduler_stop = scheduler_stop_;
+    }
+    if (scheduler_stop) scheduler_stop();
+
+    const uint64_t now = normalizedNow(0);
+    const uint64_t deadline =
+        deadline_ns == 0 ? now + params_.timeoutNs() : deadline_ns;
+    const uint64_t wait_ns = deadline > now ? deadline - now : 0;
+    // The deadline is expressed in the injected clock's domain; the wait
+    // itself must use the real clock because the scheduler thread is gone.
+    const auto real_deadline =
+        std::chrono::steady_clock::now() + std::chrono::nanoseconds(wait_ns);
+
+    std::vector<ProbeHandoff> handoffs;
+    ProbeReportSink* report = nullptr;
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        const size_t initial = inflight_.size();
+        while (!inflight_.empty()) {
+            if (inflight_cv_.wait_until(lock, real_deadline) ==
+                std::cv_status::timeout) {
+                break;
+            }
+        }
+        result.settled =
+            initial > inflight_.size() ? initial - inflight_.size() : 0;
+
+        // Step 2: anything still unresolved becomes a shutdown orphan. No
+        // interface-2 report is emitted during shutdown.
+        std::vector<uint64_t> unresolved;
+        unresolved.reserve(inflight_.size());
+        for (const auto& [token, record] : inflight_) {
+            unresolved.push_back(token);
+        }
+        for (uint64_t token : unresolved) {
+            auto record = inflight_.find(token);
+            if (record != inflight_.end() &&
+                !record->second->settled.load(std::memory_order_acquire)) {
+                moveToOrphansLocked(record->second, OrphanReason::kShutdown,
+                                    now);
+            }
+        }
+
+        // Step 3: the handoff snapshot is the existing orphan table (which now
+        // includes the records just moved). Claim each record once.
+        for (auto it = orphans_.begin(); it != orphans_.end();) {
+            auto record = it->second;
+            if (record->settled.exchange(true)) {
+                it = orphans_.erase(it);
+                continue;
+            }
+            ProbeHandoff handoff;
+            handoff.token = record->token;
+            handoff.lane = LaneKey{record->key.version.path.local_nic, 0,
+                                   record->key.jetty_generation};
+            auto port = ports_.find(record->key.version.path.local_nic);
+            if (port != ports_.end() && port->second.supply.probe_jetty) {
+                handoff.lane.native_jetty_id =
+                    port->second.supply.probe_jetty->id();
+            }
+            handoff.key = record->key;
+            handoff.posted_ns = record->posted_ns;
+            handoff.deadline_ns = record->deadline_ns;
+            handoff.timed_out =
+                record->timed_out.load(std::memory_order_acquire);
+            handoff.orphan_reason = record->orphan_reason;
+            handoff.source = std::move(record->source);
+            handoff.area = std::move(record->area);
+            handoff.credit = record->credit;
+            record->state = RecordState::kHandedOff;
+            ++stats_.probe_orphan_handed_off;
+            ++stats_.probe_drain_unproven;
+            handoffs.push_back(std::move(handoff));
+            it = orphans_.erase(it);
+        }
+        result.unproven = handoffs.size();
+        result.drained = handoffs.empty();
+        std::lock_guard<std::mutex> hook_lock(hook_mutex_);
+        report = report_;
+    }
+
+    // Step 4: hand off outside the lock. Acquire-before-release: the sink must
+    // copy the references into its own registry before this snapshot dies.
+    if (report == nullptr && !handoffs.empty()) {
+        LOG(WARNING) << "UB probe: dropping " << handoffs.size()
+                     << " unproven probe record(s): no report sink configured";
+    }
+    if (report != nullptr) {
+        for (const auto& handoff : handoffs) {
+            report->handoffUnproven(handoff);
+        }
+    }
+    return result;
 }
 
 std::vector<PathHealthView> ProbeLinkManager::healthView() const {

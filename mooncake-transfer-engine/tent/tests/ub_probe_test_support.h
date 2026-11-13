@@ -21,10 +21,14 @@
 #ifndef TENT_TESTS_UB_PROBE_TEST_SUPPORT_H_
 #define TENT_TESTS_UB_PROBE_TEST_SUPPORT_H_
 
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -136,10 +140,139 @@ class RecordingReportSink : public ProbeReportSink {
                                           path, reason.code()});
     }
 
-    void handoffUnproven(const ProbeHandoff&) override { ++handoff_calls; }
+    void handoffUnproven(const ProbeHandoff& handoff) override {
+        handoffs.push_back(handoff);
+        ++handoff_calls;
+    }
 
     std::vector<RetireCall> retire_calls;
+    // The handoff payload keeps its segment references so tests can check that
+    // the PLM transferred ownership instead of releasing early.
+    std::vector<ProbeHandoff> handoffs;
     size_t handoff_calls{0};
+};
+
+// Deterministic poster double. Tests drive completion settlement themselves;
+// this only records the WR/Target it was asked to post and returns a configured
+// result.
+enum class FakePostResult : uint8_t {
+    kAccepted,
+    kRejected,
+    kUnknown,
+};
+
+struct ProbePostCall {
+    uint64_t token{0};
+    uint64_t jetty_generation{0};
+    uint64_t source_address{0};
+    uint64_t source_length{0};
+    uint64_t area_address{0};
+    uint64_t area_length{0};
+    uint32_t native_jetty_id{0};
+};
+
+class FakeProbePoster : public ProbePoster {
+   public:
+    explicit FakeProbePoster(FakePostResult result = FakePostResult::kAccepted)
+        : result_(result) {}
+
+    Status post(const ProbePostTarget& target, const ProbeWorkRequest& request,
+                size_t& posted) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ProbePostCall call;
+        call.token = request.token;
+        call.jetty_generation = target.jetty_generation;
+        call.source_address = request.source_address;
+        call.source_length = request.source_length;
+        call.area_address = request.area_address;
+        call.area_length = request.area_length;
+        if (target.probe_jetty) call.native_jetty_id = target.probe_jetty->id();
+        calls_.push_back(std::move(call));
+        Status status = Status::OK();
+        posted = 0;
+        switch (result_) {
+            case FakePostResult::kAccepted:
+                posted = 1;
+                break;
+            case FakePostResult::kRejected:
+                status = Status::InternalError("fake probe post rejected");
+                break;
+            case FakePostResult::kUnknown:
+                // Provider returns OK but proves no acceptance: unknown.
+                break;
+        }
+        cv_.notify_all();
+        return status;
+    }
+
+    void setResult(FakePostResult result) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        result_ = result;
+    }
+
+    [[nodiscard]] size_t callCount() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return calls_.size();
+    }
+
+    [[nodiscard]] std::vector<ProbePostCall> calls() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return calls_;
+    }
+
+    [[nodiscard]] ProbePostCall lastCall() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return calls_.empty() ? ProbePostCall{} : calls_.back();
+    }
+
+    bool waitForCalls(size_t count, std::chrono::milliseconds timeout =
+                                        std::chrono::milliseconds(2000)) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return cv_.wait_for(lock, timeout,
+                            [this, count] { return calls_.size() >= count; });
+    }
+
+   private:
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+    std::vector<ProbePostCall> calls_;
+    FakePostResult result_;
+};
+
+template <typename Predicate>
+bool waitUntil(Predicate predicate, std::chrono::milliseconds timeout =
+                                        std::chrono::milliseconds(2000)) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (predicate()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return predicate();
+}
+
+// Builds and applies interface-7 events with a monotonic event_seq.
+class EventDriver {
+   public:
+    explicit EventDriver(ProbeLinkManager& plm, uint64_t graph_epoch = 1)
+        : plm_(plm), graph_epoch_(graph_epoch) {}
+
+    Status send(ProbeEvent event) {
+        event.graph_epoch = graph_epoch_;
+        event.event_seq = ++seq_;
+        return plm_.onPoolAvailabilityChange(event);
+    }
+
+    void nextGraphEpoch() {
+        ++graph_epoch_;
+        seq_ = 0;
+    }
+
+    [[nodiscard]] uint64_t seq() const { return seq_; }
+
+   private:
+    ProbeLinkManager& plm_;
+    uint64_t graph_epoch_;
+    uint64_t seq_{0};
 };
 
 inline ProbeParams defaultParams() {

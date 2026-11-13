@@ -34,31 +34,6 @@ using namespace probe_test;
 
 constexpr uint64_t kIntervalNs = 1000ULL * 1000 * 1000;
 
-// Builds and applies interface-7 events with a monotonic event_seq.
-class EventDriver {
-   public:
-    explicit EventDriver(ProbeLinkManager& plm, uint64_t graph_epoch = 1)
-        : plm_(plm), graph_epoch_(graph_epoch) {}
-
-    Status send(ProbeEvent event) {
-        event.graph_epoch = graph_epoch_;
-        event.event_seq = ++seq_;
-        return plm_.onPoolAvailabilityChange(event);
-    }
-
-    void nextGraphEpoch() {
-        ++graph_epoch_;
-        seq_ = 0;
-    }
-
-    [[nodiscard]] uint64_t seq() const { return seq_; }
-
-   private:
-    ProbeLinkManager& plm_;
-    uint64_t graph_epoch_;
-    uint64_t seq_{0};
-};
-
 TEST(UbProbeCampaignTest, ConvergesThroughGateBlockedRecovery) {
     TestClock clock;
     ProbeLinkManager plm(defaultParams(), clock.clock());

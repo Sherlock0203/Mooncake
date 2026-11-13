@@ -39,6 +39,7 @@
 #define TENT_TRANSPORT_UB_PROBE_LINK_MANAGER_H_
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -149,6 +150,15 @@ struct CampaignView {
     std::vector<CampaignEntryView> entries;
 };
 
+// Shutdown accounting (design §9.6). `settled` counts records that terminated
+// while draining, `unproven` counts records handed off with unresolved hardware
+// responsibility. `drained` is true when nothing had to be handed off.
+struct ProbeDrainResult {
+    size_t settled{0};
+    size_t unproven{0};
+    bool drained{true};
+};
+
 class ProbeLinkManager final : public ProbeAvailabilitySink {
    public:
     using Clock = std::function<uint64_t()>;
@@ -161,10 +171,11 @@ class ProbeLinkManager final : public ProbeAvailabilitySink {
     ProbeLinkManager& operator=(const ProbeLinkManager&) = delete;
 
     // Reporting (interface 2 and the W1 handoff seam) may be provided by the
-    // same object that supplies resources, or a narrower sink.
-    void setReportSink(ProbeReportSink* sink) { report_ = sink; }
+    // same object that supplies resources, or a narrower sink. The hook mutex
+    // makes the setter safe against concurrent emitEffects().
+    void setReportSink(ProbeReportSink* sink);
     // Invoked outside the PLM mutex whenever scheduling state changed.
-    void setWakeCallback(WakeCallback callback) { wake_ = std::move(callback); }
+    void setWakeCallback(WakeCallback callback);
 
     // Interface 7 entry point handed to the provider at wiring time.
     [[nodiscard]] ProbeAvailabilitySink* availabilitySink() { return this; }
@@ -193,6 +204,32 @@ class ProbeLinkManager final : public ProbeAvailabilitySink {
     // Earliest time the scheduler has something to do, or 0 if it can sleep
     // until the next external event (design §8.7).
     [[nodiscard]] uint64_t nextDeadline(uint64_t now_ns) const;
+
+    // ---- timeout scan and shutdown (design §9.4/§9.6) --------------------
+    // Marks every record past its deadline exactly once: retires the probe
+    // lane, marks the port Pending and moves the record to the orphan table.
+    // Resources and the port slot stay pinned (L-4); a late completion only
+    // settles the orphan. Called by the scheduler thread before its wait.
+    void scanTimeouts(uint64_t now_ns);
+
+    // Stops scheduling new probes and cancels queued campaign entries;
+    // in-flight records keep settling (design §13.4). Idempotent.
+    void stopPosting();
+
+    // Scheduler lifecycle hook: the scheduler registers "request stop and join
+    // me" so drainBeforePollStop can join the scheduler before pollers stop.
+    void setSchedulerStopHook(std::function<void()> hook);
+
+    // Prepares shutdown: stops posting, joins the scheduler through the hook,
+    // waits (bounded) for in-flight completions, then moves every unresolved
+    // record plus the existing orphan table into one handoff snapshot. Must be
+    // called from a thread other than the scheduler thread. The sink is called
+    // outside the PLM mutex and must acquire the references before returning
+    // (acquire-before-release). A zero deadline means now + timeout_ms.
+    ProbeDrainResult drainBeforePollStop(uint64_t deadline_ns = 0);
+
+    // High-water mark for the poster's blocking time (design §13.2).
+    void notePostBlockUs(uint64_t micros);
 
     // ---- poller seam (design §9.1/§9.2) -----------------------------------
     // Returns false when the token does not belong to the probe namespace.
@@ -311,6 +348,9 @@ class ProbeLinkManager final : public ProbeAvailabilitySink {
     static bool externalGateOk(const ProbeEdgeSupply& edge);
     uint64_t backoffDelayLocked(uint64_t consecutive_failures) const;
 
+    // Task/health/campaign eligibility ignoring the next_probe deadline.
+    bool timeEligibleLocked(const PathVersion& version,
+                            const PathRuntime& runtime) const;
     bool dueLocked(const PathVersion& version, const PathRuntime& runtime,
                    uint64_t now_ns) const;
     bool schedulableLocked(const PathVersion& version,
@@ -359,10 +399,19 @@ class ProbeLinkManager final : public ProbeAvailabilitySink {
         const UbPostPath& evidence, bool require_matching_generation);
 
     mutable std::mutex mutex_;
+    // Guards the externally installed hooks (report sink, wake callback and
+    // scheduler stop hook) so they can be replaced/cleared while another
+    // thread emits effects.
+    mutable std::mutex hook_mutex_;
     ProbeParams params_;
     Clock clock_;
     ProbeReportSink* report_{nullptr};
     WakeCallback wake_;
+    std::function<void()> scheduler_stop_;
+    // Woken when the in-flight table loses an entry, for bounded drain waits.
+    std::condition_variable inflight_cv_;
+    // False after stopPosting(): no new probe may be claimed or created.
+    std::atomic<bool> accepting_{true};
 
     bool initialized_{false};
     uint64_t graph_epoch_{0};
