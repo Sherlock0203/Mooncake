@@ -44,6 +44,7 @@
 #include "tent/transport/ub/rail_monitor.h"
 #include "tent/transport/ub/ub_transport.h"
 #include "tent/transport/ub/workers.h"
+#include "ub_fake_topology.h"
 #include "ub_fake_urma.h"
 #include "ub_probe_test_support.h"
 

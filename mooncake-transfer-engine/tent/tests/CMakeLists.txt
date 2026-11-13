@@ -606,6 +606,20 @@ if(USE_UB)
   # Probe-link W1c: workers seams + transport assembly against the fake URMA
   # provider (design §14.2 #12). tent_link_group already contains the probe
   # sources through tent_xport_ub, so they must not be compiled in again.
+  # Standalone probe resource provider (P1): owns probe-native resources
+  # without the business Jetty pool. Only the provider implementation is
+  # compiled in; the PLM/scheduler are not involved at this stage.
+  add_executable(
+    tent_ub_probe_standalone_provider_test
+    ub_probe_standalone_provider_test.cpp
+    ../src/transport/ub/probe_provider_standalone.cpp)
+  target_link_libraries(tent_ub_probe_standalone_provider_test
+                        PRIVATE tent_common gtest gtest_main)
+  target_include_directories(tent_ub_probe_standalone_provider_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_probe_standalone_provider_test
+           COMMAND tent_ub_probe_standalone_provider_test)
+
   add_executable(tent_ub_probe_integration_test ub_probe_integration_test.cpp)
   target_link_libraries(tent_ub_probe_integration_test
                         PRIVATE gtest gtest_main tent_link_group)
