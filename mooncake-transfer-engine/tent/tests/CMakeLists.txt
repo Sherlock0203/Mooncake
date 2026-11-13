@@ -569,6 +569,27 @@ if(USE_UB)
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_ub_teardown_test COMMAND tent_ub_teardown_test)
 
+  # Probe-link W1a: state machine + campaign (design §14.2 #1-3, #11, #13,
+  # #14, #17). The scheduler/poster seam and the workers integration are
+  # separate milestone targets, so these link only the PLM implementation.
+  add_executable(
+    tent_ub_probe_plm_test
+    ub_probe_plm_test.cpp ../src/transport/ub/probe_link_manager.cpp)
+  target_link_libraries(tent_ub_probe_plm_test PRIVATE tent_common gtest
+                                                      gtest_main)
+  target_include_directories(tent_ub_probe_plm_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_probe_plm_test COMMAND tent_ub_probe_plm_test)
+
+  add_executable(
+    tent_ub_probe_campaign_test
+    ub_probe_campaign_test.cpp ../src/transport/ub/probe_link_manager.cpp)
+  target_link_libraries(tent_ub_probe_campaign_test PRIVATE tent_common gtest
+                                                            gtest_main)
+  target_include_directories(tent_ub_probe_campaign_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_probe_campaign_test COMMAND tent_ub_probe_campaign_test)
+
   add_executable(tent_ub_native_data_path_test ub_native_data_path_test.cpp)
   target_link_libraries(tent_ub_native_data_path_test PRIVATE gtest gtest_main
                                                               tent_link_group)
