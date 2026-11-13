@@ -380,6 +380,47 @@ TEST(UbProbeIntegrationTest, ProbeJfcPollFailureDisablesProbePaths) {
     env.shutdown();
 }
 
+std::shared_ptr<ControlService> startFakeControl(
+    const std::shared_ptr<Topology>& topology, std::string& segment_name) {
+    auto control = std::make_shared<ControlService>("p2p", "", nullptr);
+    uint16_t rpc_port = 0;
+    if (!control->start(rpc_port).ok()) return nullptr;
+    segment_name =
+        "127.0.0.1:" + std::to_string(static_cast<unsigned>(rpc_port));
+    if (!control->segmentManager()
+             .updateLocal([&](SegmentDesc& segment) {
+                 segment.name = segment_name;
+                 segment.rpc_server_addr = segment_name;
+                 segment.machine_id = "fake-machine";
+                 segment.type = SegmentType::Memory;
+                 segment.detail = MemorySegmentDesc{};
+                 std::get<MemorySegmentDesc>(segment.detail).topology =
+                     *topology;
+                 return Status::OK();
+             })
+             .ok()) {
+        return nullptr;
+    }
+    return control;
+}
+
+std::shared_ptr<Config> makeTransportConfig(bool probe_enabled) {
+    auto config = std::make_shared<Config>();
+    config->set("transports/ub/enable", true);
+    config->set("transports/ub/worker_count", 1);
+    config->set("transports/ub/poller_count", 1);
+    config->set("transports/ub/jfc_per_context", 1);
+    config->set("transports/ub/jetty_per_endpoint", 1);
+    config->set("transports/ub/max_endpoints", 16);
+    config->set("transports/ub/slice_size", 16);
+    config->set("transports/ub/max_slices_per_task", 8);
+    config->set("transports/ub/max_retries", 1);
+    config->set("transports/ub/slice_timeout_ms", 1000);
+    config->set("transports/ub/endpoint_cooldown_ms", 100);
+    config->set("transports/ub/probe/enabled", probe_enabled);
+    return config;
+}
+
 // The transport assembly needs a complete fake supply; it never posts because
 // no campaign exists.
 class FakeProbeProvider final : public ProbeResourceProvider {
@@ -438,37 +479,10 @@ TEST(UbProbeIntegrationTest, TransportAssemblesAndTearsDownProbeScheduler) {
     auto poster = std::make_shared<pt::FakeProbePoster>();
 
     auto topology = fakeTopology();
-    auto control = std::make_shared<ControlService>("p2p", "", nullptr);
-    uint16_t rpc_port = 0;
-    ASSERT_TRUE(control->start(rpc_port).ok());
-    const std::string segment_name =
-        "127.0.0.1:" + std::to_string(static_cast<unsigned>(rpc_port));
-    ASSERT_TRUE(control->segmentManager()
-                    .updateLocal([&](SegmentDesc& segment) {
-                        segment.name = segment_name;
-                        segment.rpc_server_addr = segment_name;
-                        segment.machine_id = "fake-machine";
-                        segment.type = SegmentType::Memory;
-                        segment.detail = MemorySegmentDesc{};
-                        std::get<MemorySegmentDesc>(segment.detail).topology =
-                            *topology;
-                        return Status::OK();
-                    })
-                    .ok());
-
-    auto config = std::make_shared<Config>();
-    config->set("transports/ub/enable", true);
-    config->set("transports/ub/worker_count", 1);
-    config->set("transports/ub/poller_count", 1);
-    config->set("transports/ub/jfc_per_context", 1);
-    config->set("transports/ub/jetty_per_endpoint", 1);
-    config->set("transports/ub/max_endpoints", 16);
-    config->set("transports/ub/slice_size", 16);
-    config->set("transports/ub/max_slices_per_task", 8);
-    config->set("transports/ub/max_retries", 1);
-    config->set("transports/ub/slice_timeout_ms", 1000);
-    config->set("transports/ub/endpoint_cooldown_ms", 100);
-    config->set("transports/ub/probe/enabled", true);
+    std::string segment_name;
+    auto control = startFakeControl(topology, segment_name);
+    ASSERT_NE(control, nullptr);
+    auto config = makeTransportConfig(/*probe_enabled=*/true);
 
     UbTransport transport(adapter, provider, poster);
     std::string mutable_segment_name = segment_name;
@@ -481,6 +495,25 @@ TEST(UbProbeIntegrationTest, TransportAssemblesAndTearsDownProbeScheduler) {
 
     EXPECT_TRUE(transport.uninstall().ok());
     EXPECT_EQ(provider->handoffs, 0);
+}
+
+TEST(UbProbeIntegrationTest, EnabledProbeWithoutSupplyFailsInstall) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    auto topology = fakeTopology();
+    std::string segment_name;
+    auto control = startFakeControl(topology, segment_name);
+    ASSERT_NE(control, nullptr);
+    auto config = makeTransportConfig(/*probe_enabled=*/true);
+
+    // No provider/poster: enabling probing must fail fast instead of silently
+    // degrading to "no probing" (design §12.3).
+    UbTransport transport(adapter);
+    std::string mutable_segment_name = segment_name;
+    const auto status =
+        transport.install(mutable_segment_name, control, topology, config);
+    EXPECT_FALSE(status.ok());
+    EXPECT_TRUE(status.IsInvalidArgument());
+    EXPECT_TRUE(transport.uninstall().ok());
 }
 
 }  // namespace

@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <chrono>
 #include <limits>
+#include <sstream>
 #include <utility>
 
 #include <glog/logging.h>
@@ -31,6 +32,28 @@ namespace {
 constexpr uint64_t kPostRejectedRetryCapNs = 100ULL * 1000 * 1000;
 // Backoff doubling saturates here; interval_ms << 16 already exceeds a day.
 constexpr uint64_t kMaxBackoffShift = 16;
+
+// Stable text form used by the rate-limited diagnostics; every log line names
+// the full probe identity (design §13.2).
+std::string pathText(const PathVersion& version) {
+    std::ostringstream oss;
+    oss << "local_nic=" << version.path.local_nic
+        << " peer=" << version.path.segment_id
+        << " remote_nic=" << version.path.remote_nic
+        << " topo_epoch=" << version.topology_epoch
+        << " target_epoch=" << version.target_epoch;
+    return oss.str();
+}
+
+std::string probeKeyText(const ProbeKey& key) {
+    std::ostringstream oss;
+    oss << pathText(key.version) << " fault_epoch=" << key.fault_epoch
+        << " probe_seq=" << key.probe_seq
+        << " jetty_gen=" << key.jetty_generation
+        << " area_epoch=" << key.area_epoch << " campaign=" << key.campaign_id
+        << "/" << key.campaign_epoch;
+    return oss.str();
+}
 
 EntryState mapCampaignOutcome(CompletionCategory category) {
     switch (category) {
@@ -512,6 +535,8 @@ void ProbeLinkManager::onPostResult(const std::shared_ptr<ProbeRecord>& record,
             // self-contradictory, so retire the probe lane without rolling
             // back health (design §8.6).
             ++stats_.probe_post_conflict;
+            LOG_EVERY_N(WARNING, 10) << "UB probe post/completion conflict: "
+                                     << probeKeyText(record->key);
             PortRuntime* port =
                 findPortLocked(record->key.version.path.local_nic);
             if (port != nullptr) {
@@ -522,6 +547,8 @@ void ProbeLinkManager::onPostResult(const std::shared_ptr<ProbeRecord>& record,
             }
         } else {
             ++stats_.probe_post_rejected;
+            LOG_EVERY_N(WARNING, 100)
+                << "UB probe post rejected: " << probeKeyText(record->key);
             record->state = RecordState::kRejected;
             const uint64_t token = record->token;
             inflight_.erase(token);
@@ -702,6 +729,8 @@ void ProbeLinkManager::applyLocked(const Completion& completion,
                 setHealthLocked(runtime, LinkHealth::kRecovering, effects);
             }
             if (externalGateOk(edge)) {
+                LOG_EVERY_N(INFO, 100)
+                    << "UB probe path recovered: " << pathText(version);
                 publishHealthyLocked(runtime, effects);
             } else {
                 // Probe proved liveness, but an external gate is closed:
@@ -731,6 +760,10 @@ void ProbeLinkManager::applyLocked(const Completion& completion,
             runtime.backoff_ns =
                 backoffDelayLocked(runtime.consecutive_failures);
             runtime.next_probe_ns = now_ns + runtime.backoff_ns;
+            LOG_EVERY_N(WARNING, 100)
+                << "UB probe path error: " << pathText(version)
+                << " failures=" << runtime.consecutive_failures
+                << " backoff_ns=" << runtime.backoff_ns;
             laneRetireLocked(port, now_ns, version,
                              Status::RdmaError("probe remote path error"),
                              effects);
@@ -740,6 +773,9 @@ void ProbeLinkManager::applyLocked(const Completion& completion,
             // Probe area/token mismatch is a lane/configuration problem, never
             // evidence that the path is bad (design §9.3 / L-3).
             ++stats_.probe_area_config_error;
+            LOG_EVERY_N(WARNING, 100)
+                << "UB probe area configuration error: " << pathText(version)
+                << " jetty_gen=" << port.generation;
             laneRetireLocked(port, now_ns, version,
                              Status::InternalError("probe area config error"),
                              effects);
@@ -750,6 +786,10 @@ void ProbeLinkManager::applyLocked(const Completion& completion,
         case CompletionCategory::UNKNOWN_ERROR:
         default:
             ++stats_.probe_failure_lane;
+            LOG_EVERY_N(WARNING, 100)
+                << "UB probe lane error: " << pathText(version)
+                << " jetty_gen=" << port.generation
+                << " category=" << static_cast<int>(completion.category);
             laneRetireLocked(port, now_ns, version,
                              Status::InternalError("probe lane error"),
                              effects);
@@ -848,6 +888,10 @@ void ProbeLinkManager::exitFinishedCampaignsLocked() {
         if (active) {
             ++it;
         } else {
+            LOG_EVERY_N(INFO, 100)
+                << "UB probe campaign exited: peer="
+                << it->second.peer.segment_id << " campaign=" << it->second.id
+                << " epoch=" << it->second.epoch;
             it = campaigns_.erase(it);
             ++stats_.campaign_exited;
         }
@@ -862,6 +906,9 @@ void ProbeLinkManager::mergeOrCreateCampaignLocked(const ProbePeerKey& peer,
         campaign = &it->second;
         ++campaign->epoch;
         ++stats_.campaign_merged;
+        LOG_EVERY_N(INFO, 100)
+            << "UB probe campaign merged: peer=" << peer.segment_id
+            << " campaign=" << campaign->id << " epoch=" << campaign->epoch;
     } else {
         Campaign fresh;
         fresh.id = ++campaign_seq_;
@@ -870,6 +917,9 @@ void ProbeLinkManager::mergeOrCreateCampaignLocked(const ProbePeerKey& peer,
         it = campaigns_.emplace(peer, std::move(fresh)).first;
         campaign = &it->second;
         ++stats_.campaign_created;
+        LOG_EVERY_N(INFO, 100)
+            << "UB probe campaign created: peer=" << peer.segment_id
+            << " campaign=" << campaign->id;
     }
 
     for (auto& [version, runtime] : paths_) {
@@ -930,12 +980,23 @@ std::optional<PathVersion> ProbeLinkManager::resolveVersionLocked(
         // L-7: an unmappable fault is attributed to the rail's current
         // version anyway, so a real fault is never lost; a success, however,
         // must not promote a path version it does not belong to.
+        LOG_EVERY_N(WARNING, 100)
+            << "UB probe business evidence generation does not map: "
+            << pathText(version) << " anchor=" << anchor
+            << " evidence=" << evidence.endpoint_generation;
         ++stats_.probe_evidence_unmapped;
         if (require_matching_generation) return std::nullopt;
         resolved = version;
         break;
     }
-    if (!found) ++stats_.probe_evidence_unmapped;
+    if (!found) {
+        LOG_EVERY_N(WARNING, 100)
+            << "UB probe business evidence has no path row: local_nic="
+            << evidence.local_topology_id
+            << " peer=" << evidence.remote_segment_id
+            << " remote_nic=" << evidence.remote_device_id;
+        ++stats_.probe_evidence_unmapped;
+    }
     return resolved;
 }
 
@@ -1092,6 +1153,11 @@ void ProbeLinkManager::laneRetireLocked(PortRuntime& port, uint64_t now_ns,
         effects.error_epoch = ++lane_error_epoch_;
         effects.path = path;
         effects.reason = reason;
+        LOG_EVERY_N(WARNING, 100)
+            << "UB probe lane retired: local_nic=" << port.supply.local_nic
+            << " jetty_gen=" << port.generation
+            << " error_epoch=" << effects.error_epoch
+            << " reason=" << reason.ToString();
     }
     markPortPendingLocked(port, PendingReason::kLaneRetired, now_ns);
 }
@@ -1442,6 +1508,9 @@ void ProbeLinkManager::scanTimeouts(uint64_t now_ns) {
             // the port slot and the references pinned, report the lane once,
             // and let a late completion or a new handle generation resolve it.
             ++stats_.probe_timeout_unknown;
+            LOG_EVERY_N(WARNING, 100)
+                << "UB probe completion timeout (unknown responsibility): "
+                << probeKeyText(record->key);
             PortRuntime* port =
                 findPortLocked(record->key.version.path.local_nic);
             if (port != nullptr) {

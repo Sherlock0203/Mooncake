@@ -17,6 +17,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <limits>
 #include <string>
 #include <utility>
@@ -49,9 +50,7 @@ struct UbParams {
     bool enable_bandwidth_estimation = true;
     bool enable_notifications = false;
 
-    // Probe-link parameters. W1c only reads `enabled`; parsing the
-    // transports/ub/probe/* keys into this struct is the W1d configuration
-    // milestone.
+    // Probe-link parameters, read from transports/ub/probe/* below.
     ProbeParams probe;
 
     // Reads every UB setting from transports/ub/*. Numeric settings are
@@ -110,11 +109,67 @@ struct UbParams {
                               parsed.enable_notifications,
                               parsed.enable_notifications));
 
-        // W1c only needs the probe on/off switch for assembly. The remaining
-        // transports/ub/probe/* keys and their cross-key validation are added
-        // by the W1d configuration milestone.
         CHECK_STATUS(readBool(config, "transports/ub/probe/enabled",
                               parsed.probe.enabled, parsed.probe.enabled));
+        CHECK_STATUS(readPositive(config, "transports/ub/probe/interval_ms",
+                                  parsed.probe.interval_ms,
+                                  parsed.probe.interval_ms));
+        CHECK_STATUS(readPositive(config, "transports/ub/probe/backoff_max_ms",
+                                  parsed.probe.backoff_max_ms,
+                                  parsed.probe.backoff_max_ms));
+        CHECK_STATUS(readPositive(config, "transports/ub/probe/timeout_ms",
+                                  parsed.probe.timeout_ms,
+                                  parsed.probe.timeout_ms));
+        CHECK_STATUS(readPositive(config, "transports/ub/probe/peer_budget",
+                                  parsed.probe.peer_budget,
+                                  parsed.probe.peer_budget));
+        CHECK_STATUS(readPositive(
+            config, "transports/ub/probe/failure_threshold",
+            parsed.probe.failure_threshold, parsed.probe.failure_threshold));
+        // stop_on_recovery and recover_success_threshold are fixed values in
+        // W1: any other value is rejected instead of being silently ignored.
+        CHECK_STATUS(readFixedBool(
+            config, "transports/ub/probe/stop_on_recovery", true));
+        CHECK_STATUS(readFixedU32(
+            config, "transports/ub/probe/recover_success_threshold", 1));
+        std::string jfc_mode;
+        CHECK_STATUS(readStringEnum(config, "transports/ub/probe/jfc_mode",
+                                    "dedicated", {"dedicated", "shared"},
+                                    jfc_mode));
+        parsed.probe.jfc_mode = jfc_mode == "shared" ? ProbeJfcMode::kShared
+                                                     : ProbeJfcMode::kDedicated;
+        CHECK_STATUS(readPositive(config, "transports/ub/probe/jfc_depth",
+                                  parsed.probe.jfc_depth,
+                                  parsed.probe.jfc_depth));
+        CHECK_STATUS(readNonNegative(
+            config, "transports/ub/probe/credit_reserve",
+            parsed.probe.credit_reserve, parsed.probe.credit_reserve));
+
+        // Cross-key constraints (design §13.1). Each one has its own message
+        // so an operator can tell which pair is inconsistent.
+        if (parsed.probe.backoff_max_ms < parsed.probe.interval_ms) {
+            return Status::InvalidArgument(
+                "transports/ub/probe/backoff_max_ms must be >= "
+                "transports/ub/probe/interval_ms");
+        }
+        if (parsed.probe.timeout_ms > parsed.probe.interval_ms) {
+            return Status::InvalidArgument(
+                "transports/ub/probe/timeout_ms must be <= "
+                "transports/ub/probe/interval_ms");
+        }
+        if (parsed.probe.jfc_depth < 8) {
+            return Status::InvalidArgument(
+                "transports/ub/probe/jfc_depth must be >= 8");
+        }
+        if (parsed.probe.jfc_mode == ProbeJfcMode::kShared &&
+            parsed.probe.credit_reserve == 0) {
+            return Status::InvalidArgument(
+                "transports/ub/probe/credit_reserve must be > 0 in shared "
+                "mode");
+        }
+        if (!parsed.probe.valid()) {
+            return Status::InvalidArgument("invalid probe configuration");
+        }
 
         output = std::move(parsed);
         return Status::OK();
@@ -180,6 +235,76 @@ struct UbParams {
         }
         output = static_cast<T>(signed_value);
         return Status::OK();
+    }
+
+    // A fixed-value key may be omitted (the default is the fixed value) but
+    // must never carry a different value.
+    static Status readFixedBool(const Config& config, const char* key,
+                                bool required) {
+        const json value = config.get<json>(key, json());
+        if (value.is_null()) return Status::OK();
+        if (!value.is_boolean()) {
+            return Status::InvalidArgument(std::string(key) +
+                                           " must be a boolean");
+        }
+        if (value.get<bool>() != required) {
+            return Status::InvalidArgument(std::string(key) + " is fixed to " +
+                                           (required ? "true" : "false"));
+        }
+        return Status::OK();
+    }
+
+    static Status readFixedU32(const Config& config, const char* key,
+                               uint32_t required) {
+        const json value = config.get<json>(key, json());
+        if (value.is_null()) return Status::OK();
+        if (!value.is_number_integer()) {
+            return Status::InvalidArgument(std::string(key) +
+                                           " must be an integer");
+        }
+        int64_t signed_value = 0;
+        try {
+            signed_value = value.get<int64_t>();
+        } catch (...) {
+            return Status::InvalidArgument(std::string(key) +
+                                           " is outside the supported range");
+        }
+        if (signed_value < 0 || static_cast<uint64_t>(signed_value) !=
+                                    static_cast<uint64_t>(required)) {
+            return Status::InvalidArgument(std::string(key) + " is fixed to " +
+                                           std::to_string(required));
+        }
+        return Status::OK();
+    }
+
+    // String enumerations are read as JSON strings and matched exactly; an
+    // unknown spelling is rejected rather than defaulted.
+    static Status readStringEnum(const Config& config, const char* key,
+                                 const char* default_value,
+                                 std::initializer_list<const char*> allowed,
+                                 std::string& output) {
+        const json value = config.get<json>(key, json());
+        if (value.is_null()) {
+            output = default_value;
+            return Status::OK();
+        }
+        if (!value.is_string()) {
+            return Status::InvalidArgument(std::string(key) +
+                                           " must be a string");
+        }
+        const std::string parsed = value.get<std::string>();
+        for (const char* candidate : allowed) {
+            if (parsed == candidate) {
+                output = parsed;
+                return Status::OK();
+            }
+        }
+        std::string message = std::string(key) + " must be one of:";
+        for (const char* candidate : allowed) {
+            message += " ";
+            message += candidate;
+        }
+        return Status::InvalidArgument(message);
     }
 
     static Status readBool(const Config& config, const char* key,
