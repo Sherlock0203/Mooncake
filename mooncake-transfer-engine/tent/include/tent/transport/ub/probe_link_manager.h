@@ -51,6 +51,7 @@
 #include <vector>
 
 #include "tent/common/status.h"
+#include "tent/transport/ub/completion_record.h"
 #include "tent/transport/ub/probe_resources.h"
 #include "tent/transport/ub/probe_types.h"
 #include "tent/transport/ub/slice.h"
@@ -77,10 +78,17 @@ enum class ProbePostOutcome : uint8_t {
     kUnknown,
 };
 
-// W1 stand-in for the total design's CompletionRecord (design §5.2/§12.2).
-// W2 replaces it with a sub-view of the shared record.
+// Probe owner of the shared completion record (design D-9 / W2 §5.5).
+//
+// `core` is the very same CompletionRecord the business data path uses; the
+// probe side only fills its identity and one-shot facts and keeps its own
+// fields alongside. `core.finalize_claimed` is the W1 `settled` bit: exactly
+// one thread may settle (clean up) this record. `core.timed_out` marks a
+// timeout without settling it: resources and the port slot stay pinned (L-4).
+// The migration is deliberately mechanical - no probe decision, lock boundary,
+// side-effect order or log line changed with it (invariant 10).
 struct ProbeRecord {
-    uint64_t token{0};
+    CompletionRecord core;
     ProbeKey key;
     // Budget release must still work after the PathVersion row has been
     // dropped (stale settlement, orphans), so the peer is carried alongside
@@ -88,11 +96,6 @@ struct ProbeRecord {
     ProbePeerKey peer;
     uint64_t posted_ns{0};
     uint64_t deadline_ns{0};
-    // One-shot claim: exactly one thread may settle this record.
-    std::atomic<bool> settled{false};
-    // One-shot timeout mark. It does NOT settle the record: the resources and
-    // the port slot stay pinned (L-4).
-    std::atomic<bool> timed_out{false};
     RecordState state{RecordState::kPosting};
     OrphanReason orphan_reason{OrphanReason::kNone};
     // Holding these references keeps the probe source page and the remote

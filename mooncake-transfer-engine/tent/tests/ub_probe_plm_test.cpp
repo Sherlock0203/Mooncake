@@ -486,7 +486,8 @@ TEST(UbProbeLinkManagerTest, PeerBudgetGatesCrossPortScheduling) {
     // A lane error cancels the first entry and frees the budget; the second
     // path is then schedulable and can recover.
     ASSERT_TRUE(plm.onProbeCompletion(
-        makeCompletion(first_probe->token, CompletionCategory::ENDPOINT_ERROR),
+        makeCompletion(first_probe->core.token,
+                       CompletionCategory::ENDPOINT_ERROR),
         clock.now()));
     auto retry = postNext(plm, token_seq, clock.now());
     ASSERT_TRUE(retry.has_value());
