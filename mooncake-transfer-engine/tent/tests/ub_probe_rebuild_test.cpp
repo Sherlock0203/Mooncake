@@ -120,6 +120,7 @@ TEST(UbProbeRebuildTest, RebuildsLaneAndEmitsHandleReplaced) {
     provider.retireProbeLane(LaneKey{0, old_jetty_id, 1}, old_generation, 7,
                              graph.edges[0].version,
                              Status::InternalError("injected lane error"));
+    ASSERT_TRUE(provider.waitForRebuilds(2000));
 
     ASSERT_EQ(provider.portViews().size(), 1U);
     EXPECT_EQ(provider.portViews()[0].generation, old_generation + 1);
@@ -150,6 +151,7 @@ TEST(UbProbeRebuildTest, RebuildsLaneAndEmitsHandleReplaced) {
     provider.retireProbeLane(LaneKey{0, old_jetty_id, 1}, old_generation, 7,
                              graph.edges[0].version,
                              Status::InternalError("duplicate"));
+    ASSERT_TRUE(provider.waitForRebuilds(2000));
     EXPECT_EQ(sink.events.size(), 1U);
     EXPECT_EQ(provider.portViews()[0].generation, old_generation + 1);
 
@@ -197,6 +199,7 @@ TEST(UbProbeRebuildTest, RetriesAfterQuiesceFailure) {
     provider.retireProbeLane(LaneKey{0, old_jetty_id, 1}, old_generation, 7,
                              graph.edges[0].version,
                              Status::InternalError("first attempt"));
+    ASSERT_TRUE(provider.waitForRebuilds(2000));
     EXPECT_EQ(provider.portViews()[0].generation, old_generation);
     EXPECT_TRUE(sink.events.empty());
     EXPECT_EQ(fixture.adapter->liveJettyCount(), 1U);
@@ -205,6 +208,7 @@ TEST(UbProbeRebuildTest, RetriesAfterQuiesceFailure) {
     provider.retireProbeLane(LaneKey{0, old_jetty_id, 1}, old_generation, 7,
                              graph.edges[0].version,
                              Status::InternalError("retry"));
+    ASSERT_TRUE(provider.waitForRebuilds(2000));
     EXPECT_EQ(provider.portViews()[0].generation, old_generation + 1);
     ASSERT_EQ(sink.events.size(), 1U);
     EXPECT_EQ(fixture.adapter->liveJettyCount(), 1U);
@@ -230,6 +234,7 @@ TEST(UbProbeRebuildTest, RefusesRebuildWithoutSinks) {
     provider.retireProbeLane(LaneKey{0, old_jetty_id, 1}, old_generation, 7,
                              graph.edges[0].version,
                              Status::InternalError("no sinks"));
+    ASSERT_TRUE(provider.waitForRebuilds(2000));
     EXPECT_EQ(provider.retireCalls(), 1U);
     EXPECT_EQ(provider.portViews()[0].generation, old_generation);
     EXPECT_EQ(provider.retiredPageCount(), 0U);

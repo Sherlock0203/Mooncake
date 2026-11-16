@@ -499,6 +499,38 @@ TEST(UbProbeLinkManagerTest, PeerBudgetGatesCrossPortScheduling) {
     EXPECT_EQ(healthOf(plm, first).health, LinkHealth::kIsolated);
 }
 
+TEST(UbProbeLinkManagerTest, HandleReplacedPreservesBackoff) {
+    TestClock clock;
+    ProbeLinkManager plm(defaultParams(), clock.clock());
+    auto graph = makeGraph({makePortSupply(0, 1)}, {makeEdgeSupply(0, 10, 0)});
+    ASSERT_TRUE(plm.initialize(graph).ok());
+    const uint64_t now = clock.now();
+
+    plm.onBusinessPathError(makeEvidence(0, 10, 0),
+                            BusinessErrorKind::kPathFault, now);
+    uint64_t token_seq = 0;
+    auto probe = postNext(plm, token_seq, now);
+    ASSERT_TRUE(probe.has_value());
+    ASSERT_TRUE(plm.onProbeCompletion(
+        makeCompletion(probe->token, CompletionCategory::REMOTE_PATH_ERROR),
+        now));
+    ASSERT_EQ(healthOf(plm, probe->record->key.version).health,
+              LinkHealth::kIsolated);
+
+    // The lane was retired; a replacement event must not erase the backoff.
+    ProbeEvent event;
+    event.kind = ProbeEventKind::kProbeHandleReplaced;
+    event.local_nic = 0;
+    event.graph_epoch = plm.graphEpoch();
+    event.event_seq = 1;
+    event.port = makePortSupply(0, 2);
+    ASSERT_TRUE(plm.onPoolAvailabilityChange(event).ok());
+
+    EXPECT_TRUE(plm.pendingActions(now).empty());
+    clock.advance(1000ULL * 1000 * 1000);
+    EXPECT_FALSE(plm.pendingActions(clock.now()).empty());
+}
+
 }  // namespace
 }  // namespace ub
 }  // namespace tent

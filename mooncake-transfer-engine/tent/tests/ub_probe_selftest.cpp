@@ -22,21 +22,32 @@
 // JSON files manually. The probe test mode is enabled by default; use
 // --apply-health=false for a pure link check.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <arpa/inet.h>
 #include <csignal>
 #include <cstdint>
+#include <cstring>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #include <cstdlib>
 #include <filesystem>
+#include <fcntl.h>
 #include <fstream>
 #include <iostream>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "tent/thirdparty/nlohmann/json.h"
+#include "tent/transport/ub/device_selection.h"
 #include "tent/transport/ub/probe_link_manager.h"
 #include "tent/transport/ub/probe_peer_handshake.h"
 #include "tent/transport/ub/probe_poster_urma.h"
@@ -63,7 +74,13 @@ uint64_t selftestNowNs() {
 struct Options {
     std::string node;
     std::string peer;
+    enum class Mode { kFile, kTarget, kInitiator };
+    Mode mode{Mode::kFile};
     std::string exchange_dir{"/tmp/tent_probe_selftest"};
+    std::string bind_address{"0.0.0.0"};
+    uint16_t listen_port{19090};
+    std::string target_host{"127.0.0.1"};
+    uint16_t target_port{19090};
     uint64_t duration_s{60};
     uint64_t wait_timeout_s{120};
     uint64_t test_interval_ms{5000};
@@ -73,14 +90,28 @@ struct Options {
     uint32_t peer_budget{4};
     uint64_t source_page_size{0};
     bool apply_health{false};
+    bool list_devices{false};
+    bool verbose_paths{false};
     std::vector<std::string> device_filter;
+    struct PortPair {
+        int32_t local_nic{0};
+        int32_t peer_nic{0};
+    };
+    std::vector<PortPair> pairs;
 };
 
 void usage(const char* argv0) {
     std::cout
         << "Usage: " << argv0 << " --node <name> --peer <name> [options]\n"
-        << "  --exchange-dir <dir>      shared directory for <node>.json "
-           "(default /tmp/tent_probe_selftest)\n"
+        << "  --mode <file|target|initiator>  exchange mode (default file)\n"
+        << "  --exchange-dir <dir>      file mode: shared directory for "
+           "<node>.json\n"
+        << "  --listen-port <port>      target mode: TCP listen port (default "
+           "19090)\n"
+        << "  --bind-address <addr>     target mode: bind address (default "
+           "0.0.0.0)\n"
+        << "  --target-host <host>      initiator mode: target host\n"
+        << "  --target-port <port>      initiator mode: target port\n"
         << "  --duration <sec>          run time (default 60)\n"
         << "  --wait-timeout <sec>      wait for peer JSON (default 120)\n"
         << "  --test-interval-ms <ms>  probe test cadence (default 5000)\n"
@@ -95,6 +126,11 @@ void usage(const char* argv0) {
         << "  --device-filter <a,b>     native/topology names (default all "
            "non-bonding)\n"
         << "  --source-page-size <n>    0 = system page (default 0)\n"
+        << "  --list-devices            list selectable non-bonding ports "
+           "(with index) and exit\n"
+        << "  --pairs <l>:<p>,...       explicit local/peer port pairs, e.g. "
+           "1:3,2:4\n"
+        << "  --verbose-paths           print every path state each report\n"
         << "\nRemove stale <node>.json files from the exchange directory "
            "before "
            "a new run.\n";
@@ -126,8 +162,32 @@ bool parseOptions(int argc, char** argv, Options& options) {
             if (!value(options.node)) return false;
         } else if (key == "--peer") {
             if (!value(options.peer)) return false;
+        } else if (key == "--mode") {
+            std::string text;
+            if (!value(text)) return false;
+            if (text == "file") {
+                options.mode = Options::Mode::kFile;
+            } else if (text == "target") {
+                options.mode = Options::Mode::kTarget;
+            } else if (text == "initiator") {
+                options.mode = Options::Mode::kInitiator;
+            } else {
+                return false;
+            }
         } else if (key == "--exchange-dir") {
             if (!value(options.exchange_dir)) return false;
+        } else if (key == "--listen-port") {
+            std::string text;
+            if (!value(text)) return false;
+            options.listen_port = static_cast<uint16_t>(std::stoul(text));
+        } else if (key == "--bind-address") {
+            if (!value(options.bind_address)) return false;
+        } else if (key == "--target-host") {
+            if (!value(options.target_host)) return false;
+        } else if (key == "--target-port") {
+            std::string text;
+            if (!value(text)) return false;
+            options.target_port = static_cast<uint16_t>(std::stoul(text));
         } else if (key == "--duration") {
             std::string text;
             if (!value(text)) return false;
@@ -165,6 +225,30 @@ bool parseOptions(int argc, char** argv, Options& options) {
             if (!value(text) || !parseBool(text, options.apply_health)) {
                 return false;
             }
+        } else if (key == "--list-devices") {
+            options.list_devices = true;
+        } else if (key == "--verbose-paths") {
+            options.verbose_paths = true;
+        } else if (key == "--pairs") {
+            std::string text;
+            if (!value(text)) return false;
+            size_t start = 0;
+            while (start <= text.size()) {
+                const size_t comma = text.find(',', start);
+                const std::string item = text.substr(
+                    start, comma == std::string::npos ? std::string::npos
+                                                      : comma - start);
+                const size_t colon = item.find(':');
+                if (colon == std::string::npos || colon == 0 ||
+                    colon + 1 == item.size()) {
+                    return false;
+                }
+                options.pairs.push_back(
+                    Options::PortPair{std::stoi(item.substr(0, colon)),
+                                      std::stoi(item.substr(colon + 1))});
+                if (comma == std::string::npos) break;
+                start = comma + 1;
+            }
         } else if (key == "--device-filter") {
             std::string text;
             if (!value(text)) return false;
@@ -183,6 +267,7 @@ bool parseOptions(int argc, char** argv, Options& options) {
             return false;
         }
     }
+    if (options.list_devices) return true;
     if (options.node.empty() || options.peer.empty()) return false;
     if (options.node == options.peer) {
         std::cerr << "--node and --peer must differ\n";
@@ -210,6 +295,7 @@ bool descriptorFromJson(const nlohmann::json& value,
 
 struct PeerPort {
     int32_t local_nic{-1};
+    std::string native_device_name;
     std::string topology_name;
     std::string device_eid;
     SegmentDescriptor area_descriptor;
@@ -234,8 +320,8 @@ class StaticPeerSource final : public ProbePeerDescriptorSource {
     std::vector<ProbePeerDescriptor> descriptors_;
 };
 
-void writeLocalJson(const std::string& path, const std::string& node,
-                    const StandaloneProbeResourceProvider& provider) {
+nlohmann::json buildLocalJson(const std::string& node,
+                              const StandaloneProbeResourceProvider& provider) {
     const auto ports = provider.portViews();
     const auto areas = provider.localAreaViews();
     std::map<Topology::NicID,
@@ -253,6 +339,7 @@ void writeLocalJson(const std::string& path, const std::string& node,
         const auto& local_area = *area->second;
         root["ports"].push_back(nlohmann::json{
             {"local_nic", port.local_nic},
+            {"native_device_name", port.native_device_name},
             {"topology_name", port.topology_name},
             {"device_eid", port.device_eid},
             {"area_descriptor", descriptorToJson(local_area.descriptor)},
@@ -266,7 +353,12 @@ void writeLocalJson(const std::string& path, const std::string& node,
               {"uasid", port.native_jetty_uasid},
               {"token", local_area.token}}}});
     }
+    return root;
+}
 
+void writeLocalJson(const std::string& path, const std::string& node,
+                    const StandaloneProbeResourceProvider& provider) {
+    const auto root = buildLocalJson(node, provider);
     std::filesystem::create_directories(
         std::filesystem::path(path).parent_path());
     const std::string tmp = path + ".tmp";
@@ -276,6 +368,170 @@ void writeLocalJson(const std::string& path, const std::string& node,
         out << root.dump(2) << "\n";
     }
     std::filesystem::rename(tmp, path);
+}
+
+void setSocketTimeouts(int fd, uint64_t timeout_s) {
+    timeval timeout{};
+    timeout.tv_sec = static_cast<time_t>(timeout_s);
+    timeout.tv_usec = 0;
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+}
+
+bool sendAll(int fd, const void* data, size_t length) {
+    const char* cursor = static_cast<const char*>(data);
+    size_t sent = 0;
+    while (sent < length) {
+        const ssize_t rc = ::send(fd, cursor + sent, length - sent, 0);
+        if (rc > 0) {
+            sent += static_cast<size_t>(rc);
+            continue;
+        }
+        if (rc < 0 && errno == EINTR) continue;
+        return false;
+    }
+    return true;
+}
+
+bool recvAll(int fd, void* data, size_t length) {
+    char* cursor = static_cast<char*>(data);
+    size_t received = 0;
+    while (received < length) {
+        const ssize_t rc = ::recv(fd, cursor + received, length - received, 0);
+        if (rc > 0) {
+            received += static_cast<size_t>(rc);
+            continue;
+        }
+        if (rc < 0 && errno == EINTR) continue;
+        return false;
+    }
+    return true;
+}
+
+bool sendFrame(int fd, const nlohmann::json& payload) {
+    const std::string text = payload.dump();
+    if (text.size() > 4 * 1024 * 1024) return false;
+    const uint32_t length = htonl(static_cast<uint32_t>(text.size()));
+    return sendAll(fd, &length, sizeof(length)) &&
+           sendAll(fd, text.data(), text.size());
+}
+
+bool recvFrame(int fd, nlohmann::json& payload) {
+    uint32_t length = 0;
+    if (!recvAll(fd, &length, sizeof(length))) return false;
+    length = ntohl(length);
+    if (length == 0 || length > 4 * 1024 * 1024) return false;
+    std::string text(length, '\0');
+    if (!recvAll(fd, text.data(), text.size())) return false;
+    try {
+        payload = nlohmann::json::parse(text);
+    } catch (const std::exception&) {
+        return false;
+    }
+    return true;
+}
+
+int connectWithTimeout(const std::string& host, uint16_t port,
+                       uint64_t timeout_s) {
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* addresses = nullptr;
+    const std::string port_text = std::to_string(port);
+    if (getaddrinfo(host.c_str(), port_text.c_str(), &hints, &addresses) != 0) {
+        return -1;
+    }
+    int connected = -1;
+    for (addrinfo* address = addresses; address != nullptr;
+         address = address->ai_next) {
+        const int fd = ::socket(address->ai_family, address->ai_socktype,
+                                address->ai_protocol);
+        if (fd < 0) continue;
+        const int flags = fcntl(fd, F_GETFL, 0);
+        (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        int rc = ::connect(fd, address->ai_addr, address->ai_addrlen);
+        if (rc < 0 && errno == EINPROGRESS) {
+            pollfd descriptor{fd, POLLOUT, 0};
+            rc = ::poll(&descriptor, 1, static_cast<int>(timeout_s * 1000));
+            if (rc > 0) {
+                int error = 0;
+                socklen_t error_length = sizeof(error);
+                (void)getsockopt(fd, SOL_SOCKET, SO_ERROR, &error,
+                                 &error_length);
+                rc = error == 0 ? 0 : -1;
+            } else {
+                rc = -1;
+            }
+        } else {
+            rc = rc < 0 ? -1 : 0;
+        }
+        if (rc == 0) {
+            (void)fcntl(fd, F_SETFL, flags);
+            setSocketTimeouts(fd, timeout_s);
+            connected = fd;
+            break;
+        }
+        ::close(fd);
+    }
+    freeaddrinfo(addresses);
+    return connected;
+}
+
+nlohmann::json exchangeOverTcp(const nlohmann::json& local,
+                               const Options& options) {
+    nlohmann::json peer;
+    if (options.mode == Options::Mode::kTarget) {
+        int listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (listen_fd < 0) {
+            throw std::runtime_error("cannot create listen socket");
+        }
+        int reuse = 1;
+        (void)setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse,
+                         sizeof(reuse));
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_port = htons(options.listen_port);
+        if (inet_pton(AF_INET, options.bind_address.c_str(),
+                      &address.sin_addr) != 1) {
+            address.sin_addr.s_addr = htonl(INADDR_ANY);
+        }
+        if (::bind(listen_fd, reinterpret_cast<sockaddr*>(&address),
+                   sizeof(address)) != 0 ||
+            ::listen(listen_fd, 1) != 0) {
+            ::close(listen_fd);
+            throw std::runtime_error("cannot bind/listen on " +
+                                     options.bind_address + ":" +
+                                     std::to_string(options.listen_port));
+        }
+        std::cout << "target listening on " << options.bind_address << ":"
+                  << options.listen_port << std::endl;
+        pollfd descriptor{listen_fd, POLLIN, 0};
+        const int ready = ::poll(
+            &descriptor, 1, static_cast<int>(options.wait_timeout_s * 1000));
+        if (ready <= 0) {
+            ::close(listen_fd);
+            throw std::runtime_error("timed out waiting for initiator");
+        }
+        const int fd = ::accept(listen_fd, nullptr, nullptr);
+        ::close(listen_fd);
+        if (fd < 0) throw std::runtime_error("accept failed");
+        setSocketTimeouts(fd, options.wait_timeout_s);
+        const bool ok = recvFrame(fd, peer) && sendFrame(fd, local);
+        ::close(fd);
+        if (!ok) throw std::runtime_error("target exchange failed");
+    } else {
+        const int fd = connectWithTimeout(
+            options.target_host, options.target_port, options.wait_timeout_s);
+        if (fd < 0) {
+            throw std::runtime_error("cannot connect to " +
+                                     options.target_host + ":" +
+                                     std::to_string(options.target_port));
+        }
+        const bool ok = sendFrame(fd, local) && recvFrame(fd, peer);
+        ::close(fd);
+        if (!ok) throw std::runtime_error("initiator exchange failed");
+    }
+    return peer;
 }
 
 bool waitForPeerJson(const std::string& path, uint64_t timeout_s,
@@ -311,6 +567,8 @@ std::vector<PeerPort> parsePeerPorts(const nlohmann::json& root,
     for (const auto& item : root["ports"]) {
         PeerPort port;
         port.local_nic = item.value("local_nic", -1);
+        port.native_device_name =
+            item.value("native_device_name", std::string());
         port.topology_name = item.value("topology_name", std::string());
         port.device_eid = item.value("device_eid", std::string());
         port.area_epoch = item.value("area_epoch", 0ULL);
@@ -337,25 +595,86 @@ std::vector<PeerPort> parsePeerPorts(const nlohmann::json& root,
     return ports;
 }
 
-void printStats(const ProbeLinkManager& plm, uint64_t elapsed_s) {
+const char* taskName(TaskState state) {
+    switch (state) {
+        case TaskState::kIdle:
+            return "idle";
+        case TaskState::kQueued:
+            return "queued";
+        case TaskState::kInflight:
+            return "inflight";
+    }
+    return "?";
+}
+
+const char* pendingName(PendingReason reason) {
+    switch (reason) {
+        case PendingReason::kNone:
+            return "none";
+        case PendingReason::kLaneRetired:
+            return "lane_retired";
+        case PendingReason::kPortRevoked:
+            return "port_revoked";
+        case PendingReason::kContextFailure:
+            return "context_failure";
+    }
+    return "?";
+}
+
+void printStats(const ProbeLinkManager& plm, uint64_t elapsed_s,
+                bool verbose_paths) {
     const auto stats = plm.stats();
+    const auto view = plm.healthView();
+    size_t eligible = 0;
     size_t healthy = 0;
     size_t isolated = 0;
     size_t recovering = 0;
-    for (const auto& entry : plm.healthView()) {
-        if (entry.health == LinkHealth::kHealthy) ++healthy;
-        if (entry.health == LinkHealth::kIsolated) ++isolated;
-        if (entry.health == LinkHealth::kRecovering) ++recovering;
+    size_t disabled = 0;
+    size_t pending = 0;
+    for (const auto& entry : view) {
+        switch (entry.health) {
+            case LinkHealth::kEligibleUnverified:
+                ++eligible;
+                break;
+            case LinkHealth::kHealthy:
+                ++healthy;
+                break;
+            case LinkHealth::kIsolated:
+                ++isolated;
+                break;
+            case LinkHealth::kRecovering:
+                ++recovering;
+                break;
+            case LinkHealth::kDisabled:
+                ++disabled;
+                break;
+        }
+        if (entry.pending) ++pending;
     }
-    std::cout << "[probe] t=" << elapsed_s
-              << "s inflight=" << plm.inflightCount()
+    std::cout << "[probe] t=" << elapsed_s << "s paths=" << view.size()
+              << " eligible=" << eligible << " healthy=" << healthy
+              << " isolated=" << isolated << " recovering=" << recovering
+              << " disabled=" << disabled << " pending=" << pending
+              << " inflight=" << plm.inflightCount()
               << " test_post=" << stats.probe_test_post
               << " ok=" << stats.probe_test_ok
               << " fail=" << stats.probe_test_fail
               << " missed=" << stats.probe_test_missed
-              << " timeout=" << stats.probe_timeout_unknown
-              << " healthy=" << healthy << " isolated=" << isolated
-              << " recovering=" << recovering << std::endl;
+              << " timeout=" << stats.probe_timeout_unknown << std::endl;
+    if (verbose_paths) {
+        for (const auto& entry : view) {
+            std::cout << "[path] local=" << entry.version.path.local_nic
+                      << " peer=" << entry.peer.segment_id
+                      << " remote=" << entry.version.path.remote_nic
+                      << " state=" << linkHealthName(entry.health)
+                      << " task=" << taskName(entry.task) << " pending="
+                      << (entry.pending ? pendingName(entry.pending_reason)
+                                        : "none")
+                      << " fault_epoch=" << entry.fault_epoch
+                      << " failures=" << entry.consecutive_failures
+                      << " seq=" << entry.probe_seq << std::endl;
+        }
+    }
 }
 
 }  // namespace
@@ -372,6 +691,29 @@ int runSelftest(const Options& options) {
     if (!status.ok()) {
         std::cerr << "adapter initialize failed: " << status.ToString() << "\n";
         return 1;
+    }
+    if (options.list_devices) {
+        std::vector<DeviceInfo> devices;
+        status = adapter->discoverDevices(devices);
+        if (!status.ok()) {
+            std::cerr << "device discovery failed: " << status.ToString()
+                      << "\n";
+            adapter->shutdown();
+            return 1;
+        }
+        size_t index = 0;
+        for (const auto& device : devices) {
+            if (!device.active || isBondingDevice(device)) continue;
+            std::cout << "index=" << index++
+                      << " native=" << device.native_device_name
+                      << " topology=" << device.topology_name
+                      << " eid=" << device.eid
+                      << " eid_index=" << device.eid_index
+                      << " transport_modes="
+                      << device.capabilities.transport_modes << std::endl;
+        }
+        adapter->shutdown();
+        return 0;
     }
 
     ProbeParams params;
@@ -406,24 +748,25 @@ int runSelftest(const Options& options) {
         return 1;
     }
 
-    const std::filesystem::path exchange(options.exchange_dir);
-    const auto local_file = exchange / (options.node + ".json");
-    const auto peer_file = exchange / (options.peer + ".json");
-    try {
-        writeLocalJson(local_file.string(), options.node, *provider);
-    } catch (const std::exception& error) {
-        std::cerr << "cannot write local JSON: " << error.what() << "\n";
-        provider->shutdown();
-        adapter->shutdown();
-        return 1;
-    }
-    std::cout << "local descriptors written to " << local_file
-              << "; waiting for " << peer_file << std::endl;
-
+    const nlohmann::json local_json = buildLocalJson(options.node, *provider);
     nlohmann::json peer_json;
-    if (!waitForPeerJson(peer_file.string(), options.wait_timeout_s,
-                         peer_json)) {
-        std::cerr << "timed out waiting for peer JSON\n";
+    try {
+        if (options.mode == Options::Mode::kFile) {
+            const std::filesystem::path exchange(options.exchange_dir);
+            const auto local_file = exchange / (options.node + ".json");
+            const auto peer_file = exchange / (options.peer + ".json");
+            writeLocalJson(local_file.string(), options.node, *provider);
+            std::cout << "local descriptors written to " << local_file
+                      << "; waiting for " << peer_file << std::endl;
+            if (!waitForPeerJson(peer_file.string(), options.wait_timeout_s,
+                                 peer_json)) {
+                throw std::runtime_error("timed out waiting for peer JSON");
+            }
+        } else {
+            peer_json = exchangeOverTcp(local_json, options);
+        }
+    } catch (const std::exception& error) {
+        std::cerr << "descriptor exchange failed: " << error.what() << "\n";
         provider->shutdown();
         adapter->shutdown();
         return 1;
@@ -438,39 +781,100 @@ int runSelftest(const Options& options) {
         return 1;
     }
 
-    const auto local_ports = provider->portViews();
+    auto local_ports = provider->portViews();
     if (local_ports.empty()) {
         std::cerr << "no local probe port\n";
         provider->shutdown();
         adapter->shutdown();
         return 1;
     }
-    std::map<int32_t, PeerPort> peer_by_nic;
-    for (auto& port : peer_ports) peer_by_nic[port.local_nic] = port;
+    std::sort(local_ports.begin(), local_ports.end(),
+              [](const auto& left, const auto& right) {
+                  return left.local_nic < right.local_nic;
+              });
+    std::sort(peer_ports.begin(), peer_ports.end(),
+              [](const PeerPort& left, const PeerPort& right) {
+                  return left.local_nic < right.local_nic;
+              });
+    std::map<int32_t, const StandaloneProbeResourceProvider::PortView*>
+        local_by_nic;
+    std::map<int32_t, const PeerPort*> peer_by_nic;
+    for (const auto& port : local_ports) local_by_nic[port.local_nic] = &port;
+    for (const auto& port : peer_ports) peer_by_nic[port.local_nic] = &port;
+
+    std::vector<std::pair<const StandaloneProbeResourceProvider::PortView*,
+                          const PeerPort*>>
+        pairs;
+    if (!options.pairs.empty()) {
+        for (const auto& requested : options.pairs) {
+            auto local = local_by_nic.find(requested.local_nic);
+            auto peer = peer_by_nic.find(requested.peer_nic);
+            if (local == local_by_nic.end() || peer == peer_by_nic.end()) {
+                std::cerr << "warning: pair " << requested.local_nic << ":"
+                          << requested.peer_nic << " is not available\n";
+                continue;
+            }
+            pairs.emplace_back(local->second, peer->second);
+        }
+    } else {
+        // Same-name physical ports are the intended adjacency when both sides
+        // export native_device_name; discovery order is only a fallback.
+        std::map<std::string, const PeerPort*> peer_by_native;
+        for (const auto& port : peer_ports) {
+            if (!port.native_device_name.empty()) {
+                peer_by_native.emplace(port.native_device_name, &port);
+            }
+        }
+        std::set<const PeerPort*> used;
+        std::vector<const StandaloneProbeResourceProvider::PortView*> unmatched;
+        for (const auto& local : local_ports) {
+            if (!local.native_device_name.empty()) {
+                auto peer = peer_by_native.find(local.native_device_name);
+                if (peer != peer_by_native.end() &&
+                    used.find(peer->second) == used.end()) {
+                    used.insert(peer->second);
+                    pairs.emplace_back(&local, peer->second);
+                    continue;
+                }
+            }
+            unmatched.push_back(&local);
+        }
+        std::vector<const PeerPort*> remaining;
+        for (const auto& port : peer_ports) {
+            if (used.find(&port) == used.end()) remaining.push_back(&port);
+        }
+        const size_t fallback = std::min(unmatched.size(), remaining.size());
+        for (size_t i = 0; i < fallback; ++i) {
+            pairs.emplace_back(unmatched[i], remaining[i]);
+        }
+        if (pairs.size() != local_ports.size()) {
+            std::cerr << "warning: paired " << pairs.size() << " of "
+                      << local_ports.size() << " local port(s)\n";
+        }
+    }
 
     std::vector<ProbePeerDescriptor> descriptors;
     constexpr SegmentID kPeerSegmentId = 1;
-    for (const auto& local : local_ports) {
-        auto peer = peer_by_nic.find(local.local_nic);
-        if (peer == peer_by_nic.end()) {
-            std::cerr << "warning: no peer port for local_nic="
-                      << local.local_nic << "\n";
-            continue;
-        }
+    for (const auto& pair : pairs) {
+        const auto& local = *pair.first;
+        const auto& peer = *pair.second;
+        std::cout << "probe pair: local_nic=" << local.local_nic
+                  << " native=" << local.native_device_name
+                  << " -> peer_nic=" << peer.local_nic
+                  << " native=" << peer.native_device_name << std::endl;
         ProbePeerDescriptor descriptor;
         descriptor.local_nic = local.local_nic;
         descriptor.peer_segment_id = kPeerSegmentId;
-        descriptor.remote_nic = peer->second.local_nic;
+        descriptor.remote_nic = peer.local_nic;
         descriptor.peer_nic_path = "peer@" + options.peer;
         descriptor.topology_epoch = 1;
         descriptor.target_epoch = 1;
-        descriptor.area_descriptor = peer->second.area_descriptor;
+        descriptor.area_descriptor = peer.area_descriptor;
         descriptor.area_length = 1;
-        descriptor.area_epoch = peer->second.area_epoch;
-        descriptor.area_token = peer->second.area_token;
-        descriptor.remote_jetty =
-            RemoteJettyInfo{peer->second.device_eid, peer->second.jetty_id,
-                            peer->second.jetty_uasid, peer->second.jetty_token};
+        descriptor.area_epoch = peer.area_epoch;
+        descriptor.area_token = peer.area_token;
+        descriptor.remote_jetty = RemoteJettyInfo{
+            peer.device_eid, peer.jetty_id, peer.jetty_uasid, peer.jetty_token};
         descriptor.node_gate_ok = true;
         descriptor.port_gate_ok = true;
         descriptor.profile_gate_ok = true;
@@ -509,6 +913,15 @@ int runSelftest(const Options& options) {
         adapter->shutdown();
         return 1;
     }
+    // The PLM now owns its copy of the supply; drop the local graph references
+    // so a later lane rebuild can delete the old Jetty handle.
+    std::vector<JfcPtr> poll_jfcs;
+    for (const auto& port : graph.ports) {
+        if (port.probe_jfc) poll_jfcs.push_back(port.probe_jfc);
+    }
+    graph.ports.clear();
+    graph.edges.clear();
+
     provider->setAvailabilitySink(plm.availabilitySink());
     provider->setCompletionSink([&plm](const Completion& completion) {
         if (!isProbeToken(completion.token)) {
@@ -522,9 +935,8 @@ int runSelftest(const Options& options) {
 
     std::atomic<bool> poll_stop{false};
     std::vector<std::thread> pollers;
-    for (const auto& port : graph.ports) {
-        if (!port.probe_jfc) continue;
-        pollers.emplace_back([&, jfc = port.probe_jfc] {
+    for (const auto& jfc : poll_jfcs) {
+        pollers.emplace_back([&, jfc] {
             while (!poll_stop.load(std::memory_order_acquire)) {
                 std::vector<Completion> completions;
                 auto poll_status = adapter->poll(jfc, 64, completions);
@@ -550,19 +962,27 @@ int runSelftest(const Options& options) {
 
     const uint64_t start_ns = selftestNowNs();
     const uint64_t duration_ns = options.duration_s * 1'000'000'000ULL;
-    uint64_t next_report_ns = start_ns + 1'000'000'000ULL;
+    // One report per test round instead of a fixed one-second tick.
+    const uint64_t report_interval_ns =
+        std::max<uint64_t>(options.test_interval_ms, 1) * 1'000'000ULL;
+    uint64_t next_report_ns = start_ns + report_interval_ns;
     std::cout << "probe selftest started: node=" << options.node
               << " peer=" << options.peer
               << " test_interval_ms=" << options.test_interval_ms
               << " apply_health=" << (options.apply_health ? "true" : "false")
               << std::endl;
+    printStats(plm, 0, options.verbose_paths);
 
     while (!g_stop.load(std::memory_order_acquire)) {
         const uint64_t now = selftestNowNs();
         if (now - start_ns >= duration_ns) break;
         if (now >= next_report_ns) {
-            printStats(plm, (now - start_ns) / 1'000'000'000ULL);
-            next_report_ns += 1'000'000'000ULL;
+            printStats(plm, (now - start_ns) / 1'000'000'000ULL,
+                       options.verbose_paths);
+            next_report_ns += report_interval_ns;
+            if (next_report_ns <= now) {
+                next_report_ns = now + report_interval_ns;
+            }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }

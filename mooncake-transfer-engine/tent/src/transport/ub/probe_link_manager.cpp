@@ -562,6 +562,15 @@ void ProbeLinkManager::onPostResult(const std::shared_ptr<ProbeRecord>& record,
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        // A timeout/shutdown may have moved the record to the orphan table
+        // before an asynchronous poster reports its result. Such a result must
+        // not release the slot, peer budget or segments a second time.
+        if (record->state == RecordState::kOrphan ||
+            record->state == RecordState::kRejected ||
+            (inflight_.find(record->token) == inflight_.end() &&
+             !record->settled.load(std::memory_order_acquire))) {
+            return;
+        }
         switch (outcome) {
             case ProbePostOutcome::kAccepted:
                 // The completion may legally have arrived before the post
@@ -617,12 +626,11 @@ void ProbeLinkManager::onPostResult(const std::shared_ptr<ProbeRecord>& record,
             PathRuntime* runtime = findPathLocked(record->key.version);
             if (runtime != nullptr) {
                 if (record->test_probe) {
-                    runtime->test_due_ns =
-                        now + params_.testIntervalNs();
+                    runtime->test_due_ns = now + params_.testIntervalNs();
                 } else {
                     runtime->next_probe_ns =
-                        now + std::min(params_.intervalNs(),
-                                       kPostRejectedRetryCapNs);
+                        now +
+                        std::min(params_.intervalNs(), kPostRejectedRetryCapNs);
                 }
             }
             // Rejection is not a path fault: hand the task slot back so a
@@ -718,6 +726,11 @@ bool ProbeLinkManager::onProbeCompletion(const Completion& completion,
             if (current) {
                 if (record->test_probe && !params_.test_apply_health) {
                     // Pure link check: no health, campaign or lane change.
+                    LOG(INFO)
+                        << "probe test result: "
+                        << pathText(record->key.version)
+                        << " category=" << static_cast<int>(completion.category)
+                        << " token=" << completion.token;
                     if (completion.category == CompletionCategory::SUCCESS) {
                         ++stats_.probe_test_ok;
                     } else {
@@ -725,8 +738,7 @@ bool ProbeLinkManager::onProbeCompletion(const Completion& completion,
                     }
                 } else {
                     applyLocked(completion, record->key.version, *runtime,
-                                *edge, *port, now, record->test_probe,
-                                effects);
+                                *edge, *port, now, record->test_probe, effects);
                 }
             } else {
                 ++stats_.probe_stale;
@@ -1424,7 +1436,10 @@ Status ProbeLinkManager::applyEventLocked(const ProbeEvent& event,
                 if (runtime == nullptr) continue;
                 if (runtime->health == LinkHealth::kIsolated ||
                     runtime->health == LinkHealth::kRecovering) {
-                    runtime->next_probe_ns = now_ns;
+                    // Do not pull an existing backoff earlier: a rebuild must
+                    // not turn a bad path into a rebuild/probe storm.
+                    runtime->next_probe_ns =
+                        std::max(runtime->next_probe_ns, now_ns);
                 }
             }
             effects.bump = true;
@@ -1454,8 +1469,10 @@ Status ProbeLinkManager::applyEventLocked(const ProbeEvent& event,
                 (runtime->health == LinkHealth::kIsolated ||
                  runtime->health == LinkHealth::kRecovering)) {
                 // In-flight records for this version are stale via area_epoch;
-                // the periodic task resumes immediately on the new page.
-                runtime->next_probe_ns = now_ns;
+                // the periodic task resumes on the new page, but never earlier
+                // than an already scheduled backoff.
+                runtime->next_probe_ns =
+                    std::max(runtime->next_probe_ns, now_ns);
             }
             effects.bump = true;
             return Status::OK();

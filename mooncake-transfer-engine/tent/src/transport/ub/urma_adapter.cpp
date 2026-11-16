@@ -404,6 +404,7 @@ class RealJfc final : public Jfc {
     ~RealJfc() override { (void)close(); }
 
     Status initialize(const JfcOptions& options) {
+        send_only_ = options.send_only;
         if (options.enable_completion_events) {
             jfce_ = urma_create_jfce(context_->native());
             if (jfce_ == nullptr) return nativePointerError("urma_create_jfce");
@@ -415,31 +416,54 @@ class RealJfc final : public Jfc {
         send_jfc_ = urma_create_jfc(context_->native(), &send_cfg);
         if (send_jfc_ == nullptr)
             return nativePointerError("urma_create_jfc(send)");
+        if (send_only_) return Status::OK();
 
-        urma_jfc_cfg_t receive_cfg{};
-        receive_cfg.depth = options.receiver_depth;
-        receive_jfc_ = urma_create_jfc(context_->native(), &receive_cfg);
-        if (receive_jfc_ == nullptr) {
-            return nativePointerError("urma_create_jfc(receive)");
+        if (options.transport_mode == JettyTransportMode::kRm) {
+            // UMDK's RM health probe uses one JFC for both the JFS and the JFR.
+            shared_jfc_ = true;
+            receive_jfc_ = send_jfc_;
+        } else {
+            urma_jfc_cfg_t receive_cfg{};
+            receive_cfg.depth = options.receiver_depth;
+            receive_jfc_ = urma_create_jfc(context_->native(), &receive_cfg);
+            if (receive_jfc_ == nullptr) {
+                return nativePointerError("urma_create_jfc(receive)");
+            }
         }
 
         urma_jfr_cfg_t receiver_cfg{};
         receiver_cfg.depth = options.receiver_depth;
         receiver_cfg.flag.bs.tag_matching = 0;
-        receiver_cfg.trans_mode = URMA_TM_RC;
+        receiver_cfg.trans_mode =
+            options.transport_mode == JettyTransportMode::kRm ? URMA_TM_RM
+                                                              : URMA_TM_RC;
         receiver_cfg.max_sge = 1;
-        receiver_cfg.min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER;
+        // UMDK's own RM health probe leaves min_rnr_timer at 0 and uses a
+        // depth-1 JFR; mirror it for the probe JFC.
+        receiver_cfg.min_rnr_timer =
+            options.transport_mode == JettyTransportMode::kRm
+                ? 0
+                : URMA_TYPICAL_MIN_RNR_TIMER;
         receiver_cfg.jfc = receive_jfc_;
         receiver_cfg.token_value.token = options.token;
         receiver_jfr_ = urma_create_jfr(context_->native(), &receiver_cfg);
         if (receiver_jfr_ == nullptr)
             return nativePointerError("urma_create_jfr");
+        if (options.transport_mode == JettyTransportMode::kRm) {
+            LOG(INFO) << "probe RM JFC created: jfr_depth="
+                      << receiver_jfr_->jfr_cfg.depth << " jfr_trans_mode="
+                      << static_cast<int>(receiver_jfr_->jfr_cfg.trans_mode)
+                      << " jfr_min_rnr_timer="
+                      << static_cast<int>(receiver_jfr_->jfr_cfg.min_rnr_timer)
+                      << " jfr_token=" << options.token;
+        }
         return Status::OK();
     }
 
     bool valid() const noexcept override {
-        return send_jfc_ != nullptr && receive_jfc_ != nullptr &&
-               receiver_jfr_ != nullptr;
+        if (send_jfc_ == nullptr) return false;
+        return send_only_ ||
+               (receive_jfc_ != nullptr && receiver_jfr_ != nullptr);
     }
 
     int eventFd() const noexcept override {
@@ -525,11 +549,13 @@ class RealJfc final : public Jfc {
             if (rc != URMA_SUCCESS) return nativeError("urma_delete_jfr", rc);
             receiver_jfr_ = nullptr;
         }
-        if (receive_jfc_ != nullptr) {
+        if (receive_jfc_ != nullptr && !shared_jfc_) {
             const int rc = urma_delete_jfc(receive_jfc_);
             if (rc != URMA_SUCCESS) {
                 return nativeError("urma_delete_jfc(receive)", rc);
             }
+            receive_jfc_ = nullptr;
+        } else if (shared_jfc_) {
             receive_jfc_ = nullptr;
         }
         if (send_jfc_ != nullptr) {
@@ -550,6 +576,8 @@ class RealJfc final : public Jfc {
    private:
     std::shared_ptr<RealContext> context_;
     urma_jfce_t* jfce_ = nullptr;
+    bool send_only_{false};
+    bool shared_jfc_{false};
     urma_jfc_t* send_jfc_ = nullptr;
     urma_jfc_t* receive_jfc_ = nullptr;
     urma_jfr_t* receiver_jfr_ = nullptr;
@@ -671,11 +699,12 @@ class RealJetty final : public Jetty {
 
     Status initialize(const JettyOptions& options) {
         urma_jetty_cfg_t config{};
+        reliable_message_ = options.transport_mode == JettyTransportMode::kRm;
+        // UMDK requires JFS.trans_mode == shared JFR.trans_mode; the probe JFC
+        // is created with an RM JFR so RM Jetties share it like RC ones do.
         config.flag.bs.share_jfr = 1;
         config.jfs_cfg.depth = options.depth;
-        reliable_message_ = options.transport_mode == JettyTransportMode::kRm;
-        config.jfs_cfg.trans_mode =
-            reliable_message_ ? URMA_TM_RM : URMA_TM_RC;
+        config.jfs_cfg.trans_mode = reliable_message_ ? URMA_TM_RM : URMA_TM_RC;
         config.jfs_cfg.priority = context_->isBondingDevice()
                                       ? context_->ctpPriority()
                                       : options.priority;
@@ -683,15 +712,41 @@ class RealJetty final : public Jetty {
             config.jfs_cfg.flag.bs.multi_path = 1;
         }
         config.jfs_cfg.max_sge = options.max_sge;
-        config.jfs_cfg.max_rsge = options.max_sge;
-        config.jfs_cfg.rnr_retry = options.rnr_retry;
-        config.jfs_cfg.err_timeout = options.error_timeout;
+        if (reliable_message_) {
+            // Mirror UMDK's own RM health-probe Jetty: leave max_rsge at the
+            // device default and disable the RC-style error timeout. Some RM
+            // devices reject the RC values with URMA_EINVAL.
+            config.jfs_cfg.max_rsge = 0;
+            config.jfs_cfg.rnr_retry = options.rnr_retry;
+            config.jfs_cfg.err_timeout = 0;
+        } else {
+            config.jfs_cfg.max_rsge = options.max_sge;
+            config.jfs_cfg.rnr_retry = options.rnr_retry;
+            config.jfs_cfg.err_timeout = options.error_timeout;
+        }
         config.jfs_cfg.jfc = jfc_->nativeSendJfc();
         config.shared.jfr = jfc_->nativeReceiver();
         config.shared.jfc = nullptr;
 
         native_ = urma_create_jetty(context_->native(), &config);
-        if (native_ == nullptr) return nativePointerError("urma_create_jetty");
+        if (native_ == nullptr) {
+            auto* jfr = jfc_->nativeReceiver();
+            LOG(WARNING)
+                << "urma_create_jetty failed: trans_mode="
+                << (reliable_message_ ? "RM" : "RC")
+                << " share_jfr=" << config.flag.bs.share_jfr
+                << " jfr=" << config.shared.jfr << " jfr_trans_mode="
+                << (jfr ? static_cast<int>(jfr->jfr_cfg.trans_mode) : -1)
+                << " depth=" << config.jfs_cfg.depth
+                << " max_sge=" << config.jfs_cfg.max_sge
+                << " max_rsge=" << static_cast<int>(config.jfs_cfg.max_rsge)
+                << " rnr_retry=" << static_cast<int>(config.jfs_cfg.rnr_retry)
+                << " err_timeout="
+                << static_cast<int>(config.jfs_cfg.err_timeout)
+                << " device_transport_modes="
+                << context_->deviceInfo().capabilities.transport_modes;
+            return nativePointerError("urma_create_jetty");
+        }
         depth_ = options.depth;
         return Status::OK();
     }
@@ -1752,8 +1807,8 @@ class RealUrmaAdapter final : public UrmaAdapter {
             request.length > std::numeric_limits<uint32_t>::max()) {
             return Status::InvalidArgument("invalid work request length");
         }
-        auto local = std::dynamic_pointer_cast<RealLocalSegment>(
-            request.local_segment);
+        auto local =
+            std::dynamic_pointer_cast<RealLocalSegment>(request.local_segment);
         auto remote = std::dynamic_pointer_cast<RealRemoteSegment>(
             request.remote_segment);
         if (!local || !local->valid()) return invalidHandle("LocalSegment");

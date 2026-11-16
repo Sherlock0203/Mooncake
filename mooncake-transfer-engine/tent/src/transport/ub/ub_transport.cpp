@@ -358,7 +358,12 @@ struct UbTransport::Impl {
                 }
                 auto standalone =
                     std::make_shared<ub::StandaloneProbeResourceProvider>(
-                        adapter, params.probe);
+                        adapter, params.probe,
+                        [topology =
+                             local_topology](const std::string& topology_name) {
+                            return topology ? topology->getNicId(topology_name)
+                                            : static_cast<Topology::NicID>(-1);
+                        });
                 auto discover = standalone->discover();
                 if (!discover.ok()) return failInstall(discover);
                 probe_directory =
