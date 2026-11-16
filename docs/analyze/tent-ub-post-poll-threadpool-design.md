@@ -86,7 +86,7 @@
 | 1 | 优先级 deque 无界（workers.h:229） | 有界队列＋分桶 defer 登记＋availability epoch 唤醒 | §4、§5 |
 | 2 | poller stride 绑定 JFC，数量 min(poller_count, JFC)（workers.cpp:374-377） | 保留绑定模型，纳入 probe shard 且每轮优先 | §7.1 |
 | 3 | post 用 `endpoint->jetty(worker_index)` 选工位（workers.cpp:904） | 选路后 `tryAcquireOne` 租借＋池化侧 `tryClaimPost` 认领 | §5.5 |
-| 4 | Inflight 仅 token/引用/超时位（workers.cpp:54-68） | CompletionRecord 13 字段＋完成门（业务与 probe record 共用结构） | §7.3、§7.4 |
+| 4 | Inflight 仅 token/引用/超时位（workers.cpp:54-68） | CompletionRecord 13 字段＋完成门（业务与 probe record 共用结构）；**W2 已替换为「共享内核 + 侧挂 owner」** | §7.3、§7.4 |
 | 5 | post 二态，靠 posted_count 推断接受（urma_adapter.h:268） | PostResult 三态 acceptance | §6 |
 | 6 | 无 K | task_max_inflight_attempts 准入 | §5.3 |
 | 7 | 事件 7 类枚举，poller 线程直接回调应用（workers.cpp:1000-1032） | 十类分类＋callback 执行器 | §7.2、§7.5 |
@@ -663,6 +663,8 @@ context 初始化（业务 JFC）
 每阶段先过注入 adapter、时钟与线程交错单测；实机验证依赖池化侧阶段零 provider 门槛（mock 不能证明 DMA fence）。
 
 **W1 实现状态（2026-11-13）**：W1a（类型/状态机/campaign/接口 7）、W1b（调度线程/超时/退避/关闭）、W1c（workers 三处接缝/装配/stub 供给）、W1d（配置校验/诊断日志）已实现并通过单测与 fake adapter 集成测试；`probe/enabled` 默认 false，生产行为未改变。真实链路联调待 **probe provider（探测资源独立供给）** 与**逐 WR target 的 adapter 能力（RM；或 RC 每路径绑定退化）**，以及该文 §16 十一点契约结论；这些都不要求探测资源经过业务 Jetty 池。
+
+**W2 实现状态（2026-11-16）**：W2a–W2d 已实现，细节与落地偏差见《tent-ub-w2-completion-gate-design》§12.1。要点：`CompletionRecord` 共享内核 + `BusinessRecord`/`ProbeRecord` 侧挂 owner（§7.3 落地形态）；完成门双入口（`gate::onPostReturn`/`onRealCr`）与 `handler_refs` 纪律；dispatcher 三步骨架（namespace → registry → unknown）；`CompletionStats` 观测；超时路径保留同步 quiesce 但增加 `handler_refs==0` 前置；`ProbeRecord` 嵌入内核（探测语义零变化）。业务可观察变化仅三处（early CQE 的释放时点、重复 CQE 可观测、post 未返回时超时延后到 fence 之前——D-7 的安全优先取舍），其余路径结算结果与释放次数不变。
 
 ### 13.1 风险与缓解
 

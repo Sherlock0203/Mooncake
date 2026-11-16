@@ -3,7 +3,7 @@
 > 日期：2026-11-16。定位：**W2 子里程碑详设**（总设计 §13 实施切分的第二步）。
 > 上游文档（冲突时以上游为准）：本文的父文档是《tent-ub-post-poll-threadpool-design》（下称**总设计**）；探测侧共用契约见《tent-ub-probe-link-detail-design》（下称**探测详设**）；探测资源供给见《tent-ub-probe-standalone-supply》。
 > 代码基线：`49d7757b`（探测链路：修复拓扑映射、退避与异步重建）。本文行号均对该基线；父文档行号对应 `956af65e`，两者在 `workers.cpp` 上同源（W1 只做接缝，未动完成路径）。
-> 状态：**设计文档，未实现**。W1（探测）已实现且默认关闭；W2 是业务 post/poll 路径的第一个里程碑。
+> 状态：**已实现（2026-11-16，W2a–W2d 全部落地）**，落地偏差见 §12.1。W1（探测）已实现且默认关闭；W2 是业务 post/poll 路径的第一个里程碑。
 > 阅读顺序建议：§0（决策）→ §2（心智模型）→ §6（完成门）→ §8（改动清单）。
 
 ## 0. 已确认决策与锁定默认
@@ -16,7 +16,7 @@ W2 的争议点集中在"记录该长什么样"和"谁有权释放资源"，先�
 | D-2 | 记录采用**共享内核 + 侧挂 owner**：`CompletionRecord` 只放身份与一次性事实位，不含任一侧私有类型；业务 owner 放 `BusinessRecord`，探测 owner 放 `ProbeRecord` 其余字段 | 是；内核零依赖 `slice.h` / `probe_types.h` | 总设计 §7.3 要求"两侧共用同一结构"，但两侧身份与资源句柄确实不同 |
 | D-3 | **registry 的删除权归"完成认领方"**（CQE、fence 证据或超时证据）；post 侧只写事实位，永不删表。**唯一例外：`NotAccepted`（确定零接受）可由 post 侧删除**，因为 WR 未发出、不可能再有完成 | 是 | 否则 post 先返回时会删表，导致随后到达的合法 CQE 被判未知 token |
 | D-4 | `handler_refs` 是**完成门事实位**，不是生命周期手段（`shared_ptr` 已保证存活）；post 调用栈与每次结算作用域各持一个引用 | 是 | 总设计 §1.3.4"旧 handler 不再访问可复用状态"；fixed by early-CQE 用例 |
-| D-5 | `acceptance` 三态字段现在就定；W2 由 legacy 适配函数从 `posted_count` 推导，`kUnknown` **在 W2 不可达** | 是；W3 换真三态只改 `legacyAcceptance()` 一个函数 | 总设计 §6；P0-B 未就绪 |
+| D-5 | `acceptance` 三态字段现在就定；W2 由 legacy 适配函数从 `posted_count` 推导。`kUnknown` **只由 `posted_count > 1`（自相矛盾的适配器）产生**：不猜、不回滚，阻塞到超时 fence 为止（§12.1 #3） | 是；W3 换真三态只改 `legacyAcceptance()` 一个函数 | 总设计 §6；P0-B 未就绪 |
 | D-6 | 正常归还谓词是**必要条件**，最终裁决仍在池化侧；W2 无 lease，`lease_return_claimed` 这个 CAS 保护的是"outstanding + quota"释放 | 是；P0-D 后同一 CAS 位置换成 `release(lease)` | 总设计 §1.3.4 / §7.4 |
 | D-7 | 超时入口 W2 **保留同步 quiesce**，但只对 `handler_refs == 0` 的记录执行 fence；refs>0 的记录本轮跳过、下一轮再来 | 是；W5 只删掉 quiesce 段，门与 finalize 不动 | 总设计 §8 要求 W5 才重构超时，但 W2 不能引入"post 未返回就释放 owner" |
 | D-8 | 逻辑结果拆成"决定"与"投递"：**决定**在 settle 认领时写入记录，**投递**（`slice->resolveAttempt`）在 owner 释放之后、`handler_refs == 0` 之后；W4 再迁往 callback 执行器 | 是 | 否则 early-CQE 时可能在 `adapter->post()` 尚未返回时就 `enqueueRetry` 同一 slice |
@@ -88,6 +88,11 @@ t3 advance      refs==0 → 一次性认领逻辑结果（onSettle）→ 有责�
 | --- | --- | --- | --- |
 | early CQE 的释放时点（连带切片投递时点） | CQE 抢先时 `handleCompletion` 立即 `releaseInflight`：`releaseOutstanding` + `quota->release` 发生在 `adapter->post()` 尚未返回时 | 等 `handler_refs==0` 才释放；切片结算也一并后移 | 提前归还 quota 会让其他 worker 超额准入；P0-D 之后就是提前归还 lease，属于数据正确性问题 |
 | 重复 CQE | 第二次查表失败静默丢弃（`return`） | 计入 `unknown_token`/`duplicate_cr` 观测并经 sink 上报 | 门要求"只结算一次"可验证；静默丢弃无法证明没双释放 |
+| post 未返回时的超时 | 直接标记并 fence（可能在 `adapter->post()` 还在用该记录时回收内存） | 该轮跳过，`post_returned` 之后才 fence（D-7） | 先保证安全，再谈时效；见下方"代价" |
+
+前两处同源（early CQE），第三处是 D-7 的直接后果，必须一起评审。
+
+**D-7 的代价**：`adapter->post()` 若在 provider 内永久阻塞，该记录**永远不会被超时扫描 fence**（只会每轮累加 `timeout_deferred_by_post_return`），slice 只能等 `stop()`；而 `stop()` 又要先 join posting 线程，因此同样卡住。这是"宁可慢也不在未知 DMA 上回收内存"的取舍，**已登记为 §13 风险**，出口留给 W5（超时结构重构）——届时 record 归属 poller 分区、post 阻塞由池化侧接口 9/10 上报，不再由本侧扫描兜底。
 
 其余路径（成功、错误、超时、stop）**结算结果与释放次数完全不变**，只是把释放动作收进各出口的一次性认领里（§6.3/§6.4）。
 
@@ -151,7 +156,7 @@ t3 advance      refs==0 → 一次性认领逻辑结果（onSettle）→ 有责�
 | --- | --- | --- | --- |
 | `include/tent/transport/ub/completion_record.h` | 新增 | `RecordKind`、`PostAcceptance`、`RecordPath`、`CompletionRecord`、`gate::{Sink, PostReturn, WrFacts, BlockReason, FaultKind}`、`CompletionStats` | ~260 行 |
 | `src/transport/ub/completion_record.cpp` | 新增 | `gate::onPostReturn/onRealCr/onTimeout/onFenceProven/onFenceFailed/onUnposted/advance`、`CompletionStats::snapshot` | ~240 行 |
-| `include/tent/transport/ub/entity_event.h` | 新增 | 接口 8 的最小形状：`EntityEventSink` + `EntityEvent{kind,...}`（W2 只有 `kUnknownToken`） | ~60 行 |
+| `include/tent/transport/ub/entity_event.h` | 新增 | 接口 8 的最小形状：`EntityEventSink` + `EntityEvent{kind,...}`（W2 只用 `kUnknownToken` 与 `kUnclassified`） | ~120 行 |
 | `include/tent/transport/ub/workers.h` | 改 | 删 `Inflight`；`records_` 取代 `inflight_`；新增 sink 实现声明、stats 取值器 | ~40 行改动 |
 | `src/transport/ub/workers.cpp` | 改 | `BusinessRecord`、publish/claim/sink、`handleCompletion` 拆分、`scanTimeouts` 加前置、`stop()` 尾部改 finalize | ~180 行改动 |
 | `include/tent/transport/ub/probe_link_manager.h` | 改 | `ProbeRecord` 嵌入 `CompletionRecord core` | ~10 行改动 |
@@ -204,16 +209,19 @@ t3 advance      refs==0 → 一次性认领逻辑结果（onSettle）→ 有责�
 
 | 位 | 认领的动作 | 认领者 |
 | --- | --- | --- |
+| `cr_claimed` | `terminal` / `wr_terminal` 的**写入权**（"这条完成由我落账"） | `onRealCr` |
 | `settle_claimed` | 选择并提交逻辑结果（COMPLETED/FAILED/TIMEOUT/CANCELED） | `advance` |
 | `reject_claimed` | 拒绝回滚（`NotAccepted`） | `advance` |
 | `finalize_claimed` | 故障/超时/停止路径的 owner 清理 | `advance` |
 | `lease_return_claimed` | 正常归还 owner | `advance` |
 | `fault_reported` | 故障副作用（rail_monitor/PLM/接口 2）的一次性上报 | `advance` 或 `scanTimeouts` |
+| `conflict_claimed` | "确定零接受却收到完成"这条矛盾记录只上报一次 | `advance`（refs 归零后的唯一汇合点） |
 
 两条硬规矩：
 
 1. **释放 owner 的前提是"责任证据"**——`wr_terminal || fence_proven || 确定零接受（NotAccepted）`。`fault_seen` 只是逻辑标记，没有责任证据时释放资源就是在未知 DMA 上回收内存（探测详设 §9.4 的 L-4 同构）。
 2. **`timed_out` 与 `finalize_claimed` 是两个独立位**；超时不终结责任，只标记逻辑结果。
+3. **重复完成必须靠认领位而不是事实位判定**：`wr_terminal` 是给读方的发布事实，`cr_claimed` 才是"谁写它"的认领。poller 上的真实 CQE 与 `scanTimeouts()`/`stop()` 里 fence 回吐的完成**会由两个线程同时进入 `onRealCr`**（一个 JFC 只有一个 poller，但 fence 在触发它的线程上执行），因此 `onRealCr` 必须先 `cr_claimed.exchange`、失败即走 `onDuplicate`，**绝不能先 load `wr_terminal` 再写 `terminal`**（那是数据竞争，且可能混入后到者的 category/bytes）。
 
 ### 5.2 内存序表
 
@@ -308,37 +316,43 @@ struct ProbeRecord {
 - registry 三条规则：
   1. **发布**：`tryCommitPost` 成功后、`adapter->post()` 之前插入（现状已如此，保持）；
   2. **查找**：只在 `records_mutex_` 内取 `shared_ptr`，出锁后用；
-  3. **删除**：只有完成认领方（`onRealCr` 赢得 `wr_terminal`）、超时 fence 成功方、`stop()` 兜底方可以删除；超时方删表前必须在同一临界区内复核"该记录仍属于我"（CQE 可能已抢先认领并删表）。**`onPostReturn` 永不删表**（D-3）。
+  3. **删除**：只有完成认领方可以删除——实现上是"owner 处置完成时删"（`onOwners` 的 `eraseRecord`），因为处置只由认领方执行；超时 fence 成功方在处置**之前**删表，且必须在同一临界区内复核"该记录仍属于我"（CQE 可能已抢先认领并处置）。删除点不放在 `wr_terminal` 置位时，是为了让"记录还在表里 = 重复完成（`duplicate_cr`）"与"记录已不在表里 = 未知 token（`unknown_token`）"可区分（§7.1）。**`onPostReturn` 永不删表**（D-3）。
 
 ## 6. 完成门
 
 ### 6.1 双入口
 
 ```cpp
+// handler_refs 由调用作用域的 RAII 守卫持有（§6.5），门入口本身不加减引用：
+// 由"最后一个释放者"调用 advance，任何提前返回都不会漏减。
+
 // gate::onPostReturn —— processPending 在 adapter->post() 返回后调用，唯一一次
-void onPostReturn(CompletionRecord& rec, const PostReturn& r, Sink& sink) {
+void onPostReturn(CompletionRecord& rec, const PostReturn& r, GateContext& ctx) {
     if (rec.post_returned.load(std::memory_order_acquire)) {     // 防御：本入口只该被调用一次
-        stats.one_shot_violations++;                             // 恒 0；非 0 即缺陷
+        ctx.stats.one_shot_violations++;                         // 恒 0；非 0 即缺陷
         return;
     }
     rec.acceptance.store(r.acceptance, std::memory_order_relaxed);  // ① 数据先写
     rec.posted_bytes = r.posted_bytes;                              //    数据先写
+    rec.post_retryable = r.retryable;                               //    数据先写
     rec.post_returned.store(true, std::memory_order_release);       // ② release 发布
-    if (rec.handler_refs.fetch_sub(1, std::memory_order_acq_rel) == 1) advance(rec, sink);
 }
 
-// gate::onRealCr —— dispatcher 在 registry 命中后调用
-void onRealCr(CompletionRecord& rec, const WrFacts& f, Sink& sink) {
-    if (rec.wr_terminal.load(std::memory_order_acquire)) {       // 重复 CQE
+// gate::onRealCr —— dispatcher（或 fence 回吐路径）在 registry 命中后调用
+void onRealCr(CompletionRecord& rec, const WrFacts& f, Sink& sink, GateContext& ctx) {
+    if (rec.cr_claimed.exchange(true, std::memory_order_acq_rel)) {  // 重复完成：认领失败
+        ctx.stats.duplicate_cr++;
         sink.onDuplicate(rec);                                   //   只记账，不碰 record
         return;
     }
+    if (!rec.post_returned.load(std::memory_order_acquire)) ctx.stats.early_cqe++;
     rec.terminal = f;                                            // ① 结果先写
+    if (!f.success) rec.fault_seen.store(true, std::memory_order_release);  // 同属结果
     rec.wr_terminal.store(true, std::memory_order_release);      // ② release 发布
-    if (!f.success) rec.fault_seen.store(true, std::memory_order_acq_rel);
-    if (rec.handler_refs.fetch_sub(1, std::memory_order_acq_rel) == 1) advance(rec, sink);
 }
 ```
+
+> **为什么重复判定用 `cr_claimed` 而不是 `wr_terminal`**：一个 JFC 只有一个 poller，但 `scanTimeouts()`/`stop()` 的 fence 在**触发它的那个线程**上回吐完成，所以两条真实完成可能由两个线程同时进入 `onRealCr`。先 `load` 再写 `terminal` 是数据竞争，且两条结果可能被混写；认领位保证只有一条落账（IN-1）。
 
 两个入口都遵循同一条发布纪律，不写成 `exchange` 后赋数据：
 
@@ -359,7 +373,7 @@ void onRealCr(CompletionRecord& rec, const WrFacts& f, Sink& sink) {
 | `onTimeout(rec, sink)` | `scanTimeouts` | `timed_out` + `fault_reported` 一次；**不调 `advance`** | `false` = 已被别的出口认领 |
 | `onFenceProven(rec, sink)` | `scanTimeouts`（quiesce 成功后） | `fence_proven` 一次，随后 `advance` | void |
 | `onFenceFailed(rec)` | `scanTimeouts`（quiesce 失败后） | 撤销 `timed_out`（可重复调用） | void |
-| `onUnposted(rec, reason, sink)` | `processPending`（`NotAccepted`）/ `stop()` | 兜底 `settle` + `onOwners`，幂等 | void |
+| `onUnposted(rec, reason, sink)` | `stop()`（posting/poller 均已 join） | 兜底 `settle` + `onOwners`，幂等；有 handler 引用时**拒绝释放**并计数 | void |
 
 **`onTimeout` 为什么不调 `advance`**：此时 `timed_out` 是**暂定**的（fence 还没证据）。若此刻就认领逻辑结果，一旦 fence 失败、`timed_out` 被撤销，逻辑结果却已定格为 TIMEOUT，就与基线"fence 失败后自然 SUCCESS CQE 仍算 COMPLETED"的行为不一致。因此超时的逻辑结果只在 `onFenceProven` 或真实 CQE 到达时认领。
 
@@ -390,8 +404,11 @@ readyForNormalReturn(rec) =
 `advance` 做两件**互不替代**的事，各有自己的认领位。把它们混在一起是 W2 最容易写错的地方：`fault_seen` 只该决定"记不记故障、报不报"，不该决定"能不能释放资源"。
 
 ```cpp
-void advance(CompletionRecord& rec, Sink& sink) {
-    if (rec.handler_refs.load(std::memory_order_acquire) != 0) return;   // 还有人在跑
+void advance(CompletionRecord& rec, Sink& sink, GateContext& ctx) {
+    if (rec.handler_refs.load(std::memory_order_acquire) != 0) {          // 还有人在跑
+        ctx.stats.gate_blocked_by_handler_refs++;
+        return;
+    }
 
     // 责任证据三选一：真实 CQE / fence 成功 / 确定零接受（NotAccepted 本身即证据）
     const bool responsibility_ended =
@@ -400,15 +417,25 @@ void advance(CompletionRecord& rec, Sink& sink) {
         (rec.post_returned.load(std::memory_order_acquire) &&
          rec.acceptance.load(std::memory_order_relaxed) == PostAcceptance::kNotAccepted);
 
-    // ---- 第一段：逻辑结果（谁先认领谁定，一次性）----
-    if (!rec.settle_claimed.exchange(true, std::memory_order_acq_rel)) {
-        sink.onSettle(rec, logicalOutcomeOf(rec, responsibility_ended));
+    // "确定零接受却收到完成"的自相矛盾记录：两个事实由两条入口各自发布，可能互相
+    // 看不见对方刚写的位（先看后写），所以在入口里计数会漏计。两个事实都在释放自己
+    // 那份 handler 引用**之前**发布，而引用计数是 acquire/release 链，因此"最后一个
+    // 释放者"——也就是执行本函数的线程——必然同时看见两者，计数在这里精确一次。
+    if (rec.notAccepted() && rec.wr_terminal.load(acquire) &&
+        !rec.conflict_claimed.exchange(true, acquire))
+        ctx.stats.not_accepted_with_completion++;
+
+    // 责任没终结就只能上报，绝不能释放（IN-3）；此时也**不认领结算位**，
+    // 否则真实 CQE 到达后逻辑结果再也写不进去。
+    if (!responsibility_ended) {
+        ctx.stats.gate_blocked_by_responsibility++;
+        sink.onBlocked(rec, BlockReason::kResponsibility);
+        return;
     }
 
-    // 责任没终结就只能上报，绝不能释放（IN-3）
-    if (!responsibility_ended) {
-        sink.onBlocked(rec, BlockReason::kAwaitingResponsibility);
-        return;
+    // ---- 第一段：逻辑结果（谁先认领谁定，一次性）----
+    if (!rec.settle_claimed.exchange(true, std::memory_order_acq_rel)) {
+        sink.onSettle(rec, logicalOutcomeOf(rec));
     }
 
     // ---- 第二段：owner 处置（三条互斥出口，各一个一次性位）----
@@ -470,17 +497,17 @@ void advance(CompletionRecord& rec, Sink& sink) {
 
 | 时刻 | 操作 | 理由 |
 | --- | --- | --- |
-| publish 后、`adapter->post()` 前 | `fetch_add(1)` | post 调用栈正在使用 record 的 segment/target |
-| `onPostReturn` 末尾 | `fetch_sub(1)` | 栈即将退出 |
-| dispatcher 找到 record 后 | `fetch_add(1)` | 结算作用域开始 |
-| `onRealCr` 末尾 | `fetch_sub(1)` | 作用域结束 |
-| `stop()`/超时 fence 的兜底结算 | 同样成对 | 与 CQE 侧同构 |
+| 入表**之前**、`adapter->post()` 前 | 守卫构造 → `fetch_add(1)` | post 栈要用 segment/target；先取引用再入表，避免超时扫描看到"已发布但 `refs==0`"的记录去 fence 一个还没开始的 post |
+| post 作用域结束（`onPostReturn` 之后） | 守卫析构 → `fetch_sub(1)` | 栈即将退出 |
+| dispatcher 找到 record 后 | 守卫构造 → `fetch_add(1)` | 结算作用域开始 |
+| 结算作用域结束（`onRealCr` 返回后） | 守卫析构 → `fetch_sub(1)` | 作用域结束 |
+| `stop()`/超时 fence 的兜底结算 | 不持引用（调用方已 join 执行体；`onUnposted` 发现 refs>0 时拒绝释放，§6.9） | 与 CQE 侧同构 |
 
 三条硬规矩：
 
 1. **只有 `fetch_sub` 返回 0 的线程调用 `advance`**（不是"每个进入的线程都调用"）——避免无谓 CAS 竞争，也让"最后一个离开的人关门"语义显式；
 2. `handler_refs` 不参与生命周期（`shared_ptr` 已经保证），只参与门判定；
-3. 每个作用域用 RAII 守卫（`HandlerRef`），异常/提前返回路径都不漏减。
+3. 每个作用域用 RAII 守卫（`HandlerRef`）：**守卫同时负责加与减**，门入口不自己加减，因此异常/提前返回路径都不漏减。
 
 ### 6.6 交错矩阵（W2a 验收依据）
 
@@ -522,7 +549,8 @@ scanTimeouts(now):
 
 四个必须与现状逐字对齐的点：
 
-1. **fence 失败时撤销 `timed_out`**（现状 `workers.cpp:1188-1190`），且此时**逻辑结果尚未认领**：fence 不成立就没有"旧 DMA 已停"的证明，此时既不能释放 owner，也不能阻止后续自然完成。撤销标记让该记录回到"在途"，下一轮重新尝试 fence——**不是重发 WR**。副作用（`fault_reported`）已被一次性认领，不会重复上报或重复计数。
+1. **fence 失败时撤销 `timed_out`**（现状 `workers.cpp:1188-1190`），且此时**逻辑结果尚未认领**：fence 不成立就没有"旧 DMA 已停"的证明，此时既不能释放 owner，也不能阻止后续自然完成。撤销标记让该记录回到"在途"，下一轮重新尝试 fence——**不是重发 WR**。
+   `onTimeout` 只置 `timed_out`，**不认领故障副作用**：`fault_reported` 在随后 `advance` 的 `onFault` 里才认领。否则"fence 失败撤销超时 → 之后到达真实错误 CQE"会因侧效应已被认领而丢掉 rail 记账与成员退役（基线 `recordTimeoutOnce` 也只在有证据后执行），与 IN-11 冲突。
 2. **先 dispatch drained 再判处置**：quiesce 回吐的完成可能正是该 token 的真实 CQE，必须先经 dispatcher 记账（它自己会认领 `wr_terminal`），再决定 owner 处置，否则会漏掉"硬件责任已终结"这一事实。
 3. **erase 与"是否仍属于我"在同一临界区判定**：若 CQE 侧已认领并删表，扫描方必须放弃处置（否则两个出口都去释放）。这是 D-3 在超时路径上的落点。
 4. **`retryable` 的现状语义保留**：`onSettle` 里按现状给 TIMEOUT 结果（fence 成功后允许重试），W5 才改重试策略（§1.4.1）。
@@ -543,6 +571,7 @@ scanTimeouts(now):
 
 - `posting_threads_` join 之后所有 post 栈已退出，`handler_refs` 只可能来自 poller；`stop()` 的兜底与 CQE/超时侧共用同一组认领位（`settle_claimed` / `lease_return_claimed` / `finalize_claimed` / `reject_claimed`），任一已被认领则兜底只补结算、不再释放，**双释放不可能**。
 - `stop()` 现有"quiesce 全部 endpoint → dispatch drained → 等 100ms → 停 poller → 清空剩余"的顺序**不动**；只把尾部 `releaseInflight + resolveAttempt` 换成 `gate::onUnposted(rec, kShutdown, sink)`（内部就是 `settle` + `onOwners(kFinalize)`）。
+- `onUnposted` 的调用约定是"posting 与 poller 均已 join"，因此 `handler_refs` 必为 0。防御性地：若发现 `refs > 0`，只补 `settle` 并**拒绝释放**（`handler_ref_leak_on_finalize++`），把缺陷暴露成计数而不是"post 未返回就回收内存"——宁可泄漏一条记录，也不换一次 use-after-free。
 - 返回值语义不动（W6 才引入 Draining/Unproven 报告）。
 
 ## 7. dispatcher 骨架
@@ -632,7 +661,8 @@ dispatchCompletion(c) -> bool:          // 返回值语义沿用基线：本完�
 | `early_cqe` (= `cqe_before_post_return`) | CQE 早于 post 返回的次数 | 常态 > 0（fake 下必现）；不是异常 |
 | `duplicate_cr` | 重复 CQE | 每次重复 +1，且 record 不被二次触碰 |
 | `unknown_token` | 查表失败 | 只在真的迟到/未知时增长 |
-| `gate_blocked_by_{post_return,cqe,responsibility,handler_refs,fault,not_accepted}` | 门阻塞原因分布（`BlockReason` 逐项） | 用于解释"为什么还没归还/没结算" |
+| `gate_blocked_by_{post_return,cqe,responsibility,handler_refs,fault,not_accepted,acceptance}` | 门阻塞原因分布（`BlockReason` 逐项） | 用于解释"为什么还没归还/没结算"；`acceptance` 只在不接受状态无法证明时增长 |
+| `not_accepted_with_completion` | "确定零接受"却收到真实完成（自相矛盾的适配器） | **每条冲突记录 +1**（由 `conflict_claimed` 在 refs 归零的 `advance` 汇合点判定，两个到达顺序都精确计入）；由 reject 出口隔离该端点。记录若已被 reject 出口删表，迟到完成改按 `unknown_token` 记账——仍然可见，只是换了桶 |
 | `gate_claim_race` | 两线程同时争到 refs==0 | 正常竞争，非缺陷 |
 | `one_shot_violations` | 任一次性位被写两次 | **恒 0**，非 0 即缺陷 |
 | `handler_ref_leak_on_finalize` | finalize 时 refs>0 | **恒 0** |
@@ -646,7 +676,7 @@ dispatchCompletion(c) -> bool:          // 返回值语义沿用基线：本完�
 
 | 编号 | 不变量 |
 | --- | --- |
-| IN-1 | 每个 token 的 `settle` / `reject` / `finalize` / `return` 四个动作各最多发生一次（四个独立 CAS） |
+| IN-1 | 每个 token 的 `terminal` 写入 / `settle` / `reject` / `finalize` / `return` 五个动作各最多发生一次（五个动作认领位），另有两个辅助认领位保证副作用只做一次：`cr_claimed` 保 `terminal` 写入、`conflict_claimed` 保冲突上报（`fault_reported` 保故障副作用）；共 7 个一次性位 |
 | IN-2 | 正常归还与 finalize 互斥：`fault_seen`/`timed_out` 任一置位后永不走正常归还 |
 | IN-3 | **没有责任证据（`wr_terminal` / `fence_proven` / `NotAccepted`）时不释放任何 owner**；`fault_seen` 单独不足以释放 |
 | IN-4 | registry 的删除只发生在完成认领方；`onPostReturn` 仅在 `NotAccepted`（零接受、不可能有 CQE）时删表；超时路径删表前必须复核"仍属于我" |
@@ -664,7 +694,7 @@ dispatchCompletion(c) -> bool:          // 返回值语义沿用基线：本完�
 | --- | --- | --- |
 | early CQE | owner 不提前释放；归还一次；post 返回后才结算 | G-2、I-1 |
 | post 先返回 | 归还一次 | G-1 |
-| 重复 CQE | 只结算一次 + 计入 `duplicate_cr` | G-4、I-3 |
+| 重复 CQE | 只结算一次 + 计入 `duplicate_cr` | G-4、I-3、G-16（并发首次完成） |
 | NotAccepted | 不归还、不记故障、回滚完整（W2 现状回滚） | G-5 |
 | 错误 CQE | `fault_seen` + finalize 一次 + 不归还 | G-6 |
 | 超时 + 迟到成功 | 不归还；finalize 一次；逻辑 TIMEOUT | G-7、I-4 |
@@ -689,7 +719,8 @@ dispatchCompletion(c) -> bool:          // 返回值语义沿用基线：本完�
 | G-12 | `handler_refs` 泄漏检测：故意少减一次，断言 `handler_ref_leak_on_finalize==1` 且不崩溃 |
 | G-13 | 一次性位被写两次 → `one_shot_violations==1` |
 | G-14 | fence 失败撤销路径：`timed_out` 回 false、无 owner 释放、`fault_reported` 只置一次 |
-| G-15 | `legacyAcceptance()` 映射表：`posted_count ∈ {0,1}` × `status ok/fail` 四种组合 |
+| G-15 | `legacyAcceptance()` 映射表：`posted_count ∈ {0,1}` × `status ok/fail` 四种组合，另加 `posted_count>1 → Unknown` |
+| G-16 | 并发首次完成：4 线程同时进入 `onRealCr`，仅一条落账、`terminal` 不混写（TSan 下同样为零告警；旧实现会报数据竞争） |
 
 ### 11.2 集成（fake adapter）
 
@@ -725,6 +756,29 @@ ctest --test-dir build -R "tent_ub_" --output-on-failure
 
 W2a 可与池化侧 P0-B 契约冻结并行；W2b 之后若 P0-B/P0-D 就绪，W3 直接替换 `legacyAcceptance()` 与 `release(lease)` 两处即可。单人约 4–5 天，W2a 占一半。
 
+### 12.1 实现状态与落地偏差（2026-11-16）
+
+W2a–W2d 全部落地，文件与 §4.2 清单一致（`completion_record.h/.cpp`、`entity_event.h`、`workers.h/.cpp`、`probe_link_manager.h/.cpp`、两个新测试目标、fake adapter 钩子与四个集成用例）。回归口径：
+
+```bash
+cmake --build build --target tent_ub_completion_gate_test tent_ub_completion_record_test \
+      tent_ub_native_data_path_test tent_ub_teardown_test tent_ub_probe_integration_test -j
+ctest --test-dir build -R "tent_ub_" --output-on-failure
+```
+
+§5.1（认领位）、§5.6（删除点）、§6.1/§6.3（伪码与入口表）、§6.5（引用纪律）、§6.7（超时侧效应归属）、§9（指标）、§10.1（IN-1）**已按落地形状改写**，正文与代码一致。下表只列仍与正文有实质差别、需要评审记住的点：
+
+| # | 偏差 | 理由 |
+| --- | --- | --- |
+| 1 | 故障副作用合并成两类 `FaultKind`（截止期超时 / 真实错误 CQE），后者再按 `terminal.outcome` 分类；**成员退役保持在基线的两处**（错误分类分支内、fence 成功之后） | 基线 CQE 错误分支是"先释放后退役"、fence 成功路径是"先退役后释放"；集中到一处会改变 `EndpointStore` 的 quarantine 时序 |
+| 2 | `NotAccepted` 的**逻辑结果**由门判为 `CANCELED`，业务 sink 仍**投递 `FAILED`** + 基线可重试性 | 上游 §8 冻结"post 确定未接受 = FAILED/NotExecuted"，§2.3 要求结算结果不变；W3 引入真三态时再统一（`deliverSettlement` 一个 switch） |
+| 3 | `legacyAcceptance()` 对 `posted_count > 1` 返回 `Unknown`（不猜、不回滚），该记录一直阻塞到超时 fence；阻塞原因单列为 `BlockReason::kAcceptance` | 适配器多报时无法证明哪条 WR 在飞；回滚可能回收仍在 DMA 的页（IN-3）。代价是占用到 `slice_timeout_ms`，已由 `gate_blocked_by_acceptance` 观测 |
+| 4 | `GateContext` 自持计数器，不注入时钟 | W2 的判定不依赖时间（完成时刻随 `WrFacts` 传入）；无全局变量，单线程即可复现 |
+| 5 | `entity_event.h` 增加 `kUnclassified`；token 0 只计数、type 记 `kJfc` | W2 无法区分 marker/AE，只计数不误报类型；W4 填内容时不改调用点 |
+| 6 | `dispatchCompletion` 增加两个**默认参数** `local_nic`/`jfc_index` | 接口 8 需要 JFC 键；默认值保持既有调用点（fence/stop 回吐）可用 |
+| 7 | `post_claimed` 只写不读 | §5.1 的状态位（防本侧双发、留观测）；"能否 post"的权威判定在 W3 的 `tryClaimPost` |
+| 8 | `ProbeRecord`：`settled → core.finalize_claimed`、`timed_out/token → core.*`，身份在 `beginPost` 写入，`core.orphan_reason` 由 `OrphanReason` 映射 | D-9 的机械替换；判定、锁边界、副作用顺序、日志文本未动，探测 12 用例原样通过 |
+
 ## 13. 风险与缓解
 
 | 风险 | 影响 | 缓解 |
@@ -735,6 +789,7 @@ W2a 可与池化侧 P0-B 契约冻结并行；W2b 之后若 P0-B/P0-D 就绪，W
 | W2 悄悄改了错误分支的重试语义 | 回归失败 / 线上行为漂移 | §6.3 明确"错误分支逻辑保持现状，只换释放收口" |
 | 超时路径与 CQE 竞争导致双 finalize | 双释放 | 全部走 `finalize_claimed` CAS；IN-1 + IN-3 |
 | probe 内核迁移引入语义漂移 | 探测恢复链退化 | 只允许 §5.5 的机械替换；独立 commit；12 个 probe 用例为门槛 |
+| `adapter->post()` 在 provider 内阻塞不返回（D-7 的 liveness 代价） | 该记录不会被超时扫描 fence，只能等 `stop()`，而 `stop()` 同样要先 join posting 线程 | 不赌时效：宁可不释放也不在未知 DMA 上回收内存；用 `timeout_deferred_by_post_return` 持续观测，W5 重构超时归属（record 按 poller 分区、post 阻塞经接口 9/10 上报）后再消除 |
 | W2 期间 P0-B/P0-D 契约变化 | 返工 | 记录层只依赖 `PostAcceptance` 与 `RecordPath` 两个自有类型，acceptor 映射集中在 `legacyAcceptance()` |
 | 没有真实硬件，门只被 fake 证明 | 实机才暴露 | 与 W1 同样口径：fake 证明记账，实机门槛在 P0 之后 |
 
