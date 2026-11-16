@@ -617,12 +617,11 @@ void ProbeLinkManager::onPostResult(const std::shared_ptr<ProbeRecord>& record,
             PathRuntime* runtime = findPathLocked(record->key.version);
             if (runtime != nullptr) {
                 if (record->test_probe) {
-                    runtime->test_due_ns =
-                        now + params_.testIntervalNs();
+                    runtime->test_due_ns = now + params_.testIntervalNs();
                 } else {
                     runtime->next_probe_ns =
-                        now + std::min(params_.intervalNs(),
-                                       kPostRejectedRetryCapNs);
+                        now +
+                        std::min(params_.intervalNs(), kPostRejectedRetryCapNs);
                 }
             }
             // Rejection is not a path fault: hand the task slot back so a
@@ -718,6 +717,11 @@ bool ProbeLinkManager::onProbeCompletion(const Completion& completion,
             if (current) {
                 if (record->test_probe && !params_.test_apply_health) {
                     // Pure link check: no health, campaign or lane change.
+                    LOG(INFO)
+                        << "probe test result: "
+                        << pathText(record->key.version)
+                        << " category=" << static_cast<int>(completion.category)
+                        << " token=" << completion.token;
                     if (completion.category == CompletionCategory::SUCCESS) {
                         ++stats_.probe_test_ok;
                     } else {
@@ -725,8 +729,7 @@ bool ProbeLinkManager::onProbeCompletion(const Completion& completion,
                     }
                 } else {
                     applyLocked(completion, record->key.version, *runtime,
-                                *edge, *port, now, record->test_probe,
-                                effects);
+                                *edge, *port, now, record->test_probe, effects);
                 }
             } else {
                 ++stats_.probe_stale;

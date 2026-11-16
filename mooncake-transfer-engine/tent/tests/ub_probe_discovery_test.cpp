@@ -123,26 +123,26 @@ TEST(UbProbeDiscoveryTest, RejectsOnlyBondingDevices) {
     EXPECT_TRUE(adapter->shutdown().ok());
 }
 
-TEST(UbProbeDiscoveryTest, AppliesDeviceFilterAndKeepsStableIndices) {
+TEST(UbProbeDiscoveryTest, AppliesDeviceFilterAndUsesSelectedPort) {
     auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
     ASSERT_TRUE(adapter->initialize().ok());
     adapter->setDiscoveredDevices(
         {fakeDeviceNamed("fake0"), fakeDeviceNamed("fake1")});
-    StaticDirectory directory({makeEdge(0, 42, 0), makeEdge(1, 43, 0)});
+    StaticDirectory directory({makeEdge(0, 42, 0)});
 
     auto params = makeProbeParams();
     params.device_filter = {"fake1"};
     StandaloneProbeResourceProvider provider(adapter, params);
     ASSERT_TRUE(provider.discover().ok());
     ASSERT_EQ(provider.contexts().size(), 1U);
-    EXPECT_NE(provider.contexts().find(1), provider.contexts().end());
+    EXPECT_NE(provider.contexts().find(0), provider.contexts().end());
     provider.setRemoteDirectory(&directory);
 
     ProbeGraph graph;
     ASSERT_TRUE(provider.snapshot(graph).ok());
     ASSERT_EQ(graph.ports.size(), 1U);
-    EXPECT_EQ(graph.ports[0].local_nic, 1);
-    EXPECT_EQ(provider.portViews()[0].local_nic, 1);
+    EXPECT_EQ(graph.ports[0].local_nic, 0);
+    EXPECT_EQ(provider.portViews()[0].local_nic, 0);
 
     ASSERT_TRUE(provider.shutdown().ok());
     EXPECT_TRUE(adapter->shutdown().ok());

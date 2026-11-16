@@ -102,15 +102,29 @@ Status StandaloneProbeResourceProvider::discoverLocked() {
         // Bonding devices are always excluded: probe uses a physical port
         // directly and never shares the bond provider's device.
         if (isBondingDevice(device)) continue;
-        if (!seen_devices.insert(device.native_device_name).second) {
-            // One probe port per physical device; use the first active EID.
+        const bool selected =
+            params_.device_filter.empty() ||
+            std::find(params_.device_filter.begin(),
+                      params_.device_filter.end(), device.native_device_name) !=
+                params_.device_filter.end() ||
+            std::find(params_.device_filter.begin(),
+                      params_.device_filter.end(),
+                      device.topology_name) != params_.device_filter.end();
+        if (!selected) continue;
+        // With an explicit filter a topology_name selects one EID; without a
+        // filter keep one probe port per physical device (the first active
+        // EID). A native-name filter also selects the first active EID.
+        if (!seen_devices.insert(device.native_device_name).second &&
+            std::find(params_.device_filter.begin(),
+                      params_.device_filter.end(),
+                      device.topology_name) == params_.device_filter.end()) {
             continue;
         }
         physical.push_back(std::move(device));
     }
     if (physical.empty()) {
         return Status::DeviceNotFound(
-            "no non-bonding physical device is available for probe");
+            "no non-bonding physical device matches probe/device_filter");
     }
 
     size_t matched = 0;
@@ -118,28 +132,13 @@ Status StandaloneProbeResourceProvider::discoverLocked() {
     ports_.reserve(physical.size());
     for (size_t index = 0; index < physical.size(); ++index) {
         PortState port;
-        // Index is the position in the unfiltered physical-device list, so a
-        // device_filter never renumbers the remaining probe ports.
+        // Indices are contiguous over the selected non-bonding devices; the
+        // selftest pairs the two ends by selection order.
         port.config.local_nic = static_cast<Topology::NicID>(index);
         port.config.generation = 1;
         port.source_generation = 1;
         port.topology_name = physical[index].topology_name;
-        bool selected = params_.device_filter.empty();
-        if (!selected) {
-            selected = std::find(params_.device_filter.begin(),
-                                 params_.device_filter.end(),
-                                 physical[index].native_device_name) !=
-                           params_.device_filter.end() ||
-                       std::find(params_.device_filter.begin(),
-                                 params_.device_filter.end(),
-                                 physical[index].topology_name) !=
-                           params_.device_filter.end();
-        }
-        if (!selected) {
-            port.available = false;
-            ports_.push_back(std::move(port));
-            continue;
-        }
+        port.native_device_name = physical[index].native_device_name;
         ++matched;
         ContextPtr context;
         status = adapter_->openContext(physical[index], context);
@@ -151,6 +150,11 @@ Status StandaloneProbeResourceProvider::discoverLocked() {
         } else {
             port.config.context = std::move(context);
             ++available;
+            LOG(INFO) << "UB probe device "
+                      << physical[index].native_device_name
+                      << " topology=" << physical[index].topology_name
+                      << " transport_modes="
+                      << physical[index].capabilities.transport_modes;
         }
         ports_.push_back(std::move(port));
     }
@@ -209,6 +213,24 @@ size_t StandaloneProbeResourceProvider::pageSize() const {
                : static_cast<size_t>(params_.source_page_size);
 }
 
+uint32_t StandaloneProbeResourceProvider::probeDepth(
+    const PortState& port) const {
+    // UMDK's own RM health probe uses a 1024-deep JFC/Jetty. Smaller depths
+    // were rejected by some providers with URMA_EINVAL; clamp to the device
+    // capability when it is known.
+    uint32_t depth = std::max<uint32_t>(params_.jfc_depth, 1024);
+    if (port.config.context) {
+        const auto& caps = port.config.context->deviceInfo().capabilities;
+        if (caps.max_jfc_depth != 0) {
+            depth = std::min(depth, caps.max_jfc_depth);
+        }
+        if (caps.max_jetty_depth != 0) {
+            depth = std::min(depth, caps.max_jetty_depth);
+        }
+    }
+    return std::max<uint32_t>(depth, 8);
+}
+
 Status StandaloneProbeResourceProvider::createPortLocked(PortState& port) {
     if (!params_.valid()) {
         return Status::InvalidArgument("invalid probe parameters");
@@ -231,7 +253,11 @@ Status StandaloneProbeResourceProvider::createPortLocked(PortState& port) {
     bool owns_jfc = false;
     if (params_.jfc_mode == ProbeJfcMode::kDedicated) {
         JfcOptions options;
-        options.depth = params_.jfc_depth;
+        options.depth = probeDepth(port);
+        // The probe JFC only carries completions; mirror UMDK's health-probe
+        // JFR (depth 1, no receive token).
+        options.receiver_depth = 1;
+        options.token = 0;
         options.enable_completion_events = false;
         options.transport_mode = JettyTransportMode::kRm;
         auto status = adapter_->createJfc(port.config.context, options, jfc);
@@ -249,6 +275,10 @@ Status StandaloneProbeResourceProvider::createPortLocked(PortState& port) {
     }
 
     JettyOptions jetty_options;
+    // Probe needs a single in-flight WR per port; keep the queue shallow and
+    // the priority low so the RM Jetty fits the least capable physical port.
+    jetty_options.depth = probeDepth(port);
+    jetty_options.priority = 0;
     jetty_options.max_sge = 1;
     // Probe postings carry a per-WR remote target; RM keeps the probe Jetty
     // unbound and independent of any endpoint binding.
@@ -278,6 +308,9 @@ Status StandaloneProbeResourceProvider::createPortLocked(PortState& port) {
     SegmentOptions segment_options;
     segment_options.access = SEGMENT_ACCESS_LOCAL_ONLY;
     LocalSegmentPtr segment;
+    LOG(INFO) << "UB probe: register source page va=0x" << std::hex
+              << reinterpret_cast<uint64_t>(memory) << " len=0x" << page
+              << std::dec << " access=" << segment_options.access;
     status = adapter_->registerLocalSegment(port.config.context,
                                             reinterpret_cast<uint64_t>(memory),
                                             page, segment_options, segment);
@@ -305,9 +338,15 @@ Status StandaloneProbeResourceProvider::createPortLocked(PortState& port) {
     }
     std::memset(area_memory, 0, page);
     SegmentOptions area_options;
-    area_options.access = SEGMENT_ACCESS_WRITE;
+    // Some providers reject a write-only segment. The peer only writes this
+    // page, but granting read as well keeps the registration portable.
+    area_options.access = SEGMENT_ACCESS_READ | SEGMENT_ACCESS_WRITE;
     area_options.token = kProbeAreaToken;
     LocalSegmentPtr area_segment;
+    LOG(INFO) << "UB probe: register local area page va=0x" << std::hex
+              << reinterpret_cast<uint64_t>(area_memory) << " len=0x" << page
+              << std::dec << " access=" << area_options.access
+              << " token=" << area_options.token;
     status = adapter_->registerLocalSegment(
         port.config.context, reinterpret_cast<uint64_t>(area_memory), page,
         area_options, area_segment);
@@ -693,6 +732,8 @@ Status StandaloneProbeResourceProvider::rebuildPortLocked(
 
     JfcPtr jfc = port.owns_jfc ? port.probe_jfc : port.config.shared_jfc;
     JettyOptions jetty_options;
+    jetty_options.depth = probeDepth(port);
+    jetty_options.priority = 0;
     jetty_options.max_sge = 1;
     jetty_options.transport_mode = JettyTransportMode::kRm;
     JettyPtr new_jetty;
@@ -718,6 +759,9 @@ Status StandaloneProbeResourceProvider::rebuildPortLocked(
         SegmentOptions options;
         options.access = access;
         options.token = token;
+        LOG(INFO) << "UB probe: rebuild register page va=0x" << std::hex
+                  << reinterpret_cast<uint64_t>(buffer) << " len=0x" << page
+                  << std::dec << " access=" << access << " token=" << token;
         auto registered = adapter_->registerLocalSegment(
             port.config.context, reinterpret_cast<uint64_t>(buffer), page,
             options, segment);
@@ -740,8 +784,8 @@ Status StandaloneProbeResourceProvider::rebuildPortLocked(
     status = allocate_page(SEGMENT_ACCESS_LOCAL_ONLY, 0, 0x5A, new_source,
                            new_source_memory);
     if (status.ok()) {
-        status = allocate_page(SEGMENT_ACCESS_WRITE, kProbeAreaToken, 0,
-                               new_area, new_area_memory);
+        status = allocate_page(SEGMENT_ACCESS_READ | SEGMENT_ACCESS_WRITE,
+                               kProbeAreaToken, 0, new_area, new_area_memory);
     }
     if (!status.ok()) {
         if (new_source) (void)adapter_->unregisterLocalSegment(new_source);
@@ -870,7 +914,7 @@ StandaloneProbeResourceProvider::portViews() const {
             port.source_generation, port.owns_jfc, port.probe_jetty->uasid(),
             port.config.context ? port.config.context->deviceInfo().eid
                                 : std::string(),
-            port.topology_name});
+            port.topology_name, port.native_device_name});
     }
     return views;
 }

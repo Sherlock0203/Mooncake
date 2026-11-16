@@ -146,6 +146,7 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
         uint32_t native_jetty_uasid{0};
         std::string device_eid;
         std::string topology_name;
+        std::string native_device_name;
     };
 
     // Local probe area page: the page peers write their 1-byte probes into.
@@ -172,6 +173,7 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
     struct PortState {
         ProbeLocalPortConfig config;
         std::string topology_name;
+        std::string native_device_name;
         bool available{true};
         JfcPtr probe_jfc;
         bool owns_jfc{false};
@@ -194,6 +196,7 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
     };
 
     Status discoverLocked();
+    uint32_t probeDepth(const PortState& port) const;
     Status createLocalResourcesLocked();
     Status validatePageSizeLocked() const;
     size_t pageSize() const;

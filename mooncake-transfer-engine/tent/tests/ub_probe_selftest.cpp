@@ -22,6 +22,7 @@
 // JSON files manually. The probe test mode is enabled by default; use
 // --apply-health=false for a pure link check.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -32,11 +33,13 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "tent/thirdparty/nlohmann/json.h"
+#include "tent/transport/ub/device_selection.h"
 #include "tent/transport/ub/probe_link_manager.h"
 #include "tent/transport/ub/probe_peer_handshake.h"
 #include "tent/transport/ub/probe_poster_urma.h"
@@ -73,7 +76,13 @@ struct Options {
     uint32_t peer_budget{4};
     uint64_t source_page_size{0};
     bool apply_health{false};
+    bool list_devices{false};
     std::vector<std::string> device_filter;
+    struct PortPair {
+        int32_t local_nic{0};
+        int32_t peer_nic{0};
+    };
+    std::vector<PortPair> pairs;
 };
 
 void usage(const char* argv0) {
@@ -95,6 +104,10 @@ void usage(const char* argv0) {
         << "  --device-filter <a,b>     native/topology names (default all "
            "non-bonding)\n"
         << "  --source-page-size <n>    0 = system page (default 0)\n"
+        << "  --list-devices            list selectable non-bonding ports "
+           "(with index) and exit\n"
+        << "  --pairs <l>:<p>,...       explicit local/peer port pairs, e.g. "
+           "1:3,2:4\n"
         << "\nRemove stale <node>.json files from the exchange directory "
            "before "
            "a new run.\n";
@@ -165,6 +178,28 @@ bool parseOptions(int argc, char** argv, Options& options) {
             if (!value(text) || !parseBool(text, options.apply_health)) {
                 return false;
             }
+        } else if (key == "--list-devices") {
+            options.list_devices = true;
+        } else if (key == "--pairs") {
+            std::string text;
+            if (!value(text)) return false;
+            size_t start = 0;
+            while (start <= text.size()) {
+                const size_t comma = text.find(',', start);
+                const std::string item = text.substr(
+                    start, comma == std::string::npos ? std::string::npos
+                                                      : comma - start);
+                const size_t colon = item.find(':');
+                if (colon == std::string::npos || colon == 0 ||
+                    colon + 1 == item.size()) {
+                    return false;
+                }
+                options.pairs.push_back(
+                    Options::PortPair{std::stoi(item.substr(0, colon)),
+                                      std::stoi(item.substr(colon + 1))});
+                if (comma == std::string::npos) break;
+                start = comma + 1;
+            }
         } else if (key == "--device-filter") {
             std::string text;
             if (!value(text)) return false;
@@ -183,6 +218,7 @@ bool parseOptions(int argc, char** argv, Options& options) {
             return false;
         }
     }
+    if (options.list_devices) return true;
     if (options.node.empty() || options.peer.empty()) return false;
     if (options.node == options.peer) {
         std::cerr << "--node and --peer must differ\n";
@@ -210,6 +246,7 @@ bool descriptorFromJson(const nlohmann::json& value,
 
 struct PeerPort {
     int32_t local_nic{-1};
+    std::string native_device_name;
     std::string topology_name;
     std::string device_eid;
     SegmentDescriptor area_descriptor;
@@ -253,6 +290,7 @@ void writeLocalJson(const std::string& path, const std::string& node,
         const auto& local_area = *area->second;
         root["ports"].push_back(nlohmann::json{
             {"local_nic", port.local_nic},
+            {"native_device_name", port.native_device_name},
             {"topology_name", port.topology_name},
             {"device_eid", port.device_eid},
             {"area_descriptor", descriptorToJson(local_area.descriptor)},
@@ -311,6 +349,8 @@ std::vector<PeerPort> parsePeerPorts(const nlohmann::json& root,
     for (const auto& item : root["ports"]) {
         PeerPort port;
         port.local_nic = item.value("local_nic", -1);
+        port.native_device_name =
+            item.value("native_device_name", std::string());
         port.topology_name = item.value("topology_name", std::string());
         port.device_eid = item.value("device_eid", std::string());
         port.area_epoch = item.value("area_epoch", 0ULL);
@@ -372,6 +412,29 @@ int runSelftest(const Options& options) {
     if (!status.ok()) {
         std::cerr << "adapter initialize failed: " << status.ToString() << "\n";
         return 1;
+    }
+    if (options.list_devices) {
+        std::vector<DeviceInfo> devices;
+        status = adapter->discoverDevices(devices);
+        if (!status.ok()) {
+            std::cerr << "device discovery failed: " << status.ToString()
+                      << "\n";
+            adapter->shutdown();
+            return 1;
+        }
+        size_t index = 0;
+        for (const auto& device : devices) {
+            if (!device.active || isBondingDevice(device)) continue;
+            std::cout << "index=" << index++
+                      << " native=" << device.native_device_name
+                      << " topology=" << device.topology_name
+                      << " eid=" << device.eid
+                      << " eid_index=" << device.eid_index
+                      << " transport_modes="
+                      << device.capabilities.transport_modes << std::endl;
+        }
+        adapter->shutdown();
+        return 0;
     }
 
     ProbeParams params;
@@ -438,39 +501,100 @@ int runSelftest(const Options& options) {
         return 1;
     }
 
-    const auto local_ports = provider->portViews();
+    auto local_ports = provider->portViews();
     if (local_ports.empty()) {
         std::cerr << "no local probe port\n";
         provider->shutdown();
         adapter->shutdown();
         return 1;
     }
-    std::map<int32_t, PeerPort> peer_by_nic;
-    for (auto& port : peer_ports) peer_by_nic[port.local_nic] = port;
+    std::sort(local_ports.begin(), local_ports.end(),
+              [](const auto& left, const auto& right) {
+                  return left.local_nic < right.local_nic;
+              });
+    std::sort(peer_ports.begin(), peer_ports.end(),
+              [](const PeerPort& left, const PeerPort& right) {
+                  return left.local_nic < right.local_nic;
+              });
+    std::map<int32_t, const StandaloneProbeResourceProvider::PortView*>
+        local_by_nic;
+    std::map<int32_t, const PeerPort*> peer_by_nic;
+    for (const auto& port : local_ports) local_by_nic[port.local_nic] = &port;
+    for (const auto& port : peer_ports) peer_by_nic[port.local_nic] = &port;
+
+    std::vector<std::pair<const StandaloneProbeResourceProvider::PortView*,
+                          const PeerPort*>>
+        pairs;
+    if (!options.pairs.empty()) {
+        for (const auto& requested : options.pairs) {
+            auto local = local_by_nic.find(requested.local_nic);
+            auto peer = peer_by_nic.find(requested.peer_nic);
+            if (local == local_by_nic.end() || peer == peer_by_nic.end()) {
+                std::cerr << "warning: pair " << requested.local_nic << ":"
+                          << requested.peer_nic << " is not available\n";
+                continue;
+            }
+            pairs.emplace_back(local->second, peer->second);
+        }
+    } else {
+        // Same-name physical ports are the intended adjacency when both sides
+        // export native_device_name; discovery order is only a fallback.
+        std::map<std::string, const PeerPort*> peer_by_native;
+        for (const auto& port : peer_ports) {
+            if (!port.native_device_name.empty()) {
+                peer_by_native.emplace(port.native_device_name, &port);
+            }
+        }
+        std::set<const PeerPort*> used;
+        std::vector<const StandaloneProbeResourceProvider::PortView*> unmatched;
+        for (const auto& local : local_ports) {
+            if (!local.native_device_name.empty()) {
+                auto peer = peer_by_native.find(local.native_device_name);
+                if (peer != peer_by_native.end() &&
+                    used.find(peer->second) == used.end()) {
+                    used.insert(peer->second);
+                    pairs.emplace_back(&local, peer->second);
+                    continue;
+                }
+            }
+            unmatched.push_back(&local);
+        }
+        std::vector<const PeerPort*> remaining;
+        for (const auto& port : peer_ports) {
+            if (used.find(&port) == used.end()) remaining.push_back(&port);
+        }
+        const size_t fallback = std::min(unmatched.size(), remaining.size());
+        for (size_t i = 0; i < fallback; ++i) {
+            pairs.emplace_back(unmatched[i], remaining[i]);
+        }
+        if (pairs.size() != local_ports.size()) {
+            std::cerr << "warning: paired " << pairs.size() << " of "
+                      << local_ports.size() << " local port(s)\n";
+        }
+    }
 
     std::vector<ProbePeerDescriptor> descriptors;
     constexpr SegmentID kPeerSegmentId = 1;
-    for (const auto& local : local_ports) {
-        auto peer = peer_by_nic.find(local.local_nic);
-        if (peer == peer_by_nic.end()) {
-            std::cerr << "warning: no peer port for local_nic="
-                      << local.local_nic << "\n";
-            continue;
-        }
+    for (const auto& pair : pairs) {
+        const auto& local = *pair.first;
+        const auto& peer = *pair.second;
+        std::cout << "probe pair: local_nic=" << local.local_nic
+                  << " native=" << local.native_device_name
+                  << " -> peer_nic=" << peer.local_nic
+                  << " native=" << peer.native_device_name << std::endl;
         ProbePeerDescriptor descriptor;
         descriptor.local_nic = local.local_nic;
         descriptor.peer_segment_id = kPeerSegmentId;
-        descriptor.remote_nic = peer->second.local_nic;
+        descriptor.remote_nic = peer.local_nic;
         descriptor.peer_nic_path = "peer@" + options.peer;
         descriptor.topology_epoch = 1;
         descriptor.target_epoch = 1;
-        descriptor.area_descriptor = peer->second.area_descriptor;
+        descriptor.area_descriptor = peer.area_descriptor;
         descriptor.area_length = 1;
-        descriptor.area_epoch = peer->second.area_epoch;
-        descriptor.area_token = peer->second.area_token;
-        descriptor.remote_jetty =
-            RemoteJettyInfo{peer->second.device_eid, peer->second.jetty_id,
-                            peer->second.jetty_uasid, peer->second.jetty_token};
+        descriptor.area_epoch = peer.area_epoch;
+        descriptor.area_token = peer.area_token;
+        descriptor.remote_jetty = RemoteJettyInfo{
+            peer.device_eid, peer.jetty_id, peer.jetty_uasid, peer.jetty_token};
         descriptor.node_gate_ok = true;
         descriptor.port_gate_ok = true;
         descriptor.profile_gate_ok = true;
