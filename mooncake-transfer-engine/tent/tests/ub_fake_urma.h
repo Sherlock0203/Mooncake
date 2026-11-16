@@ -400,6 +400,14 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     void holdNextCompletion() {
         hold_next_completion_.store(true, std::memory_order_release);
     }
+    void pushPendingCompletion(const JettyPtr& jetty, uint64_t token) {
+        auto fake = std::dynamic_pointer_cast<FakeJetty>(jetty);
+        if (!fake) return;
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        WorkRequest request;
+        request.token = token;
+        pending_.push_back(Pending{fake->id(), request});
+    }
     void dropNextQuiescedCompletion() {
         drop_next_quiesced_completion_.store(true, std::memory_order_release);
     }

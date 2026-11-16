@@ -493,6 +493,7 @@ stateDiagram-v2
 - **probe 调度线程**（本侧，首版 1 个）：计算到期动作、直接 post、处理 post 结果、扫描完成超时，并在 `nextDeadline` 上条件等待（线性扫描＋条件变量即可，路径数上界为 Σdegree）；不占 post 池；同口多个 peer/path 公平轮转，不同口并行。
 - **每个 ProbeResource（本端口）最多一个在途 probe**（含 post 未退出或责任不明阶段）：两个 target 的探测不同时占同一发送队列，避免其一故障使同口多个在途探测被连带 flush。该串行约束只作用于探测资源，不把业务 slice 聚成组。**peer_budget（默认 4）** 是同一 peer 跨口的在途上限；超时转孤儿时随记录释放其预算，避免累计 4 次超时让整个 peer 不可调度。
 - **端口槽按 generation 作用域**：`slot_token` 只约束"当前这一代探测通道"；lane 退役后槽保持占用（不重发），接口 7 新代次到达时归零，旧在途记录转入孤儿表（按 token 索引，保留源页/探测页引用），迟到的完成只结清资源、不发布健康。
+- **provider 侧退役实现（P4）**：quiesce 旧 Jetty 并派发其完成 → reset/delete → 同一 JFC 建新 Jetty/源页/探测区页（generation+1）→ 接口 7 `kProbeHandleReplaced`；旧代页面保留在 retired 列表（与 quarantine 一起）到关闭，重建时不注销。需 completion/availability sink；transport 在 P5 注入。
 - probe WR 构造（UMDK 实机依据，§7.2.1）：标准 WR，`URMA_OPC_WRITE`、`complete_enable=1`、`next=null`，一字节 payload 写入对端授权的专用探测区（peer 槽位）；本地源缓冲保持不变；**注册范围按页对齐/provider 要求分配——payload=1 ≠ 注册长度 1**；禁止写业务内存、禁止校验所谓 magic。WRITE probe 成功只证明当前探测配置可用，不证明业务 READ 权限、任意长度能力或物理端口 GOOD（§9.6）。
 - **独立 provider 的 probe Jetty 以 `JettyOptions::transport_mode=kRm` 创建**；post 走 `UrmaAdapter::post(jetty, target, wr)` 的逐 WR target 重载——adapter 按 `(eid, id, uasid, token)` 缓存 `urma_import_jetty` 得到的 target，每个 WR 设 `wr.tjetty`，不 `bind`；lane 退役/关闭时 unimport 全部 target。
 - **探测区由 bootstrap v2 显式发布 descriptor（至少 address/length/token/epoch），每 remote target 一页一槽，经接口 4 供给；本端只消费描述符、不猜测地址**。探测页独立注册、独立 token，不写业务内存；换代（`area_epoch` 变化）原地更新该边，在途 record 判 stale，周期项 `next=now`，campaign 条目保留。

@@ -33,6 +33,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -87,20 +88,29 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
     // every resource it created.
     Status snapshot(ProbeGraph& graph) override;
 
-    // Interface 2 seam. P1 records the request; native modify/flush/delete and
-    // the replacement generation land in P4.
+    // Interface 2. Quiesces the old probe Jetty, dispatches its completions
+    // through the completion sink, replaces the Jetty/source page/area page on
+    // the same JFC and emits kProbeHandleReplaced (interface 7). Requires both
+    // sinks; without them the request is recorded and no native rebuild is
+    // attempted.
     void retireProbeLane(const LaneKey& lane, uint64_t jetty_generation,
                          uint64_t error_epoch, const PathVersion& path,
                          const Status& reason) override;
 
-    // Unresolved responsibility handoff. P1 retains the references in a
-    // quarantine list until shutdown; P4 gives the quarantine its own lifetime
-    // so source pages can be reclaimed only after every reference is gone.
+    // Unresolved responsibility handoff. References stay quarantined until
+    // shutdown; retired pages are unregistered only after both the quarantine
+    // and the retired-page list are released.
     void handoffUnproven(const ProbeHandoff& handoff) override;
 
     // Releases every local probe resource. Idempotent; must run before the
     // owning contexts are shut down.
     Status shutdown();
+
+    // Interface 7 sink (ProbeLinkManager) and interface-2 completion sink
+    // (workers dispatcher). Both are required before a lane can be rebuilt.
+    void setAvailabilitySink(ProbeAvailabilitySink* sink);
+    using CompletionSink = std::function<Status(const Completion&)>;
+    void setCompletionSink(CompletionSink sink);
 
     struct PortView {
         Topology::NicID local_nic{-1};
@@ -128,6 +138,7 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
     [[nodiscard]] std::vector<PortView> portViews() const;
     [[nodiscard]] std::vector<LocalAreaView> localAreaViews() const;
     [[nodiscard]] size_t quarantineCount() const;
+    [[nodiscard]] size_t retiredPageCount() const;
     [[nodiscard]] uint64_t retireCalls() const;
     [[nodiscard]] bool initialized() const;
 
@@ -147,11 +158,23 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
         uint64_t area_epoch{0};
     };
 
+    struct RetiredPage {
+        LocalSegmentPtr segment;
+        void* memory{nullptr};
+        size_t size{0};
+        uint64_t generation{0};
+    };
+
     Status createPortLocked(PortState& port);
     Status destroyPortLocked(PortState& port);
     void rollbackPortsLocked();
     void releaseQuarantineLocked();
+    void releaseRetiredPagesLocked();
     Status buildGraphLocked(ProbeGraph& graph);
+    ProbePortSupply makePortSupplyLocked(const PortState& port) const;
+    Status rebuildPortLocked(PortState& port, uint64_t error_epoch,
+                             std::vector<Completion>& completions);
+    Status emitHandleReplacedLocked(const ProbePortSupply& supply);
 
     mutable std::mutex mutex_;
     const std::shared_ptr<UrmaAdapter> adapter_;
@@ -159,6 +182,11 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
     std::vector<PortState> ports_;
     ProbePeerDirectory* const directory_;
     std::vector<ProbeHandoff> quarantine_;
+    std::vector<RetiredPage> retired_pages_;
+    ProbeAvailabilitySink* availability_sink_{nullptr};
+    CompletionSink completion_sink_;
+    uint64_t graph_epoch_{0};
+    uint64_t event_seq_{0};
     uint64_t retire_calls_{0};
     uint64_t next_graph_epoch_{1};
     bool initialized_{false};

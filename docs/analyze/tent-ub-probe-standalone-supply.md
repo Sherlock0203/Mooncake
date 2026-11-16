@@ -85,7 +85,7 @@
 2. **probe Jetty**：`JettyOptions{depth=…, max_sge=1, priority=…, transport_mode=kRm}` 创建，**RM 下不 bind**；RC 退化见 §7。
 3. **源页**：按 page size 对齐分配（payload=1，注册长度≥1 页），`registerLocalSegment`；访问权限只覆盖本端 DMA 读，具体 flag 待 provider 验证；`source_generation` 每代递增。
 4. **本端探测区页**：每口分配一页并 `registerLocalSegment`（access=WRITE，带 probe token），供对端写入 1 字节；`area_epoch` 随探测通道代次；descriptor/token 由握手层发布给对端。
-5. **lane 退役**：`retireProbeLane` → 停止该口 post → modify ERROR → quiesce/flush → delete Jetty → 建新 Jetty + 新源页 → `kProbeHandleReplaced`（新代次）。调度器在退役窗口不会 post（PLM 置 `handle_valid=false`）。
+5. **lane 退役**：`retireProbeLane` → quiesce 旧 Jetty，完成经 completion sink 交回 PLM → reset/delete 旧 Jetty → **同一 JFC** 上建新 Jetty + 新源页 + 新探测区页（generation+1）→ 发 `kProbeHandleReplaced`。旧代页面保留在 retired 列表直到关闭（与 quarantine 一起释放），重建时**不注销**，避免孤儿记录或对端迟写造成 UAF。需要 completion/availability 两个 sink；缺一时只记录退役、不重建。调度器在退役窗口不会 post（PLM 置 `handle_valid=false`）。
 6. **quarantine**：`handoffUnproven` 接管引用；旧代源页/探测页在所有引用（含孤儿）清零后注销；关闭时按 §9.6 移交。
 7. **credit/budget**：控制额度 1/口；peer 预算由本侧按 `probe/peer_budget` 统计，provider 不参与。
 
@@ -138,11 +138,11 @@
 | **P1** | provider 骨架 + 本端资源管理（建/删 probe Jetty/JFC/源页），fake adapter 可跑 | 安装/拆卸不泄漏；每口资源可查 | 无 |
 | **P2** | 握手字段 + 探测页 import，单 peer/单口建图 | `ProbeGraph` 含边；对端不支持时降级并计数 | 握手字段评审 |
 | **P3** | Poster：RM 逐 WR（已实现）/ RC 绑定退化（bring-up） | 1 字节 WRITE 完成；token 正确回传 | RM adapter |
-| **P4** | lane 退役/重建 + 接口 7 事件 + quarantine | 超时→退役→新代次→恢复；旧页引用清零前不注销 | P1–P3 |
+| **P4** | lane 退役/重建 + 接口 7 事件 + quarantine（provider 侧已实现） | 超时→退役→新代次→恢复；旧页引用清零前不注销 | P1–P3 |
 | **P5** | 多口/多 peer/多代次；shared 模式可选 | 矩阵 #4/#6/#16 在真实 adapter 上通过 | P4 |
 | **P6** | 实机：单机双端 → 跨机多口 | 探测完成、超时、关闭移交与日志一致 | 硬件＋池化侧 provider |
 
-**实现状态（2026-11-13）**：P1（provider 骨架与本端资源：probe JFC/Jetty/源页/探测区页）、P2 的本地半部（descriptor 校验、探测页 import/cache/替换、单 peer/单口建图）与 P3 RM poster（逐 WR target）已实现并通过 fake adapter 测试；P2 的 bootstrap 线上字段与 transport 装配仍待 P5。注意：本机默认构建 `TENT_HAS_REAL_URMA=OFF`；RM 原生路径已用仓库内 vendored UMDK 头文件（`build/_deps/urma-src`）以 `-DTENT_HAS_REAL_URMA=1` 完成对象级编译，仍需 real liburma 链接构建与实机验证。
+**实现状态（2026-11-16）**：P1（provider 骨架与本端资源）、P2 的本地半部（descriptor 校验、探测页 import/cache/替换、单 peer/单口建图）、P3 RM poster（逐 WR target）与 P4 的 provider 侧（quiesce→替换 Jetty/源页/探测区页→接口 7 事件、旧页 quarantine）已实现并通过 fake adapter 测试；P2 的 bootstrap 线上字段、P4 的 transport 装配（completion/availability sink 注入）仍待 P5。注意：本机默认构建 `TENT_HAS_REAL_URMA=OFF`；RM 原生路径已用仓库内 vendored UMDK 头文件（`build/_deps/urma-src`）以 `-DTENT_HAS_REAL_URMA=1` 完成对象级编译，仍需 real liburma 链接构建与实机验证。
 
 新增代码面（预计）：
 
@@ -151,7 +151,10 @@
 - adapter：`JettyOptions::transport_mode`、`UrmaAdapter::post(jetty, target, wr)`、按 target 缓存 import；
 - `params.h`：`probe/provider`（pool/standalone）、`probe/rc_fallback`（默认 false）等；
 - `ub_transport.cpp`：按配置选择 provider/poster（现有注入缝不变）；
-- `tests/ub_probe_standalone_provider_test.cpp`：fake adapter 生命周期、握手降级、RC 退化。
+- `tests/ub_probe_standalone_provider_test.cpp`：fake adapter 生命周期、握手降级、RC 退化；
+- `tests/ub_probe_handshake_test.cpp`：descriptor 校验/import/cache；
+- `tests/ub_probe_poster_test.cpp`：RM 逐 WR WRITE；
+- `tests/ub_probe_rebuild_test.cpp`：退役/重建、接口 7 事件、完成派发与旧页 quarantine。
 
 不改：`probe_link_manager.*`、`probe_scheduler.*`、workers 的探测接缝、W1 既有测试。
 

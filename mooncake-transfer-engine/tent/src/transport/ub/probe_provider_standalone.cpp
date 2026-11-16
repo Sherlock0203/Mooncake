@@ -14,6 +14,7 @@
 
 #include "tent/transport/ub/probe_provider_standalone.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <set>
@@ -242,6 +243,23 @@ void StandaloneProbeResourceProvider::releaseQuarantineLocked() {
     quarantine_.clear();
 }
 
+ProbePortSupply StandaloneProbeResourceProvider::makePortSupplyLocked(
+    const PortState& port) const {
+    ProbePortSupply supply;
+    supply.local_nic = port.config.local_nic;
+    supply.context = port.config.context;
+    supply.probe_jetty = port.probe_jetty;
+    supply.jetty_generation = port.config.generation;
+    supply.probe_jfc = port.owns_jfc ? port.probe_jfc : nullptr;
+    supply.source_segment = port.source_segment;
+    supply.source_address = reinterpret_cast<uint64_t>(port.source_memory);
+    supply.source_length = 1;
+    supply.source_generation = port.source_generation;
+    supply.control_credit = 1;
+    supply.peer_budget = params_.peer_budget;
+    return supply;
+}
+
 Status StandaloneProbeResourceProvider::buildGraphLocked(ProbeGraph& graph) {
     std::vector<ProbeEdgeSupply> edges;
     if (directory_ == nullptr) {
@@ -281,21 +299,7 @@ Status StandaloneProbeResourceProvider::buildGraphLocked(ProbeGraph& graph) {
     built.graph_epoch = next_graph_epoch_;
     built.ports.reserve(ports_.size());
     for (const auto& port : ports_) {
-        ProbePortSupply supply;
-        supply.local_nic = port.config.local_nic;
-        supply.context = port.config.context;
-        supply.probe_jetty = port.probe_jetty;
-        supply.jetty_generation = port.config.generation;
-        supply.probe_jfc = params_.jfc_mode == ProbeJfcMode::kDedicated
-                               ? port.probe_jfc
-                               : nullptr;
-        supply.source_segment = port.source_segment;
-        supply.source_address = reinterpret_cast<uint64_t>(port.source_memory);
-        supply.source_length = 1;
-        supply.source_generation = port.source_generation;
-        supply.control_credit = 1;
-        supply.peer_budget = params_.peer_budget;
-        built.ports.push_back(std::move(supply));
+        built.ports.push_back(makePortSupplyLocked(port));
     }
     built.edges = std::move(edges);
     graph = std::move(built);
@@ -351,6 +355,8 @@ Status StandaloneProbeResourceProvider::snapshot(ProbeGraph& graph) {
         return status;
     }
     ++next_graph_epoch_;
+    graph_epoch_ = built.graph_epoch;
+    event_seq_ = 0;
     initialized_ = true;
     graph = std::move(built);
     LOG(INFO) << "UB standalone probe provider created " << ports_.size()
@@ -363,19 +369,76 @@ void StandaloneProbeResourceProvider::retireProbeLane(const LaneKey& lane,
                                                       uint64_t error_epoch,
                                                       const PathVersion& path,
                                                       const Status& reason) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    ++retire_calls_;
-    // P1 only records the retirement: the PLM already stopped posting on this
-    // lane (handle_valid=false). Native modify/flush/delete, the replacement
-    // generation and kProbeHandleReplaced land in P4.
-    LOG_EVERY_N(WARNING, 100)
-        << "UB standalone probe provider: lane retire recorded "
-           "(native rebuild lands in P4): local_nic="
-        << lane.local_nic << " native_jetty_id=" << lane.native_jetty_id
-        << " jetty_generation=" << jetty_generation
-        << " error_epoch=" << error_epoch << " path=" << path.path.local_nic
-        << "/" << path.path.segment_id << "/" << path.path.remote_nic
-        << " reason=" << reason.ToString();
+    std::vector<Completion> completions;
+    Status rebuild_status = Status::OK();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++retire_calls_;
+        if (!initialized_ || shut_down_) return;
+
+        auto port = std::find_if(
+            ports_.begin(), ports_.end(), [&](const PortState& candidate) {
+                return candidate.config.local_nic == lane.local_nic;
+            });
+        if (port == ports_.end()) {
+            LOG_EVERY_N(WARNING, 100)
+                << "UB standalone probe provider: retire for unknown local "
+                   "port "
+                << lane.local_nic;
+            return;
+        }
+        if (port->config.generation != jetty_generation || !port->probe_jetty ||
+            port->probe_jetty->id() != lane.native_jetty_id) {
+            LOG_EVERY_N(WARNING, 100)
+                << "UB standalone probe provider: stale lane retire ignored: "
+                   "local_nic="
+                << lane.local_nic << " generation=" << jetty_generation
+                << " current=" << port->config.generation;
+            return;
+        }
+        if (!completion_sink_ || !availability_sink_) {
+            LOG_EVERY_N(WARNING, 100)
+                << "UB standalone probe provider: lane retire recorded but no "
+                   "completion/availability sink is configured; the lane "
+                   "stays down (local_nic="
+                << lane.local_nic << ")";
+            return;
+        }
+
+        rebuild_status = rebuildPortLocked(*port, error_epoch, completions);
+        if (rebuild_status.ok()) {
+            LOG(INFO) << "UB standalone probe provider: rebuilt probe lane "
+                      << path.path.local_nic << "/" << path.path.segment_id
+                      << "/" << path.path.remote_nic << " generation "
+                      << jetty_generation << " -> " << port->config.generation;
+        }
+    }
+
+    // Dispatch quiesced completions outside the provider lock: the sink
+    // (PLM/workers) may call back into handoffUnproven on the same thread.
+    CompletionSink sink;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        sink = completion_sink_;
+    }
+    if (sink) {
+        for (const auto& completion : completions) {
+            auto dispatched = sink(completion);
+            if (!dispatched.ok()) {
+                LOG_EVERY_N(WARNING, 100)
+                    << "UB standalone probe provider: quiesced completion "
+                       "dispatch failed token="
+                    << completion.token << " status=" << dispatched.ToString();
+            }
+        }
+    }
+    if (!rebuild_status.ok()) {
+        LOG_EVERY_N(ERROR, 100)
+            << "UB standalone probe provider: lane rebuild failed: local_nic="
+            << lane.local_nic << " generation=" << jetty_generation
+            << " status=" << rebuild_status.ToString()
+            << " reason=" << reason.ToString();
+    }
 }
 
 void StandaloneProbeResourceProvider::handoffUnproven(
@@ -388,6 +451,170 @@ void StandaloneProbeResourceProvider::handoffUnproven(
         << " reason=" << static_cast<int>(handoff.orphan_reason);
 }
 
+void StandaloneProbeResourceProvider::setAvailabilitySink(
+    ProbeAvailabilitySink* sink) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    availability_sink_ = sink;
+}
+
+void StandaloneProbeResourceProvider::setCompletionSink(CompletionSink sink) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    completion_sink_ = std::move(sink);
+}
+
+Status StandaloneProbeResourceProvider::rebuildPortLocked(
+    PortState& port, uint64_t error_epoch,
+    std::vector<Completion>& completions) {
+    (void)error_epoch;
+    const uint64_t old_generation = port.config.generation;
+    if (!port.probe_jetty || (!port.probe_jfc && !port.config.shared_jfc)) {
+        return Status::InvalidArgument("probe port has no Jetty/JFC");
+    }
+
+    const uint32_t timeout_ms = static_cast<uint32_t>(
+        std::min<uint64_t>(params_.timeout_ms, UINT32_MAX));
+    auto status =
+        adapter_->quiesceJetty(port.probe_jetty, timeout_ms, completions);
+    if (!status.ok()) return status;
+
+    JfcPtr jfc = port.owns_jfc ? port.probe_jfc : port.config.shared_jfc;
+    JettyOptions jetty_options;
+    jetty_options.max_sge = 1;
+    jetty_options.transport_mode = JettyTransportMode::kRm;
+    JettyPtr new_jetty;
+    status = adapter_->createJetty(port.config.context, jfc, jetty_options,
+                                   new_jetty);
+    if (!status.ok() || !new_jetty) {
+        return status.ok()
+                   ? Status::InternalError(
+                         "URMA adapter returned no replacement probe Jetty")
+                   : status;
+    }
+
+    const size_t page = probePageSize();
+    auto allocate_page = [&](uint32_t access, uint32_t token, int fill,
+                             LocalSegmentPtr& segment,
+                             void*& memory) -> Status {
+        void* buffer = nullptr;
+        if (::posix_memalign(&buffer, page, page) != 0 || buffer == nullptr) {
+            return Status::InternalError(
+                "Cannot allocate a probe generation page");
+        }
+        std::memset(buffer, fill, page);
+        SegmentOptions options;
+        options.access = access;
+        options.token = token;
+        auto registered = adapter_->registerLocalSegment(
+            port.config.context, reinterpret_cast<uint64_t>(buffer), page,
+            options, segment);
+        if (!registered.ok() || !segment) {
+            std::free(buffer);
+            return registered.ok()
+                       ? Status::InternalError(
+                             "URMA adapter returned no probe generation "
+                             "segment")
+                       : registered;
+        }
+        memory = buffer;
+        return Status::OK();
+    };
+
+    LocalSegmentPtr new_source;
+    LocalSegmentPtr new_area;
+    void* new_source_memory = nullptr;
+    void* new_area_memory = nullptr;
+    status = allocate_page(SEGMENT_ACCESS_LOCAL_ONLY, 0, 0x5A, new_source,
+                           new_source_memory);
+    if (status.ok()) {
+        status = allocate_page(SEGMENT_ACCESS_WRITE, kProbeAreaToken, 0,
+                               new_area, new_area_memory);
+    }
+    if (!status.ok()) {
+        if (new_source) (void)adapter_->unregisterLocalSegment(new_source);
+        if (new_area) (void)adapter_->unregisterLocalSegment(new_area);
+        if (new_source_memory) std::free(new_source_memory);
+        if (new_area_memory) std::free(new_area_memory);
+        (void)adapter_->resetJetty(new_jetty);
+        (void)adapter_->deleteJetty(new_jetty);
+        return status;
+    }
+
+    // Quiesce fenced the old lane; reset is required before deletion.
+    status = adapter_->resetJetty(port.probe_jetty);
+    if (status.ok()) status = adapter_->deleteJetty(port.probe_jetty);
+    if (!status.ok()) {
+        if (new_source) (void)adapter_->unregisterLocalSegment(new_source);
+        if (new_area) (void)adapter_->unregisterLocalSegment(new_area);
+        if (new_source_memory) std::free(new_source_memory);
+        if (new_area_memory) std::free(new_area_memory);
+        (void)adapter_->resetJetty(new_jetty);
+        (void)adapter_->deleteJetty(new_jetty);
+        return status;
+    }
+
+    // Keep the old pages registered: orphan records and the peer may still
+    // reference them. They are released at shutdown, after the quarantine.
+    retired_pages_.push_back(RetiredPage{std::move(port.source_segment),
+                                         port.source_memory, port.source_size,
+                                         old_generation});
+    retired_pages_.push_back(RetiredPage{std::move(port.area_segment),
+                                         port.area_memory, port.area_size,
+                                         old_generation});
+    port.source_memory = nullptr;
+    port.source_size = 0;
+    port.area_memory = nullptr;
+    port.area_size = 0;
+
+    port.probe_jetty = std::move(new_jetty);
+    port.source_segment = std::move(new_source);
+    port.source_memory = new_source_memory;
+    port.source_size = page;
+    port.area_segment = std::move(new_area);
+    port.area_memory = new_area_memory;
+    port.area_size = page;
+
+    const uint64_t next_generation = old_generation + 1;
+    port.config.generation = next_generation;
+    port.source_generation = next_generation;
+    port.area_epoch = next_generation;
+    return emitHandleReplacedLocked(makePortSupplyLocked(port));
+}
+
+Status StandaloneProbeResourceProvider::emitHandleReplacedLocked(
+    const ProbePortSupply& supply) {
+    if (availability_sink_ == nullptr) {
+        return Status::InvalidArgument(
+            "probe provider has no availability sink");
+    }
+    if (graph_epoch_ == 0) {
+        return Status::InvalidArgument("probe graph epoch is not initialized");
+    }
+    ProbeEvent event;
+    event.kind = ProbeEventKind::kProbeHandleReplaced;
+    event.local_nic = supply.local_nic;
+    event.graph_epoch = graph_epoch_;
+    event.event_seq = event_seq_ + 1;
+    event.port = supply;
+    auto status = availability_sink_->onPoolAvailabilityChange(event);
+    if (status.ok()) ++event_seq_;
+    return status;
+}
+
+void StandaloneProbeResourceProvider::releaseRetiredPagesLocked() {
+    for (auto& page : retired_pages_) {
+        if (page.segment) {
+            (void)adapter_->unregisterLocalSegment(page.segment);
+        }
+        if (page.memory != nullptr) std::free(page.memory);
+    }
+    retired_pages_.clear();
+}
+
+size_t StandaloneProbeResourceProvider::retiredPageCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return retired_pages_.size();
+}
+
 Status StandaloneProbeResourceProvider::shutdown() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (shut_down_) return Status::OK();
@@ -395,6 +622,7 @@ Status StandaloneProbeResourceProvider::shutdown() {
     // Drop handoff references first: they may still point at older-generation
     // source pages that the current port state does not own.
     releaseQuarantineLocked();
+    releaseRetiredPagesLocked();
     for (auto& port : ports_) {
         auto status = destroyPortLocked(port);
         if (first_error.ok() && !status.ok()) first_error = status;
