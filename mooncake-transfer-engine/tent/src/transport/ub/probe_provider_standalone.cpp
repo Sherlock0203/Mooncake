@@ -23,6 +23,8 @@
 #include <glog/logging.h>
 #include <unistd.h>
 
+#include "tent/transport/ub/device_selection.h"
+
 namespace mooncake {
 namespace tent {
 namespace ub {
@@ -41,6 +43,14 @@ constexpr uint32_t kProbeAreaToken = 0xACFE;
 }  // namespace
 
 StandaloneProbeResourceProvider::StandaloneProbeResourceProvider(
+    std::shared_ptr<UrmaAdapter> adapter, ProbeParams params)
+    : adapter_(std::move(adapter)),
+      params_(std::move(params)),
+      directory_(nullptr),
+      owns_contexts_(true),
+      auto_discover_(true) {}
+
+StandaloneProbeResourceProvider::StandaloneProbeResourceProvider(
     std::shared_ptr<UrmaAdapter> adapter, ProbeParams params,
     std::vector<ProbeLocalPortConfig> ports, ProbePeerDirectory* directory)
     : adapter_(std::move(adapter)),
@@ -57,6 +67,146 @@ StandaloneProbeResourceProvider::StandaloneProbeResourceProvider(
 
 StandaloneProbeResourceProvider::~StandaloneProbeResourceProvider() {
     (void)shutdown();
+}
+
+Status StandaloneProbeResourceProvider::discover() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return discoverLocked();
+}
+
+Status StandaloneProbeResourceProvider::discoverLocked() {
+    if (shut_down_) {
+        return Status::InvalidArgument(
+            "standalone probe provider is shut down");
+    }
+    if (!ports_.empty()) return Status::OK();
+    if (!params_.valid()) {
+        return Status::InvalidArgument("invalid probe parameters");
+    }
+    if (!adapter_) {
+        return Status::InvalidArgument("probe provider has no URMA adapter");
+    }
+    auto status = validatePageSizeLocked();
+    if (!status.ok()) return status;
+
+    std::vector<DeviceInfo> devices;
+    status = adapter_->discoverDevices(devices);
+    if (!status.ok()) return status;
+    if (devices.empty()) {
+        return Status::DeviceNotFound("no URMA device is available for probe");
+    }
+    std::vector<DeviceInfo> physical;
+    std::set<std::string> seen_devices;
+    for (auto& device : devices) {
+        if (!device.active) continue;
+        // Bonding devices are always excluded: probe uses a physical port
+        // directly and never shares the bond provider's device.
+        if (isBondingDevice(device)) continue;
+        if (!seen_devices.insert(device.native_device_name).second) {
+            // One probe port per physical device; use the first active EID.
+            continue;
+        }
+        physical.push_back(std::move(device));
+    }
+    if (physical.empty()) {
+        return Status::DeviceNotFound(
+            "no non-bonding physical device is available for probe");
+    }
+
+    size_t matched = 0;
+    size_t available = 0;
+    ports_.reserve(physical.size());
+    for (size_t index = 0; index < physical.size(); ++index) {
+        PortState port;
+        // Index is the position in the unfiltered physical-device list, so a
+        // device_filter never renumbers the remaining probe ports.
+        port.config.local_nic = static_cast<Topology::NicID>(index);
+        port.config.generation = 1;
+        port.source_generation = 1;
+        port.topology_name = physical[index].topology_name;
+        bool selected = params_.device_filter.empty();
+        if (!selected) {
+            selected = std::find(params_.device_filter.begin(),
+                                 params_.device_filter.end(),
+                                 physical[index].native_device_name) !=
+                           params_.device_filter.end() ||
+                       std::find(params_.device_filter.begin(),
+                                 params_.device_filter.end(),
+                                 physical[index].topology_name) !=
+                           params_.device_filter.end();
+        }
+        if (!selected) {
+            port.available = false;
+            ports_.push_back(std::move(port));
+            continue;
+        }
+        ++matched;
+        ContextPtr context;
+        status = adapter_->openContext(physical[index], context);
+        if (!status.ok() || !context || !context->valid()) {
+            port.available = false;
+            LOG(WARNING) << "UB probe: cannot open probe context for "
+                         << physical[index].native_device_name
+                         << " status=" << status.ToString();
+        } else {
+            port.config.context = std::move(context);
+            ++available;
+        }
+        ports_.push_back(std::move(port));
+    }
+    if (matched == 0) {
+        ports_.clear();
+        return Status::DeviceNotFound(
+            "no non-bonding probe device matches probe/device_filter");
+    }
+    if (available == 0) {
+        for (auto& port : ports_) {
+            if (port.config.context) {
+                (void)adapter_->closeContext(port.config.context);
+            }
+        }
+        ports_.clear();
+        return Status::DeviceNotFound(
+            "cannot open any probe context on the selected devices");
+    }
+    LOG(INFO) << "UB probe: discovered " << available << " probe port(s) of "
+              << matched << " selected device(s)";
+    return Status::OK();
+}
+
+std::map<Topology::NicID, ContextPtr>
+StandaloneProbeResourceProvider::contexts() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::map<Topology::NicID, ContextPtr> result;
+    for (const auto& port : ports_) {
+        if (!port.available || !port.config.context) continue;
+        result.emplace(port.config.local_nic, port.config.context);
+    }
+    return result;
+}
+
+void StandaloneProbeResourceProvider::setRemoteDirectory(
+    ProbePeerDirectory* directory) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    directory_ = directory;
+}
+
+Status StandaloneProbeResourceProvider::validatePageSizeLocked() const {
+    if (params_.source_page_size == 0) return Status::OK();
+    const size_t system_page = probePageSize();
+    if (params_.source_page_size < system_page ||
+        params_.source_page_size % system_page != 0) {
+        return Status::InvalidArgument(
+            "transports/ub/probe/source_page_size must be a page-aligned "
+            "multiple of the system page size");
+    }
+    return Status::OK();
+}
+
+size_t StandaloneProbeResourceProvider::pageSize() const {
+    return params_.source_page_size == 0
+               ? probePageSize()
+               : static_cast<size_t>(params_.source_page_size);
 }
 
 Status StandaloneProbeResourceProvider::createPortLocked(PortState& port) {
@@ -112,7 +262,7 @@ Status StandaloneProbeResourceProvider::createPortLocked(PortState& port) {
                            : status;
     }
 
-    const size_t page = probePageSize();
+    const size_t page = pageSize();
     void* memory = nullptr;
     if (::posix_memalign(&memory, page, page) != 0 || memory == nullptr) {
         (void)adapter_->deleteJetty(jetty);
@@ -187,6 +337,7 @@ Status StandaloneProbeResourceProvider::createPortLocked(PortState& port) {
 
 Status StandaloneProbeResourceProvider::destroyPortLocked(PortState& port) {
     Status first_error = Status::OK();
+    if (!port.available) return first_error;
     if (adapter_ && port.probe_jetty) {
         // deleteJetty requires a reset Jetty. Probe has no in-flight WRs at
         // this point: the transport drains the PLM before provider shutdown.
@@ -229,7 +380,7 @@ Status StandaloneProbeResourceProvider::destroyPortLocked(PortState& port) {
 
 void StandaloneProbeResourceProvider::rollbackPortsLocked() {
     for (auto& port : ports_) {
-        (void)destroyPortLocked(port);
+        if (port.available) (void)destroyPortLocked(port);
     }
 }
 
@@ -269,9 +420,17 @@ Status StandaloneProbeResourceProvider::buildGraphLocked(ProbeGraph& graph) {
     if (!status.ok()) return status;
 
     std::set<PathVersion> versions;
-    std::set<Topology::NicID> ports;
-    for (const auto& port : ports_) ports.insert(port.config.local_nic);
-    for (const auto& edge : edges) {
+    std::set<Topology::NicID> available_ports;
+    std::set<Topology::NicID> known_ports;
+    for (const auto& port : ports_) {
+        known_ports.insert(port.config.local_nic);
+        if (port.available) available_ports.insert(port.config.local_nic);
+    }
+
+    std::vector<ProbeEdgeSupply> kept_edges;
+    kept_edges.reserve(edges.size());
+    size_t skipped_edges = 0;
+    for (auto& edge : edges) {
         if (!edge.version.valid()) {
             return Status::InvalidArgument(
                 "probe directory returned an invalid path version");
@@ -285,7 +444,15 @@ Status StandaloneProbeResourceProvider::buildGraphLocked(ProbeGraph& graph) {
             return Status::InvalidArgument(
                 "probe directory returned an invalid probe area");
         }
-        if (ports.find(edge.version.path.local_nic) == ports.end()) {
+        if (available_ports.find(edge.version.path.local_nic) ==
+            available_ports.end()) {
+            if (known_ports.find(edge.version.path.local_nic) !=
+                known_ports.end()) {
+                // The local port exists but was filtered out or failed to
+                // open; its remote descriptors are simply not used.
+                ++skipped_edges;
+                continue;
+            }
             return Status::InvalidArgument(
                 "probe directory edge references an unknown local port");
         }
@@ -293,20 +460,79 @@ Status StandaloneProbeResourceProvider::buildGraphLocked(ProbeGraph& graph) {
             return Status::InvalidArgument(
                 "probe directory returned a duplicate path version");
         }
+        kept_edges.push_back(std::move(edge));
+    }
+    if (skipped_edges != 0) {
+        LOG(INFO) << "UB probe: ignoring " << skipped_edges
+                  << " edge(s) on unavailable local port(s)";
     }
 
     ProbeGraph built;
     built.graph_epoch = next_graph_epoch_;
-    built.ports.reserve(ports_.size());
+    built.ports.reserve(available_ports.size());
     for (const auto& port : ports_) {
-        built.ports.push_back(makePortSupplyLocked(port));
+        if (port.available) built.ports.push_back(makePortSupplyLocked(port));
     }
-    built.edges = std::move(edges);
+    built.edges = std::move(kept_edges);
     graph = std::move(built);
     return Status::OK();
 }
 
+Status StandaloneProbeResourceProvider::prepareLocal() {
+    if (auto_discover_) {
+        auto status = discover();
+        if (!status.ok()) return status;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (shut_down_) {
+        return Status::InvalidArgument(
+            "standalone probe provider is shut down");
+    }
+    if (initialized_ || resources_ready_) return Status::OK();
+    if (!params_.enabled) {
+        return Status::InvalidArgument("probe is disabled by configuration");
+    }
+    return createLocalResourcesLocked();
+}
+
+Status StandaloneProbeResourceProvider::createLocalResourcesLocked() {
+    auto page_status = validatePageSizeLocked();
+    if (!page_status.ok()) return page_status;
+
+    std::set<Topology::NicID> local_nics;
+    size_t available = 0;
+    for (const auto& port : ports_) {
+        if (!port.available) continue;
+        if (port.config.local_nic < 0 ||
+            !local_nics.insert(port.config.local_nic).second ||
+            port.config.generation == 0 || !port.config.context ||
+            !port.config.context->valid()) {
+            return Status::InvalidArgument(
+                "invalid or duplicate local probe port");
+        }
+        ++available;
+    }
+    if (available == 0) {
+        return Status::InvalidArgument("probe provider has no available port");
+    }
+
+    for (auto& port : ports_) {
+        if (!port.available) continue;
+        auto status = createPortLocked(port);
+        if (!status.ok()) {
+            rollbackPortsLocked();
+            return status;
+        }
+    }
+    resources_ready_ = true;
+    return Status::OK();
+}
+
 Status StandaloneProbeResourceProvider::snapshot(ProbeGraph& graph) {
+    if (auto_discover_) {
+        auto status = discover();
+        if (!status.ok()) return status;
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     if (shut_down_) {
         return Status::InvalidArgument(
@@ -325,27 +551,13 @@ Status StandaloneProbeResourceProvider::snapshot(ProbeGraph& graph) {
     if (directory_ == nullptr) {
         return Status::InvalidArgument("probe provider has no peer directory");
     }
-    if (ports_.empty()) {
-        return Status::InvalidArgument("probe provider has no local port");
+    if (!resources_ready_) {
+        auto status = createLocalResourcesLocked();
+        if (!status.ok()) return status;
     }
-
-    std::set<Topology::NicID> local_nics;
+    size_t available = 0;
     for (const auto& port : ports_) {
-        if (port.config.local_nic < 0 ||
-            !local_nics.insert(port.config.local_nic).second ||
-            port.config.generation == 0 || !port.config.context ||
-            !port.config.context->valid()) {
-            return Status::InvalidArgument(
-                "invalid or duplicate local probe port");
-        }
-    }
-
-    for (auto& port : ports_) {
-        auto status = createPortLocked(port);
-        if (!status.ok()) {
-            rollbackPortsLocked();
-            return status;
-        }
+        if (port.available) ++available;
     }
 
     ProbeGraph built;
@@ -359,7 +571,7 @@ Status StandaloneProbeResourceProvider::snapshot(ProbeGraph& graph) {
     event_seq_ = 0;
     initialized_ = true;
     graph = std::move(built);
-    LOG(INFO) << "UB standalone probe provider created " << ports_.size()
+    LOG(INFO) << "UB standalone probe provider created " << available
               << " probe port(s)";
     return Status::OK();
 }
@@ -492,7 +704,7 @@ Status StandaloneProbeResourceProvider::rebuildPortLocked(
                    : status;
     }
 
-    const size_t page = probePageSize();
+    const size_t page = pageSize();
     auto allocate_page = [&](uint32_t access, uint32_t token, int fill,
                              LocalSegmentPtr& segment,
                              void*& memory) -> Status {
@@ -628,6 +840,15 @@ Status StandaloneProbeResourceProvider::shutdown() {
         auto status = destroyPortLocked(port);
         if (first_error.ok() && !status.ok()) first_error = status;
     }
+    if (owns_contexts_) {
+        for (auto& port : ports_) {
+            if (!port.config.context) continue;
+            auto status = adapter_->closeContext(port.config.context);
+            if (first_error.ok() && !status.ok()) first_error = status;
+        }
+        ports_.clear();
+    }
+    resources_ready_ = false;
     initialized_ = false;
     shut_down_ = true;
     LOG(INFO) << "UB standalone probe provider shut down";
@@ -640,11 +861,15 @@ StandaloneProbeResourceProvider::portViews() const {
     std::vector<PortView> views;
     views.reserve(ports_.size());
     for (const auto& port : ports_) {
-        if (!port.probe_jetty) continue;
-        views.push_back(PortView{port.config.local_nic, port.config.generation,
-                                 port.probe_jetty->id(),
-                                 reinterpret_cast<uint64_t>(port.source_memory),
-                                 1, port.source_generation, port.owns_jfc});
+        if (!port.available || !port.probe_jetty) continue;
+        views.push_back(PortView{
+            port.config.local_nic, port.config.generation,
+            port.probe_jetty->id(),
+            reinterpret_cast<uint64_t>(port.source_memory), 1,
+            port.source_generation, port.owns_jfc, port.probe_jetty->uasid(),
+            port.config.context ? port.config.context->deviceInfo().eid
+                                : std::string(),
+            port.topology_name});
     }
     return views;
 }
@@ -655,7 +880,7 @@ StandaloneProbeResourceProvider::localAreaViews() const {
     std::vector<LocalAreaView> views;
     views.reserve(ports_.size());
     for (const auto& port : ports_) {
-        if (!port.area_segment) continue;
+        if (!port.available || !port.area_segment) continue;
         LocalAreaView view;
         view.local_nic = port.config.local_nic;
         view.generation = port.config.generation;

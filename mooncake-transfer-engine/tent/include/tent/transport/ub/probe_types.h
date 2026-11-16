@@ -277,13 +277,25 @@ struct ProbeParams {
     uint32_t recover_success_threshold{1};
     ProbeJfcMode jfc_mode{ProbeJfcMode::kDedicated};
     ProbeProviderKind provider{ProbeProviderKind::kPool};
+    // Self-owned probe resources (standalone): empty = all non-bonding
+    // physical devices; entries match native_device_name or topology_name.
+    std::vector<std::string> device_filter;
+    // 0 = system page size; otherwise a page-aligned multiple.
+    uint64_t source_page_size{0};
     uint32_t jfc_depth{64};
     uint32_t credit_reserve{8};
+    // Test mode (validation only; production must keep periodic_all=false).
+    bool test_periodic_all{false};
+    uint64_t test_interval_ms{5000};
+    bool test_apply_health{true};
 
     [[nodiscard]] uint64_t intervalNs() const { return interval_ms * kNsPerMs; }
     [[nodiscard]] uint64_t timeoutNs() const { return timeout_ms * kNsPerMs; }
     [[nodiscard]] uint64_t backoffMaxNs() const {
         return backoff_max_ms * kNsPerMs;
+    }
+    [[nodiscard]] uint64_t testIntervalNs() const {
+        return test_interval_ms * kNsPerMs;
     }
 
     [[nodiscard]] bool valid() const {
@@ -303,6 +315,8 @@ struct ProbeParams {
             jfc_mode == ProbeJfcMode::kShared) {
             return false;
         }
+        if (test_interval_ms == 0) return false;
+        if (test_periodic_all && !enabled) return false;
         return true;
     }
 };
@@ -356,6 +370,11 @@ struct ProbeStats {
     uint64_t probe_orphan_settled{0};
     uint64_t probe_orphan_handed_off{0};
     uint64_t probe_slot_anomaly{0};
+    uint64_t probe_test_post{0};
+    uint64_t probe_test_ok{0};
+    uint64_t probe_test_fail{0};
+    uint64_t probe_test_missed{0};
+    uint64_t probe_test_interval_missed{0};
     uint64_t probe_event_malformed{0};
     uint64_t probe_event_gap{0};
     uint64_t probe_event_gap_stuck{0};

@@ -101,6 +101,15 @@ Status ProbeLinkManager::initialize(const ProbeGraph& graph) {
     if (!params_.valid()) {
         return Status::InvalidArgument("invalid probe parameters");
     }
+    if (params_.test_periodic_all) {
+        LOG(WARNING) << "probe test mode enabled: periodic probing of all "
+                        "links (validation only; disable in production)";
+        if (params_.test_interval_ms < params_.timeout_ms) {
+            LOG(WARNING)
+                << "probe test interval is shorter than the completion "
+                   "timeout; a port may stay occupied by the previous probe";
+        }
+    }
     if (graph.graph_epoch == 0) {
         return Status::InvalidArgument("probe graph epoch must be non-zero");
     }
@@ -344,6 +353,22 @@ bool ProbeLinkManager::schedulableLocked(const PathVersion& version,
     return peerBudgetAvailableLocked(runtime.peer);
 }
 
+bool ProbeLinkManager::testEligibleLocked(const PathRuntime& runtime,
+                                          uint64_t now_ns) const {
+    if (!params_.test_periodic_all) return false;
+    // Test probes are a third scheduling class: campaign and periodic work
+    // always win, and a path that is already posting is not a candidate.
+    if (runtime.task != TaskState::kIdle) return false;
+    if (runtime.health == LinkHealth::kDisabled) return false;
+    return now_ns >= runtime.test_due_ns;
+}
+
+bool ProbeLinkManager::testSchedulableLocked(const PathRuntime& runtime,
+                                             uint64_t now_ns) const {
+    return !runtime.pending && testEligibleLocked(runtime, now_ns) &&
+           peerBudgetAvailableLocked(runtime.peer);
+}
+
 ProbeAction ProbeLinkManager::makeActionLocked(
     const PortRuntime& port, const PathVersion& version,
     const PathRuntime& runtime) const {
@@ -392,6 +417,8 @@ std::vector<ProbeAction> ProbeLinkManager::pendingActions(uint64_t now_ns) {
         const size_t count = port.paths.size();
         if (count == 0) continue;
         const size_t start = port.rr_cursor % count;
+        bool selected = false;
+        // Priority 1/2: campaign and periodic work.
         for (size_t offset = 0; offset < count; ++offset) {
             const size_t index = (start + offset) % count;
             const PathVersion& version = port.paths[index];
@@ -411,6 +438,29 @@ std::vector<ProbeAction> ProbeLinkManager::pendingActions(uint64_t now_ns) {
             port.rr_cursor = index + 1;
             if (port.rr_cursor >= count) ++stats_.probe_rr_round;
             actions.push_back(makeActionLocked(port, version, runtime->second));
+            selected = true;
+            break;
+        }
+        if (selected || !params_.test_periodic_all) continue;
+        // Priority 3: test-mode sweep. It ignores health and backoff, but still
+        // obeys the port slot, Pending and peer budget.
+        for (size_t offset = 0; offset < count; ++offset) {
+            const size_t index = (start + offset) % count;
+            const PathVersion& version = port.paths[index];
+            auto runtime = paths_.find(version);
+            if (runtime == paths_.end()) continue;
+            if (!testEligibleLocked(runtime->second, now)) continue;
+            if (runtime->second.pending ||
+                !peerBudgetAvailableLocked(runtime->second.peer)) {
+                ++stats_.probe_test_missed;
+                continue;
+            }
+            port.rr_cursor = index + 1;
+            if (port.rr_cursor >= count) ++stats_.probe_rr_round;
+            auto action = makeActionLocked(port, version, runtime->second);
+            action.test = true;
+            action.due_ns = runtime->second.test_due_ns;
+            actions.push_back(std::move(action));
             break;
         }
     }
@@ -440,14 +490,18 @@ std::shared_ptr<ProbeRecord> ProbeLinkManager::beginPost(
     ProbeEdgeSupply* edge = findEdgeLocked(version);
     if (runtime == nullptr || edge == nullptr) return nullptr;
     if (edge->area_epoch != action.area_epoch) return nullptr;
-    if (!schedulableLocked(version, *runtime, now)) return nullptr;
+    if (action.test) {
+        if (!testSchedulableLocked(*runtime, now)) return nullptr;
+    } else if (!schedulableLocked(version, *runtime, now)) {
+        return nullptr;
+    }
 
     // Campaign alignment happens here, under the same lock that publishes the
     // token: no separate "snapshot re-check" is needed afterwards (design
     // §7.3).
     uint64_t campaign_id = 0;
     uint64_t campaign_epoch = 0;
-    if (runtime->task == TaskState::kQueued) {
+    if (!action.test && runtime->task == TaskState::kQueued) {
         auto campaign = campaigns_.find(runtime->peer);
         if (campaign == campaigns_.end()) return nullptr;
         auto entry = campaign->second.entries.find(version);
@@ -484,6 +538,7 @@ std::shared_ptr<ProbeRecord> ProbeLinkManager::beginPost(
     record->source = port->supply.source_segment;
     record->area = edge->area_segment;
     record->credit = 1;
+    record->test_probe = action.test;
 
     port->slot_token = token;
     port->slot_generation = port->generation;
@@ -493,6 +548,7 @@ std::shared_ptr<ProbeRecord> ProbeLinkManager::beginPost(
     ++peer_inflight_[runtime->peer];
     inflight_.emplace(token, record);
     ++stats_.probe_scheduled;
+    if (action.test) ++stats_.probe_test_post;
     return record;
 }
 
@@ -560,9 +616,14 @@ void ProbeLinkManager::onPostResult(const std::shared_ptr<ProbeRecord>& record,
             releaseBudgetLocked(record->peer);
             PathRuntime* runtime = findPathLocked(record->key.version);
             if (runtime != nullptr) {
-                runtime->next_probe_ns =
-                    now +
-                    std::min(params_.intervalNs(), kPostRejectedRetryCapNs);
+                if (record->test_probe) {
+                    runtime->test_due_ns =
+                        now + params_.testIntervalNs();
+                } else {
+                    runtime->next_probe_ns =
+                        now + std::min(params_.intervalNs(),
+                                       kPostRejectedRetryCapNs);
+                }
             }
             // Rejection is not a path fault: hand the task slot back so a
             // campaign entry returns to kQueued instead of hanging in
@@ -593,12 +654,18 @@ uint64_t ProbeLinkManager::nextDeadline(uint64_t now_ns) const {
         for (const auto& version : port.paths) {
             auto runtime = paths_.find(version);
             if (runtime == paths_.end()) continue;
-            // Everything except the time comparison: a path that becomes due
-            // later still has to wake the scheduler at next_probe_ns.
-            if (!timeEligibleLocked(version, runtime->second)) continue;
             if (runtime->second.pending) continue;
             if (!peerBudgetAvailableLocked(runtime->second.peer)) continue;
-            consider(std::max(runtime->second.next_probe_ns, now));
+            // Everything except the time comparison: a path that becomes due
+            // later still has to wake the scheduler at next_probe_ns.
+            if (timeEligibleLocked(version, runtime->second)) {
+                consider(std::max(runtime->second.next_probe_ns, now));
+            }
+            if (params_.test_periodic_all &&
+                runtime->second.task == TaskState::kIdle &&
+                runtime->second.health != LinkHealth::kDisabled) {
+                consider(std::max(runtime->second.test_due_ns, now));
+            }
         }
     }
     return deadline;
@@ -649,8 +716,18 @@ bool ProbeLinkManager::onProbeCompletion(const Completion& completion,
             const StaleReason stale = staleReasonLocked(*record);
             const bool current = stale == StaleReason::kNone;
             if (current) {
-                applyLocked(completion, record->key.version, *runtime, *edge,
-                            *port, now, effects);
+                if (record->test_probe && !params_.test_apply_health) {
+                    // Pure link check: no health, campaign or lane change.
+                    if (completion.category == CompletionCategory::SUCCESS) {
+                        ++stats_.probe_test_ok;
+                    } else {
+                        ++stats_.probe_test_fail;
+                    }
+                } else {
+                    applyLocked(completion, record->key.version, *runtime,
+                                *edge, *port, now, record->test_probe,
+                                effects);
+                }
             } else {
                 ++stats_.probe_stale;
                 switch (stale) {
@@ -671,6 +748,11 @@ bool ProbeLinkManager::onProbeCompletion(const Completion& completion,
             // Campaign accounting is filtered by id/epoch; a stale health
             // result still terminalizes its matching entry so the campaign
             // cannot hang on an in-flight item (design §7.3).
+            if (record->test_probe && runtime != nullptr) {
+                // The test cadence is independent of health and backoff; even a
+                // stale result advances it so the port does not spin.
+                runtime->test_due_ns = now + params_.testIntervalNs();
+            }
             campaignProgressLocked(
                 record->key, current ? mapCampaignOutcome(completion.category)
                                      : EntryState::kCanceled);
@@ -715,13 +797,14 @@ void ProbeLinkManager::applyLocked(const Completion& completion,
                                    PathRuntime& runtime,
                                    const ProbeEdgeSupply& edge,
                                    PortRuntime& port, uint64_t now_ns,
-                                   Effects& effects) {
+                                   bool test_probe, Effects& effects) {
     switch (completion.category) {
         case CompletionCategory::SUCCESS: {
             runtime.consecutive_failures = 0;
             runtime.backoff_ns = 0;
             ++runtime.success_count;
             ++stats_.probe_success;
+            if (test_probe) ++stats_.probe_test_ok;
             if (runtime.health == LinkHealth::kHealthy) {
                 // Normal verification on a healthy path: no repeated publish.
                 return;
@@ -748,6 +831,7 @@ void ProbeLinkManager::applyLocked(const Completion& completion,
             // a path fault, while the lane is retired too, so both possible
             // root causes are covered (design §9.3).
             ++stats_.probe_failure_path;
+            if (test_probe) ++stats_.probe_test_fail;
             if (completion.category == CompletionCategory::TIMEOUT) {
                 ++stats_.probe_ack_timeout;
             }
@@ -757,10 +841,14 @@ void ProbeLinkManager::applyLocked(const Completion& completion,
                 ++runtime.fault_epoch;
                 setHealthLocked(runtime, LinkHealth::kIsolated, effects);
             }
-            ++runtime.consecutive_failures;
-            runtime.backoff_ns =
-                backoffDelayLocked(runtime.consecutive_failures);
-            runtime.next_probe_ns = now_ns + runtime.backoff_ns;
+            if (!test_probe) {
+                // Test-mode failures drive health but never apply exponential
+                // backoff: the next sweep stays on test_interval.
+                ++runtime.consecutive_failures;
+                runtime.backoff_ns =
+                    backoffDelayLocked(runtime.consecutive_failures);
+                runtime.next_probe_ns = now_ns + runtime.backoff_ns;
+            }
             LOG_EVERY_N(WARNING, 100)
                 << "UB probe path error: " << pathText(version)
                 << " failures=" << runtime.consecutive_failures
@@ -774,6 +862,7 @@ void ProbeLinkManager::applyLocked(const Completion& completion,
             // Probe area/token mismatch is a lane/configuration problem, never
             // evidence that the path is bad (design §9.3 / L-3).
             ++stats_.probe_area_config_error;
+            if (test_probe) ++stats_.probe_test_fail;
             LOG_EVERY_N(WARNING, 100)
                 << "UB probe area configuration error: " << pathText(version)
                 << " jetty_gen=" << port.generation;
@@ -787,6 +876,7 @@ void ProbeLinkManager::applyLocked(const Completion& completion,
         case CompletionCategory::UNKNOWN_ERROR:
         default:
             ++stats_.probe_failure_lane;
+            if (test_probe) ++stats_.probe_test_fail;
             LOG_EVERY_N(WARNING, 100)
                 << "UB probe lane error: " << pathText(version)
                 << " jetty_gen=" << port.generation
@@ -1519,6 +1609,10 @@ void ProbeLinkManager::scanTimeouts(uint64_t now_ns) {
                     *port, now, record->key.version,
                     Status::InternalError("probe completion timeout"), effects);
                 markPortPendingLocked(*port, PendingReason::kLaneRetired, now);
+            }
+            PathRuntime* runtime = findPathLocked(record->key.version);
+            if (runtime != nullptr && record->test_probe) {
+                runtime->test_due_ns = now + params_.testIntervalNs();
             }
             moveToOrphansLocked(record, OrphanReason::kTimeout, now);
         }

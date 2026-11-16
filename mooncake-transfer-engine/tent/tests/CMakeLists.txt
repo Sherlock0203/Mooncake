@@ -603,6 +603,18 @@ if(USE_UB)
   add_test(NAME tent_ub_probe_scheduler_test
            COMMAND tent_ub_probe_scheduler_test)
 
+  # Test mode (probe/test/*): periodic sweep of all links, optional health
+  # application, campaign priority.
+  add_executable(
+    tent_ub_probe_test_mode_test
+    ub_probe_test_mode_test.cpp ../src/transport/ub/probe_link_manager.cpp)
+  target_link_libraries(tent_ub_probe_test_mode_test
+                        PRIVATE tent_common gtest gtest_main)
+  target_include_directories(tent_ub_probe_test_mode_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_probe_test_mode_test
+           COMMAND tent_ub_probe_test_mode_test)
+
   # Probe-link W1c: workers seams + transport assembly against the fake URMA
   # provider (design §14.2 #12). tent_link_group already contains the probe
   # sources through tent_xport_ub, so they must not be compiled in again.
@@ -619,6 +631,19 @@ if(USE_UB)
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_ub_probe_standalone_provider_test
            COMMAND tent_ub_probe_standalone_provider_test)
+
+  # v1.7 self-owned resources: discovery, bond rejection, device filter and
+  # source-page-size validation.
+  add_executable(
+    tent_ub_probe_discovery_test
+    ub_probe_discovery_test.cpp
+    ../src/transport/ub/probe_provider_standalone.cpp)
+  target_link_libraries(tent_ub_probe_discovery_test
+                        PRIVATE tent_common gtest gtest_main)
+  target_include_directories(tent_ub_probe_discovery_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_probe_discovery_test
+           COMMAND tent_ub_probe_discovery_test)
 
   # Probe peer handshake seam (P2): descriptor validation, probe-area import
   # and caching. The bootstrap wire that fills the descriptor source lands in
@@ -653,6 +678,12 @@ if(USE_UB)
   target_include_directories(tent_ub_probe_rebuild_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_ub_probe_rebuild_test COMMAND tent_ub_probe_rebuild_test)
+
+  # Two-node probe-only selftest tool (manual; not a ctest entry).
+  add_executable(tent_probe_selftest ub_probe_selftest.cpp)
+  target_link_libraries(tent_probe_selftest PRIVATE tent_xport_ub)
+  target_include_directories(tent_probe_selftest
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 
   add_executable(tent_ub_probe_integration_test ub_probe_integration_test.cpp)
   target_link_libraries(tent_ub_probe_integration_test

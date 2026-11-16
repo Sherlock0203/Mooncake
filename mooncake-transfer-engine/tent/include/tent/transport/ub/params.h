@@ -150,6 +150,29 @@ struct UbParams {
         CHECK_STATUS(readNonNegative(
             config, "transports/ub/probe/credit_reserve",
             parsed.probe.credit_reserve, parsed.probe.credit_reserve));
+        CHECK_STATUS(readStringList(config,
+                                    "transports/ub/probe/device_filter",
+                                    parsed.probe.device_filter));
+        uint64_t source_page_size = parsed.probe.source_page_size;
+        CHECK_STATUS(readNonNegative(config,
+                                     "transports/ub/probe/source_page_size",
+                                     source_page_size, source_page_size));
+        if (source_page_size > std::numeric_limits<size_t>::max()) {
+            return Status::InvalidArgument(
+                "transports/ub/probe/source_page_size exceeds size_t");
+        }
+        parsed.probe.source_page_size =
+            static_cast<size_t>(source_page_size);
+        CHECK_STATUS(readBool(config, "transports/ub/probe/test/periodic_all",
+                              parsed.probe.test_periodic_all,
+                              parsed.probe.test_periodic_all));
+        CHECK_STATUS(readPositive(config,
+                                  "transports/ub/probe/test/interval_ms",
+                                  parsed.probe.test_interval_ms,
+                                  parsed.probe.test_interval_ms));
+        CHECK_STATUS(readBool(config, "transports/ub/probe/test/apply_health",
+                              parsed.probe.test_apply_health,
+                              parsed.probe.test_apply_health));
 
         // Cross-key constraints (design §13.1). Each one has its own message
         // so an operator can tell which pair is inconsistent.
@@ -178,6 +201,11 @@ struct UbParams {
             return Status::InvalidArgument(
                 "transports/ub/probe/provider=standalone requires "
                 "transports/ub/probe/jfc_mode=dedicated");
+        }
+        if (parsed.probe.test_periodic_all && !parsed.probe.enabled) {
+            return Status::InvalidArgument(
+                "transports/ub/probe/test/periodic_all requires "
+                "transports/ub/probe/enabled=true");
         }
         if (!parsed.probe.valid()) {
             return Status::InvalidArgument("invalid probe configuration");
@@ -334,10 +362,10 @@ struct UbParams {
         return Status::OK();
     }
 
-    static Status readDeviceFilter(const Config& config,
-                                   std::vector<std::string>& output) {
-        static constexpr const char* kKey = "transports/ub/device_filter";
-        const json value = config.get<json>(kKey, json());
+    static Status readStringList(const Config& config,
+                                 const std::string& key,
+                                 std::vector<std::string>& output) {
+        const json value = config.get<json>(key, json());
         if (value.is_null()) {
             output.clear();
             return Status::OK();
@@ -350,24 +378,28 @@ struct UbParams {
             for (const auto& entry : value) {
                 if (!entry.is_string()) {
                     return Status::InvalidArgument(
-                        "transports/ub/device_filter entries must be strings");
+                        key + " entries must be strings");
                 }
                 parsed.push_back(entry.get<std::string>());
             }
         } else {
             return Status::InvalidArgument(
-                "transports/ub/device_filter must be a string or string "
-                "array");
+                key + " must be a string or string array");
         }
 
         for (const auto& entry : parsed) {
             if (entry.empty()) {
                 return Status::InvalidArgument(
-                    "transports/ub/device_filter entries must not be empty");
+                    key + " entries must not be empty");
             }
         }
         output = std::move(parsed);
         return Status::OK();
+    }
+
+    static Status readDeviceFilter(const Config& config,
+                                   std::vector<std::string>& output) {
+        return readStringList(config, "transports/ub/device_filter", output);
     }
 };
 

@@ -4,7 +4,7 @@
 > 代码基线：Mooncake v3 / 956af65e（mooncake-transfer-engine/tent），本文行号均对应该基线；UMDK 参考基线 09086da5（gitcode.com/openeuler/umdk，同级参考，非构建依赖；本地检出 .tmp-umdk/，09086da5 为其祖先，本文引用行号已逐条复核）。
 > 状态：设计文档；**W1 链路探测已实现（`probe/enabled` 默认 false）**，其余里程碑待实现。本文覆盖 post/poll 线程池、K 准入、事件分类与分发、完成门与归还、超时扫描、callback 执行器、启停协议，以及**链路探测子系统（健康状态机、campaign、探测调度与探测 WR）**。
 > **2026-11-10 修订四**：删除历史决议记录（其有效规则已全部位于正文相应章节），全文移除决议编号引用；实施顺序调整为**链路探测先行**（§13 之 W1）。
-> 版本历史：11-04 冻结两侧接口与分工结论（本文为两侧对齐的唯一文档）；11-09 链路探测子系统移入本侧（§9），接口 3/4/6/7 相应调整；11-10 查漏补缺（探测 JFC 模式、探测区 descriptor、参数错误分类、K 默认值、轮询公平性、结果三层语义表、风险与缓解、改造点清单、术语表）；**11-13 按《tent-ub-probe-link-detail-design》§17 回写 W1 实现结论**（超时归属、Pending、业务成功语义、campaign 退出与合并、失败分类、责任不明恢复、关闭顺序、配置键、验收口径、指标）；**11-13 解耦**：明确链路探测不依赖业务 Jetty 池化，独立探测资源供给方案见 [tent-ub-probe-standalone-supply](tent-ub-probe-standalone-supply.md)（§9.1.1）；**11-16 P1–P5**：独立 provider、握手目录、RM poster、退役重建/接口 7、transport standalone 装配与 `probe/provider` 配置已落地（bootstrap 线上字段仍待接入）。
+> 版本历史：11-04 冻结两侧接口与分工结论（本文为两侧对齐的唯一文档）；11-09 链路探测子系统移入本侧（§9），接口 3/4/6/7 相应调整；11-10 查漏补缺（探测 JFC 模式、探测区 descriptor、参数错误分类、K 默认值、轮询公平性、结果三层语义表、风险与缓解、改造点清单、术语表）；**11-13 按《tent-ub-probe-link-detail-design》§17 回写 W1 实现结论**（超时归属、Pending、业务成功语义、campaign 退出与合并、失败分类、责任不明恢复、关闭顺序、配置键、验收口径、指标）；**11-13 解耦**：明确链路探测不依赖业务 Jetty 池化，独立探测资源供给方案见 [tent-ub-probe-standalone-supply](tent-ub-probe-standalone-supply.md)（§9.1.1）；**11-16 P1–P5**：独立 provider、握手目录、RM poster、退役重建/接口 7、transport standalone 装配与 `probe/provider` 配置已落地（bootstrap 线上字段仍待接入）；**11-16 v1.7 对齐**：探测资源改为本侧自建（发现非 bonding 物理口、自建 probe Context/JFC/Jetty/源页），接口 4/7 只承载远端描述符/邻接/门禁；新增测试模式 `probe/test/*`；新增两节点 `tent_probe_selftest`（JSON 交换、不经 bootstrap）。
 > 不在本文范围：Jetty 池化与预算（池化详设 §5）、**全部原生 Jetty 资源角色的退役/删除/补池机械（业务＋探测角色，其 §7）**、RM adapter 迁移与 bootstrap v2（其 §4）、TENT/Store/staging 安全接入（单独指派）。探测子系统原属其 §6，已移入本文 §9。
 
 ## 1. 约束语义与设计边界
@@ -433,7 +433,9 @@ sequenceDiagram
 
 #### 9.1.1 与 Jetty 池化的关系（解耦结论）
 
-链路探测**不依赖业务 Jetty 池化**。dedicated 模式只需要：每本地口一个专用 probe Jetty、一个 probe JFC、一页探测源页、对端探测页 descriptor、远端 probe Jetty identity、拓扑/邻接/代次与 poller 线程；这些都不是业务池资源，也不经 lease 租借、K 准入、quota、endpoint Jetty 集合、RC bind 或补池预算。
+链路探测**不依赖业务 Jetty 池化**。v1.7 起这些资源由**本侧自建**：adapter 枚举措物理口（过滤 bond，`probe/device_filter` 可收窄）、每口自建 probe Context/JFC/Jetty/源页；接口 4/7 只承载远端 target/探测页描述符 + 邻接 + 门禁，接口 2 不再承载探测 lane 退役。当前实现见 `StandaloneProbeResourceProvider`（发现/自建/自退役重建）与 `HandshakeProbePeerDirectory`（远端 import）。
+
+dedicated 模式只需要：每本地口一个专用 probe Jetty、一个 probe JFC、一页探测源页、对端探测页 descriptor、远端 probe Jetty identity、拓扑/邻接/代次与 poller 线程；这些都不是业务池资源，也不经 lease 租借、K 准入、quota、endpoint Jetty 集合、RC bind 或补池预算。
 
 真正的硬依赖只有四条：
 
@@ -504,6 +506,7 @@ stateDiagram-v2
   - **路径类** probe 错误 → 隔离其**明确归属**路径、经接口 2 上报探测 lane 退役（句柄代次失效、同口其余路径 Pending）；**lane/配置类**错误只退役 lane、同口 Pending，不记路径 BAD；
   - stale（代次不匹配）→ 只结算旧责任（finalize 释放 pin/target/额度），不更新当前健康；
   - **完成超时（无完成，责任不明）→ 由调度线程的超时扫描处理**：`timed_out` 一次性置位、退役 lane、同口 Pending、转孤儿表；不重发、不放当前代次端口槽、不解除源页 pin，等迟到完成或新代次。
+- **测试模式（`probe/test/*`，默认关闭，生产禁用）**：`periodic_all=true` 时所有合法路径按 `test_interval_ms` 参与调度，优先级 campaign > 周期 > 测试；仍受每口单在途、`peer_budget`、口内轮转约束，但**忽略 HEALTHY 不探与指数退避**。`apply_health=false` 时结果只计数/日志，不改健康、不退役 lane；`apply_health=true` 时结果正常驱动健康，但失败不进入指数退避。`nextDeadline` 纳入 `test_due_ns`；启动打印 warning。
 - **post 三态处理**：确定未接受（`posted_count==0` 且错误且 record 未被完成认领）→ 释放槽/credit、回退任务槽、`next=now+min(interval,100ms)`，记 `probe_post_rejected`，**不记路径故障**；已接受 → 等完成；未定 → 按已接受处理、不重发。未接受与已完成冲突 → 只退役 lane，不回滚健康。
 - **退避**：`delay = min(interval << min(failures-1,16), backoff_max)`，成功清零；不加随机抖动。**新句柄就绪不覆盖 `next_probe_ns`**，避免"失败→退役→重建→立刻重探"的重建风暴。
 - probe record 不走业务完成门与 lease 归还：finalize 一次性释放 pin、target 引用与控制额度；handler 退出前不复用探测源页。
@@ -623,6 +626,11 @@ context 初始化（业务 JFC）
 | probe/provider | pool（默认）/standalone | `pool` 使用注入的 W1 provider/poster；`standalone` 由 transport 基于本端 Context 构造 `StandaloneProbeResourceProvider` + `HandshakeProbePeerDirectory` + `UrmaProbePoster`；需要调用方注入 `ProbePeerDescriptorSource`，且仅支持 dedicated JFC |
 | probe/jfc_depth | 64 | dedicated probe JFC 深度 |
 | probe/credit_reserve | 8 | shared 模式下预留的控制 credit |
+| probe/device_filter | 空（全部非 bonding 物理口） | 字符串或字符串数组；按 native/topology 名匹配；bond 设备始终排除，有 bonding 时使用剩余非 bonding 设备，仅当没有可用非 bond 设备时失败 |
+| probe/source_page_size | 0（系统页大小） | 0 或页对齐的整数倍；用于探测源页/本端探测区页注册 |
+| probe/test/periodic_all | false | 测试模式：定时探测全部链路；需 `probe/enabled=true`，生产禁用 |
+| probe/test/interval_ms | 5000 | 测试间隔；< `timeout_ms` 时告警，不拒绝 |
+| probe/test/apply_health | true | false = 纯链路检查，只计数/日志，不改健康、不退役 lane |
 | slice_size / max_slices_per_task / slice_timeout_ms / max_retries | 既有 | 语义不变；slice_timeout_ms 现仅驱动 TimeoutScan 标记，不再驱动 quiesce |
 
 注 1：business_queue_budget / callback_queue_budget 为本侧新增键，需同步登记进池化详设 §9.1 配置表。
@@ -724,6 +732,7 @@ probe_scheduled / probe_posted / probe_post_rejected / probe_post_unknown / prob
 probe_timeout_unknown（责任不明计数）/ probe_stale / probe_unknown_token
 probe_evidence_unmapped / probe_area_config_error
 probe_skipped{pending, credit, peer_budget, broken}
+probe_test_post / probe_test_ok / probe_test_fail / probe_test_missed / probe_test_interval_missed
 probe_handle_generation_mismatch / probe_gate_blocked_by_{epoch, resource, external}
 campaign_created / campaign_merged / campaign_exited / campaign_waiting_for_event
 campaign_entry_{ok, fail, canceled}

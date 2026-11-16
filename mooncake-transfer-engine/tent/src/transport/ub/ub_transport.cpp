@@ -356,29 +356,16 @@ struct UbTransport::Impl {
                         "UB probe provider=standalone requires a peer "
                         "descriptor source" LOC_MARK));
                 }
-                std::map<Topology::NicID, ub::ContextPtr> probe_contexts;
-                std::vector<ub::ProbeLocalPortConfig> probe_ports;
-                for (const auto& context : contexts) {
-                    if (!context || !context->handle()) {
-                        return failInstall(Status::InvalidArgument(
-                            "UB standalone probe provider requires an active "
-                            "local context" LOC_MARK));
-                    }
-                    const auto local_nic = context->topologyId();
-                    probe_contexts.emplace(local_nic, context->handle());
-                    ub::ProbeLocalPortConfig port;
-                    port.local_nic = local_nic;
-                    port.context = context->handle();
-                    port.generation = 1;
-                    probe_ports.push_back(std::move(port));
-                }
+                auto standalone =
+                    std::make_shared<ub::StandaloneProbeResourceProvider>(
+                        adapter, params.probe);
+                auto discover = standalone->discover();
+                if (!discover.ok()) return failInstall(discover);
                 probe_directory =
                     std::make_shared<ub::HandshakeProbePeerDirectory>(
-                        adapter, std::move(probe_contexts), probe_peer_source);
-                probe_provider =
-                    std::make_shared<ub::StandaloneProbeResourceProvider>(
-                        adapter, params.probe, std::move(probe_ports),
-                        probe_directory.get());
+                        adapter, standalone->contexts(), probe_peer_source);
+                standalone->setRemoteDirectory(probe_directory.get());
+                probe_provider = standalone;
                 probe_poster = std::make_shared<ub::UrmaProbePoster>(adapter);
             }
             ub::ProbeGraph graph;
@@ -518,6 +505,9 @@ struct UbTransport::Impl {
         probe_scheduler.reset();
         probe_manager.reset();
         probe_poster.reset();
+        // Unimport remote probe areas while the probe Contexts are still
+        // alive; the self-owned provider closes them in its shutdown.
+        if (probe_directory) (void)probe_directory->shutdown();
         probe_provider.reset();
         probe_directory.reset();
         if (endpoints) {

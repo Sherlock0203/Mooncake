@@ -1,5 +1,7 @@
 # TENT UB 探测资源独立供给（与 Jetty 池化解耦）
 
+> **v1.7 更新（2026-11-16）**：探测资源已改为**本侧自建**（发现非 bonding 物理口、自建 probe Context/JFC/Jetty/源页），不再由池化侧/provider 供给本地 probe 句柄。本文的 A/B 供给方案保留为资源归属演进记录；当前实现见 `StandaloneProbeResourceProvider` 与 v1.7 详细设计 §12.1。
+>
 > 日期：2026-11-13。
 > 关系：补充总设计《tent-ub-post-poll-threadpool-design》§9.1/§9.1.1 与接口 2/4/7 的落地拆分；**取代**《tent-ub-probe-link-detail-design》§3.4/§16 中“真实实现依赖池化侧 P0-B / 探测资源归池化侧”的表述（该文 v1.6 提交后回写一行指向本文）。
 > 结论：**dedicated 模式下，链路探测不依赖业务 Jetty 池化。**
@@ -142,7 +144,7 @@
 | **P5** | 多口/多 peer/多代次；shared 模式可选 | 矩阵 #4/#6/#16 在真实 adapter 上通过 | P4 |
 | **P6** | 实机：单机双端 → 跨机多口 | 探测完成、超时、关闭移交与日志一致 | 硬件＋池化侧 provider |
 
-**实现状态（2026-11-16）**：P1（provider 骨架与本端资源）、P2 的本地半部（descriptor 校验、探测页 import/cache/替换、单 peer/单口建图）、P3 RM poster（逐 WR target）、P4 的 provider 侧（quiesce→替换 Jetty/源页/探测区页→接口 7 事件、旧页 quarantine）与 P5 的 transport 装配（`probe/provider=standalone`、sink 注入、启停顺序）已实现并通过 fake adapter/集成测试；剩余：bootstrap 线上字段（描述符交换）与 `probe/rc_fallback`。注意：本机默认构建 `TENT_HAS_REAL_URMA=OFF`；RM 原生路径已用仓库内 vendored UMDK 头文件（`build/_deps/urma-src`）以 `-DTENT_HAS_REAL_URMA=1` 完成对象级编译，仍需 real liburma 链接构建与实机验证。
+**实现状态（2026-11-16）**：P1–P5 已落地；**v1.7 进一步改为本侧自建资源**：`StandaloneProbeResourceProvider::discover()` 枚举物理口、过滤 bond（有 bonding 时使用剩余非 bonding 设备）、支持 `probe/device_filter`，每口自建 probe Context/JFC/Jetty/源页；transport 以发现出的 probe Context 构造远端 directory。测试模式 `probe/test/*` 已实现（periodic_all / interval_ms / apply_health）。剩余：bootstrap 线上字段（描述符交换）、`probe/rc_fallback`、未决资源 Unproven 语义的完整回写。注意：本机默认构建 `TENT_HAS_REAL_URMA=OFF`；RM 原生路径已用仓库内 vendored UMDK 头文件（`build/_deps/urma-src`）以 `-DTENT_HAS_REAL_URMA=1` 完成对象级编译，仍需 real liburma 链接构建与实机验证。
 
 新增代码面（预计）：
 
@@ -167,6 +169,56 @@
 | `probe/peer_unsupported` | 计数 | 对端不支持探测时的降级观测 |
 
 W1d 已实现的 11 个 `probe/*` 键保持不变；`probe/provider` 已在 P5 实现（默认 `pool`）；`probe/rc_fallback` 仍未实现，暂不进入配置表。
+
+## 11. 两节点 selftest（tent_probe_selftest）
+
+用于没有 bootstrap/控制面时，快速验证真实 URMA 两节点探测。工具位于
+`mooncake-transfer-engine/tent/tests/ub_probe_selftest.cpp`，构建目标
+`tent_probe_selftest`，不经 `TransferEngine`。
+
+**前提**：两端已用 real URMA 构建（`USE_UB=ON` + 有效 `URMA_LIBRARY`），
+UMDK 设备/EID 互通；bond 会被过滤，只有没有任何非 bonding 物理口时才失败。
+
+**流程**：
+
+1. 两端选择一个共享目录（NFS/sshfs），或手工 scp JSON；
+2. 每端启动工具：发现物理口 → 自建 probe Context/JFC/Jetty/源页/探测区页
+   → 写 `<node>.json`（area descriptor/token/epoch + probe jetty id/uasid/eid）
+   → 等 `<peer>.json`；
+3. 读到对端 JSON 后按 `local_nic` 配对，import 对端探测页，启动 PLM +
+   scheduler + probe JFC poll 线程；
+4. 测试模式按 `--test-interval-ms` 定时探测全部链路。
+
+```bash
+# 节点 A
+tent_probe_selftest --node a --peer b --exchange-dir /shared \
+  --device-filter <物理口名> --test-interval-ms 5000 --apply-health=false
+
+# 节点 B
+tent_probe_selftest --node b --peer a --exchange-dir /shared \
+  --device-filter <物理口名> --test-interval-ms 5000 --apply-health=false
+```
+
+**预期输出**：
+
+```text
+local descriptors written to /shared/a.json; waiting for /shared/b.json
+probe selftest started: node=a peer=b test_interval_ms=5000 apply_health=false
+[probe] t=1s inflight=0 test_post=1 ok=1 fail=0 missed=0 timeout=0 ...
+```
+
+判定：两端 `test_post/ok` 持续增长、`fail/timeout` 不增长；Ctrl-C 后
+`drained=true`。若出现 `unproven`，工具返回 2 并故意保留资源到进程退出
+（避免对可能仍在 DMA 的页做 unimport）。
+
+**注意**：
+
+- 每次运行前删除共享目录里的旧 `<node>.json`，否则会读到上一轮的
+  Jetty/area 身份；
+- 两端 `local_nic` 必须能配对；端口数不同时按同号配对，缺失口会告警跳过；
+- 第一轮建议 `--apply-health=false`（纯链路检查），通了再 `--apply-health=true`
+  观察 ISOLATED/RECOVERING/HEALTHY；
+- 生产验证仍然需要正式 bootstrap 描述符交换；selftest 只用于两节点联调。
 
 ## 10. 未决问题
 
