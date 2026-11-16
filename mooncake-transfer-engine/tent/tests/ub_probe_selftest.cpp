@@ -91,6 +91,7 @@ struct Options {
     uint64_t source_page_size{0};
     bool apply_health{false};
     bool list_devices{false};
+    bool verbose_paths{false};
     std::vector<std::string> device_filter;
     struct PortPair {
         int32_t local_nic{0};
@@ -129,6 +130,7 @@ void usage(const char* argv0) {
            "(with index) and exit\n"
         << "  --pairs <l>:<p>,...       explicit local/peer port pairs, e.g. "
            "1:3,2:4\n"
+        << "  --verbose-paths           print every path state each report\n"
         << "\nRemove stale <node>.json files from the exchange directory "
            "before "
            "a new run.\n";
@@ -225,6 +227,8 @@ bool parseOptions(int argc, char** argv, Options& options) {
             }
         } else if (key == "--list-devices") {
             options.list_devices = true;
+        } else if (key == "--verbose-paths") {
+            options.verbose_paths = true;
         } else if (key == "--pairs") {
             std::string text;
             if (!value(text)) return false;
@@ -591,25 +595,86 @@ std::vector<PeerPort> parsePeerPorts(const nlohmann::json& root,
     return ports;
 }
 
-void printStats(const ProbeLinkManager& plm, uint64_t elapsed_s) {
+const char* taskName(TaskState state) {
+    switch (state) {
+        case TaskState::kIdle:
+            return "idle";
+        case TaskState::kQueued:
+            return "queued";
+        case TaskState::kInflight:
+            return "inflight";
+    }
+    return "?";
+}
+
+const char* pendingName(PendingReason reason) {
+    switch (reason) {
+        case PendingReason::kNone:
+            return "none";
+        case PendingReason::kLaneRetired:
+            return "lane_retired";
+        case PendingReason::kPortRevoked:
+            return "port_revoked";
+        case PendingReason::kContextFailure:
+            return "context_failure";
+    }
+    return "?";
+}
+
+void printStats(const ProbeLinkManager& plm, uint64_t elapsed_s,
+                bool verbose_paths) {
     const auto stats = plm.stats();
+    const auto view = plm.healthView();
+    size_t eligible = 0;
     size_t healthy = 0;
     size_t isolated = 0;
     size_t recovering = 0;
-    for (const auto& entry : plm.healthView()) {
-        if (entry.health == LinkHealth::kHealthy) ++healthy;
-        if (entry.health == LinkHealth::kIsolated) ++isolated;
-        if (entry.health == LinkHealth::kRecovering) ++recovering;
+    size_t disabled = 0;
+    size_t pending = 0;
+    for (const auto& entry : view) {
+        switch (entry.health) {
+            case LinkHealth::kEligibleUnverified:
+                ++eligible;
+                break;
+            case LinkHealth::kHealthy:
+                ++healthy;
+                break;
+            case LinkHealth::kIsolated:
+                ++isolated;
+                break;
+            case LinkHealth::kRecovering:
+                ++recovering;
+                break;
+            case LinkHealth::kDisabled:
+                ++disabled;
+                break;
+        }
+        if (entry.pending) ++pending;
     }
-    std::cout << "[probe] t=" << elapsed_s
-              << "s inflight=" << plm.inflightCount()
+    std::cout << "[probe] t=" << elapsed_s << "s paths=" << view.size()
+              << " eligible=" << eligible << " healthy=" << healthy
+              << " isolated=" << isolated << " recovering=" << recovering
+              << " disabled=" << disabled << " pending=" << pending
+              << " inflight=" << plm.inflightCount()
               << " test_post=" << stats.probe_test_post
               << " ok=" << stats.probe_test_ok
               << " fail=" << stats.probe_test_fail
               << " missed=" << stats.probe_test_missed
-              << " timeout=" << stats.probe_timeout_unknown
-              << " healthy=" << healthy << " isolated=" << isolated
-              << " recovering=" << recovering << std::endl;
+              << " timeout=" << stats.probe_timeout_unknown << std::endl;
+    if (verbose_paths) {
+        for (const auto& entry : view) {
+            std::cout << "[path] local=" << entry.version.path.local_nic
+                      << " peer=" << entry.peer.segment_id
+                      << " remote=" << entry.version.path.remote_nic
+                      << " state=" << linkHealthName(entry.health)
+                      << " task=" << taskName(entry.task) << " pending="
+                      << (entry.pending ? pendingName(entry.pending_reason)
+                                        : "none")
+                      << " fault_epoch=" << entry.fault_epoch
+                      << " failures=" << entry.consecutive_failures
+                      << " seq=" << entry.probe_seq << std::endl;
+        }
+    }
 }
 
 }  // namespace
@@ -848,6 +913,15 @@ int runSelftest(const Options& options) {
         adapter->shutdown();
         return 1;
     }
+    // The PLM now owns its copy of the supply; drop the local graph references
+    // so a later lane rebuild can delete the old Jetty handle.
+    std::vector<JfcPtr> poll_jfcs;
+    for (const auto& port : graph.ports) {
+        if (port.probe_jfc) poll_jfcs.push_back(port.probe_jfc);
+    }
+    graph.ports.clear();
+    graph.edges.clear();
+
     provider->setAvailabilitySink(plm.availabilitySink());
     provider->setCompletionSink([&plm](const Completion& completion) {
         if (!isProbeToken(completion.token)) {
@@ -861,9 +935,8 @@ int runSelftest(const Options& options) {
 
     std::atomic<bool> poll_stop{false};
     std::vector<std::thread> pollers;
-    for (const auto& port : graph.ports) {
-        if (!port.probe_jfc) continue;
-        pollers.emplace_back([&, jfc = port.probe_jfc] {
+    for (const auto& jfc : poll_jfcs) {
+        pollers.emplace_back([&, jfc] {
             while (!poll_stop.load(std::memory_order_acquire)) {
                 std::vector<Completion> completions;
                 auto poll_status = adapter->poll(jfc, 64, completions);
@@ -889,19 +962,27 @@ int runSelftest(const Options& options) {
 
     const uint64_t start_ns = selftestNowNs();
     const uint64_t duration_ns = options.duration_s * 1'000'000'000ULL;
-    uint64_t next_report_ns = start_ns + 1'000'000'000ULL;
+    // One report per test round instead of a fixed one-second tick.
+    const uint64_t report_interval_ns =
+        std::max<uint64_t>(options.test_interval_ms, 1) * 1'000'000ULL;
+    uint64_t next_report_ns = start_ns + report_interval_ns;
     std::cout << "probe selftest started: node=" << options.node
               << " peer=" << options.peer
               << " test_interval_ms=" << options.test_interval_ms
               << " apply_health=" << (options.apply_health ? "true" : "false")
               << std::endl;
+    printStats(plm, 0, options.verbose_paths);
 
     while (!g_stop.load(std::memory_order_acquire)) {
         const uint64_t now = selftestNowNs();
         if (now - start_ns >= duration_ns) break;
         if (now >= next_report_ns) {
-            printStats(plm, (now - start_ns) / 1'000'000'000ULL);
-            next_report_ns += 1'000'000'000ULL;
+            printStats(plm, (now - start_ns) / 1'000'000'000ULL,
+                       options.verbose_paths);
+            next_report_ns += report_interval_ns;
+            if (next_report_ns <= now) {
+                next_report_ns = now + report_interval_ns;
+            }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }

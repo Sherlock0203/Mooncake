@@ -797,9 +797,10 @@ Status StandaloneProbeResourceProvider::rebuildPortLocked(
         return status;
     }
 
-    // Quiesce fenced the old lane; reset is required before deletion.
-    status = adapter_->resetJetty(port.probe_jetty);
-    if (status.ok()) status = adapter_->deleteJetty(port.probe_jetty);
+    // Quiesce fenced the old lane; reset it before the replacement event, but
+    // keep the handle alive until PLM has dropped its old supply reference.
+    JettyPtr old_jetty = port.probe_jetty;
+    status = adapter_->resetJetty(old_jetty);
     if (!status.ok()) {
         if (new_source) (void)adapter_->unregisterLocalSegment(new_source);
         if (new_area) (void)adapter_->unregisterLocalSegment(new_area);
@@ -835,7 +836,19 @@ Status StandaloneProbeResourceProvider::rebuildPortLocked(
     port.config.generation = next_generation;
     port.source_generation = next_generation;
     port.area_epoch = next_generation;
-    return emitHandleReplacedLocked(makePortSupplyLocked(port));
+
+    // Publish the new generation first: the PLM replaces its PortRuntime
+    // supply here, dropping the old Jetty reference. Only then can the adapter
+    // delete the old handle (it refuses handles with use_count != 1).
+    status = emitHandleReplacedLocked(makePortSupplyLocked(port));
+    if (!status.ok()) return status;
+
+    auto delete_status = adapter_->deleteJetty(old_jetty);
+    if (!delete_status.ok()) {
+        LOG(WARNING) << "UB probe: old Jetty deletion deferred: "
+                     << delete_status.ToString();
+    }
+    return Status::OK();
 }
 
 Status StandaloneProbeResourceProvider::emitHandleReplacedLocked(
