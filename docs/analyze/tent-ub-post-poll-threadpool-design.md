@@ -626,7 +626,7 @@ context 初始化（业务 JFC）
 | probe/provider | pool（默认）/standalone | `pool` 使用注入的 W1 provider/poster；`standalone` 由 transport 基于本端 Context 构造 `StandaloneProbeResourceProvider` + `HandshakeProbePeerDirectory` + `UrmaProbePoster`；需要调用方注入 `ProbePeerDescriptorSource`，且仅支持 dedicated JFC |
 | probe/jfc_depth | 64 | dedicated probe JFC 深度 |
 | probe/credit_reserve | 8 | shared 模式下预留的控制 credit |
-| probe/device_filter | 空（全部非 bonding 物理口） | 字符串或字符串数组；按 native/topology 名匹配；bond 设备始终排除，有 bonding 时使用剩余非 bonding 设备，仅当没有可用非 bond 设备时失败 |
+| probe/device_filter | 空（全部非 bonding 物理口） | 字符串或字符串数组；按 native 名、`native:eidN` 或完整 topology 名匹配；只写 native 时每设备取第一个 active EID，显式 EID 可同时选同一设备的多个 EID；bond 设备始终排除，有 bonding 时使用剩余非 bonding 设备，仅当没有可用非 bond 设备时失败 |
 | probe/source_page_size | 0（系统页大小） | 0 或页对齐的整数倍；用于探测源页/本端探测区页注册 |
 | probe/test/periodic_all | false | 测试模式：定时探测全部链路；需 `probe/enabled=true`，生产禁用 |
 | probe/test/interval_ms | 5000 | 测试间隔；< `timeout_ms` 时告警，不拒绝 |

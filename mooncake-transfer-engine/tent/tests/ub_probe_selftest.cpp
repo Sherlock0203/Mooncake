@@ -819,8 +819,14 @@ int runSelftest(const Options& options) {
     } else {
         // Same-name physical ports are the intended adjacency when both sides
         // export native_device_name; discovery order is only a fallback.
+        // topology_name contains the EID, so it must win over the native name
+        // when one device exposes multiple EIDs.
+        std::map<std::string, const PeerPort*> peer_by_topology;
         std::map<std::string, const PeerPort*> peer_by_native;
         for (const auto& port : peer_ports) {
+            if (!port.topology_name.empty()) {
+                peer_by_topology.emplace(port.topology_name, &port);
+            }
             if (!port.native_device_name.empty()) {
                 peer_by_native.emplace(port.native_device_name, &port);
             }
@@ -828,14 +834,25 @@ int runSelftest(const Options& options) {
         std::set<const PeerPort*> used;
         std::vector<const StandaloneProbeResourceProvider::PortView*> unmatched;
         for (const auto& local : local_ports) {
-            if (!local.native_device_name.empty()) {
+            const PeerPort* matched = nullptr;
+            if (!local.topology_name.empty()) {
+                auto peer = peer_by_topology.find(local.topology_name);
+                if (peer != peer_by_topology.end() &&
+                    used.find(peer->second) == used.end()) {
+                    matched = peer->second;
+                }
+            }
+            if (matched == nullptr && !local.native_device_name.empty()) {
                 auto peer = peer_by_native.find(local.native_device_name);
                 if (peer != peer_by_native.end() &&
                     used.find(peer->second) == used.end()) {
-                    used.insert(peer->second);
-                    pairs.emplace_back(&local, peer->second);
-                    continue;
+                    matched = peer->second;
                 }
+            }
+            if (matched != nullptr) {
+                used.insert(matched);
+                pairs.emplace_back(&local, matched);
+                continue;
             }
             unmatched.push_back(&local);
         }
@@ -859,9 +876,9 @@ int runSelftest(const Options& options) {
         const auto& local = *pair.first;
         const auto& peer = *pair.second;
         std::cout << "probe pair: local_nic=" << local.local_nic
-                  << " native=" << local.native_device_name
+                  << " topology=" << local.topology_name
                   << " -> peer_nic=" << peer.local_nic
-                  << " native=" << peer.native_device_name << std::endl;
+                  << " topology=" << peer.topology_name << std::endl;
         ProbePeerDescriptor descriptor;
         descriptor.local_nic = local.local_nic;
         descriptor.peer_segment_id = kPeerSegmentId;
