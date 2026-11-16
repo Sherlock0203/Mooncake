@@ -25,10 +25,18 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <arpa/inet.h>
 #include <csignal>
 #include <cstdint>
+#include <cstring>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #include <cstdlib>
 #include <filesystem>
+#include <fcntl.h>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -66,7 +74,13 @@ uint64_t selftestNowNs() {
 struct Options {
     std::string node;
     std::string peer;
+    enum class Mode { kFile, kTarget, kInitiator };
+    Mode mode{Mode::kFile};
     std::string exchange_dir{"/tmp/tent_probe_selftest"};
+    std::string bind_address{"0.0.0.0"};
+    uint16_t listen_port{19090};
+    std::string target_host{"127.0.0.1"};
+    uint16_t target_port{19090};
     uint64_t duration_s{60};
     uint64_t wait_timeout_s{120};
     uint64_t test_interval_ms{5000};
@@ -88,8 +102,15 @@ struct Options {
 void usage(const char* argv0) {
     std::cout
         << "Usage: " << argv0 << " --node <name> --peer <name> [options]\n"
-        << "  --exchange-dir <dir>      shared directory for <node>.json "
-           "(default /tmp/tent_probe_selftest)\n"
+        << "  --mode <file|target|initiator>  exchange mode (default file)\n"
+        << "  --exchange-dir <dir>      file mode: shared directory for "
+           "<node>.json\n"
+        << "  --listen-port <port>      target mode: TCP listen port (default "
+           "19090)\n"
+        << "  --bind-address <addr>     target mode: bind address (default "
+           "0.0.0.0)\n"
+        << "  --target-host <host>      initiator mode: target host\n"
+        << "  --target-port <port>      initiator mode: target port\n"
         << "  --duration <sec>          run time (default 60)\n"
         << "  --wait-timeout <sec>      wait for peer JSON (default 120)\n"
         << "  --test-interval-ms <ms>  probe test cadence (default 5000)\n"
@@ -139,8 +160,32 @@ bool parseOptions(int argc, char** argv, Options& options) {
             if (!value(options.node)) return false;
         } else if (key == "--peer") {
             if (!value(options.peer)) return false;
+        } else if (key == "--mode") {
+            std::string text;
+            if (!value(text)) return false;
+            if (text == "file") {
+                options.mode = Options::Mode::kFile;
+            } else if (text == "target") {
+                options.mode = Options::Mode::kTarget;
+            } else if (text == "initiator") {
+                options.mode = Options::Mode::kInitiator;
+            } else {
+                return false;
+            }
         } else if (key == "--exchange-dir") {
             if (!value(options.exchange_dir)) return false;
+        } else if (key == "--listen-port") {
+            std::string text;
+            if (!value(text)) return false;
+            options.listen_port = static_cast<uint16_t>(std::stoul(text));
+        } else if (key == "--bind-address") {
+            if (!value(options.bind_address)) return false;
+        } else if (key == "--target-host") {
+            if (!value(options.target_host)) return false;
+        } else if (key == "--target-port") {
+            std::string text;
+            if (!value(text)) return false;
+            options.target_port = static_cast<uint16_t>(std::stoul(text));
         } else if (key == "--duration") {
             std::string text;
             if (!value(text)) return false;
@@ -271,8 +316,8 @@ class StaticPeerSource final : public ProbePeerDescriptorSource {
     std::vector<ProbePeerDescriptor> descriptors_;
 };
 
-void writeLocalJson(const std::string& path, const std::string& node,
-                    const StandaloneProbeResourceProvider& provider) {
+nlohmann::json buildLocalJson(const std::string& node,
+                              const StandaloneProbeResourceProvider& provider) {
     const auto ports = provider.portViews();
     const auto areas = provider.localAreaViews();
     std::map<Topology::NicID,
@@ -304,7 +349,12 @@ void writeLocalJson(const std::string& path, const std::string& node,
               {"uasid", port.native_jetty_uasid},
               {"token", local_area.token}}}});
     }
+    return root;
+}
 
+void writeLocalJson(const std::string& path, const std::string& node,
+                    const StandaloneProbeResourceProvider& provider) {
+    const auto root = buildLocalJson(node, provider);
     std::filesystem::create_directories(
         std::filesystem::path(path).parent_path());
     const std::string tmp = path + ".tmp";
@@ -314,6 +364,170 @@ void writeLocalJson(const std::string& path, const std::string& node,
         out << root.dump(2) << "\n";
     }
     std::filesystem::rename(tmp, path);
+}
+
+void setSocketTimeouts(int fd, uint64_t timeout_s) {
+    timeval timeout{};
+    timeout.tv_sec = static_cast<time_t>(timeout_s);
+    timeout.tv_usec = 0;
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+}
+
+bool sendAll(int fd, const void* data, size_t length) {
+    const char* cursor = static_cast<const char*>(data);
+    size_t sent = 0;
+    while (sent < length) {
+        const ssize_t rc = ::send(fd, cursor + sent, length - sent, 0);
+        if (rc > 0) {
+            sent += static_cast<size_t>(rc);
+            continue;
+        }
+        if (rc < 0 && errno == EINTR) continue;
+        return false;
+    }
+    return true;
+}
+
+bool recvAll(int fd, void* data, size_t length) {
+    char* cursor = static_cast<char*>(data);
+    size_t received = 0;
+    while (received < length) {
+        const ssize_t rc = ::recv(fd, cursor + received, length - received, 0);
+        if (rc > 0) {
+            received += static_cast<size_t>(rc);
+            continue;
+        }
+        if (rc < 0 && errno == EINTR) continue;
+        return false;
+    }
+    return true;
+}
+
+bool sendFrame(int fd, const nlohmann::json& payload) {
+    const std::string text = payload.dump();
+    if (text.size() > 4 * 1024 * 1024) return false;
+    const uint32_t length = htonl(static_cast<uint32_t>(text.size()));
+    return sendAll(fd, &length, sizeof(length)) &&
+           sendAll(fd, text.data(), text.size());
+}
+
+bool recvFrame(int fd, nlohmann::json& payload) {
+    uint32_t length = 0;
+    if (!recvAll(fd, &length, sizeof(length))) return false;
+    length = ntohl(length);
+    if (length == 0 || length > 4 * 1024 * 1024) return false;
+    std::string text(length, '\0');
+    if (!recvAll(fd, text.data(), text.size())) return false;
+    try {
+        payload = nlohmann::json::parse(text);
+    } catch (const std::exception&) {
+        return false;
+    }
+    return true;
+}
+
+int connectWithTimeout(const std::string& host, uint16_t port,
+                       uint64_t timeout_s) {
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* addresses = nullptr;
+    const std::string port_text = std::to_string(port);
+    if (getaddrinfo(host.c_str(), port_text.c_str(), &hints, &addresses) != 0) {
+        return -1;
+    }
+    int connected = -1;
+    for (addrinfo* address = addresses; address != nullptr;
+         address = address->ai_next) {
+        const int fd = ::socket(address->ai_family, address->ai_socktype,
+                                address->ai_protocol);
+        if (fd < 0) continue;
+        const int flags = fcntl(fd, F_GETFL, 0);
+        (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        int rc = ::connect(fd, address->ai_addr, address->ai_addrlen);
+        if (rc < 0 && errno == EINPROGRESS) {
+            pollfd descriptor{fd, POLLOUT, 0};
+            rc = ::poll(&descriptor, 1, static_cast<int>(timeout_s * 1000));
+            if (rc > 0) {
+                int error = 0;
+                socklen_t error_length = sizeof(error);
+                (void)getsockopt(fd, SOL_SOCKET, SO_ERROR, &error,
+                                 &error_length);
+                rc = error == 0 ? 0 : -1;
+            } else {
+                rc = -1;
+            }
+        } else {
+            rc = rc < 0 ? -1 : 0;
+        }
+        if (rc == 0) {
+            (void)fcntl(fd, F_SETFL, flags);
+            setSocketTimeouts(fd, timeout_s);
+            connected = fd;
+            break;
+        }
+        ::close(fd);
+    }
+    freeaddrinfo(addresses);
+    return connected;
+}
+
+nlohmann::json exchangeOverTcp(const nlohmann::json& local,
+                               const Options& options) {
+    nlohmann::json peer;
+    if (options.mode == Options::Mode::kTarget) {
+        int listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (listen_fd < 0) {
+            throw std::runtime_error("cannot create listen socket");
+        }
+        int reuse = 1;
+        (void)setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse,
+                         sizeof(reuse));
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_port = htons(options.listen_port);
+        if (inet_pton(AF_INET, options.bind_address.c_str(),
+                      &address.sin_addr) != 1) {
+            address.sin_addr.s_addr = htonl(INADDR_ANY);
+        }
+        if (::bind(listen_fd, reinterpret_cast<sockaddr*>(&address),
+                   sizeof(address)) != 0 ||
+            ::listen(listen_fd, 1) != 0) {
+            ::close(listen_fd);
+            throw std::runtime_error("cannot bind/listen on " +
+                                     options.bind_address + ":" +
+                                     std::to_string(options.listen_port));
+        }
+        std::cout << "target listening on " << options.bind_address << ":"
+                  << options.listen_port << std::endl;
+        pollfd descriptor{listen_fd, POLLIN, 0};
+        const int ready = ::poll(
+            &descriptor, 1, static_cast<int>(options.wait_timeout_s * 1000));
+        if (ready <= 0) {
+            ::close(listen_fd);
+            throw std::runtime_error("timed out waiting for initiator");
+        }
+        const int fd = ::accept(listen_fd, nullptr, nullptr);
+        ::close(listen_fd);
+        if (fd < 0) throw std::runtime_error("accept failed");
+        setSocketTimeouts(fd, options.wait_timeout_s);
+        const bool ok = recvFrame(fd, peer) && sendFrame(fd, local);
+        ::close(fd);
+        if (!ok) throw std::runtime_error("target exchange failed");
+    } else {
+        const int fd = connectWithTimeout(
+            options.target_host, options.target_port, options.wait_timeout_s);
+        if (fd < 0) {
+            throw std::runtime_error("cannot connect to " +
+                                     options.target_host + ":" +
+                                     std::to_string(options.target_port));
+        }
+        const bool ok = sendFrame(fd, local) && recvFrame(fd, peer);
+        ::close(fd);
+        if (!ok) throw std::runtime_error("initiator exchange failed");
+    }
+    return peer;
 }
 
 bool waitForPeerJson(const std::string& path, uint64_t timeout_s,
@@ -469,24 +683,25 @@ int runSelftest(const Options& options) {
         return 1;
     }
 
-    const std::filesystem::path exchange(options.exchange_dir);
-    const auto local_file = exchange / (options.node + ".json");
-    const auto peer_file = exchange / (options.peer + ".json");
-    try {
-        writeLocalJson(local_file.string(), options.node, *provider);
-    } catch (const std::exception& error) {
-        std::cerr << "cannot write local JSON: " << error.what() << "\n";
-        provider->shutdown();
-        adapter->shutdown();
-        return 1;
-    }
-    std::cout << "local descriptors written to " << local_file
-              << "; waiting for " << peer_file << std::endl;
-
+    const nlohmann::json local_json = buildLocalJson(options.node, *provider);
     nlohmann::json peer_json;
-    if (!waitForPeerJson(peer_file.string(), options.wait_timeout_s,
-                         peer_json)) {
-        std::cerr << "timed out waiting for peer JSON\n";
+    try {
+        if (options.mode == Options::Mode::kFile) {
+            const std::filesystem::path exchange(options.exchange_dir);
+            const auto local_file = exchange / (options.node + ".json");
+            const auto peer_file = exchange / (options.peer + ".json");
+            writeLocalJson(local_file.string(), options.node, *provider);
+            std::cout << "local descriptors written to " << local_file
+                      << "; waiting for " << peer_file << std::endl;
+            if (!waitForPeerJson(peer_file.string(), options.wait_timeout_s,
+                                 peer_json)) {
+                throw std::runtime_error("timed out waiting for peer JSON");
+            }
+        } else {
+            peer_json = exchangeOverTcp(local_json, options);
+        }
+    } catch (const std::exception& error) {
+        std::cerr << "descriptor exchange failed: " << error.what() << "\n";
         provider->shutdown();
         adapter->shutdown();
         return 1;

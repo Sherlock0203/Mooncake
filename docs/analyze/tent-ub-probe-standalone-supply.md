@@ -179,7 +179,21 @@ W1d 已实现的 11 个 `probe/*` 键保持不变；`probe/provider` 已在 P5 �
 **前提**：两端已用 real URMA 构建（`USE_UB=ON` + 有效 `URMA_LIBRARY`），
 UMDK 设备/EID 互通；bond 会被过滤，只有没有任何非 bonding 物理口时才失败。
 
-**流程**：
+**交换方式**（推荐 target/initiator，替代 scp）：
+
+```bash
+# target 端
+tent_probe_selftest --mode target --listen-port 19090 \
+  --node a --peer b --device-filter <口名> ...
+
+# initiator 端
+tent_probe_selftest --mode initiator --target-host nodeA --target-port 19090 \
+  --node b --peer a --device-filter <口名> ...
+```
+
+target 先监听，initiator 连接后双方交换同一份 JSON（4 字节长度前缀），不再依赖共享目录/文件时序。文件模式仍保留：`--mode file --exchange-dir <dir>` 或默认。
+
+**文件模式流程**：
 
 1. 两端选择一个共享目录（NFS/sshfs），或手工 scp JSON；
 2. 每端启动工具：发现物理口 → 自建 probe Context/JFC/Jetty/源页/探测区页
