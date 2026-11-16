@@ -283,6 +283,7 @@ TEST(UbProbeSchedulerTest, BackoffGrowsCapsAndResetsOnSuccess) {
     EXPECT_EQ(reports.retire_calls.size(), 1U);
 
     replace_handle(2);
+    clock.advance(kIntervalNs);
     probe = postNext(plm, token_seq, clock.now());
     ASSERT_TRUE(probe.has_value());
     // An ACK timeout carries a completion; it is a path fault too, but is
@@ -296,6 +297,7 @@ TEST(UbProbeSchedulerTest, BackoffGrowsCapsAndResetsOnSuccess) {
     EXPECT_EQ(plm.stats().probe_ack_timeout, 1U);
 
     replace_handle(3);
+    clock.advance(2 * kIntervalNs);
     probe = postNext(plm, token_seq, clock.now());
     ASSERT_TRUE(probe.has_value());
     ASSERT_TRUE(plm.onProbeCompletion(
@@ -307,6 +309,7 @@ TEST(UbProbeSchedulerTest, BackoffGrowsCapsAndResetsOnSuccess) {
 
     // Fourth failure would be 8 * interval, but backoff_max caps it at 4s.
     replace_handle(4);
+    clock.advance(4 * kIntervalNs);
     probe = postNext(plm, token_seq, clock.now());
     ASSERT_TRUE(probe.has_value());
     ASSERT_TRUE(plm.onProbeCompletion(
@@ -319,6 +322,7 @@ TEST(UbProbeSchedulerTest, BackoffGrowsCapsAndResetsOnSuccess) {
 
     // Success clears failures and backoff and stops the periodic task.
     replace_handle(5);
+    clock.advance(4 * kIntervalNs);
     probe = postNext(plm, token_seq, clock.now());
     ASSERT_TRUE(probe.has_value());
     ASSERT_TRUE(

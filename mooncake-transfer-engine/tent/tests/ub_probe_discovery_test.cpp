@@ -177,6 +177,31 @@ TEST(UbProbeDiscoveryTest, PrepareLocalThenSnapshotReusesResources) {
     EXPECT_TRUE(adapter->shutdown().ok());
 }
 
+TEST(UbProbeDiscoveryTest, ResolvesBusinessTopologyNicId) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+    StaticDirectory directory({makeEdge(100, 42, 0)});
+
+    StandaloneProbeResourceProvider provider(
+        adapter, makeProbeParams(),
+        [](const std::string& name) -> Topology::NicID {
+            return name == "ub:fake0:eid0" ? 100 : -1;
+        });
+    ASSERT_TRUE(provider.discover().ok());
+    ASSERT_EQ(provider.contexts().size(), 1U);
+    EXPECT_NE(provider.contexts().find(100), provider.contexts().end());
+    provider.setRemoteDirectory(&directory);
+
+    ProbeGraph graph;
+    ASSERT_TRUE(provider.snapshot(graph).ok());
+    ASSERT_EQ(graph.ports.size(), 1U);
+    EXPECT_EQ(graph.ports[0].local_nic, 100);
+    EXPECT_EQ(provider.portViews()[0].local_nic, 100);
+
+    ASSERT_TRUE(provider.shutdown().ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
 TEST(UbProbeDiscoveryTest, RejectsUnmatchedFilter) {
     auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
     ASSERT_TRUE(adapter->initialize().ok());

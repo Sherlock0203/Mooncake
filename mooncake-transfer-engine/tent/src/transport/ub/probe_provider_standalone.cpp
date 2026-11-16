@@ -43,12 +43,16 @@ constexpr uint32_t kProbeAreaToken = 0xACFE;
 }  // namespace
 
 StandaloneProbeResourceProvider::StandaloneProbeResourceProvider(
-    std::shared_ptr<UrmaAdapter> adapter, ProbeParams params)
+    std::shared_ptr<UrmaAdapter> adapter, ProbeParams params,
+    TopologyIdResolver topology_resolver)
     : adapter_(std::move(adapter)),
       params_(std::move(params)),
       directory_(nullptr),
+      topology_resolver_(std::move(topology_resolver)),
       owns_contexts_(true),
-      auto_discover_(true) {}
+      auto_discover_(true) {
+    maintenance_ = std::thread([this] { maintenanceLoop(); });
+}
 
 StandaloneProbeResourceProvider::StandaloneProbeResourceProvider(
     std::shared_ptr<UrmaAdapter> adapter, ProbeParams params,
@@ -63,6 +67,7 @@ StandaloneProbeResourceProvider::StandaloneProbeResourceProvider(
         state.source_generation = state.config.generation;
         ports_.push_back(std::move(state));
     }
+    maintenance_ = std::thread([this] { maintenanceLoop(); });
 }
 
 StandaloneProbeResourceProvider::~StandaloneProbeResourceProvider() {
@@ -132,9 +137,24 @@ Status StandaloneProbeResourceProvider::discoverLocked() {
     ports_.reserve(physical.size());
     for (size_t index = 0; index < physical.size(); ++index) {
         PortState port;
-        // Indices are contiguous over the selected non-bonding devices; the
-        // selftest pairs the two ends by selection order.
+        // Production resolves the business Topology NIC id so business
+        // evidence (UbPostPath.local_topology_id) and probe paths share the
+        // same key. Selftest/unit tests fall back to the discovery order.
         port.config.local_nic = static_cast<Topology::NicID>(index);
+        if (topology_resolver_) {
+            const auto resolved =
+                topology_resolver_(physical[index].topology_name);
+            if (resolved >= 0) {
+                port.config.local_nic = resolved;
+            } else {
+                LOG(WARNING)
+                    << "UB probe: device " << physical[index].native_device_name
+                    << " topology=" << physical[index].topology_name
+                    << " is not in the business topology; using "
+                       "discovery index "
+                    << index;
+            }
+        }
         port.config.generation = 1;
         port.source_generation = 1;
         port.topology_name = physical[index].topology_name;
@@ -621,30 +641,72 @@ void StandaloneProbeResourceProvider::retireProbeLane(const LaneKey& lane,
                                                       uint64_t error_epoch,
                                                       const PathVersion& path,
                                                       const Status& reason) {
+    ++retire_calls_;
+    {
+        std::lock_guard<std::mutex> lock(rebuild_mutex_);
+        if (rebuild_stopping_) return;
+        if (rebuild_queue_.size() >= 64) {
+            LOG_EVERY_N(WARNING, 100)
+                << "UB standalone probe provider: rebuild queue is full; "
+                   "dropping retire for local_nic="
+                << lane.local_nic;
+            return;
+        }
+        rebuild_queue_.push_back(
+            RetireRequest{lane, jetty_generation, error_epoch, path, reason});
+    }
+    rebuild_cv_.notify_one();
+}
+
+void StandaloneProbeResourceProvider::maintenanceLoop() {
+    for (;;) {
+        RetireRequest request;
+        {
+            std::unique_lock<std::mutex> lock(rebuild_mutex_);
+            rebuild_cv_.wait(lock, [this] {
+                return rebuild_stopping_ || !rebuild_queue_.empty();
+            });
+            if (rebuild_stopping_ && rebuild_queue_.empty()) break;
+            request = std::move(rebuild_queue_.front());
+            rebuild_queue_.pop_front();
+            rebuild_active_ = true;
+        }
+        processRetire(request);
+        {
+            std::lock_guard<std::mutex> lock(rebuild_mutex_);
+            rebuild_active_ = false;
+            if (rebuild_queue_.empty()) rebuild_idle_cv_.notify_all();
+        }
+    }
+}
+
+void StandaloneProbeResourceProvider::processRetire(
+    const RetireRequest& request) {
     std::vector<Completion> completions;
     Status rebuild_status = Status::OK();
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        ++retire_calls_;
         if (!initialized_ || shut_down_) return;
 
         auto port = std::find_if(
             ports_.begin(), ports_.end(), [&](const PortState& candidate) {
-                return candidate.config.local_nic == lane.local_nic;
+                return candidate.config.local_nic == request.lane.local_nic;
             });
         if (port == ports_.end()) {
             LOG_EVERY_N(WARNING, 100)
                 << "UB standalone probe provider: retire for unknown local "
                    "port "
-                << lane.local_nic;
+                << request.lane.local_nic;
             return;
         }
-        if (port->config.generation != jetty_generation || !port->probe_jetty ||
-            port->probe_jetty->id() != lane.native_jetty_id) {
+        if (port->config.generation != request.generation ||
+            !port->probe_jetty ||
+            port->probe_jetty->id() != request.lane.native_jetty_id) {
             LOG_EVERY_N(WARNING, 100)
                 << "UB standalone probe provider: stale lane retire ignored: "
                    "local_nic="
-                << lane.local_nic << " generation=" << jetty_generation
+                << request.lane.local_nic
+                << " generation=" << request.generation
                 << " current=" << port->config.generation;
             return;
         }
@@ -653,21 +715,24 @@ void StandaloneProbeResourceProvider::retireProbeLane(const LaneKey& lane,
                 << "UB standalone probe provider: lane retire recorded but no "
                    "completion/availability sink is configured; the lane "
                    "stays down (local_nic="
-                << lane.local_nic << ")";
+                << request.lane.local_nic << ")";
             return;
         }
 
-        rebuild_status = rebuildPortLocked(*port, error_epoch, completions);
+        rebuild_status =
+            rebuildPortLocked(*port, request.error_epoch, completions);
         if (rebuild_status.ok()) {
             LOG(INFO) << "UB standalone probe provider: rebuilt probe lane "
-                      << path.path.local_nic << "/" << path.path.segment_id
-                      << "/" << path.path.remote_nic << " generation "
-                      << jetty_generation << " -> " << port->config.generation;
+                      << request.path.path.local_nic << "/"
+                      << request.path.path.segment_id << "/"
+                      << request.path.path.remote_nic << " generation "
+                      << request.generation << " -> "
+                      << port->config.generation;
         }
     }
 
-    // Dispatch quiesced completions outside the provider lock: the sink
-    // (PLM/workers) may call back into handoffUnproven on the same thread.
+    // Dispatch quiesced completions outside the provider lock: the sink may
+    // call back into handoffUnproven on this worker thread.
     ProbeCompletionSink sink;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -687,10 +752,17 @@ void StandaloneProbeResourceProvider::retireProbeLane(const LaneKey& lane,
     if (!rebuild_status.ok()) {
         LOG_EVERY_N(ERROR, 100)
             << "UB standalone probe provider: lane rebuild failed: local_nic="
-            << lane.local_nic << " generation=" << jetty_generation
+            << request.lane.local_nic << " generation=" << request.generation
             << " status=" << rebuild_status.ToString()
-            << " reason=" << reason.ToString();
+            << " reason=" << request.reason.ToString();
     }
+}
+
+bool StandaloneProbeResourceProvider::waitForRebuilds(uint64_t timeout_ms) {
+    std::unique_lock<std::mutex> lock(rebuild_mutex_);
+    return rebuild_idle_cv_.wait_for(
+        lock, std::chrono::milliseconds(timeout_ms),
+        [this] { return rebuild_queue_.empty() && !rebuild_active_; });
 }
 
 void StandaloneProbeResourceProvider::handoffUnproven(
@@ -887,6 +959,14 @@ size_t StandaloneProbeResourceProvider::retiredPageCount() const {
 }
 
 Status StandaloneProbeResourceProvider::shutdown() {
+    {
+        std::lock_guard<std::mutex> lock(rebuild_mutex_);
+        rebuild_stopping_ = true;
+        rebuild_queue_.clear();
+    }
+    rebuild_cv_.notify_all();
+    if (maintenance_.joinable()) maintenance_.join();
+
     std::lock_guard<std::mutex> lock(mutex_);
     if (shut_down_) return Status::OK();
     Status first_error = Status::OK();
@@ -958,8 +1038,7 @@ size_t StandaloneProbeResourceProvider::quarantineCount() const {
 }
 
 uint64_t StandaloneProbeResourceProvider::retireCalls() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return retire_calls_;
+    return retire_calls_.load(std::memory_order_relaxed);
 }
 
 bool StandaloneProbeResourceProvider::initialized() const {

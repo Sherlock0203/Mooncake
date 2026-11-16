@@ -562,6 +562,15 @@ void ProbeLinkManager::onPostResult(const std::shared_ptr<ProbeRecord>& record,
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        // A timeout/shutdown may have moved the record to the orphan table
+        // before an asynchronous poster reports its result. Such a result must
+        // not release the slot, peer budget or segments a second time.
+        if (record->state == RecordState::kOrphan ||
+            record->state == RecordState::kRejected ||
+            (inflight_.find(record->token) == inflight_.end() &&
+             !record->settled.load(std::memory_order_acquire))) {
+            return;
+        }
         switch (outcome) {
             case ProbePostOutcome::kAccepted:
                 // The completion may legally have arrived before the post
@@ -1427,7 +1436,10 @@ Status ProbeLinkManager::applyEventLocked(const ProbeEvent& event,
                 if (runtime == nullptr) continue;
                 if (runtime->health == LinkHealth::kIsolated ||
                     runtime->health == LinkHealth::kRecovering) {
-                    runtime->next_probe_ns = now_ns;
+                    // Do not pull an existing backoff earlier: a rebuild must
+                    // not turn a bad path into a rebuild/probe storm.
+                    runtime->next_probe_ns =
+                        std::max(runtime->next_probe_ns, now_ns);
                 }
             }
             effects.bump = true;
@@ -1457,8 +1469,10 @@ Status ProbeLinkManager::applyEventLocked(const ProbeEvent& event,
                 (runtime->health == LinkHealth::kIsolated ||
                  runtime->health == LinkHealth::kRecovering)) {
                 // In-flight records for this version are stale via area_epoch;
-                // the periodic task resumes immediately on the new page.
-                runtime->next_probe_ns = now_ns;
+                // the periodic task resumes on the new page, but never earlier
+                // than an already scheduled backoff.
+                runtime->next_probe_ns =
+                    std::max(runtime->next_probe_ns, now_ns);
             }
             effects.bump = true;
             return Status::OK();

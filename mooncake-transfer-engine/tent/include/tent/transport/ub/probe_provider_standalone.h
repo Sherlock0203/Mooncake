@@ -33,11 +33,15 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "tent/common/status.h"
@@ -74,11 +78,16 @@ class ProbePeerDirectory {
 // threads.
 class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
    public:
+    // Maps a probe device's topology_name to the business Topology NIC id.
+    // Without a resolver (selftest/unit tests) the discovery index is used.
+    using TopologyIdResolver =
+        std::function<Topology::NicID(const std::string& topology_name)>;
     // Self-owned mode (v1.7): discovers non-bonding physical devices, opens
     // probe-only Contexts and creates JFC/Jetty/pages. The remote directory is
     // attached with setRemoteDirectory() after discover().
     StandaloneProbeResourceProvider(std::shared_ptr<UrmaAdapter> adapter,
-                                    ProbeParams params);
+                                    ProbeParams params,
+                                    TopologyIdResolver topology_resolver = {});
     // Injected mode: used by unit tests and the legacy pool seam.
     StandaloneProbeResourceProvider(std::shared_ptr<UrmaAdapter> adapter,
                                     ProbeParams params,
@@ -127,8 +136,12 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
     void handoffUnproven(const ProbeHandoff& handoff) override;
 
     // Releases every local probe resource. Idempotent; must run before the
-    // owning contexts are shut down.
+    // owning contexts are shut down. Stops the maintenance thread first.
     Status shutdown();
+
+    // Waits until every queued lane rebuild has been processed. Intended for
+    // tests and orderly handoff; production callers rely on the async worker.
+    bool waitForRebuilds(uint64_t timeout_ms = 5000);
 
     // Interface 7 sink (ProbeLinkManager) and interface-2 completion sink
     // (workers dispatcher). Both are required before a lane can be rebuilt.
@@ -188,6 +201,14 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
         uint64_t area_epoch{0};
     };
 
+    struct RetireRequest {
+        LaneKey lane;
+        uint64_t generation{0};
+        uint64_t error_epoch{0};
+        PathVersion path;
+        Status reason;
+    };
+
     struct RetiredPage {
         LocalSegmentPtr segment;
         void* memory{nullptr};
@@ -195,6 +216,8 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
         uint64_t generation{0};
     };
 
+    void maintenanceLoop();
+    void processRetire(const RetireRequest& request);
     Status discoverLocked();
     uint32_t probeDepth(const PortState& port) const;
     Status createLocalResourcesLocked();
@@ -213,10 +236,18 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
     Status emitHandleReplacedLocked(const ProbePortSupply& supply);
 
     mutable std::mutex mutex_;
+    std::thread maintenance_;
+    std::mutex rebuild_mutex_;
+    std::condition_variable rebuild_cv_;
+    std::condition_variable rebuild_idle_cv_;
+    std::deque<RetireRequest> rebuild_queue_;
+    bool rebuild_stopping_{false};
+    bool rebuild_active_{false};
     const std::shared_ptr<UrmaAdapter> adapter_;
     const ProbeParams params_;
     std::vector<PortState> ports_;
     ProbePeerDirectory* directory_;
+    const TopologyIdResolver topology_resolver_;
     bool owns_contexts_{false};
     bool auto_discover_{false};
     std::vector<ProbeHandoff> quarantine_;
@@ -225,7 +256,7 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
     ProbeCompletionSink completion_sink_;
     uint64_t graph_epoch_{0};
     uint64_t event_seq_{0};
-    uint64_t retire_calls_{0};
+    std::atomic<uint64_t> retire_calls_{0};
     uint64_t next_graph_epoch_{1};
     bool resources_ready_{false};
     bool initialized_{false};
