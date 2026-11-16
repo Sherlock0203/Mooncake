@@ -277,8 +277,10 @@ struct ProbeParams {
     uint32_t recover_success_threshold{1};
     ProbeJfcMode jfc_mode{ProbeJfcMode::kDedicated};
     ProbeProviderKind provider{ProbeProviderKind::kPool};
-    // Self-owned probe resources (standalone): empty = all non-bonding
-    // physical devices; entries match native_device_name or topology_name.
+    // Self-owned probe resources (standalone): empty = all active EIDs of all
+    // non-bonding physical devices; entries match native_device_name,
+    // topology_name, or native:eidN. A native-only entry selects every active
+    // EID of that device; an explicit EID entry selects exactly that EID.
     std::vector<std::string> device_filter;
     // 0 = system page size; otherwise a page-aligned multiple.
     uint64_t source_page_size{0};

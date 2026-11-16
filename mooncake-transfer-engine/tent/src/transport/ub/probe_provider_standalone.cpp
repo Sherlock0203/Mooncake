@@ -79,6 +79,26 @@ Status StandaloneProbeResourceProvider::discover() {
     return discoverLocked();
 }
 
+namespace {
+
+std::string shortEidName(const DeviceInfo& device) {
+    return device.native_device_name + ":eid" +
+           std::to_string(device.eid_index);
+}
+
+bool matchesProbeFilter(const DeviceInfo& device,
+                        const std::vector<std::string>& filter) {
+    if (filter.empty()) return true;
+    const std::string short_name = shortEidName(device);
+    return std::find(filter.begin(), filter.end(), device.native_device_name) !=
+               filter.end() ||
+           std::find(filter.begin(), filter.end(), device.topology_name) !=
+               filter.end() ||
+           std::find(filter.begin(), filter.end(), short_name) != filter.end();
+}
+
+}  // namespace
+
 Status StandaloneProbeResourceProvider::discoverLocked() {
     if (shut_down_) {
         return Status::InvalidArgument(
@@ -101,30 +121,15 @@ Status StandaloneProbeResourceProvider::discoverLocked() {
         return Status::DeviceNotFound("no URMA device is available for probe");
     }
     std::vector<DeviceInfo> physical;
-    std::set<std::string> seen_devices;
     for (auto& device : devices) {
         if (!device.active) continue;
         // Bonding devices are always excluded: probe uses a physical port
         // directly and never shares the bond provider's device.
         if (isBondingDevice(device)) continue;
-        const bool selected =
-            params_.device_filter.empty() ||
-            std::find(params_.device_filter.begin(),
-                      params_.device_filter.end(), device.native_device_name) !=
-                params_.device_filter.end() ||
-            std::find(params_.device_filter.begin(),
-                      params_.device_filter.end(),
-                      device.topology_name) != params_.device_filter.end();
-        if (!selected) continue;
-        // With an explicit filter a topology_name selects one EID; without a
-        // filter keep one probe port per physical device (the first active
-        // EID). A native-name filter also selects the first active EID.
-        if (!seen_devices.insert(device.native_device_name).second &&
-            std::find(params_.device_filter.begin(),
-                      params_.device_filter.end(),
-                      device.topology_name) == params_.device_filter.end()) {
-            continue;
-        }
+        if (!matchesProbeFilter(device, params_.device_filter)) continue;
+        // Empty filter or a native-only entry selects every active EID of the
+        // matching device(s). A native:eidN / topology entry selects exactly
+        // that EID (and can coexist with other EIDs of the same device).
         physical.push_back(std::move(device));
     }
     if (physical.empty()) {

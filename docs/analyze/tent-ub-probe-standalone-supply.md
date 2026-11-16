@@ -178,6 +178,9 @@ W1d 已实现的 11 个 `probe/*` 键保持不变；`probe/provider` 已在 P5 �
 
 **前提**：两端已用 real URMA 构建（`USE_UB=ON` + 有效 `URMA_LIBRARY`），
 UMDK 设备/EID 互通；bond 会被过滤，只有没有任何非 bonding 物理口时才失败。
+`--list-devices` 会列出每个设备的全部 EID（`topology=...:eidN`）；`--device-filter`
+支持 `<native>`、`<native>:eidN` 和完整 `topology_name`。只写 native 时枚举该设备全部
+active EID；显式 EID 只选该 EID，配对优先按 `topology_name`（含 EID）。
 
 **交换方式**（推荐 target/initiator，替代 scp）：
 
@@ -199,18 +202,18 @@ target 先监听，initiator 连接后双方交换同一份 JSON（4 字节长�
 2. 每端启动工具：发现物理口 → 自建 probe Context/JFC/Jetty/源页/探测区页
    → 写 `<node>.json`（area descriptor/token/epoch + probe jetty id/uasid/eid）
    → 等 `<peer>.json`；
-3. 读到对端 JSON 后按 `local_nic` 配对，import 对端探测页，启动 PLM +
-   scheduler + probe JFC poll 线程；
+3. 读到对端 JSON 后按 `topology_name`（优先，含 EID）/ native 名配对，import
+   对端探测页，启动 PLM + scheduler + probe JFC poll 线程；
 4. 测试模式按 `--test-interval-ms` 定时探测全部链路。
 
 ```bash
 # 节点 A
 tent_probe_selftest --node a --peer b --exchange-dir /shared \
-  --device-filter <物理口名> --test-interval-ms 5000 --apply-health=false
+  --device-filter <物理口名或 native:eidN> --test-interval-ms 5000 --apply-health=false
 
 # 节点 B
 tent_probe_selftest --node b --peer a --exchange-dir /shared \
-  --device-filter <物理口名> --test-interval-ms 5000 --apply-health=false
+  --device-filter <物理口名或 native:eidN> --test-interval-ms 5000 --apply-health=false
 ```
 
 **预期输出**：

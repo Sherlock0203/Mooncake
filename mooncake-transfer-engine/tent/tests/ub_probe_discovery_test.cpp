@@ -202,6 +202,81 @@ TEST(UbProbeDiscoveryTest, ResolvesBusinessTopologyNicId) {
     EXPECT_TRUE(adapter->shutdown().ok());
 }
 
+TEST(UbProbeDiscoveryTest, DiscoversAllEidsWithoutFilter) {
+    auto eid0 = fakeDevice();
+    auto eid1 = fakeDevice();
+    eid1.eid_index = 1;
+    eid1.eid = "0001:0000:0000:0000:0000:0000:0000:0001";
+    eid1.topology_name = "ub:fake0:eid1";
+    auto adapter = std::make_shared<FakeUrmaAdapter>(eid0);
+    adapter->setDiscoveredDevices({eid0, eid1});
+    ASSERT_TRUE(adapter->initialize().ok());
+
+    StandaloneProbeResourceProvider provider(adapter, makeProbeParams());
+    ASSERT_TRUE(provider.discover().ok());
+    ASSERT_TRUE(provider.prepareLocal().ok());
+    const auto views = provider.portViews();
+    ASSERT_EQ(views.size(), 2U);
+    EXPECT_EQ(views[0].topology_name, "ub:fake0:eid0");
+    EXPECT_EQ(views[1].topology_name, "ub:fake0:eid1");
+
+    ASSERT_TRUE(provider.shutdown().ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
+TEST(UbProbeDiscoveryTest, NativeFilterSelectsAllEids) {
+    auto eid0 = fakeDevice();
+    auto eid1 = fakeDevice();
+    eid1.eid_index = 1;
+    eid1.eid = "0001:0000:0000:0000:0000:0000:0000:0001";
+    eid1.topology_name = "ub:fake0:eid1";
+    auto adapter = std::make_shared<FakeUrmaAdapter>(eid0);
+    adapter->setDiscoveredDevices({eid0, eid1});
+    ASSERT_TRUE(adapter->initialize().ok());
+
+    auto params = makeProbeParams();
+    params.device_filter = {"fake0"};
+    StandaloneProbeResourceProvider provider(adapter, params);
+    ASSERT_TRUE(provider.discover().ok());
+    ASSERT_TRUE(provider.prepareLocal().ok());
+    const auto views = provider.portViews();
+    ASSERT_EQ(views.size(), 2U);
+    EXPECT_EQ(views[0].topology_name, "ub:fake0:eid0");
+    EXPECT_EQ(views[1].topology_name, "ub:fake0:eid1");
+
+    ASSERT_TRUE(provider.shutdown().ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
+TEST(UbProbeDiscoveryTest, SelectsExplicitEid) {
+    auto eid0 = fakeDevice();
+    auto eid1 = fakeDevice();
+    eid1.eid_index = 1;
+    eid1.eid = "0001:0000:0000:0000:0000:0000:0000:0001";
+    eid1.topology_name = "ub:fake0:eid1";
+    auto adapter = std::make_shared<FakeUrmaAdapter>(eid0);
+    adapter->setDiscoveredDevices({eid0, eid1});
+    ASSERT_TRUE(adapter->initialize().ok());
+
+    auto params = makeProbeParams();
+    params.device_filter = {"fake0:eid1"};
+    StaticDirectory directory({makeEdge(0, 42, 0)});
+    StandaloneProbeResourceProvider provider(adapter, params);
+    ASSERT_TRUE(provider.discover().ok());
+    provider.setRemoteDirectory(&directory);
+
+    ProbeGraph graph;
+    ASSERT_TRUE(provider.snapshot(graph).ok());
+    ASSERT_EQ(graph.ports.size(), 1U);
+    const auto views = provider.portViews();
+    ASSERT_EQ(views.size(), 1U);
+    EXPECT_EQ(views[0].topology_name, "ub:fake0:eid1");
+    EXPECT_EQ(views[0].device_eid, eid1.eid);
+
+    ASSERT_TRUE(provider.shutdown().ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
 TEST(UbProbeDiscoveryTest, RejectsUnmatchedFilter) {
     auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
     ASSERT_TRUE(adapter->initialize().ok());
