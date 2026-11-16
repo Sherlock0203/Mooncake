@@ -195,11 +195,12 @@ struct UbTransport::Impl {
 
         // RM Legacy capability gate: every selectable device must be a
         // trusted PHYSICAL device whose provider capabilities pass the
-        // LocalSendProfile derivation (RM transport mode, RM/RTP support,
+        // LocalSendProfile derivation (RM transport mode, RM/CTP support,
         // priority bind mask). The gate runs before any native resource
         // (context, JFC, Jetty) is created and fails closed with
         // NotImplemented; there is never a silent fallback to RC or bonding.
         uint32_t rm_capability_bind_tp_type_mask = 0;
+        uint8_t rm_capability_priority = ub::JettyOptions{}.priority;
         if (runtime_mode == ub::UbRuntimeMode::kRmLegacy) {
             for (const auto& [name, device] : by_topology_name) {
                 if (preferred_topology_names.find(device.topology_name) ==
@@ -226,6 +227,7 @@ struct UbTransport::Impl {
                         profile_status.ToString() + LOC_MARK));
                 }
                 rm_capability_bind_tp_type_mask = profile.bind_tp_type_mask;
+                rm_capability_priority = profile.priority;
             }
         }
 
@@ -341,6 +343,7 @@ struct UbTransport::Impl {
             jetty_options.trans_mode = ub::kUrmaTransportModeRm;
             jetty_options.bind_tp_type_mask =
                 rm_capability_bind_tp_type_mask;
+            jetty_options.priority = rm_capability_priority;
         }
         for (const auto& context : contexts) {
             const auto& device_caps = context->deviceInfo().capabilities;

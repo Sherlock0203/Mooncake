@@ -481,9 +481,9 @@ Status UbEndpoint::bindRm(const UbBootstrapDesc& peer,
             target.target_epoch != peer.endpoint_generation ||
             target.profile.trans_mode != kUrmaTransportModeRm ||
             target.profile.target_type != kUrmaTargetTypeJetty ||
-            target.profile.tp_type != kUrmaTpTypeRtp) {
+            target.profile.tp_type != kUrmaTpTypeCtp) {
             return failLocked(Status::InvalidArgument(
-                "Peer RM target descriptor violates the RM/RTP profile "
+                "Peer RM target descriptor violates the RM/CTP profile "
                 "contract" LOC_MARK));
         }
     }
@@ -639,7 +639,7 @@ Status UbEndpoint::makeBootstrapDescV2(const std::string& segment_name,
         target.target_epoch = generation_;
         target.profile.trans_mode = jetty_options_.trans_mode;
         target.profile.target_type = kUrmaTargetTypeJetty;
-        target.profile.tp_type = kUrmaTpTypeRtp;
+        target.profile.tp_type = kUrmaTpTypeCtp;
         rm.targets.push_back(std::move(target));
     }
     output.rm = std::move(rm);

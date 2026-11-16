@@ -106,8 +106,8 @@ Status validateV2(const UbBootstrapDesc& desc) {
         if (target.profile.target_type != kUrmaTargetTypeJetty) {
             return invalidBootstrap("target type must be URMA_JETTY");
         }
-        if (target.profile.tp_type != kUrmaTpTypeRtp) {
-            return invalidBootstrap("target tp_type must be URMA_RTP");
+        if (target.profile.tp_type != kUrmaTpTypeCtp) {
+            return invalidBootstrap("target tp_type must be URMA_CTP");
         }
         if (!target_identities.insert(target.target_identity).second) {
             return invalidBootstrap("duplicate target identity");

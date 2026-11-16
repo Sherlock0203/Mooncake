@@ -85,7 +85,9 @@ inline constexpr uint8_t kUrmaMaxPriority = 15;
 inline constexpr size_t kUrmaPriorityCount = 16;
 inline constexpr uint8_t kUrmaTargetTypeJetty = 1;
 inline constexpr uint8_t kUrmaTpTypeRtp = 0;
+inline constexpr uint8_t kUrmaTpTypeCtp = 1;
 inline constexpr uint32_t kUrmaTpTypeRtpMask = 1U << kUrmaTpTypeRtp;
+inline constexpr uint32_t kUrmaTpTypeCtpMask = 1U << kUrmaTpTypeCtp;
 // Default receive-side JFR token shared by the RC and RM import paths.
 inline constexpr uint32_t kUrmaJfrDefaultToken = 0xACFE;
 
@@ -147,14 +149,31 @@ inline Status buildLocalSendProfile(const DeviceInfo& device, int64_t priority,
     if ((capabilities.rm_tp_cap & kUrmaTpTypeRtpMask) == 0) {
         return Status::InvalidArgument("URMA RM capability does not include RTP");
     }
-    const uint32_t bind_tp_type_mask =
-        capabilities.priority_tp_type_masks[static_cast<size_t>(priority)];
-    if ((bind_tp_type_mask & kUrmaTpTypeRtpMask) == 0) {
-        return Status::InvalidArgument(
-            "URMA JFS priority does not support the remote RTP target");
+    // RM over CTR: rm_tp_cap is advisory here  because some providers leave it
+    // zero while still exposing CPT in the per-priority table.
+    // the per-priority bind mask is the authoritative local signal.
+    uint8_t selected_priority = static_cast<uint8_t>(priority);
+    uint32_t bind_tp_type_mask = capabilities.priority_tp_type_masks[static_cast
+        <size_t>(selected_priority)];
+    if ((bind_tp_type_mask & kUrmaTpTypeCtpMask) == 0) {
+        bool ctp_priority_found = false;
+        for (uint8_t candidate = 0; candidate < kUrmaPriorityCount; ++candidate) {
+            const uint32_t candidate_mask = capabilities.priority_tp_type_masks[candidate];
+            if ((candidate_mask & kUrmaTpTypeCtpMask)!=0) {
+                selected_priority = candidate;
+                bind_tp_type_mask = candidate_mask;
+                ctp_priority_found = true;
+                break;
+            }
+        }
+        if (!ctp_priority_found) {
+            return Status::InvalidArgument(
+                "URMA JFS priority does not support the remote CTP target");
+        }
     }
+
     LocalSendProfile profile;
-    profile.priority = static_cast<uint8_t>(priority);
+    profile.priority = selected_priority;
     profile.bind_tp_type_mask = bind_tp_type_mask;
     profile.local_capabilities = capabilities;
     output = profile;
@@ -273,7 +292,7 @@ struct JettyOptions {
     uint8_t max_sge = 1;
     uint8_t rnr_retry = 7;
     uint8_t error_timeout = 17;
-    // RM Legacy: drives the native JFS transport mode and the RTP bind mask.
+    // RM Legacy: drives the native JFS transport mode and the CTP bind mask.
     // Both are derived from the trusted LocalSendProfile at install time and
     // are never taken from peer-supplied bootstrap fields. Defaults keep the
     // RC legacy creation path unchanged.

@@ -51,8 +51,8 @@ static_assert(kUrmaTransportModeUm == URMA_TM_UM);
 static_assert(kUrmaMaxPriority == URMA_MAX_PRIORITY);
 static_assert(kUrmaPriorityCount == URMA_MAX_PRIORITY_CNT);
 static_assert(kUrmaTargetTypeJetty == URMA_JETTY);
-static_assert(kUrmaTpTypeRtp == URMA_RTP);
-static_assert(kUrmaTpTypeRtpMask == (1U << URMA_RTP));
+static_assert(kUrmaTpTypeCtp == URMA_CTP);
+static_assert(kUrmaTpTypeCtpMask == (1U << URMA_CTP));
 #endif
 
 constexpr char kUnavailableMessage[] =
@@ -703,9 +703,9 @@ class RealJetty final : public Jetty {
             // address imported targets whose tp_type is covered by the
             // provider-derived bind mask carried in the LocalSendProfile.
             // The native post remains the final fence.
-            if ((options.bind_tp_type_mask & kUrmaTpTypeRtpMask) == 0) {
+            if ((options.bind_tp_type_mask & kUrmaTpTypeCtpMask) == 0) {
                 return Status::InvalidArgument(
-                    "RM JFS bind mask does not cover URMA_RTP");
+                    "RM JFS bind mask does not cover URMA_CTP");
             }
         }
         urma_jetty_cfg_t config{};
@@ -1589,11 +1589,11 @@ class RealUrmaAdapter final : public UrmaAdapter {
             return Status::InvalidArgument(
                 "RM target Jetty ID must be non-zero");
         }
-        // Fail closed on any profile outside the verified RM/RTP contract.
+        // Fail closed on any profile outside the verified RM/CTP contract.
         if (trans_mode != URMA_TM_RM || target_type != URMA_JETTY ||
-            tp_type != URMA_RTP) {
+            tp_type != URMA_CTP) {
             return Status::InvalidArgument(
-                "RM target profile must be URMA_TM_RM/URMA_JETTY/URMA_RTP");
+                "RM target profile must be URMA_TM_RM/URMA_JETTY/URMA_CTP");
         }
         urma_eid_t remote_eid{};
         if (!parseEid(eid, remote_eid) || isAllZero(remote_eid)) {
@@ -1606,7 +1606,7 @@ class RealUrmaAdapter final : public UrmaAdapter {
         descriptor.jetty_id.id = id;
         descriptor.trans_mode = URMA_TM_RM;
         descriptor.type = URMA_JETTY;
-        descriptor.tp_type = URMA_RTP;
+        descriptor.tp_type = URMA_CTP;
 
         // The import token mirrors the receive-side JFR default; the UASID
         // contract itself is decided by the selected provider and validated

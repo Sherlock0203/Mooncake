@@ -51,7 +51,7 @@ T ubBootstrapJsonUnsigned(const nlohmann::json& j, const char* key) {
 struct UbRemoteTargetProfile {
     uint16_t trans_mode = ub::kUrmaTransportModeRm;
     uint8_t target_type = ub::kUrmaTargetTypeJetty;
-    uint8_t tp_type = ub::kUrmaTpTypeRtp;
+    uint8_t tp_type = ub::kUrmaTpTypeCtp;
 };
 
 inline void to_json(nlohmann::json& j, const UbRemoteTargetProfile& profile) {
