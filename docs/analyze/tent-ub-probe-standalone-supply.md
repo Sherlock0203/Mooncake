@@ -179,8 +179,8 @@ W1d 已实现的 11 个 `probe/*` 键保持不变；`probe/provider` 已在 P5 �
 **前提**：两端已用 real URMA 构建（`USE_UB=ON` + 有效 `URMA_LIBRARY`），
 UMDK 设备/EID 互通；bond 会被过滤，只有没有任何非 bonding 物理口时才失败。
 `--list-devices` 会列出每个设备的全部 EID（`topology=...:eidN`）；`--device-filter`
-支持 `<native>`、`<native>:eidN` 和完整 `topology_name`。只写 native 时每设备取第一个
-active EID；显式 EID 可同时选同一设备的多个 EID，配对优先按 `topology_name`（含 EID）。
+支持 `<native>`、`<native>:eidN` 和完整 `topology_name`。只写 native 时枚举该设备全部
+active EID；显式 EID 只选该 EID，配对优先按 `topology_name`（含 EID）。
 
 **交换方式**（推荐 target/initiator，替代 scp）：
 

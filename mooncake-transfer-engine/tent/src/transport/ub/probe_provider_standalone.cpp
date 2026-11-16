@@ -97,14 +97,6 @@ bool matchesProbeFilter(const DeviceInfo& device,
            std::find(filter.begin(), filter.end(), short_name) != filter.end();
 }
 
-bool explicitlySelectsEid(const DeviceInfo& device,
-                          const std::vector<std::string>& filter) {
-    const std::string short_name = shortEidName(device);
-    return std::find(filter.begin(), filter.end(), device.topology_name) !=
-               filter.end() ||
-           std::find(filter.begin(), filter.end(), short_name) != filter.end();
-}
-
 }  // namespace
 
 Status StandaloneProbeResourceProvider::discoverLocked() {
@@ -129,21 +121,15 @@ Status StandaloneProbeResourceProvider::discoverLocked() {
         return Status::DeviceNotFound("no URMA device is available for probe");
     }
     std::vector<DeviceInfo> physical;
-    std::set<std::string> seen_devices;
     for (auto& device : devices) {
         if (!device.active) continue;
         // Bonding devices are always excluded: probe uses a physical port
         // directly and never shares the bond provider's device.
         if (isBondingDevice(device)) continue;
         if (!matchesProbeFilter(device, params_.device_filter)) continue;
-        // Keep one probe port per physical device by default (the first active
-        // EID). A filter entry that names the EID explicitly (topology_name or
-        // native:eidN) keeps that EID even when the native device is already
-        // represented, so multiple EIDs of one device can be selected.
-        if (!seen_devices.insert(device.native_device_name).second &&
-            !explicitlySelectsEid(device, params_.device_filter)) {
-            continue;
-        }
+        // Empty filter or a native-only entry selects every active EID of the
+        // matching device(s). A native:eidN / topology entry selects exactly
+        // that EID (and can coexist with other EIDs of the same device).
         physical.push_back(std::move(device));
     }
     if (physical.empty()) {
