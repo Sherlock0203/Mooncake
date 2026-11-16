@@ -34,8 +34,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "tent/common/status.h"
@@ -72,6 +74,12 @@ class ProbePeerDirectory {
 // threads.
 class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
    public:
+    // Self-owned mode (v1.7): discovers non-bonding physical devices, opens
+    // probe-only Contexts and creates JFC/Jetty/pages. The remote directory is
+    // attached with setRemoteDirectory() after discover().
+    StandaloneProbeResourceProvider(std::shared_ptr<UrmaAdapter> adapter,
+                                    ProbeParams params);
+    // Injected mode: used by unit tests and the legacy pool seam.
     StandaloneProbeResourceProvider(std::shared_ptr<UrmaAdapter> adapter,
                                     ProbeParams params,
                                     std::vector<ProbeLocalPortConfig> ports,
@@ -82,6 +90,22 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
         delete;
     StandaloneProbeResourceProvider& operator=(
         const StandaloneProbeResourceProvider&) = delete;
+
+    // Discovers the probe physical ports (bond devices are filtered out) and
+    // opens one probe Context per port. Idempotent.
+    Status discover();
+
+    // Creates JFC/Jetty/source page/local area page without building the graph.
+    // Used by the two-node selftest to publish the local identity before the
+    // peer descriptors are available. snapshot() reuses these resources.
+    Status prepareLocal();
+
+    // Probe-local Contexts keyed by the stable local port index; used to build
+    // the remote directory.
+    [[nodiscard]] std::map<Topology::NicID, ContextPtr> contexts() const;
+
+    // Attaches the remote descriptor source before snapshot().
+    void setRemoteDirectory(ProbePeerDirectory* directory);
 
     // Interface 4: creates the local resources once and returns the full
     // graph. A second call after success is rejected; a failed call rolls back
@@ -119,6 +143,9 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
         uint64_t source_length{0};
         uint64_t source_generation{0};
         bool owns_jfc{false};
+        uint32_t native_jetty_uasid{0};
+        std::string device_eid;
+        std::string topology_name;
     };
 
     // Local probe area page: the page peers write their 1-byte probes into.
@@ -144,6 +171,8 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
    private:
     struct PortState {
         ProbeLocalPortConfig config;
+        std::string topology_name;
+        bool available{true};
         JfcPtr probe_jfc;
         bool owns_jfc{false};
         JettyPtr probe_jetty;
@@ -164,6 +193,11 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
         uint64_t generation{0};
     };
 
+    Status discoverLocked();
+    Status createLocalResourcesLocked();
+    Status validatePageSizeLocked() const;
+    size_t pageSize() const;
+
     Status createPortLocked(PortState& port);
     Status destroyPortLocked(PortState& port);
     void rollbackPortsLocked();
@@ -179,7 +213,9 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
     const std::shared_ptr<UrmaAdapter> adapter_;
     const ProbeParams params_;
     std::vector<PortState> ports_;
-    ProbePeerDirectory* const directory_;
+    ProbePeerDirectory* directory_;
+    bool owns_contexts_{false};
+    bool auto_discover_{false};
     std::vector<ProbeHandoff> quarantine_;
     std::vector<RetiredPage> retired_pages_;
     ProbeAvailabilitySink* availability_sink_{nullptr};
@@ -188,6 +224,7 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
     uint64_t event_seq_{0};
     uint64_t retire_calls_{0};
     uint64_t next_graph_epoch_{1};
+    bool resources_ready_{false};
     bool initialized_{false};
     bool shut_down_{false};
 };

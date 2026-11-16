@@ -60,6 +60,11 @@ TEST(UbParamsTest, ParsesProbeConfigAndRejectsIllegalValues) {
     EXPECT_EQ(params.probe.recover_success_threshold, 1U);
     EXPECT_EQ(params.probe.jfc_mode, ProbeJfcMode::kDedicated);
     EXPECT_EQ(params.probe.provider, ProbeProviderKind::kPool);
+    EXPECT_TRUE(params.probe.device_filter.empty());
+    EXPECT_EQ(params.probe.source_page_size, 0U);
+    EXPECT_FALSE(params.probe.test_periodic_all);
+    EXPECT_EQ(params.probe.test_interval_ms, 5000U);
+    EXPECT_TRUE(params.probe.test_apply_health);
     EXPECT_EQ(params.probe.jfc_depth, 64U);
     EXPECT_EQ(params.probe.credit_reserve, 8U);
 
@@ -92,6 +97,21 @@ TEST(UbParamsTest, ParsesProbeConfigAndRejectsIllegalValues) {
     ASSERT_TRUE(UbParams::FromConfig(standalone, params).ok());
     EXPECT_EQ(params.probe.provider, ProbeProviderKind::kStandalone);
 
+    Config test_mode;
+    test_mode.set("transports/ub/probe/enabled", true);
+    test_mode.set("transports/ub/probe/test/periodic_all", true);
+    test_mode.set("transports/ub/probe/test/interval_ms", 2000);
+    test_mode.set("transports/ub/probe/test/apply_health", false);
+    test_mode.set("transports/ub/probe/device_filter", "fake0");
+    test_mode.set("transports/ub/probe/source_page_size", 8192);
+    ASSERT_TRUE(UbParams::FromConfig(test_mode, params).ok());
+    EXPECT_TRUE(params.probe.test_periodic_all);
+    EXPECT_EQ(params.probe.test_interval_ms, 2000U);
+    EXPECT_FALSE(params.probe.test_apply_health);
+    ASSERT_EQ(params.probe.device_filter.size(), 1U);
+    EXPECT_EQ(params.probe.device_filter[0], "fake0");
+    EXPECT_EQ(params.probe.source_page_size, 8192U);
+
     auto expect_invalid = [](const std::string& key, const json& value) {
         Config config;
         config.set(key, value);
@@ -110,6 +130,11 @@ TEST(UbParamsTest, ParsesProbeConfigAndRejectsIllegalValues) {
     expect_invalid("transports/ub/probe/stop_on_recovery", false);
     expect_invalid("transports/ub/probe/recover_success_threshold", 2);
     expect_invalid("transports/ub/probe/provider", "bogus");
+    expect_invalid("transports/ub/probe/test/periodic_all", "yes");
+    expect_invalid("transports/ub/probe/test/interval_ms", 0);
+    expect_invalid("transports/ub/probe/test/apply_health", 1);
+    expect_invalid("transports/ub/probe/source_page_size", -1);
+    expect_invalid("transports/ub/probe/device_filter", 42);
     expect_invalid("transports/ub/probe/provider", 1);
     expect_invalid("transports/ub/probe/jfc_mode", "bogus");
     expect_invalid("transports/ub/probe/jfc_mode", 1);
@@ -137,6 +162,8 @@ TEST(UbParamsTest, ParsesProbeConfigAndRejectsIllegalValues) {
                         "transports/ub/probe/credit_reserve", 0);
     expect_pair_invalid("transports/ub/probe/provider", "standalone",
                         "transports/ub/probe/jfc_mode", "shared");
+    expect_pair_invalid("transports/ub/probe/test/periodic_all", true,
+                        "transports/ub/probe/enabled", false);
 }
 
 Request makeRequest(size_t length) {

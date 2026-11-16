@@ -101,6 +101,9 @@ struct ProbeRecord {
     LocalSegmentPtr source;
     RemoteSegmentPtr area;
     uint32_t credit{0};
+    // Periodic test-mode probe (probe/test/periodic_all): settlement can skip
+    // health application and never applies exponential backoff.
+    bool test_probe{false};
 };
 
 // One schedulable probe computed by pendingActions() (design §8.1). The handles
@@ -113,6 +116,7 @@ struct ProbeAction {
     uint64_t jetty_generation{0};
     uint64_t area_epoch{0};
     uint64_t due_ns{0};
+    bool test{false};
     JettyPtr probe_jetty;
     RemoteJettyRef remote_jetty;
     LocalSegmentPtr source_segment;
@@ -276,6 +280,9 @@ class ProbeLinkManager final : public ProbeAvailabilitySink {
         uint64_t inflight_seq{0};
         uint64_t backoff_ns{0};
         uint64_t next_probe_ns{0};
+        // Test-mode cadence (probe/test/periodic_all); independent of health
+        // and backoff.
+        uint64_t test_due_ns{0};
         TaskState task{TaskState::kIdle};
         bool pending{false};
         PendingReason pending_reason{PendingReason::kNone};
@@ -356,6 +363,10 @@ class ProbeLinkManager final : public ProbeAvailabilitySink {
                    uint64_t now_ns) const;
     bool schedulableLocked(const PathVersion& version,
                            const PathRuntime& runtime, uint64_t now_ns) const;
+    bool testEligibleLocked(const PathRuntime& runtime,
+                            uint64_t now_ns) const;
+    bool testSchedulableLocked(const PathRuntime& runtime,
+                               uint64_t now_ns) const;
     bool peerBudgetAvailableLocked(const ProbePeerKey& peer) const;
     ProbeAction makeActionLocked(const PortRuntime& port,
                                  const PathVersion& version,
@@ -369,7 +380,8 @@ class ProbeLinkManager final : public ProbeAvailabilitySink {
     void exitFinishedCampaignsLocked();
     void applyLocked(const Completion& completion, const PathVersion& version,
                      PathRuntime& runtime, const ProbeEdgeSupply& edge,
-                     PortRuntime& port, uint64_t now_ns, Effects& effects);
+                     PortRuntime& port, uint64_t now_ns, bool test_probe,
+                     Effects& effects);
     StaleReason staleReasonLocked(const ProbeRecord& record);
     void moveToOrphansLocked(const std::shared_ptr<ProbeRecord>& record,
                              OrphanReason reason, uint64_t now_ns);

@@ -172,7 +172,8 @@ class FakeJetty final : public Jetty {
 
 class FakeUrmaAdapter final : public UrmaAdapter {
    public:
-    explicit FakeUrmaAdapter(DeviceInfo device) : device_(std::move(device)) {}
+    explicit FakeUrmaAdapter(DeviceInfo device)
+        : device_(std::move(device)), discovered_devices_{device_} {}
 
     bool available() const noexcept override { return true; }
     uint32_t nativeApiVersion() const noexcept override { return 1; }
@@ -190,15 +191,21 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     }
     Status discoverDevices(std::vector<DeviceInfo>& devices) override {
         if (!initialized_) return Status::InvalidArgument("not initialized");
-        devices = {device_};
+        devices = discovered_devices_;
         return Status::OK();
     }
+    void setDiscoveredDevices(std::vector<DeviceInfo> devices) {
+        discovered_devices_ = std::move(devices);
+    }
     Status openContext(const DeviceInfo& device, ContextPtr& context) override {
-        if (!initialized_ || device.topology_name != device_.topology_name) {
-            return Status::DeviceNotFound("fake device missing");
+        if (!initialized_) return Status::InvalidArgument("not initialized");
+        for (const auto& candidate : discovered_devices_) {
+            if (candidate.topology_name == device.topology_name) {
+                context = std::make_shared<FakeContext>(device);
+                return Status::OK();
+            }
         }
-        context = std::make_shared<FakeContext>(device);
-        return Status::OK();
+        return Status::DeviceNotFound("fake device missing");
     }
     Status closeContext(ContextPtr& context) override {
         if (auto fake = std::dynamic_pointer_cast<FakeContext>(context)) {
@@ -469,6 +476,7 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     };
 
     DeviceInfo device_;
+    std::vector<DeviceInfo> discovered_devices_;
     bool initialized_{false};
     uint32_t next_jetty_id_{1};
     std::atomic<CompletionCategory> next_completion_{
