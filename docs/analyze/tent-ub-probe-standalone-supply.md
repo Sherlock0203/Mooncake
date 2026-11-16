@@ -83,7 +83,7 @@
 
 ### 5.1 本端每口
 
-1. **JFC**：dedicated 用 `JfcOptions{depth=probe/jfc_depth, enable_completion_events=false}` 创建；shared 模式不建，探测完成落业务 JFC。
+1. **JFC**：dedicated 用 `JfcOptions{depth=probe/jfc_depth, enable_completion_events=false, transport_mode=kRm}` 创建；UMDK 要求 JFS 与共享 JFR 传输模式一致，因此探测 JFC 同时建 **RM JFR**（虽然探测只发送）；shared 模式不建，探测完成落业务 JFC。
 2. **probe Jetty**：`JettyOptions{depth=…, max_sge=1, priority=…, transport_mode=kRm}` 创建，**RM 下不 bind**；RC 退化见 §7。
 3. **源页**：按 page size 对齐分配（payload=1，注册长度≥1 页），`registerLocalSegment`；访问权限只覆盖本端 DMA 读，具体 flag 待 provider 验证；`source_generation` 每代递增。
 4. **本端探测区页**：每口分配一页并 `registerLocalSegment`（access=WRITE，带 probe token），供对端写入 1 字节；`area_epoch` 随探测通道代次；descriptor/token 由握手层发布给对端。

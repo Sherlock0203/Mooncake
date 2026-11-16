@@ -140,19 +140,25 @@ struct SegmentOptions {
     bool cacheable = false;
 };
 
-struct JfcOptions {
-    uint32_t depth = 4096;
-    uint32_t receiver_depth = 2048;
-    uint32_t token = 0xACFE;
-    bool enable_completion_events = false;
-};
-
 // RC Jetties are bound once and post through their binding. RM Jetties stay
 // unbound and carry a remote target on every WR (see the per-WR post overload
 // below). Business traffic keeps the RC default; probe traffic uses RM.
 enum class JettyTransportMode : uint8_t {
     kRc,
     kRm,
+};
+
+struct JfcOptions {
+    uint32_t depth = 4096;
+    uint32_t receiver_depth = 2048;
+    uint32_t token = 0xACFE;
+    bool enable_completion_events = false;
+    // UMDK requires the JFS and its shared JFR to use the same transport mode.
+    // Probe JFCs therefore create an RM JFR even though they only send.
+    JettyTransportMode transport_mode{JettyTransportMode::kRc};
+    // Experimental send-only mode; not used by the probe path because UMDK
+    // currently validates JFS/JFR mode through the shared JFR.
+    bool send_only = false;
 };
 
 struct JettyOptions {

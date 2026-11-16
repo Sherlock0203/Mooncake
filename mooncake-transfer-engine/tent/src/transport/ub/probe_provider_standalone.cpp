@@ -233,6 +233,7 @@ Status StandaloneProbeResourceProvider::createPortLocked(PortState& port) {
         JfcOptions options;
         options.depth = params_.jfc_depth;
         options.enable_completion_events = false;
+        options.transport_mode = JettyTransportMode::kRm;
         auto status = adapter_->createJfc(port.config.context, options, jfc);
         if (!status.ok()) return status;
         if (!jfc) {
