@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "tent/transport/ub/probe_link_manager.h"
+#include "tent/transport/ub/probe_peer_handshake.h"
+#include "tent/transport/ub/probe_poster_urma.h"
+#include "tent/transport/ub/probe_provider_standalone.h"
 #include "tent/transport/ub/probe_scheduler.h"
 #include "tent/transport/ub/ub_transport.h"
 
@@ -10,6 +13,7 @@
 #include <chrono>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <new>
 #include <sstream>
@@ -92,9 +96,11 @@ std::string encodeDeviceMetadata(Topology::NicID topology_id,
 struct UbTransport::Impl {
     Impl(std::shared_ptr<ub::UrmaAdapter> injected,
          std::shared_ptr<ub::ProbeResourceProvider> injected_probe_provider,
-         std::shared_ptr<ub::ProbePoster> injected_probe_poster)
+         std::shared_ptr<ub::ProbePoster> injected_probe_poster,
+         ub::ProbePeerDescriptorSource* injected_peer_source)
         : adapter(injected ? std::move(injected)
                            : ub::createDefaultUrmaAdapter()),
+          probe_peer_source(injected_peer_source),
           probe_provider(std::move(injected_probe_provider)),
           probe_poster(std::move(injected_probe_poster)) {}
 
@@ -338,9 +344,42 @@ struct UbTransport::Impl {
         std::vector<ub::ProbeJfcSlot> probe_jfcs;
         if (params.probe.enabled) {
             if (!probe_provider || !probe_poster) {
-                return failInstall(Status::InvalidArgument(
-                    "UB probe is enabled but no probe provider/poster is "
-                    "installed" LOC_MARK));
+                if (params.probe.provider !=
+                    ub::ProbeProviderKind::kStandalone) {
+                    return failInstall(Status::InvalidArgument(
+                        "UB probe is enabled but no probe provider/poster is "
+                        "installed; inject one or set "
+                        "transports/ub/probe/provider=standalone" LOC_MARK));
+                }
+                if (probe_peer_source == nullptr) {
+                    return failInstall(Status::InvalidArgument(
+                        "UB probe provider=standalone requires a peer "
+                        "descriptor source" LOC_MARK));
+                }
+                std::map<Topology::NicID, ub::ContextPtr> probe_contexts;
+                std::vector<ub::ProbeLocalPortConfig> probe_ports;
+                for (const auto& context : contexts) {
+                    if (!context || !context->handle()) {
+                        return failInstall(Status::InvalidArgument(
+                            "UB standalone probe provider requires an active "
+                            "local context" LOC_MARK));
+                    }
+                    const auto local_nic = context->topologyId();
+                    probe_contexts.emplace(local_nic, context->handle());
+                    ub::ProbeLocalPortConfig port;
+                    port.local_nic = local_nic;
+                    port.context = context->handle();
+                    port.generation = 1;
+                    probe_ports.push_back(std::move(port));
+                }
+                probe_directory =
+                    std::make_shared<ub::HandshakeProbePeerDirectory>(
+                        adapter, std::move(probe_contexts), probe_peer_source);
+                probe_provider =
+                    std::make_shared<ub::StandaloneProbeResourceProvider>(
+                        adapter, params.probe, std::move(probe_ports),
+                        probe_directory.get());
+                probe_poster = std::make_shared<ub::UrmaProbePoster>(adapter);
             }
             ub::ProbeGraph graph;
             status = probe_provider->snapshot(graph);
@@ -350,6 +389,27 @@ struct UbTransport::Impl {
             probe_manager->setReportSink(probe_provider.get());
             status = probe_manager->initialize(graph);
             if (!status.ok()) return failInstall(status);
+            probe_provider->setAvailabilitySink(
+                probe_manager->availabilitySink());
+            probe_provider->setCompletionSink(
+                [manager = probe_manager.get()](
+                    const ub::Completion& completion) -> Status {
+                    if (manager == nullptr) {
+                        return Status::InvalidArgument(
+                            "probe manager is gone" LOC_MARK);
+                    }
+                    // Quiesce is per probe Jetty, so every completion here
+                    // belongs to the probe namespace.
+                    if (!ub::isProbeToken(completion.token)) {
+                        return Status::InvalidArgument(
+                            "non-probe completion on a probe lane" LOC_MARK);
+                    }
+                    if (!manager->onProbeCompletion(completion)) {
+                        return Status::InternalError(
+                            "probe completion was not accepted" LOC_MARK);
+                    }
+                    return Status::OK();
+                });
             for (const auto& supply : graph.ports) {
                 if (context_by_topology_id.find(supply.local_nic) ==
                     context_by_topology_id.end()) {
@@ -435,6 +495,13 @@ struct UbTransport::Impl {
             metadata->setBootstrapUbCallback({});
             callback_installed = false;
         }
+        // Stop interface-7 rebuilds before draining workers: a retire during
+        // teardown must stay a record, not create resources that are about to
+        // be destroyed.
+        if (probe_provider) {
+            probe_provider->setAvailabilitySink(nullptr);
+            probe_provider->setCompletionSink(nullptr);
+        }
         if (workers) {
             auto status = workers->stop();
             if (!status.ok()) {
@@ -450,6 +517,9 @@ struct UbTransport::Impl {
         // the PLM only after the workers that reference it are gone.
         probe_scheduler.reset();
         probe_manager.reset();
+        probe_poster.reset();
+        probe_provider.reset();
+        probe_directory.reset();
         if (endpoints) {
             auto status = endpoints->clear();
             if (!status.ok()) return status;
@@ -669,6 +739,10 @@ struct UbTransport::Impl {
     std::unique_ptr<ub::QuotaManager> quota;
     // Declared before `workers` so destruction runs workers -> scheduler ->
     // manager -> provider/poster (the workers hold a raw manager pointer).
+    // probe_directory is declared before probe_provider so it is destroyed
+    // after the provider that borrows it.
+    ub::ProbePeerDescriptorSource* probe_peer_source{nullptr};
+    std::shared_ptr<ub::HandshakeProbePeerDirectory> probe_directory;
     std::shared_ptr<ub::ProbeResourceProvider> probe_provider;
     std::shared_ptr<ub::ProbePoster> probe_poster;
     std::unique_ptr<ub::ProbeLinkManager> probe_manager;
@@ -679,10 +753,11 @@ struct UbTransport::Impl {
 UbTransport::UbTransport(
     std::shared_ptr<ub::UrmaAdapter> adapter,
     std::shared_ptr<ub::ProbeResourceProvider> probe_provider,
-    std::shared_ptr<ub::ProbePoster> probe_poster)
-    : impl_(std::make_unique<Impl>(std::move(adapter),
-                                   std::move(probe_provider),
-                                   std::move(probe_poster))) {}
+    std::shared_ptr<ub::ProbePoster> probe_poster,
+    ub::ProbePeerDescriptorSource* probe_peer_source)
+    : impl_(
+          std::make_unique<Impl>(std::move(adapter), std::move(probe_provider),
+                                 std::move(probe_poster), probe_peer_source)) {}
 
 UbTransport::~UbTransport() {
     auto status = uninstall();

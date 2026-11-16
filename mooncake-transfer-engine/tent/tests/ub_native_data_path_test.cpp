@@ -25,6 +25,7 @@
 #include "tent/transport/ub/topology_attrs.h"
 #include "tent/transport/ub/ub_transport.h"
 #include "tent/transport/ub/workers.h"
+#include "ub_fake_topology.h"
 #include "ub_fake_urma.h"
 
 namespace mooncake::tent::ub {

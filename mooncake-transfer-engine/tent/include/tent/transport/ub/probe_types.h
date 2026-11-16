@@ -254,6 +254,14 @@ enum class ProbeJfcMode : uint8_t {
     kShared,
 };
 
+// Who owns the probe resources. kPool preserves the W1 injected-provider seam;
+// kStandalone makes the transport construct StandaloneProbeResourceProvider +
+// HandshakeProbePeerDirectory + UrmaProbePoster from the local contexts.
+enum class ProbeProviderKind : uint8_t {
+    kPool,
+    kStandalone,
+};
+
 struct ProbeParams {
     static constexpr uint64_t kNsPerMs = 1'000'000;
 
@@ -268,6 +276,7 @@ struct ProbeParams {
     bool stop_on_recovery{true};
     uint32_t recover_success_threshold{1};
     ProbeJfcMode jfc_mode{ProbeJfcMode::kDedicated};
+    ProbeProviderKind provider{ProbeProviderKind::kPool};
     uint32_t jfc_depth{64};
     uint32_t credit_reserve{8};
 
@@ -288,6 +297,12 @@ struct ProbeParams {
         if (jfc_depth < 8) return false;
         if (jfc_mode == ProbeJfcMode::kShared && credit_reserve == 0)
             return false;
+        // Standalone currently builds its probe JFC itself; shared mode needs
+        // a business JFC injected per port, which lands with the P5 follow-up.
+        if (provider == ProbeProviderKind::kStandalone &&
+            jfc_mode == ProbeJfcMode::kShared) {
+            return false;
+        }
         return true;
     }
 };

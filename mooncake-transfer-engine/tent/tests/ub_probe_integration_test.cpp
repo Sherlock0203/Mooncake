@@ -40,10 +40,12 @@
 #include "tent/transport/ub/context.h"
 #include "tent/transport/ub/endpoint_store.h"
 #include "tent/transport/ub/probe_link_manager.h"
+#include "tent/transport/ub/probe_peer_handshake.h"
 #include "tent/transport/ub/quota.h"
 #include "tent/transport/ub/rail_monitor.h"
 #include "tent/transport/ub/ub_transport.h"
 #include "tent/transport/ub/workers.h"
+#include "ub_fake_topology.h"
 #include "ub_fake_urma.h"
 #include "ub_probe_test_support.h"
 
@@ -495,6 +497,73 @@ TEST(UbProbeIntegrationTest, TransportAssemblesAndTearsDownProbeScheduler) {
 
     EXPECT_TRUE(transport.uninstall().ok());
     EXPECT_EQ(provider->handoffs, 0);
+}
+
+class StaticPeerDescriptorSource final : public ProbePeerDescriptorSource {
+   public:
+    Status snapshot(std::vector<ProbePeerDescriptor>& descriptors) override {
+        ProbePeerDescriptor descriptor;
+        descriptor.local_nic = 0;
+        descriptor.peer_segment_id = 42;
+        descriptor.remote_nic = 0;
+        descriptor.peer_nic_path = "peer@ub:fake0:eid0";
+        descriptor.area_descriptor = makeDescriptor(0xA00000, 4096);
+        descriptor.area_length = 1;
+        descriptor.area_epoch = 1;
+        descriptor.area_token = 0xACFE;
+        descriptor.remote_jetty = RemoteJettyInfo{"eid", 401, 501, 0xACFE};
+        descriptor.node_gate_ok = true;
+        descriptor.port_gate_ok = true;
+        descriptor.profile_gate_ok = true;
+        descriptors = {descriptor};
+        return Status::OK();
+    }
+};
+
+TEST(UbProbeIntegrationTest, TransportBuildsStandaloneProbeProvider) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    auto topology = fakeTopology();
+    std::string segment_name;
+    auto control = startFakeControl(topology, segment_name);
+    ASSERT_NE(control, nullptr);
+    auto config = makeTransportConfig(/*probe_enabled=*/true);
+    config->set("transports/ub/probe/provider", "standalone");
+
+    StaticPeerDescriptorSource source;
+    UbTransport transport(adapter, nullptr, nullptr, &source);
+    std::string mutable_segment_name = segment_name;
+    ASSERT_TRUE(
+        transport.install(mutable_segment_name, control, topology, config)
+            .ok());
+    // The peer probe area was imported by the standalone directory.
+    EXPECT_EQ(adapter->liveRemoteSegmentCount(), 1U);
+    EXPECT_GE(adapter->liveJfcCount(), 2U);  // business JFC + probe JFC
+
+    ASSERT_TRUE(transport.uninstall().ok());
+    EXPECT_EQ(adapter->liveJfcCount(), 0U);
+    EXPECT_EQ(adapter->liveJettyCount(), 0U);
+    EXPECT_EQ(adapter->liveLocalSegmentCount(), 0U);
+    EXPECT_EQ(adapter->liveRemoteSegmentCount(), 0U);
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
+TEST(UbProbeIntegrationTest, StandaloneProbeWithoutPeerSourceFailsInstall) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    auto topology = fakeTopology();
+    std::string segment_name;
+    auto control = startFakeControl(topology, segment_name);
+    ASSERT_NE(control, nullptr);
+    auto config = makeTransportConfig(/*probe_enabled=*/true);
+    config->set("transports/ub/probe/provider", "standalone");
+
+    UbTransport transport(adapter);
+    std::string mutable_segment_name = segment_name;
+    const auto status =
+        transport.install(mutable_segment_name, control, topology, config);
+    EXPECT_FALSE(status.ok());
+    EXPECT_TRUE(status.IsInvalidArgument());
+    EXPECT_TRUE(transport.uninstall().ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
 }
 
 TEST(UbProbeIntegrationTest, EnabledProbeWithoutSupplyFailsInstall) {

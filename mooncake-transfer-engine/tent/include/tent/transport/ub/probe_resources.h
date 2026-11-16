@@ -29,6 +29,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -197,12 +198,21 @@ class ProbeReportSink {
 };
 
 // Interface 4 supply plus outbound reporting (design §12.2).
+class ProbeAvailabilitySink;
+
+using ProbeCompletionSink = std::function<Status(const Completion&)>;
+
 class ProbeResourceProvider : public ProbeReportSink {
    public:
     // Full snapshot. Called once during transport startup before the scheduler
     // exists; returns non-OK when the probe resources are incomplete so the
     // transport can fail fast instead of silently degrading to "no probing".
     virtual Status snapshot(ProbeGraph& graph) = 0;
+
+    // Interface-7 sink (PLM) and quiesced-completion sink (poller/PLM).
+    // Providers that do not own probe-native resources ignore them.
+    virtual void setAvailabilitySink(ProbeAvailabilitySink*) {}
+    virtual void setCompletionSink(ProbeCompletionSink) {}
 };
 
 // Probe WR payload (design §8.4 / §12.2). One-byte payload, page-sized
@@ -210,7 +220,11 @@ class ProbeResourceProvider : public ProbeReportSink {
 struct ProbePostTarget {
     JettyPtr probe_jetty;
     uint64_t jetty_generation{0};
+    // RM: per-WR remote target. The adapter imports/caches it.
     RemoteJettyRef remote_jetty;
+    // The WRITE source and destination segments; both must stay alive until
+    // the completion is consumed.
+    LocalSegmentPtr source_segment;
     RemoteSegmentPtr area_segment;
 };
 

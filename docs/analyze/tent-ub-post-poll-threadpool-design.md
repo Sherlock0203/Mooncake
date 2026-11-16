@@ -4,7 +4,7 @@
 > 代码基线：Mooncake v3 / 956af65e（mooncake-transfer-engine/tent），本文行号均对应该基线；UMDK 参考基线 09086da5（gitcode.com/openeuler/umdk，同级参考，非构建依赖；本地检出 .tmp-umdk/，09086da5 为其祖先，本文引用行号已逐条复核）。
 > 状态：设计文档；**W1 链路探测已实现（`probe/enabled` 默认 false）**，其余里程碑待实现。本文覆盖 post/poll 线程池、K 准入、事件分类与分发、完成门与归还、超时扫描、callback 执行器、启停协议，以及**链路探测子系统（健康状态机、campaign、探测调度与探测 WR）**。
 > **2026-11-10 修订四**：删除历史决议记录（其有效规则已全部位于正文相应章节），全文移除决议编号引用；实施顺序调整为**链路探测先行**（§13 之 W1）。
-> 版本历史：11-04 冻结两侧接口与分工结论（本文为两侧对齐的唯一文档）；11-09 链路探测子系统移入本侧（§9），接口 3/4/6/7 相应调整；11-10 查漏补缺（探测 JFC 模式、探测区 descriptor、参数错误分类、K 默认值、轮询公平性、结果三层语义表、风险与缓解、改造点清单、术语表）；**11-13 按《tent-ub-probe-link-detail-design》§17 回写 W1 实现结论**（超时归属、Pending、业务成功语义、campaign 退出与合并、失败分类、责任不明恢复、关闭顺序、配置键、验收口径、指标）；**11-13 解耦**：明确链路探测不依赖业务 Jetty 池化，独立探测资源供给方案见 [tent-ub-probe-standalone-supply](tent-ub-probe-standalone-supply.md)（§9.1.1）。
+> 版本历史：11-04 冻结两侧接口与分工结论（本文为两侧对齐的唯一文档）；11-09 链路探测子系统移入本侧（§9），接口 3/4/6/7 相应调整；11-10 查漏补缺（探测 JFC 模式、探测区 descriptor、参数错误分类、K 默认值、轮询公平性、结果三层语义表、风险与缓解、改造点清单、术语表）；**11-13 按《tent-ub-probe-link-detail-design》§17 回写 W1 实现结论**（超时归属、Pending、业务成功语义、campaign 退出与合并、失败分类、责任不明恢复、关闭顺序、配置键、验收口径、指标）；**11-13 解耦**：明确链路探测不依赖业务 Jetty 池化，独立探测资源供给方案见 [tent-ub-probe-standalone-supply](tent-ub-probe-standalone-supply.md)（§9.1.1）；**11-16 P1–P5**：独立 provider、握手目录、RM poster、退役重建/接口 7、transport standalone 装配与 `probe/provider` 配置已落地（bootstrap 线上字段仍待接入）。
 > 不在本文范围：Jetty 池化与预算（池化详设 §5）、**全部原生 Jetty 资源角色的退役/删除/补池机械（业务＋探测角色，其 §7）**、RM adapter 迁移与 bootstrap v2（其 §4）、TENT/Store/staging 安全接入（单独指派）。探测子系统原属其 §6，已移入本文 §9。
 
 ## 1. 约束语义与设计边界
@@ -424,6 +424,7 @@ sequenceDiagram
 - **每个 local_port 一个专用 probe Jetty**：原生生命周期（创建、modify ERROR 退役、flush、删除、补池、预算、tombstone）归**独立的探测资源供给方（probe provider）**；dedicated 模式不租借业务 Jetty 池、不占业务 lease/K/quota，可与池化侧同进程部署但接口独立；refill 每口只发布一个活跃探测发送成员；**使用归本侧**——句柄与代次经接口 4 初始化供给，重建后经接口 7 更新（`kProbeHandleReplaced`，携带新句柄、源页与新代次）。
 - probe Jetty 固定归属本端口与 probe shard JFC slot，不进业务池、**不做本地 RC bind（RM 模式前提）**；探测 WR **逐 WR 指定远端 probe Jetty（identity/uasid）**，不依赖本地绑定（决策 D-2）。探测页是**独立注册、独立 token、独立 import** 的一页内存，不复用业务数据 segment 的授权；import 按 `(ContextKey, target)` 去重。
 - **探测完成队列默认 dedicated probe JFC（每 Context 一个，深度 64；建议向 probe provider 申请 send-only，省 JFR 与 `max_jfc` 预算）**，业务与探测完成队列隔离；预算受限时可切 shared 业务 JFC＋预留 credit（probe/credit_reserve）——两种模式均由 probe provider 创建、经接口 4 供给；**本侧只 poll，不拥有、不删除该 JFC**。
+- **本端探测区页每口一页**：供对端写入 1 字节，remote-write 权限＋probe token，由 probe provider 注册并经握手发布；`area_epoch` 随探测通道代次。
 - **对端探测页每 remote target 一页一槽**（决策 D-4）：descriptor 至少含 address/length/token/epoch，由对端注册、probe provider 经接口 4 供给；多口并发写同一页同一字节是安全的（payload 常量、无读回语义），因此不必每路径一槽。
 - **探测源页按 generation 隔离**：每个探测通道代次使用独立源页（`source_generation`）；旧代孤儿在终结或移交前不得注销，避免旧 WR 与新 WR 共享源内存。
 - **ProbeLink** 每条固定携带：peer_id, local_port, local_probe_jetty（句柄＋代次）, remote_port, remote_target_identity/epoch, topology_epoch, probe_key, health_state, next_probe_time, backoff, success_count, failure_count。探测链路数 = 合法邻接边数 = Σ degree(local_port)（4 口→8、6 口→12，按配置动态计算，禁硬编码）；两方向分别建表。
@@ -437,7 +438,7 @@ sequenceDiagram
 真正的硬依赖只有四条：
 
 1. adapter 的**逐 WR target** 能力（RM；若仍为 RC，则退化为"每路径一个已绑定 probe Jetty"，见 [tent-ub-probe-standalone-supply](tent-ub-probe-standalone-supply.md) 的 RC 退化）；
-2. 对端**探测页 descriptor + 远端 probe Jetty identity** 的握手（bootstrap 扩展）；
+2. **本端探测区页的发布 + 对端探测页 descriptor/远端 probe Jetty identity** 的握手（bootstrap 扩展）；
 3. 设备/拓扑/邻接/代次的供给；
 4. 完成队列的 poll 线程（复用现有 poller）。
 
@@ -492,7 +493,9 @@ stateDiagram-v2
 - **probe 调度线程**（本侧，首版 1 个）：计算到期动作、直接 post、处理 post 结果、扫描完成超时，并在 `nextDeadline` 上条件等待（线性扫描＋条件变量即可，路径数上界为 Σdegree）；不占 post 池；同口多个 peer/path 公平轮转，不同口并行。
 - **每个 ProbeResource（本端口）最多一个在途 probe**（含 post 未退出或责任不明阶段）：两个 target 的探测不同时占同一发送队列，避免其一故障使同口多个在途探测被连带 flush。该串行约束只作用于探测资源，不把业务 slice 聚成组。**peer_budget（默认 4）** 是同一 peer 跨口的在途上限；超时转孤儿时随记录释放其预算，避免累计 4 次超时让整个 peer 不可调度。
 - **端口槽按 generation 作用域**：`slot_token` 只约束"当前这一代探测通道"；lane 退役后槽保持占用（不重发），接口 7 新代次到达时归零，旧在途记录转入孤儿表（按 token 索引，保留源页/探测页引用），迟到的完成只结清资源、不发布健康。
+- **provider 侧退役实现（P4）**：quiesce 旧 Jetty 并派发其完成 → reset/delete → 同一 JFC 建新 Jetty/源页/探测区页（generation+1）→ 接口 7 `kProbeHandleReplaced`；旧代页面保留在 retired 列表（与 quarantine 一起）到关闭，重建时不注销。需 completion/availability sink；transport 在 P5 注入。
 - probe WR 构造（UMDK 实机依据，§7.2.1）：标准 WR，`URMA_OPC_WRITE`、`complete_enable=1`、`next=null`，一字节 payload 写入对端授权的专用探测区（peer 槽位）；本地源缓冲保持不变；**注册范围按页对齐/provider 要求分配——payload=1 ≠ 注册长度 1**；禁止写业务内存、禁止校验所谓 magic。WRITE probe 成功只证明当前探测配置可用，不证明业务 READ 权限、任意长度能力或物理端口 GOOD（§9.6）。
+- **独立 provider 的 probe Jetty 以 `JettyOptions::transport_mode=kRm` 创建**；post 走 `UrmaAdapter::post(jetty, target, wr)` 的逐 WR target 重载——adapter 按 `(eid, id, uasid, token)` 缓存 `urma_import_jetty` 得到的 target，每个 WR 设 `wr.tjetty`，不 `bind`；lane 退役/关闭时 unimport 全部 target。
 - **探测区由 bootstrap v2 显式发布 descriptor（至少 address/length/token/epoch），每 remote target 一页一槽，经接口 4 供给；本端只消费描述符、不猜测地址**。探测页独立注册、独立 token，不写业务内存；换代（`area_epoch` 变化）原地更新该边，在途 record 判 stale，周期项 `next=now`，campaign 条目保留。
 - post 前置（依序，均为非阻塞）：句柄代次==当前供给代次（接口 4/7）→ imported target 引用（当前 epoch）→ token 发布（probe namespace）→ 控制额度与 JFC credit 占用 → record 发布（W1 为中性 `ProbeRecord`，W2 起为 `CompletionRecord` 子集视图）。**token/record 先发布后 post**，完成可早于 post 返回；**单一投递者**（probe 调度线程串行）使代次复核无并发竞争；上报退役（接口 2）后该口暂停 post，直至接口 7 新代次句柄。
 - 相同物理 Context 已毁坏（池化侧 DRAINING，接口 7/9 通知）时不强行 post，等资源重建先恢复条件；业务节点门禁关闭不阻止受限恢复探测（探测走独立控制额度）。
@@ -617,6 +620,7 @@ context 初始化（业务 JFC）
 | probe/recover_success_threshold | 固定 1 | 其他值拒绝；恢复还须当前代次和全部门禁通过 |
 | probe/failure_threshold | 3（建议默认） | 连续失败告警/熔断阈值 |
 | probe/jfc_mode | dedicated（W1 默认）/shared | 字符串枚举，仅接受 `dedicated`/`shared`；dedicated 为每 Context 一个专用 JFC，shared 为业务 JFC＋预留 credit；W1 验收 dedicated |
+| probe/provider | pool（默认）/standalone | `pool` 使用注入的 W1 provider/poster；`standalone` 由 transport 基于本端 Context 构造 `StandaloneProbeResourceProvider` + `HandshakeProbePeerDirectory` + `UrmaProbePoster`；需要调用方注入 `ProbePeerDescriptorSource`，且仅支持 dedicated JFC |
 | probe/jfc_depth | 64 | dedicated probe JFC 深度 |
 | probe/credit_reserve | 8 | shared 模式下预留的控制 credit |
 | slice_size / max_slices_per_task / slice_timeout_ms / max_retries | 既有 | 语义不变；slice_timeout_ms 现仅驱动 TimeoutScan 标记，不再驱动 quiesce |
@@ -624,7 +628,7 @@ context 初始化（业务 JFC）
 注 1：business_queue_budget / callback_queue_budget 为本侧新增键，需同步登记进池化详设 §9.1 配置表。
 注 2：`probe/enabled` 与上表 probe 行为键归本侧；`probe/local_ports`、`probe/adjacency`、`probe/target_map` 等拓扑键仍登记在池化侧配置表（其 §9.1，两侧共用同一配置源），池化侧 §9.1 需同步删除或改为引用。
 
-注 3：`probe/stop_on_recovery`、`probe/recover_success_threshold` 为固定值（其他值拒绝）；跨键校验：`backoff_max_ms >= interval_ms`、`timeout_ms <= interval_ms`、`jfc_depth >= 8`、shared 模式下 `credit_reserve > 0`。
+注 3：`probe/stop_on_recovery`、`probe/recover_success_threshold` 为固定值（其他值拒绝）；跨键校验：`backoff_max_ms >= interval_ms`、`timeout_ms <= interval_ms`、`jfc_depth >= 8`、shared 模式下 `credit_reserve > 0`、`provider=standalone` 时 `jfc_mode` 必须为 `dedicated`。
 
 注 4：`probe/enabled=false`（W1 默认）时不构造 provider/PLM/调度线程，probe 槽为空，业务行为与引入探测前一致。
 

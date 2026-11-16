@@ -18,7 +18,6 @@
 #include <utility>
 #include <vector>
 
-#include "tent/runtime/segment_registry.h"
 #include "tent/transport/ub/topology_attrs.h"
 #include "tent/transport/ub/urma_adapter.h"
 
@@ -211,10 +210,14 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     Status createJfc(const ContextPtr&, const JfcOptions&,
                      JfcPtr& jfc) override {
         jfc = std::make_shared<FakeJfc>();
+        live_jfcs_.fetch_add(1, std::memory_order_relaxed);
         return Status::OK();
     }
     Status deleteJfc(JfcPtr& jfc) override {
-        if (auto fake = std::dynamic_pointer_cast<FakeJfc>(jfc)) fake->close();
+        if (auto fake = std::dynamic_pointer_cast<FakeJfc>(jfc)) {
+            fake->close();
+            decrement(live_jfcs_);
+        }
         jfc.reset();
         return Status::OK();
     }
@@ -225,11 +228,13 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         last_registered_access_.store(options.access,
                                       std::memory_order_release);
         segment = std::make_shared<FakeLocalSegment>(address, length);
+        live_local_segments_.fetch_add(1, std::memory_order_relaxed);
         return Status::OK();
     }
     Status unregisterLocalSegment(LocalSegmentPtr& segment) override {
         if (auto fake = std::dynamic_pointer_cast<FakeLocalSegment>(segment)) {
             fake->close();
+            decrement(live_local_segments_);
         }
         segment.reset();
         return Status::OK();
@@ -245,25 +250,30 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         }
         segment =
             std::make_shared<FakeRemoteSegment>(address, length, descriptor);
+        live_remote_segments_.fetch_add(1, std::memory_order_relaxed);
         return Status::OK();
     }
     Status unimportRemoteSegment(RemoteSegmentPtr& segment) override {
         if (auto fake = std::dynamic_pointer_cast<FakeRemoteSegment>(segment)) {
             fake->close();
+            decrement(live_remote_segments_);
         }
         segment.reset();
         return Status::OK();
     }
     Status createJetty(const ContextPtr&, const JfcPtr& jfc,
-                       const JettyOptions&, JettyPtr& jetty) override {
+                       const JettyOptions& options, JettyPtr& jetty) override {
         auto fake_jfc = std::dynamic_pointer_cast<FakeJfc>(jfc);
         if (!fake_jfc) return Status::InvalidArgument("bad JFC");
+        last_jetty_transport_mode_ = options.transport_mode;
         jetty = std::make_shared<FakeJetty>(next_jetty_id_++, fake_jfc);
+        live_jetties_.fetch_add(1, std::memory_order_relaxed);
         return Status::OK();
     }
     Status deleteJetty(JettyPtr& jetty) override {
         if (auto fake = std::dynamic_pointer_cast<FakeJetty>(jetty)) {
             fake->close();
+            decrement(live_jetties_);
         }
         jetty.reset();
         return Status::OK();
@@ -362,6 +372,16 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         }
         return Status::OK();
     }
+    Status post(const JettyPtr& jetty, const RemoteJettyInfo& target,
+                const WorkRequest& request, size_t& posted) override {
+        (void)jetty;
+        last_post_ = request;
+        last_post_target_ = target;
+        last_post_had_target_ = true;
+        posted = 1;
+        return Status::OK();
+    }
+
     Status poll(const JfcPtr& jfc, size_t maximum,
                 std::vector<Completion>& completions) override {
         completions.clear();
@@ -379,6 +399,14 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     }
     void holdNextCompletion() {
         hold_next_completion_.store(true, std::memory_order_release);
+    }
+    void pushPendingCompletion(const JettyPtr& jetty, uint64_t token) {
+        auto fake = std::dynamic_pointer_cast<FakeJetty>(jetty);
+        if (!fake) return;
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        WorkRequest request;
+        request.token = token;
+        pending_.push_back(Pending{fake->id(), request});
     }
     void dropNextQuiescedCompletion() {
         drop_next_quiesced_completion_.store(true, std::memory_order_release);
@@ -407,8 +435,34 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     uint32_t lastRegisteredAccess() const {
         return last_registered_access_.load(std::memory_order_acquire);
     }
+    size_t liveJfcCount() const {
+        return live_jfcs_.load(std::memory_order_relaxed);
+    }
+    size_t liveJettyCount() const {
+        return live_jetties_.load(std::memory_order_relaxed);
+    }
+    size_t liveLocalSegmentCount() const {
+        return live_local_segments_.load(std::memory_order_relaxed);
+    }
+    size_t liveRemoteSegmentCount() const {
+        return live_remote_segments_.load(std::memory_order_relaxed);
+    }
+    WorkRequest lastPost() const { return last_post_; }
+    RemoteJettyInfo lastPostTarget() const { return last_post_target_; }
+    bool lastPostHadTarget() const { return last_post_had_target_; }
+    JettyTransportMode lastJettyTransportMode() const {
+        return last_jetty_transport_mode_;
+    }
 
    private:
+    static void decrement(std::atomic<size_t>& counter) {
+        size_t current = counter.load(std::memory_order_relaxed);
+        while (current > 0 &&
+               !counter.compare_exchange_weak(current, current - 1,
+                                              std::memory_order_relaxed)) {
+        }
+    }
+
     struct Pending {
         uint32_t jetty_id{0};
         WorkRequest request;
@@ -430,17 +484,16 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     std::vector<Pending> pending_;
     std::atomic<uint64_t> quiesce_calls_{0};
     std::atomic<uint32_t> last_registered_access_{0};
-};
-
-class NullRegistry final : public SegmentRegistry {
-   public:
-    Status getSegmentDesc(SegmentDescRef&, const std::string&) override {
-        return Status::InvalidEntry("not used");
-    }
-    Status putSegmentDesc(SegmentDescRef&) override { return Status::OK(); }
-    Status deleteSegmentDesc(const std::string&) override {
-        return Status::OK();
-    }
+    // Live native-handle counts, used by the standalone probe provider tests to
+    // prove that every resource it creates is released again.
+    std::atomic<size_t> live_jfcs_{0};
+    std::atomic<size_t> live_jetties_{0};
+    std::atomic<size_t> live_local_segments_{0};
+    std::atomic<size_t> live_remote_segments_{0};
+    WorkRequest last_post_;
+    RemoteJettyInfo last_post_target_;
+    bool last_post_had_target_{false};
+    JettyTransportMode last_jetty_transport_mode_{JettyTransportMode::kRc};
 };
 
 DeviceInfo fakeDevice() {
@@ -454,25 +507,6 @@ DeviceInfo fakeDevice() {
     info.capabilities.max_jfc = 4;
     info.capabilities.max_jetty = 64;
     return info;
-}
-
-std::shared_ptr<Topology> fakeTopology(bool discovery_active = true) {
-    auto topology = std::make_shared<Topology>();
-    Topology::NicEntry nic{.name = "ub:fake0:eid0",
-                           .pci_bus_id = "0000:00:00.0",
-                           .type = Topology::NIC_UB,
-                           .numa_node = 0};
-    auto device = fakeDevice();
-    device.active = discovery_active;
-    encodeTopologyDeviceAttributes(device, 0, nic.device_attrs);
-    topology->nic_list_.push_back(std::move(nic));
-    Topology::MemEntry memory;
-    memory.name = kWildcardLocation;
-    memory.type = Topology::MEM_HOST;
-    memory.numa_node = -1;
-    memory.device_list[0].push_back(0);
-    topology->mem_list_.push_back(std::move(memory));
-    return topology;
 }
 
 }  // namespace fake

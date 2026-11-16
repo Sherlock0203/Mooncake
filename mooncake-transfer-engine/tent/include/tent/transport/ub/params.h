@@ -138,6 +138,12 @@ struct UbParams {
                                     jfc_mode));
         parsed.probe.jfc_mode = jfc_mode == "shared" ? ProbeJfcMode::kShared
                                                      : ProbeJfcMode::kDedicated;
+        std::string provider;
+        CHECK_STATUS(readStringEnum(config, "transports/ub/probe/provider",
+                                    "pool", {"pool", "standalone"}, provider));
+        parsed.probe.provider = provider == "standalone"
+                                    ? ProbeProviderKind::kStandalone
+                                    : ProbeProviderKind::kPool;
         CHECK_STATUS(readPositive(config, "transports/ub/probe/jfc_depth",
                                   parsed.probe.jfc_depth,
                                   parsed.probe.jfc_depth));
@@ -166,6 +172,12 @@ struct UbParams {
             return Status::InvalidArgument(
                 "transports/ub/probe/credit_reserve must be > 0 in shared "
                 "mode");
+        }
+        if (parsed.probe.provider == ProbeProviderKind::kStandalone &&
+            parsed.probe.jfc_mode == ProbeJfcMode::kShared) {
+            return Status::InvalidArgument(
+                "transports/ub/probe/provider=standalone requires "
+                "transports/ub/probe/jfc_mode=dedicated");
         }
         if (!parsed.probe.valid()) {
             return Status::InvalidArgument("invalid probe configuration");
