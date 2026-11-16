@@ -620,6 +620,19 @@ if(USE_UB)
   add_test(NAME tent_ub_probe_standalone_provider_test
            COMMAND tent_ub_probe_standalone_provider_test)
 
+  # Probe peer handshake seam (P2): descriptor validation, probe-area import
+  # and caching. The bootstrap wire that fills the descriptor source lands in
+  # P5; these tests drive the source directly.
+  add_executable(
+    tent_ub_probe_handshake_test ub_probe_handshake_test.cpp
+    ../src/transport/ub/probe_provider_standalone.cpp
+    ../src/transport/ub/probe_peer_handshake.cpp)
+  target_link_libraries(tent_ub_probe_handshake_test PRIVATE tent_common gtest
+                                                             gtest_main)
+  target_include_directories(tent_ub_probe_handshake_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_probe_handshake_test COMMAND tent_ub_probe_handshake_test)
+
   add_executable(tent_ub_probe_integration_test ub_probe_integration_test.cpp)
   target_link_libraries(tent_ub_probe_integration_test
                         PRIVATE gtest gtest_main tent_link_group)

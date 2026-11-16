@@ -32,6 +32,11 @@ size_t probePageSize() {
     return page > 0 ? static_cast<size_t>(page) : 4096;
 }
 
+// Token the peer must use when importing our probe area. P2 publishes it to
+// peers through the handshake; the value is a placeholder until the bootstrap
+// contract freezes the probe-area token.
+constexpr uint32_t kProbeAreaToken = 0xACFE;
+
 }  // namespace
 
 StandaloneProbeResourceProvider::StandaloneProbeResourceProvider(
@@ -131,6 +136,37 @@ Status StandaloneProbeResourceProvider::createPortLocked(PortState& port) {
                    : status;
     }
 
+    // Local probe area page: the peer writes its 1-byte probes here. It needs
+    // remote-write permission and its own token; the local side never reads it.
+    void* area_memory = nullptr;
+    if (::posix_memalign(&area_memory, page, page) != 0 ||
+        area_memory == nullptr) {
+        (void)adapter_->deleteJetty(jetty);
+        if (owns_jfc) (void)adapter_->deleteJfc(jfc);
+        (void)adapter_->unregisterLocalSegment(segment);
+        std::free(memory);
+        return Status::InternalError(
+            "Cannot allocate the local probe area page");
+    }
+    std::memset(area_memory, 0, page);
+    SegmentOptions area_options;
+    area_options.access = SEGMENT_ACCESS_WRITE;
+    area_options.token = kProbeAreaToken;
+    LocalSegmentPtr area_segment;
+    status = adapter_->registerLocalSegment(
+        port.config.context, reinterpret_cast<uint64_t>(area_memory), page,
+        area_options, area_segment);
+    if (!status.ok() || !area_segment) {
+        (void)adapter_->deleteJetty(jetty);
+        if (owns_jfc) (void)adapter_->deleteJfc(jfc);
+        (void)adapter_->unregisterLocalSegment(segment);
+        std::free(memory);
+        std::free(area_memory);
+        return status.ok() ? Status::InternalError(
+                                 "URMA adapter returned no probe area segment")
+                           : status;
+    }
+
     port.probe_jfc = std::move(jfc);
     port.owns_jfc = owns_jfc;
     port.probe_jetty = std::move(jetty);
@@ -138,6 +174,10 @@ Status StandaloneProbeResourceProvider::createPortLocked(PortState& port) {
     port.source_memory = memory;
     port.source_size = page;
     port.source_generation = port.config.generation;
+    port.area_segment = std::move(area_segment);
+    port.area_memory = area_memory;
+    port.area_size = page;
+    port.area_epoch = port.config.generation;
     return Status::OK();
 }
 
@@ -155,9 +195,17 @@ Status StandaloneProbeResourceProvider::destroyPortLocked(PortState& port) {
         auto status = adapter_->unregisterLocalSegment(port.source_segment);
         if (first_error.ok() && !status.ok()) first_error = status;
     }
+    if (adapter_ && port.area_segment) {
+        auto status = adapter_->unregisterLocalSegment(port.area_segment);
+        if (first_error.ok() && !status.ok()) first_error = status;
+    }
     if (port.source_memory != nullptr) {
         std::free(port.source_memory);
         port.source_memory = nullptr;
+    }
+    if (port.area_memory != nullptr) {
+        std::free(port.area_memory);
+        port.area_memory = nullptr;
     }
     port.probe_jfc.reset();
     port.owns_jfc = false;
@@ -165,6 +213,9 @@ Status StandaloneProbeResourceProvider::destroyPortLocked(PortState& port) {
     port.source_segment.reset();
     port.source_size = 0;
     port.source_generation = 0;
+    port.area_segment.reset();
+    port.area_size = 0;
+    port.area_epoch = 0;
     return first_error;
 }
 
@@ -358,6 +409,26 @@ StandaloneProbeResourceProvider::portViews() const {
                                  port.probe_jetty->id(),
                                  reinterpret_cast<uint64_t>(port.source_memory),
                                  1, port.source_generation, port.owns_jfc});
+    }
+    return views;
+}
+
+std::vector<StandaloneProbeResourceProvider::LocalAreaView>
+StandaloneProbeResourceProvider::localAreaViews() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<LocalAreaView> views;
+    views.reserve(ports_.size());
+    for (const auto& port : ports_) {
+        if (!port.area_segment) continue;
+        LocalAreaView view;
+        view.local_nic = port.config.local_nic;
+        view.generation = port.config.generation;
+        view.address = reinterpret_cast<uint64_t>(port.area_memory);
+        view.length = port.area_size;
+        view.token = kProbeAreaToken;
+        view.epoch = port.area_epoch;
+        view.descriptor = port.area_segment->descriptor();
+        views.push_back(std::move(view));
     }
     return views;
 }

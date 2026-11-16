@@ -250,11 +250,13 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         }
         segment =
             std::make_shared<FakeRemoteSegment>(address, length, descriptor);
+        live_remote_segments_.fetch_add(1, std::memory_order_relaxed);
         return Status::OK();
     }
     Status unimportRemoteSegment(RemoteSegmentPtr& segment) override {
         if (auto fake = std::dynamic_pointer_cast<FakeRemoteSegment>(segment)) {
             fake->close();
+            decrement(live_remote_segments_);
         }
         segment.reset();
         return Status::OK();
@@ -423,6 +425,9 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     size_t liveLocalSegmentCount() const {
         return live_local_segments_.load(std::memory_order_relaxed);
     }
+    size_t liveRemoteSegmentCount() const {
+        return live_remote_segments_.load(std::memory_order_relaxed);
+    }
 
    private:
     static void decrement(std::atomic<size_t>& counter) {
@@ -459,6 +464,7 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     std::atomic<size_t> live_jfcs_{0};
     std::atomic<size_t> live_jetties_{0};
     std::atomic<size_t> live_local_segments_{0};
+    std::atomic<size_t> live_remote_segments_{0};
 };
 
 DeviceInfo fakeDevice() {

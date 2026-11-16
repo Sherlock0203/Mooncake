@@ -112,7 +112,21 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
         bool owns_jfc{false};
     };
 
+    // Local probe area page: the page peers write their 1-byte probes into.
+    // It is registered with remote-write permission and published to peers by
+    // the handshake layer; the PLM never needs it.
+    struct LocalAreaView {
+        Topology::NicID local_nic{-1};
+        uint64_t generation{0};
+        uint64_t address{0};
+        uint64_t length{0};
+        uint32_t token{0};
+        uint64_t epoch{0};
+        SegmentDescriptor descriptor;
+    };
+
     [[nodiscard]] std::vector<PortView> portViews() const;
+    [[nodiscard]] std::vector<LocalAreaView> localAreaViews() const;
     [[nodiscard]] size_t quarantineCount() const;
     [[nodiscard]] uint64_t retireCalls() const;
     [[nodiscard]] bool initialized() const;
@@ -127,6 +141,10 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
         void* source_memory{nullptr};
         size_t source_size{0};
         uint64_t source_generation{1};
+        LocalSegmentPtr area_segment;
+        void* area_memory{nullptr};
+        size_t area_size{0};
+        uint64_t area_epoch{0};
     };
 
     Status createPortLocked(PortState& port);

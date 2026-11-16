@@ -17,6 +17,7 @@
 // peer edges, and the P1 handoff/retire recording behavior.
 
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <memory>
 #include <vector>
@@ -101,7 +102,18 @@ TEST(UbProbeStandaloneProviderTest, DedicatedSnapshotCreatesAndReleases) {
     EXPECT_EQ(port.peer_budget, params.peer_budget);
     EXPECT_EQ(adapter->liveJfcCount(), 1U);
     EXPECT_EQ(adapter->liveJettyCount(), 1U);
-    EXPECT_EQ(adapter->liveLocalSegmentCount(), 1U);
+    // Source page plus the local probe area page peers write into.
+    EXPECT_EQ(adapter->liveLocalSegmentCount(), 2U);
+
+    const auto areas = provider.localAreaViews();
+    ASSERT_EQ(areas.size(), 1U);
+    EXPECT_EQ(areas[0].local_nic, 0);
+    EXPECT_EQ(areas[0].generation, 1U);
+    EXPECT_EQ(areas[0].length % static_cast<uint64_t>(::getpagesize()), 0U);
+    EXPECT_EQ(areas[0].address % static_cast<uint64_t>(::getpagesize()), 0U);
+    EXPECT_EQ(areas[0].token, 0xACFEU);
+    EXPECT_EQ(areas[0].epoch, 1U);
+    EXPECT_FALSE(areas[0].descriptor.hex.empty());
 
     const auto views = provider.portViews();
     ASSERT_EQ(views.size(), 1U);
@@ -150,7 +162,7 @@ TEST(UbProbeStandaloneProviderTest, SharedModeBorrowsBusinessJfc) {
     EXPECT_EQ(graph.ports[0].probe_jfc, nullptr);
     EXPECT_EQ(adapter->liveJfcCount(), 1U);
     EXPECT_EQ(adapter->liveJettyCount(), 1U);
-    EXPECT_EQ(adapter->liveLocalSegmentCount(), 1U);
+    EXPECT_EQ(adapter->liveLocalSegmentCount(), 2U);
 
     ASSERT_TRUE(provider.shutdown().ok());
     // The business JFC is borrowed: the provider must not delete it.
