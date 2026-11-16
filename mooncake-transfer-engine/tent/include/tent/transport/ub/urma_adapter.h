@@ -146,9 +146,6 @@ inline Status buildLocalSendProfile(const DeviceInfo& device, int64_t priority,
         return Status::InvalidArgument(
             "URMA device transport_modes must be valid and include RM");
     }
-    if ((capabilities.rm_tp_cap & kUrmaTpTypeRtpMask) == 0) {
-        return Status::InvalidArgument("URMA RM capability does not include RTP");
-    }
     // RM over CTR: rm_tp_cap is advisory here  because some providers leave it
     // zero while still exposing CPT in the per-priority table.
     // the per-priority bind mask is the authoritative local signal.

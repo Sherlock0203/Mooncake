@@ -274,9 +274,9 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         auto fake_jfc = std::dynamic_pointer_cast<FakeJfc>(jfc);
         if (!fake_jfc) return Status::InvalidArgument("bad JFC");
         const bool rm_mode = options.trans_mode == kUrmaTransportModeRm;
-        if (rm_mode && (options.bind_tp_type_mask & kUrmaTpTypeRtpMask) == 0) {
+        if (rm_mode && (options.bind_tp_type_mask & kUrmaTpTypeCtpMask) == 0) {
             return Status::InvalidArgument(
-                "RM JFS bind mask does not cover URMA_RTP");
+                "RM JFS bind mask does not cover URMA_CTP");
         }
         jetty =
             std::make_shared<FakeJetty>(next_jetty_id_++, fake_jfc, rm_mode);
@@ -655,7 +655,7 @@ UbBootstrapDesc makeRmBootstrapV2Request() {
     target.target_epoch = 1;
     target.profile.trans_mode = kUrmaTransportModeRm;
     target.profile.target_type = kUrmaTargetTypeJetty;
-    target.profile.tp_type = kUrmaTpTypeRtp;
+    target.profile.tp_type = kUrmaTpTypeCtp;
 
     UbRmBootstrapDesc rm;
     rm.transport_mode = "RM";
@@ -1620,7 +1620,7 @@ TEST(UbNativeDataPathTest, UbTransportRunsSelfReadWriteOverNativeControlPlane) {
 JettyOptions rmJettyOptions() {
     JettyOptions options;
     options.trans_mode = kUrmaTransportModeRm;
-    options.bind_tp_type_mask = kUrmaTpTypeRtpMask;
+    options.bind_tp_type_mask = kUrmaTpTypeCtpMask;
     return options;
 }
 
@@ -1628,9 +1628,9 @@ DeviceInfo rmCapableDevice() {
     auto device = fakeDevice();
     device.capabilities.transport_modes = 3;  // RC|RM
     device.kind = DeviceKind::PHYSICAL;
-    device.capabilities.rm_tp_cap = kUrmaTpTypeRtpMask;
+    device.capabilities.rm_tp_cap = kUrmaTpTypeCtpMask;
     device.capabilities.priority_tp_type_masks[kUrmaMaxPriority] =
-        kUrmaTpTypeRtpMask;
+        kUrmaTpTypeCtpMask;
     return device;
 }
 
@@ -2164,7 +2164,7 @@ TEST(UbRmLegacyTest, RmJettyBindIsRejectedByTheAdapter) {
 
 TEST(UbRmLegacyTest, RmInstallGateFailsClosedWithoutRmCapabilities) {
     auto device = fakeDevice();
-    // transport_modes without RM or no RTP priority mask must reject install
+    // transport_modes without RM or no CTP priority mask must reject install
     // with NotImplemented before any Jetty is created.
     device.capabilities.transport_modes = 1;
     auto adapter = std::make_shared<FakeUrmaAdapter>(device);

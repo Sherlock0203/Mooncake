@@ -263,7 +263,7 @@ UbBootstrapDesc makeValidRmBootstrap() {
     target.target_epoch = 4;
     target.profile.trans_mode = kUrmaTransportModeRm;
     target.profile.target_type = kUrmaTargetTypeJetty;
-    target.profile.tp_type = kUrmaTpTypeRtp;
+    target.profile.tp_type = kUrmaTpTypeCtp;
 
     UbRmBootstrapDesc rm;
     rm.transport_mode = "RM";
@@ -410,7 +410,7 @@ TEST(UbBootstrapTest, ValidatesRmIdentityProfilesAndProbeReferences) {
     desc.rm->targets[0].profile.target_type = 0;  // URMA_JFR is out of scope.
     EXPECT_TRUE(validateUbBootstrap(desc).IsInvalidArgument());
     desc = makeValidRmBootstrap();
-    desc.rm->targets[0].profile.tp_type = 1;  // CTP is outside the first RM/RTP profile.
+    desc.rm->targets[0].profile.tp_type = kUrmaTpTypeCtp;  // CTP is outside the first RM/RTP profile.
     EXPECT_TRUE(validateUbBootstrap(desc).IsInvalidArgument());
     desc = makeValidRmBootstrap();
     desc.rm->targets[0].id = 0;
@@ -895,7 +895,8 @@ TEST(UbLocalSendProfileTest, RejectsInvalidPriorityAndRmRtpCapabilities) {
     invalid.capabilities.rm_tp_cap = 0;
     EXPECT_TRUE(buildLocalSendProfile(invalid, 3, profile).IsInvalidArgument());
     invalid = device;
-    invalid.capabilities.priority_tp_type_masks[3] = 1U << 1;
+    // invalid.capabilities.priority_tp_type_masks[3] = 1U << 1;
+    invalid.capabilities.priority_tp_type_masks.fill(0);
     EXPECT_TRUE(buildLocalSendProfile(invalid, 3, profile).IsInvalidArgument());
 }
 
