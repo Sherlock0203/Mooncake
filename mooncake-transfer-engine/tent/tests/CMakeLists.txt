@@ -558,6 +558,27 @@ if(USE_UB)
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_ub_core_test COMMAND tent_ub_core_test)
 
+  # Completion gate W2a: the shared record, the gate and the counters, linked
+  # against nothing but completion_record.cpp so the gate stays testable
+  # without workers, slices, an adapter or the probe link manager.
+  add_executable(tent_ub_completion_gate_test ub_completion_gate_test.cpp
+                                              ../src/transport/ub/completion_record.cpp)
+  target_link_libraries(tent_ub_completion_gate_test
+                        PRIVATE tent_common gtest gtest_main)
+  target_include_directories(tent_ub_completion_gate_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_completion_gate_test
+           COMMAND tent_ub_completion_gate_test)
+
+  add_executable(tent_ub_completion_record_test ub_completion_record_test.cpp
+                                                ../src/transport/ub/completion_record.cpp)
+  target_link_libraries(tent_ub_completion_record_test
+                        PRIVATE tent_common gtest gtest_main)
+  target_include_directories(tent_ub_completion_record_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_completion_record_test
+           COMMAND tent_ub_completion_record_test)
+
   add_executable(
     tent_ub_teardown_test
     ub_teardown_test.cpp ../src/transport/ub/buffers.cpp
