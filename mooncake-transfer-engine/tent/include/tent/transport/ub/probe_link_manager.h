@@ -115,6 +115,7 @@ struct ProbeAction {
     uint64_t due_ns{0};
     JettyPtr probe_jetty;
     RemoteJettyRef remote_jetty;
+    LocalSegmentPtr source_segment;
     RemoteSegmentPtr area_segment;
     uint64_t area_address{0};
     uint64_t area_length{0};

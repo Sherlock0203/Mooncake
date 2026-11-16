@@ -102,6 +102,7 @@ TEST(UbProbeStandaloneProviderTest, DedicatedSnapshotCreatesAndReleases) {
     EXPECT_EQ(port.peer_budget, params.peer_budget);
     EXPECT_EQ(adapter->liveJfcCount(), 1U);
     EXPECT_EQ(adapter->liveJettyCount(), 1U);
+    EXPECT_EQ(adapter->lastJettyTransportMode(), JettyTransportMode::kRm);
     // Source page plus the local probe area page peers write into.
     EXPECT_EQ(adapter->liveLocalSegmentCount(), 2U);
 

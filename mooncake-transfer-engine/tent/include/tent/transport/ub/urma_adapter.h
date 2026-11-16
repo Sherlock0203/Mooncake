@@ -147,12 +147,21 @@ struct JfcOptions {
     bool enable_completion_events = false;
 };
 
+// RC Jetties are bound once and post through their binding. RM Jetties stay
+// unbound and carry a remote target on every WR (see the per-WR post overload
+// below). Business traffic keeps the RC default; probe traffic uses RM.
+enum class JettyTransportMode : uint8_t {
+    kRc,
+    kRm,
+};
+
 struct JettyOptions {
     uint32_t depth = 256;
     uint8_t priority = 15;
     uint8_t max_sge = 1;
     uint8_t rnr_retry = 7;
     uint8_t error_timeout = 17;
+    JettyTransportMode transport_mode{JettyTransportMode::kRc};
 };
 
 struct RemoteJettyInfo {
@@ -268,6 +277,21 @@ class UrmaAdapter {
     virtual Status post(const JettyPtr& jetty,
                         const std::vector<WorkRequest>& requests,
                         size_t& posted_count) = 0;
+
+    // RM post: the Jetty must have been created with
+    // JettyOptions::transport_mode == kRm; the target is imported and cached by
+    // the adapter and installed as wr.tjetty for this WR only. The default
+    // implementation rejects the call for adapters without RM support.
+    virtual Status post(const JettyPtr& jetty, const RemoteJettyInfo& target,
+                        const WorkRequest& request, size_t& posted_count) {
+        (void)jetty;
+        (void)target;
+        (void)request;
+        posted_count = 0;
+        return Status::NotImplemented(
+            "per-WR remote target is not supported by this adapter");
+    }
+
     virtual Status poll(const JfcPtr& jfc, size_t max_completions,
                         std::vector<Completion>& completions) = 0;
 };

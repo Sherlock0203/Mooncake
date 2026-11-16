@@ -424,6 +424,7 @@ sequenceDiagram
 - **每个 local_port 一个专用 probe Jetty**：原生生命周期（创建、modify ERROR 退役、flush、删除、补池、预算、tombstone）归**独立的探测资源供给方（probe provider）**；dedicated 模式不租借业务 Jetty 池、不占业务 lease/K/quota，可与池化侧同进程部署但接口独立；refill 每口只发布一个活跃探测发送成员；**使用归本侧**——句柄与代次经接口 4 初始化供给，重建后经接口 7 更新（`kProbeHandleReplaced`，携带新句柄、源页与新代次）。
 - probe Jetty 固定归属本端口与 probe shard JFC slot，不进业务池、**不做本地 RC bind（RM 模式前提）**；探测 WR **逐 WR 指定远端 probe Jetty（identity/uasid）**，不依赖本地绑定（决策 D-2）。探测页是**独立注册、独立 token、独立 import** 的一页内存，不复用业务数据 segment 的授权；import 按 `(ContextKey, target)` 去重。
 - **探测完成队列默认 dedicated probe JFC（每 Context 一个，深度 64；建议向 probe provider 申请 send-only，省 JFR 与 `max_jfc` 预算）**，业务与探测完成队列隔离；预算受限时可切 shared 业务 JFC＋预留 credit（probe/credit_reserve）——两种模式均由 probe provider 创建、经接口 4 供给；**本侧只 poll，不拥有、不删除该 JFC**。
+- **本端探测区页每口一页**：供对端写入 1 字节，remote-write 权限＋probe token，由 probe provider 注册并经握手发布；`area_epoch` 随探测通道代次。
 - **对端探测页每 remote target 一页一槽**（决策 D-4）：descriptor 至少含 address/length/token/epoch，由对端注册、probe provider 经接口 4 供给；多口并发写同一页同一字节是安全的（payload 常量、无读回语义），因此不必每路径一槽。
 - **探测源页按 generation 隔离**：每个探测通道代次使用独立源页（`source_generation`）；旧代孤儿在终结或移交前不得注销，避免旧 WR 与新 WR 共享源内存。
 - **ProbeLink** 每条固定携带：peer_id, local_port, local_probe_jetty（句柄＋代次）, remote_port, remote_target_identity/epoch, topology_epoch, probe_key, health_state, next_probe_time, backoff, success_count, failure_count。探测链路数 = 合法邻接边数 = Σ degree(local_port)（4 口→8、6 口→12，按配置动态计算，禁硬编码）；两方向分别建表。
@@ -437,7 +438,7 @@ sequenceDiagram
 真正的硬依赖只有四条：
 
 1. adapter 的**逐 WR target** 能力（RM；若仍为 RC，则退化为"每路径一个已绑定 probe Jetty"，见 [tent-ub-probe-standalone-supply](tent-ub-probe-standalone-supply.md) 的 RC 退化）；
-2. 对端**探测页 descriptor + 远端 probe Jetty identity** 的握手（bootstrap 扩展）；
+2. **本端探测区页的发布 + 对端探测页 descriptor/远端 probe Jetty identity** 的握手（bootstrap 扩展）；
 3. 设备/拓扑/邻接/代次的供给；
 4. 完成队列的 poll 线程（复用现有 poller）。
 
@@ -493,6 +494,7 @@ stateDiagram-v2
 - **每个 ProbeResource（本端口）最多一个在途 probe**（含 post 未退出或责任不明阶段）：两个 target 的探测不同时占同一发送队列，避免其一故障使同口多个在途探测被连带 flush。该串行约束只作用于探测资源，不把业务 slice 聚成组。**peer_budget（默认 4）** 是同一 peer 跨口的在途上限；超时转孤儿时随记录释放其预算，避免累计 4 次超时让整个 peer 不可调度。
 - **端口槽按 generation 作用域**：`slot_token` 只约束"当前这一代探测通道"；lane 退役后槽保持占用（不重发），接口 7 新代次到达时归零，旧在途记录转入孤儿表（按 token 索引，保留源页/探测页引用），迟到的完成只结清资源、不发布健康。
 - probe WR 构造（UMDK 实机依据，§7.2.1）：标准 WR，`URMA_OPC_WRITE`、`complete_enable=1`、`next=null`，一字节 payload 写入对端授权的专用探测区（peer 槽位）；本地源缓冲保持不变；**注册范围按页对齐/provider 要求分配——payload=1 ≠ 注册长度 1**；禁止写业务内存、禁止校验所谓 magic。WRITE probe 成功只证明当前探测配置可用，不证明业务 READ 权限、任意长度能力或物理端口 GOOD（§9.6）。
+- **独立 provider 的 probe Jetty 以 `JettyOptions::transport_mode=kRm` 创建**；post 走 `UrmaAdapter::post(jetty, target, wr)` 的逐 WR target 重载——adapter 按 `(eid, id, uasid, token)` 缓存 `urma_import_jetty` 得到的 target，每个 WR 设 `wr.tjetty`，不 `bind`；lane 退役/关闭时 unimport 全部 target。
 - **探测区由 bootstrap v2 显式发布 descriptor（至少 address/length/token/epoch），每 remote target 一页一槽，经接口 4 供给；本端只消费描述符、不猜测地址**。探测页独立注册、独立 token，不写业务内存；换代（`area_epoch` 变化）原地更新该边，在途 record 判 stale，周期项 `next=now`，campaign 条目保留。
 - post 前置（依序，均为非阻塞）：句柄代次==当前供给代次（接口 4/7）→ imported target 引用（当前 epoch）→ token 发布（probe namespace）→ 控制额度与 JFC credit 占用 → record 发布（W1 为中性 `ProbeRecord`，W2 起为 `CompletionRecord` 子集视图）。**token/record 先发布后 post**，完成可早于 post 返回；**单一投递者**（probe 调度线程串行）使代次复核无并发竞争；上报退役（接口 2）后该口暂停 post，直至接口 7 新代次句柄。
 - 相同物理 Context 已毁坏（池化侧 DRAINING，接口 7/9 通知）时不强行 post，等资源重建先恢复条件；业务节点门禁关闭不阻止受限恢复探测（探测走独立控制额度）。

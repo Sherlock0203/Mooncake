@@ -633,6 +633,17 @@ if(USE_UB)
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_ub_probe_handshake_test COMMAND tent_ub_probe_handshake_test)
 
+  # Probe poster over the RM adapter contract (P3): one-byte WRITE with a
+  # per-WR remote target, no bind.
+  add_executable(tent_ub_probe_poster_test
+                 ub_probe_poster_test.cpp
+                 ../src/transport/ub/probe_poster_urma.cpp)
+  target_link_libraries(tent_ub_probe_poster_test PRIVATE tent_common gtest
+                                                          gtest_main)
+  target_include_directories(tent_ub_probe_poster_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_probe_poster_test COMMAND tent_ub_probe_poster_test)
+
   add_executable(tent_ub_probe_integration_test ub_probe_integration_test.cpp)
   target_link_libraries(tent_ub_probe_integration_test
                         PRIVATE gtest gtest_main tent_link_group)

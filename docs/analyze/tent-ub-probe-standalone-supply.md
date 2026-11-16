@@ -29,6 +29,7 @@
 | probe Jetty | 4 | probe provider | `jetty_generation` | 每口一个活跃发送成员；RM 下不 bind |
 | probe JFC | 4（dedicated） | probe provider | 随 Context | 深度 `probe/jfc_depth`；建议 send-only |
 | 探测源页 | 每口每代 1 | probe provider | `source_generation` | 页对齐注册；内容常量；旧代孤儿清零前不注销 |
+| 本端探测区页 | 每口 1 | probe provider | `area_epoch` | 供对端写入；remote-write 权限＋token；descriptor 经握手发布 |
 | 对端探测页 import | ≤8（按 `(ContextKey,target)` 去重） | probe provider | `area_epoch` | 独立注册、独立 token，不复用业务数据 segment |
 | 远端 probe Jetty identity | 每边 1 | 对端发布 | 随 target epoch | id/uasid/eid；逐 WR 指定（RM） |
 | 控制额度 | 每口 1 | probe provider | — | 单在途，需求恒为 1 |
@@ -70,7 +71,7 @@
 | `ProbeResourceProvider::snapshot` | 汇总本端每口资源 + 每边对端 descriptor，构造 `ProbeGraph` |
 | `retireProbeLane` | 上报探测 lane 退役；provider 执行 modify/flush/delete 并重建，发 `kProbeHandleReplaced` |
 | `handoffUnproven` | 接收 W1 的 `ProbeHandoff`，接管源页/探测页引用与 quarantine |
-| `ProbePoster::post` | RM：逐 WR tjetty；RC 退化：绑定式 Jetty（§7） |
+| `ProbePoster::post` | `UrmaProbePoster` → `UrmaAdapter::post(jetty, target, wr)`；RM 逐 WR tjetty，RC 退化走绑定式 Jetty（§7） |
 | `ProbeJfcSlot` | 把 dedicated probe JFC 交给 workers 轮询（provider 保有所有权，不删除） |
 | `ProbeEvent` 七种 kind | provider 在资源变化时调用；幂等键 `(graph_epoch,event_seq)` |
 
@@ -81,11 +82,12 @@
 ### 5.1 本端每口
 
 1. **JFC**：dedicated 用 `JfcOptions{depth=probe/jfc_depth, enable_completion_events=false}` 创建；shared 模式不建，探测完成落业务 JFC。
-2. **probe Jetty**：`JettyOptions{depth=…, max_sge=1, priority=…}` 创建，**RM 下不 bind**；RC 退化见 §7。
+2. **probe Jetty**：`JettyOptions{depth=…, max_sge=1, priority=…, transport_mode=kRm}` 创建，**RM 下不 bind**；RC 退化见 §7。
 3. **源页**：按 page size 对齐分配（payload=1，注册长度≥1 页），`registerLocalSegment`；访问权限只覆盖本端 DMA 读，具体 flag 待 provider 验证；`source_generation` 每代递增。
-4. **lane 退役**：`retireProbeLane` → 停止该口 post → modify ERROR → quiesce/flush → delete Jetty → 建新 Jetty + 新源页 → `kProbeHandleReplaced`（新代次）。调度器在退役窗口不会 post（PLM 置 `handle_valid=false`）。
-5. **quarantine**：`handoffUnproven` 接管引用；旧代源页/探测页在所有引用（含孤儿）清零后注销；关闭时按 §9.6 移交。
-6. **credit/budget**：控制额度 1/口；peer 预算由本侧按 `probe/peer_budget` 统计，provider 不参与。
+4. **本端探测区页**：每口分配一页并 `registerLocalSegment`（access=WRITE，带 probe token），供对端写入 1 字节；`area_epoch` 随探测通道代次；descriptor/token 由握手层发布给对端。
+5. **lane 退役**：`retireProbeLane` → 停止该口 post → modify ERROR → quiesce/flush → delete Jetty → 建新 Jetty + 新源页 → `kProbeHandleReplaced`（新代次）。调度器在退役窗口不会 post（PLM 置 `handle_valid=false`）。
+6. **quarantine**：`handoffUnproven` 接管引用；旧代源页/探测页在所有引用（含孤儿）清零后注销；关闭时按 §9.6 移交。
+7. **credit/budget**：控制额度 1/口；peer 预算由本侧按 `probe/peer_budget` 统计，provider 不参与。
 
 ### 5.2 远端每边
 
@@ -113,8 +115,9 @@
 
 ### 7.1 RM（首选）
 
-- 每口一个 probe Jetty，不 bind；`ProbePostTarget` 携带远端 identity，`ProbeWorkRequest` 携带 token/源地址/探测页地址（长度均为 1）。
-- adapter 侧映射到 `urma_jfs_wr_t`：`wr.tjetty = remote`，`complete_enable=1`，单 WR；这是 P0-B 的 RM 能力，不需要 Jetty 池。
+- 每口一个 probe Jetty，以 `JettyOptions::transport_mode = kRm` 创建，不 bind；`ProbePostTarget` 携带远端 identity、源页与探测页段，`ProbeWorkRequest` 携带 token/源地址/探测页地址（长度均为 1）。
+- poster 映射：`UrmaProbePoster` 构造单 WR `WorkRequest{WRITE, source, area, length=1, token}`，调用 `UrmaAdapter::post(jetty, remote_target, wr)`。
+- adapter 侧：按 `(eid, id, uasid, token)` 缓存 `urma_import_jetty` 得到的 target；每个 WR 设 `wr.tjetty = target`、`complete_enable=1`；不调用 `urma_bind_jetty`；清理时 unimport 全部 target。不需要 Jetty 池。
 
 ### 7.2 RC 退化（bring-up 用，不默认）
 
@@ -126,7 +129,7 @@
 
 ### 7.3 契约映射
 
-`ProbePostTarget = {probe_jetty, jetty_generation, remote_jetty, area_segment}`；`ProbeWorkRequest = {opcode=WRITE, token, source_address/length=1, area_address/length=1}`。RM 实现使用 `remote_jetty`；RC 退化忽略它并使用已绑定 Jetty。两种实现都不需要 PLM 变化。
+`ProbePostTarget = {probe_jetty, jetty_generation, remote_jetty, source_segment, area_segment}`；`ProbeWorkRequest = {opcode=WRITE, token, source_address/length=1, area_address/length=1}`。RM 实现使用 `remote_jetty` + 逐 WR adapter 重载；RC 退化忽略它并使用已绑定 Jetty。两种实现都不需要 PLM 变化。
 
 ## 8. 落地拆分
 
@@ -134,15 +137,18 @@
 | --- | --- | --- | --- |
 | **P1** | provider 骨架 + 本端资源管理（建/删 probe Jetty/JFC/源页），fake adapter 可跑 | 安装/拆卸不泄漏；每口资源可查 | 无 |
 | **P2** | 握手字段 + 探测页 import，单 peer/单口建图 | `ProbeGraph` 含边；对端不支持时降级并计数 | 握手字段评审 |
-| **P3** | Poster：RM 逐 WR 或 RC 绑定退化 | 1 字节 WRITE 完成；token 正确回传 | P0-B 或 RC 退化 |
+| **P3** | Poster：RM 逐 WR（已实现）/ RC 绑定退化（bring-up） | 1 字节 WRITE 完成；token 正确回传 | RM adapter |
 | **P4** | lane 退役/重建 + 接口 7 事件 + quarantine | 超时→退役→新代次→恢复；旧页引用清零前不注销 | P1–P3 |
 | **P5** | 多口/多 peer/多代次；shared 模式可选 | 矩阵 #4/#6/#16 在真实 adapter 上通过 | P4 |
 | **P6** | 实机：单机双端 → 跨机多口 | 探测完成、超时、关闭移交与日志一致 | 硬件＋池化侧 provider |
 
+**实现状态（2026-11-13）**：P1（provider 骨架与本端资源：probe JFC/Jetty/源页/探测区页）、P2 的本地半部（descriptor 校验、探测页 import/cache/替换、单 peer/单口建图）与 P3 RM poster（逐 WR target）已实现并通过 fake adapter 测试；P2 的 bootstrap 线上字段与 transport 装配仍待 P5。注意：本机默认构建 `TENT_HAS_REAL_URMA=OFF`；RM 原生路径已用仓库内 vendored UMDK 头文件（`build/_deps/urma-src`）以 `-DTENT_HAS_REAL_URMA=1` 完成对象级编译，仍需 real liburma 链接构建与实机验证。
+
 新增代码面（预计）：
 
 - `include/tent/transport/ub/probe_provider_standalone.h` + `src/transport/ub/probe_provider_standalone.cpp`（方案 B）；
-- `include/tent/transport/ub/probe_poster_urma.h` + `src/transport/ub/probe_poster_urma.cpp`（RM/RC）；
+- `include/tent/transport/ub/probe_poster_urma.h` + `src/transport/ub/probe_poster_urma.cpp`（RM）；
+- adapter：`JettyOptions::transport_mode`、`UrmaAdapter::post(jetty, target, wr)`、按 target 缓存 import；
 - `params.h`：`probe/provider`（pool/standalone）、`probe/rc_fallback`（默认 false）等；
 - `ub_transport.cpp`：按配置选择 provider/poster（现有注入缝不变）；
 - `tests/ub_probe_standalone_provider_test.cpp`：fake adapter 生命周期、握手降级、RC 退化。

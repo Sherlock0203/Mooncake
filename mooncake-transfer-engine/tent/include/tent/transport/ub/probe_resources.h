@@ -210,7 +210,11 @@ class ProbeResourceProvider : public ProbeReportSink {
 struct ProbePostTarget {
     JettyPtr probe_jetty;
     uint64_t jetty_generation{0};
+    // RM: per-WR remote target. The adapter imports/caches it.
     RemoteJettyRef remote_jetty;
+    // The WRITE source and destination segments; both must stay alive until
+    // the completion is consumed.
+    LocalSegmentPtr source_segment;
     RemoteSegmentPtr area_segment;
 };
 

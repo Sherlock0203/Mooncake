@@ -98,6 +98,9 @@ Status StandaloneProbeResourceProvider::createPortLocked(PortState& port) {
 
     JettyOptions jetty_options;
     jetty_options.max_sge = 1;
+    // Probe postings carry a per-WR remote target; RM keeps the probe Jetty
+    // unbound and independent of any endpoint binding.
+    jetty_options.transport_mode = JettyTransportMode::kRm;
     JettyPtr jetty;
     auto status =
         adapter_->createJetty(port.config.context, jfc, jetty_options, jetty);
@@ -184,7 +187,11 @@ Status StandaloneProbeResourceProvider::createPortLocked(PortState& port) {
 Status StandaloneProbeResourceProvider::destroyPortLocked(PortState& port) {
     Status first_error = Status::OK();
     if (adapter_ && port.probe_jetty) {
-        auto status = adapter_->deleteJetty(port.probe_jetty);
+        // deleteJetty requires a reset Jetty. Probe has no in-flight WRs at
+        // this point: the transport drains the PLM before provider shutdown.
+        auto status = adapter_->resetJetty(port.probe_jetty);
+        if (first_error.ok() && !status.ok()) first_error = status;
+        status = adapter_->deleteJetty(port.probe_jetty);
         if (first_error.ok() && !status.ok()) first_error = status;
     }
     if (adapter_ && port.owns_jfc && port.probe_jfc) {

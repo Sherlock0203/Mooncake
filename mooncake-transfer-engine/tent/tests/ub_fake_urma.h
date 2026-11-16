@@ -262,9 +262,10 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         return Status::OK();
     }
     Status createJetty(const ContextPtr&, const JfcPtr& jfc,
-                       const JettyOptions&, JettyPtr& jetty) override {
+                       const JettyOptions& options, JettyPtr& jetty) override {
         auto fake_jfc = std::dynamic_pointer_cast<FakeJfc>(jfc);
         if (!fake_jfc) return Status::InvalidArgument("bad JFC");
+        last_jetty_transport_mode_ = options.transport_mode;
         jetty = std::make_shared<FakeJetty>(next_jetty_id_++, fake_jfc);
         live_jetties_.fetch_add(1, std::memory_order_relaxed);
         return Status::OK();
@@ -371,6 +372,16 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         }
         return Status::OK();
     }
+    Status post(const JettyPtr& jetty, const RemoteJettyInfo& target,
+                const WorkRequest& request, size_t& posted) override {
+        (void)jetty;
+        last_post_ = request;
+        last_post_target_ = target;
+        last_post_had_target_ = true;
+        posted = 1;
+        return Status::OK();
+    }
+
     Status poll(const JfcPtr& jfc, size_t maximum,
                 std::vector<Completion>& completions) override {
         completions.clear();
@@ -428,6 +439,12 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     size_t liveRemoteSegmentCount() const {
         return live_remote_segments_.load(std::memory_order_relaxed);
     }
+    WorkRequest lastPost() const { return last_post_; }
+    RemoteJettyInfo lastPostTarget() const { return last_post_target_; }
+    bool lastPostHadTarget() const { return last_post_had_target_; }
+    JettyTransportMode lastJettyTransportMode() const {
+        return last_jetty_transport_mode_;
+    }
 
    private:
     static void decrement(std::atomic<size_t>& counter) {
@@ -465,6 +482,10 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     std::atomic<size_t> live_jetties_{0};
     std::atomic<size_t> live_local_segments_{0};
     std::atomic<size_t> live_remote_segments_{0};
+    WorkRequest last_post_;
+    RemoteJettyInfo last_post_target_;
+    bool last_post_had_target_{false};
+    JettyTransportMode last_jetty_transport_mode_{JettyTransportMode::kRc};
 };
 
 DeviceInfo fakeDevice() {

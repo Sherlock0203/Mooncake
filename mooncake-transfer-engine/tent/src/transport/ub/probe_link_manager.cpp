@@ -362,6 +362,7 @@ ProbeAction ProbeLinkManager::makeActionLocked(
     }
     action.due_ns = runtime.next_probe_ns;
     action.probe_jetty = port.supply.probe_jetty;
+    action.source_segment = port.supply.source_segment;
     action.source_address = port.supply.source_address;
     action.source_length = port.supply.source_length;
     return action;

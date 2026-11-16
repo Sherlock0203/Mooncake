@@ -143,6 +143,7 @@ void ProbeScheduler::postOne(const ProbeAction& action, uint64_t now_ns) {
     target.probe_jetty = action.probe_jetty;
     target.jetty_generation = action.jetty_generation;
     target.remote_jetty = action.remote_jetty;
+    target.source_segment = action.source_segment;
     target.area_segment = action.area_segment;
 
     ProbeWorkRequest request;
