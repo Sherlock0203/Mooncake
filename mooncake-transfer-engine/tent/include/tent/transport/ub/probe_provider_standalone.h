@@ -108,9 +108,8 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
 
     // Interface 7 sink (ProbeLinkManager) and interface-2 completion sink
     // (workers dispatcher). Both are required before a lane can be rebuilt.
-    void setAvailabilitySink(ProbeAvailabilitySink* sink);
-    using CompletionSink = std::function<Status(const Completion&)>;
-    void setCompletionSink(CompletionSink sink);
+    void setAvailabilitySink(ProbeAvailabilitySink* sink) override;
+    void setCompletionSink(ProbeCompletionSink sink) override;
 
     struct PortView {
         Topology::NicID local_nic{-1};
@@ -184,7 +183,7 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
     std::vector<ProbeHandoff> quarantine_;
     std::vector<RetiredPage> retired_pages_;
     ProbeAvailabilitySink* availability_sink_{nullptr};
-    CompletionSink completion_sink_;
+    ProbeCompletionSink completion_sink_;
     uint64_t graph_epoch_{0};
     uint64_t event_seq_{0};
     uint64_t retire_calls_{0};

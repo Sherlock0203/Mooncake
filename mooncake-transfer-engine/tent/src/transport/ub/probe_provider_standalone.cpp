@@ -416,7 +416,7 @@ void StandaloneProbeResourceProvider::retireProbeLane(const LaneKey& lane,
 
     // Dispatch quiesced completions outside the provider lock: the sink
     // (PLM/workers) may call back into handoffUnproven on the same thread.
-    CompletionSink sink;
+    ProbeCompletionSink sink;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         sink = completion_sink_;
@@ -457,7 +457,8 @@ void StandaloneProbeResourceProvider::setAvailabilitySink(
     availability_sink_ = sink;
 }
 
-void StandaloneProbeResourceProvider::setCompletionSink(CompletionSink sink) {
+void StandaloneProbeResourceProvider::setCompletionSink(
+    ProbeCompletionSink sink) {
     std::lock_guard<std::mutex> lock(mutex_);
     completion_sink_ = std::move(sink);
 }

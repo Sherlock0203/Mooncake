@@ -142,7 +142,7 @@
 | **P5** | 多口/多 peer/多代次；shared 模式可选 | 矩阵 #4/#6/#16 在真实 adapter 上通过 | P4 |
 | **P6** | 实机：单机双端 → 跨机多口 | 探测完成、超时、关闭移交与日志一致 | 硬件＋池化侧 provider |
 
-**实现状态（2026-11-16）**：P1（provider 骨架与本端资源）、P2 的本地半部（descriptor 校验、探测页 import/cache/替换、单 peer/单口建图）、P3 RM poster（逐 WR target）与 P4 的 provider 侧（quiesce→替换 Jetty/源页/探测区页→接口 7 事件、旧页 quarantine）已实现并通过 fake adapter 测试；P2 的 bootstrap 线上字段、P4 的 transport 装配（completion/availability sink 注入）仍待 P5。注意：本机默认构建 `TENT_HAS_REAL_URMA=OFF`；RM 原生路径已用仓库内 vendored UMDK 头文件（`build/_deps/urma-src`）以 `-DTENT_HAS_REAL_URMA=1` 完成对象级编译，仍需 real liburma 链接构建与实机验证。
+**实现状态（2026-11-16）**：P1（provider 骨架与本端资源）、P2 的本地半部（descriptor 校验、探测页 import/cache/替换、单 peer/单口建图）、P3 RM poster（逐 WR target）、P4 的 provider 侧（quiesce→替换 Jetty/源页/探测区页→接口 7 事件、旧页 quarantine）与 P5 的 transport 装配（`probe/provider=standalone`、sink 注入、启停顺序）已实现并通过 fake adapter/集成测试；剩余：bootstrap 线上字段（描述符交换）与 `probe/rc_fallback`。注意：本机默认构建 `TENT_HAS_REAL_URMA=OFF`；RM 原生路径已用仓库内 vendored UMDK 头文件（`build/_deps/urma-src`）以 `-DTENT_HAS_REAL_URMA=1` 完成对象级编译，仍需 real liburma 链接构建与实机验证。
 
 新增代码面（预计）：
 
@@ -162,11 +162,11 @@
 
 | 键 | 默认 | 语义 |
 | --- | --- | --- |
-| `probe/provider` | `pool`（过渡期）；P2 后可为 `standalone` | 选择 A/B 供给方；`enabled=false` 时不构造 |
+| `probe/provider` | `pool`（默认）/`standalone`（已实现） | `standalone` 由 transport 基于本端 Context 构造独立 provider；需注入 `ProbePeerDescriptorSource`，仅支持 dedicated JFC；`enabled=false` 时不构造 |
 | `probe/rc_fallback` | false | RM 未就绪时启用每边绑定式探测；仅 bring-up |
 | `probe/peer_unsupported` | 计数 | 对端不支持探测时的降级观测 |
 
-W1d 已实现的 11 个 `probe/*` 键保持不变；以上为 P1/P3 新增，需与池化侧确认后再进入配置表。
+W1d 已实现的 11 个 `probe/*` 键保持不变；`probe/provider` 已在 P5 实现（默认 `pool`）；`probe/rc_fallback` 仍未实现，暂不进入配置表。
 
 ## 10. 未决问题
 
