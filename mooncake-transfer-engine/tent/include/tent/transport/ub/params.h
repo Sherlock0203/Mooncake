@@ -81,6 +81,34 @@ struct UbProbeParams {
     bool stop_on_recovery = true;
 };
 
+// Pooled send-path parameters (C01). Both knobs are explicit positive
+// integers and are never derived from jetty_per_endpoint:
+//  - desired_per_context is the static Serving (IDLE + IN_USE) target per
+//    Context/LocalSendProfile pool key;
+//  - task_max_inflight_attempts is K, the maximum inflight attempts of one
+//    network UbTask across all contexts.
+struct UbSendPoolParams {
+    uint32_t desired_per_context = 6;
+    uint32_t task_max_inflight_attempts = 4;
+    // Bound on concurrent Jetty creations per pool key so refill cannot
+    // storm the provider.
+    uint32_t max_creating_per_key = 2;
+    // Per-JFC WR credits reserved for control records (flush-done markers,
+    // AE); business WRs only use the remaining capacity.
+    uint32_t jfc_credit_reserve = 16;
+};
+
+// Device-level native budget parameters (C01/C05).
+struct UbNativeBudgetParams {
+    // Configured Jetty budget per physical device. 0 derives the budget
+    // from the verified device limit at attach time; an explicit value must
+    // be positive and must not exceed the verified limit.
+    uint32_t max_jetty_per_device = 0;
+    // Non-negative reserve allowing bounded replacement creation while
+    // retired/quarantined predecessors still hold their budget.
+    uint32_t replacement_reserve = 2;
+};
+
 // The mode a caller may actually enter after gate evaluation.
 enum class UbRuntimeMode : uint8_t {
     kRcLegacy,
@@ -168,6 +196,9 @@ struct UbParams {
     UbJettyPoolParams jetty_pool;
     UbJettyReuseParams jetty_reuse;
     UbProbeParams probe;
+    // Pooled data-path knobs; dormant until the rm_pool gate matrix passes.
+    UbSendPoolParams send_pool;
+    UbNativeBudgetParams native_budget;
 
     bool enable_bandwidth_estimation = true;
     bool enable_notifications = false;
@@ -273,6 +304,33 @@ struct UbParams {
             return Status::InvalidArgument(
                 "transports/ub/probe/stop_on_recovery must remain true in v1");
         }
+
+        // Pooled send-path knobs: explicit positive integers, never derived
+        // from jetty_per_endpoint (C01).
+        CHECK_STATUS(readPositive(config,
+                                  "transports/ub/send_pool/desired_per_context",
+                                  parsed.send_pool.desired_per_context,
+                                  parsed.send_pool.desired_per_context));
+        CHECK_STATUS(readPositive(
+            config, "transports/ub/send_pool/task_max_inflight_attempts",
+            parsed.send_pool.task_max_inflight_attempts,
+            parsed.send_pool.task_max_inflight_attempts));
+        CHECK_STATUS(readPositive(
+            config, "transports/ub/send_pool/max_creating_per_key",
+            parsed.send_pool.max_creating_per_key,
+            parsed.send_pool.max_creating_per_key));
+        CHECK_STATUS(readNonNegative(
+            config, "transports/ub/send_pool/jfc_credit_reserve",
+            parsed.send_pool.jfc_credit_reserve,
+            parsed.send_pool.jfc_credit_reserve));
+        CHECK_STATUS(readNonNegative(
+            config, "transports/ub/native_budget/max_jetty_per_device",
+            parsed.native_budget.max_jetty_per_device,
+            parsed.native_budget.max_jetty_per_device));
+        CHECK_STATUS(readNonNegative(
+            config, "transports/ub/native_budget/replacement_reserve",
+            parsed.native_budget.replacement_reserve,
+            parsed.native_budget.replacement_reserve));
 
         output = std::move(parsed);
         return Status::OK();

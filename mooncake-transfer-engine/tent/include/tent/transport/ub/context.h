@@ -19,6 +19,7 @@
 namespace mooncake::tent::ub {
 
 class UbSendJettyPool;
+class SendJettyPool;
 
 class UbContext final : public std::enable_shared_from_this<UbContext> {
    public:
@@ -84,6 +85,16 @@ class UbContext final : public std::enable_shared_from_this<UbContext> {
         std::lock_guard<std::mutex> lock(lifecycle_mutex_);
         return jetty_pool_;
     }
+
+    // Pooled rm_pool data path (C06). Null unless the transport installed a
+    // per-attempt pool for this context; the legacy send path never touches
+    // it, so RC/RM-legacy behavior is unchanged while the rm_pool gate
+    // matrix remains fail-closed.
+    void attachPooledSendPool(std::shared_ptr<SendJettyPool> pool);
+    [[nodiscard]] std::shared_ptr<SendJettyPool> pooledSendPool() const {
+        std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+        return pooled_send_pool_;
+    }
     [[nodiscard]] std::shared_ptr<UbJfc> jfc(size_t index) const;
 
     void addInflight(uint64_t bytes) noexcept;
@@ -112,6 +123,7 @@ class UbContext final : public std::enable_shared_from_this<UbContext> {
     ContextPtr handle_;
     std::vector<std::shared_ptr<UbJfc>> jfcs_;
     std::shared_ptr<UbSendJettyPool> jetty_pool_;
+    std::shared_ptr<SendJettyPool> pooled_send_pool_;
     mutable std::mutex lifecycle_mutex_;
     std::atomic<State> state_{State::kUninitialized};
     std::atomic<uint64_t> inflight_bytes_{0};

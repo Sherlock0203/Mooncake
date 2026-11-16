@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "jetty_pool.h"
+#include "tent/transport/ub/send_jetty_pool.h"
 
 namespace mooncake::tent::ub {
 namespace {
@@ -123,6 +124,11 @@ void UbContext::attachJettyPool(std::shared_ptr<UbSendJettyPool> pool) {
     jetty_pool_ = std::move(pool);
 }
 
+void UbContext::attachPooledSendPool(std::shared_ptr<SendJettyPool> pool) {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    pooled_send_pool_ = std::move(pool);
+}
+
 Status UbContext::shutdownLocked() {
     auto current = state_.load(std::memory_order_relaxed);
     if (current == State::kClosed) return Status::OK();
@@ -139,6 +145,16 @@ Status UbContext::shutdownLocked() {
     if (jetty_pool_) {
         auto status = jetty_pool_->drain();
         if (!status.ok()) first_error = std::move(status);
+    }
+    // Drain the pooled rm_pool send pool (when attached) before the JFCs
+    // are closed. Idle members are deleted; quarantined members get one
+    // deletion attempt and otherwise keep their budget and owner.
+    if (pooled_send_pool_) {
+        pooled_send_pool_->beginStop();
+        auto status = pooled_send_pool_->drainIdle();
+        if (!status.ok() && first_error.ok()) first_error = std::move(status);
+        status = pooled_send_pool_->drainQuarantined();
+        if (!status.ok() && first_error.ok()) first_error = std::move(status);
     }
     for (size_t index = jfcs_.size(); index > 0;) {
         --index;

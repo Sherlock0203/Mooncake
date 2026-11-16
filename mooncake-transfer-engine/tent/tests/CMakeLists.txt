@@ -567,13 +567,30 @@ if(USE_UB)
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_ub_core_test COMMAND tent_ub_core_test)
 
+  # Pooled rm_pool core components (C05/C06/C07): budget ledger, admission
+  # tickets, per-attempt send pool and completion gate. Software-only: the
+  # fake adapter needs no provider or NIC.
+  add_executable(
+    tent_ub_pooled_core_test
+    ub_pooled_core_test.cpp ../src/transport/ub/native_budget.cpp
+    ../src/transport/ub/admission.cpp ../src/transport/ub/send_jetty_pool.cpp
+    ../src/transport/ub/attempt_gate.cpp ../src/transport/ub/jfc.cpp
+    ../src/transport/ub/context.cpp ../src/transport/ub/jetty_pool.cpp)
+  target_link_libraries(tent_ub_pooled_core_test
+                        PRIVATE tent_common gtest gtest_main)
+  target_include_directories(tent_ub_pooled_core_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_pooled_core_test COMMAND tent_ub_pooled_core_test)
+  set_tests_properties(tent_ub_pooled_core_test PROPERTIES TIMEOUT 300)
+
   add_executable(
     tent_ub_teardown_test
     ub_teardown_test.cpp ../src/transport/ub/bootstrap.cpp
     ../src/transport/ub/buffers.cpp
     ../src/transport/ub/context.cpp ../src/transport/ub/endpoint.cpp
     ../src/transport/ub/endpoint_store.cpp ../src/transport/ub/jetty_pool.cpp
-    ../src/transport/ub/jfc.cpp)
+    ../src/transport/ub/jfc.cpp ../src/transport/ub/native_budget.cpp
+    ../src/transport/ub/admission.cpp ../src/transport/ub/send_jetty_pool.cpp)
   target_link_libraries(tent_ub_teardown_test PRIVATE tent_common gtest
                                                       gtest_main)
   target_include_directories(tent_ub_teardown_test
