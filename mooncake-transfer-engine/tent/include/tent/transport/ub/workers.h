@@ -21,7 +21,9 @@
 #include "tent/runtime/segment_manager.h"
 #include "tent/runtime/topology.h"
 #include "tent/transport/ub/buffers.h"
+#include "tent/transport/ub/completion_record.h"
 #include "tent/transport/ub/context.h"
+#include "tent/transport/ub/entity_event.h"
 #include "tent/transport/ub/params.h"
 #include "tent/transport/ub/probe_link_manager.h"
 #include "tent/transport/ub/quota.h"
@@ -135,10 +137,15 @@ struct ProbeJfcSlot {
     JfcPtr jfc;
 };
 
-// Native UB scheduler. Posting lanes own request selection and URMA post;
-// poller lanes own completion dispatch. A monotonic numeric token, never a raw
-// UbSlice pointer, crosses the adapter boundary.
-class UbWorkers final {
+// Native UB scheduler and owner of the business half of every completion
+// record. Posting lanes own request selection and URMA post; poller lanes own
+// completion dispatch. A monotonic numeric token, never a raw UbSlice pointer,
+// crosses the adapter boundary.
+//
+// `gate::Sink` is the completion gate's side-effect outlet (design D-11): the
+// gate decides *when* each action may run, this class performs the resource
+// release, the health reporting and the slice delivery.
+class UbWorkers final : public gate::Sink {
    public:
     UbWorkers(std::shared_ptr<UrmaAdapter> adapter,
               std::vector<UbContextPtr> contexts,
@@ -164,7 +171,15 @@ class UbWorkers final {
         return accepting_.load(std::memory_order_acquire);
     }
     [[nodiscard]] size_t queuedCount() const;
+    // Number of records still registered (in-flight owner accounting).
     [[nodiscard]] size_t inflightCount() const;
+    // Completion gate counters (design §9).
+    [[nodiscard]] CompletionStatsSnapshot completionStats() const {
+        return gate_ctx_.stats.snapshot();
+    }
+    [[nodiscard]] const CountingEntityEventSink& entityEvents() const {
+        return entity_events_;
+    }
 
    private:
     struct PendingSlice {
@@ -179,7 +194,7 @@ class UbWorkers final {
         Request::OpCode opcode{Request::READ};
     };
     struct Route;
-    struct Inflight;
+    struct BusinessRecord;
     struct LocalDeviceCandidate {
         Topology::NicID id{-1};
         size_t topology_rank{Topology::DevicePriorityRanks};
@@ -197,20 +212,32 @@ class UbWorkers final {
                                     UbPostPath& path,
                                     QuotaReservation& reservation);
     // Namespace first: probe tokens are routed to the PLM before the business
-    // table can silently drop them (design §11.2).
-    bool dispatchCompletion(const Completion& completion);
+    // table can silently drop them (design §11.2). `local_nic`/`jfc_index`
+    // identify the polling slot for the interface-8 reports; the fence/stop
+    // drains pass the record's local NIC and no JFC index.
+    bool dispatchCompletion(const Completion& completion, int local_nic = -1,
+                            uint64_t jfc_index = 0);
     bool pollBusinessSlot(size_t slot_index);
     bool pollProbeSlot(size_t slot_index);
-    void handleCompletion(const Completion& completion);
     void handleLocalDeviceFailure(const UbContextPtr& context);
     void progressLocalDeviceFailure(const UbContextPtr& context);
     void scanTimeouts();
-    void releaseInflight(const std::shared_ptr<Inflight>& inflight);
-    void resolveInflight(const std::shared_ptr<Inflight>& inflight,
-                         TransferStatusEnum outcome, size_t bytes,
-                         bool retryable);
-    void recordTimeoutOnce(const std::shared_ptr<Inflight>& inflight,
-                           uint64_t now_ns);
+    static WrFacts makeWrFacts(const Completion& completion);
+    [[nodiscard]] std::shared_ptr<BusinessRecord> findRecord(
+        uint64_t token) const;
+    void releaseOwnerResources(BusinessRecord& record);
+    void eraseRecord(uint64_t token, const BusinessRecord* record);
+    void deliverSettlement(BusinessRecord& record);
+    void recordSuccessEvidence(BusinessRecord& record);
+
+    // gate::Sink. All of them run on the thread that won the corresponding
+    // claim, outside the registry lock.
+    void onSettle(CompletionRecord& record, LogicalOutcome outcome) override;
+    void onOwners(CompletionRecord& record,
+                  OwnerDisposition disposition) override;
+    void onFault(CompletionRecord& record, FaultKind kind) override;
+    void onBlocked(CompletionRecord& record, BlockReason reason) override;
+    void onDuplicate(CompletionRecord& record) override;
     void rememberEndpointDrain(const std::shared_ptr<UbEndpoint>& endpoint);
     void forgetEndpointDrain(const std::shared_ptr<UbEndpoint>& endpoint);
     void failUnposted(const PendingSlice& pending,
@@ -243,10 +270,14 @@ class UbWorkers final {
     std::condition_variable queue_cv_;
     std::array<std::deque<PendingSlice>, PRIO_LOW + 1> queues_;
 
-    mutable std::mutex inflight_mutex_;
+    mutable std::mutex records_mutex_;
     mutable std::mutex endpoint_drain_mutex_;
+    // Kept under its original name: stop() still waits on it for the registry
+    // to drain.
     std::condition_variable inflight_cv_;
-    std::unordered_map<uint64_t, std::shared_ptr<Inflight>> inflight_;
+    // Keyed by completion token. Renamed from `inflight_` because W5 adds a
+    // second, deadline-ordered index next to it.
+    std::unordered_map<uint64_t, std::shared_ptr<BusinessRecord>> records_;
     // Endpoints whose ERROR transition has not yet reached its native flush
     // fence remain owned here even if every logical token completes naturally.
     std::unordered_map<uint64_t, std::shared_ptr<UbEndpoint>>
@@ -271,6 +302,11 @@ class UbWorkers final {
     std::atomic<bool> polling_{false};
     std::atomic<bool> timeout_scans_enabled_{false};
     std::atomic<uint64_t> next_token_{1};
+
+    // Completion gate plumbing. Declared last so every member it touches during
+    // construction is already initialized.
+    GateContext gate_ctx_;
+    CountingEntityEventSink entity_events_;
 };
 
 }  // namespace mooncake::tent::ub
