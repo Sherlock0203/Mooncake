@@ -29,6 +29,14 @@ bool retryableStatus(const Status& status) {
            status.IsRdmaError();
 }
 
+// Business-side identity mapping (design §5.4). The conversion lives on the
+// owner side, never in the shared kernel, so a P0-D change to UbPostPath cannot
+// drag the probe side along with it.
+RecordPath makeBusinessRecordPath(const UbPostPath& path) {
+    return RecordPath{path.local_topology_id, path.remote_segment_id,
+                      path.remote_device_id};
+}
+
 // Rail health and quota are keyed by the physical rail, which deliberately
 // excludes the endpoint generation (see UbRailKey). These read-only probes
 // therefore only need a generation that satisfies UbPostPath::valid(); real
@@ -51,9 +59,14 @@ struct UbWorkers::Route {
     std::vector<Topology::NicID> remote_devices;
 };
 
-struct UbWorkers::Inflight {
-    uint64_t completion_token{0};
+// Owner-side half of a completion record (design §5.3). The shared kernel
+// holds identity and one-shot facts; everything below belongs to the business
+// data path and never leaks into the gate.
+struct UbWorkers::BusinessRecord {
+    CompletionRecord core;
     PendingSlice pending;
+    // Full business identity: slice settlement needs it, and the gate's
+    // attempt_key is only an observability/claiming scalar.
     UbAttemptToken attempt;
     UbPostPath path;
     std::shared_ptr<UbEndpoint> endpoint;
@@ -62,9 +75,6 @@ struct UbWorkers::Inflight {
     QuotaReservation quota;
     uint64_t posted_ns{0};
     uint64_t deadline_ns{0};
-    std::atomic<bool> timed_out{false};
-    std::atomic<bool> timeout_recorded{false};
-    std::atomic<bool> resources_released{false};
 };
 
 UbWorkers::UbWorkers(std::shared_ptr<UrmaAdapter> adapter,
@@ -203,24 +213,24 @@ Status UbWorkers::stop() {
     // before stopping pollers. A failed fence leaves pollers, tokens, native
     // segments, quota, and endpoints intact so uninstall can be retried
     // safely; fixed sleeps are never treated as proof that DMA stopped.
-    std::vector<std::shared_ptr<Inflight>> still_inflight;
+    std::vector<std::shared_ptr<BusinessRecord>> still_inflight;
     std::vector<std::shared_ptr<UbEndpoint>> endpoints_to_fence;
     {
-        std::lock_guard<std::mutex> lock(inflight_mutex_);
-        still_inflight.reserve(inflight_.size());
-        for (const auto& [_, inflight] : inflight_) {
-            still_inflight.push_back(inflight);
-            if (inflight && inflight->endpoint) {
-                endpoints_to_fence.push_back(inflight->endpoint);
+        std::lock_guard<std::mutex> lock(records_mutex_);
+        still_inflight.reserve(records_.size());
+        for (const auto& [_, record] : records_) {
+            still_inflight.push_back(record);
+            if (record && record->endpoint) {
+                endpoints_to_fence.push_back(record->endpoint);
             }
         }
         for (const auto& [_, endpoint] : draining_endpoints_) {
             if (endpoint) endpoints_to_fence.push_back(endpoint);
         }
     }
-    for (const auto& inflight : still_inflight) {
-        if (inflight && inflight->pending.slice) {
-            inflight->pending.slice->requestCancellation();
+    for (const auto& record : still_inflight) {
+        if (record && record->pending.slice) {
+            record->pending.slice->requestCancellation();
         }
     }
 
@@ -232,7 +242,9 @@ Status UbWorkers::stop() {
         }
         std::vector<Completion> drained;
         auto status = endpoint->quiesce(params_.slice_timeout_ms, drained);
-        for (const auto& completion : drained) dispatchCompletion(completion);
+        for (const auto& completion : drained) {
+            dispatchCompletion(completion, endpoint->key().local_topology_id);
+        }
         if (!status.ok()) {
             rememberEndpointDrain(endpoint);
             if (fence_error.ok()) fence_error = status;
@@ -245,7 +257,7 @@ Status UbWorkers::stop() {
         return fence_error;
     }
     {
-        std::lock_guard<std::mutex> lock(inflight_mutex_);
+        std::lock_guard<std::mutex> lock(records_mutex_);
         if (!draining_endpoints_.empty()) {
             return Status::InternalError(
                 "UB endpoint drain set changed during shutdown" LOC_MARK);
@@ -269,9 +281,9 @@ Status UbWorkers::stop() {
     // JFC can no longer touch memory. Let pollers consume already-queued CRs,
     // then stop them and safely resolve any provider-lost token.
     if (!still_inflight.empty()) {
-        std::unique_lock<std::mutex> lock(inflight_mutex_);
+        std::unique_lock<std::mutex> lock(records_mutex_);
         (void)inflight_cv_.wait_for(lock, std::chrono::milliseconds(100),
-                                    [this] { return inflight_.empty(); });
+                                    [this] { return records_.empty(); });
     }
     polling_.store(false, std::memory_order_release);
     for (auto& thread : polling_threads_) {
@@ -281,16 +293,19 @@ Status UbWorkers::stop() {
 
     still_inflight.clear();
     {
-        std::lock_guard<std::mutex> lock(inflight_mutex_);
-        for (auto& [_, inflight] : inflight_) {
-            still_inflight.push_back(std::move(inflight));
+        std::lock_guard<std::mutex> lock(records_mutex_);
+        for (auto& [_, record] : records_) {
+            still_inflight.push_back(std::move(record));
         }
-        inflight_.clear();
+        records_.clear();
     }
-    for (const auto& inflight : still_inflight) {
-        releaseInflight(inflight);
-        (void)inflight->pending.slice->resolveAttempt(inflight->attempt, FAILED,
-                                                      0, false);
+    for (const auto& record : still_inflight) {
+        // The bottom-out shares every claim bit with the CQE and timeout exits:
+        // if any of them already disposed of the record, this call only
+        // supplies the missing settlement, so a double release is impossible
+        // (design §6.9).
+        gate::onUnposted(record->core, RecordDropReason::kShutdown, *this,
+                         gate_ctx_);
     }
     inflight_cv_.notify_all();
     return Status::OK();
@@ -358,8 +373,8 @@ size_t UbWorkers::queuedCount() const {
 }
 
 size_t UbWorkers::inflightCount() const {
-    std::lock_guard<std::mutex> lock(inflight_mutex_);
-    return inflight_.size();
+    std::lock_guard<std::mutex> lock(records_mutex_);
+    return records_.size();
 }
 
 bool UbWorkers::popPending(PendingSlice& pending) {
@@ -442,8 +457,11 @@ bool UbWorkers::pollBusinessSlot(size_t slot_index) {
                          "cooldown";
         }
     }
+    const int local_nic = slot.context ? slot.context->topologyId() : -1;
+    const uint64_t jfc_index =
+        slot.jfc ? static_cast<uint64_t>(slot.jfc->index()) : 0;
     for (const auto& completion : completions) {
-        dispatchCompletion(completion);
+        dispatchCompletion(completion, local_nic, jfc_index);
     }
     return !completions.empty();
 }
@@ -463,23 +481,54 @@ bool UbWorkers::pollProbeSlot(size_t slot_index) {
     if (slot.context) progressLocalDeviceFailure(slot.context);
     // The probe JFC is provider-owned and not part of UbContext::jfcs(), so it
     // deliberately does not participate in the business JFC recovery epoch.
+    const int local_nic = slot.context ? slot.context->topologyId() : -1;
     for (const auto& completion : completions) {
-        dispatchCompletion(completion);
+        dispatchCompletion(completion, local_nic);
     }
     return !completions.empty();
 }
 
-bool UbWorkers::dispatchCompletion(const Completion& completion) {
-    // Namespace first (design §11.2): a probe completion may carry an error
-    // status that the business table would silently drop.
+bool UbWorkers::dispatchCompletion(const Completion& completion, int local_nic,
+                                   uint64_t jfc_index) {
+    // Step 1: token 0 is reserved for a native marker / async event. W2 only
+    // accounts for it: telling a marker from an AE needs the typed CR that
+    // P0-B supplies, so the W4 classification hangs off this single call site
+    // (IN-9: token 0 never reaches the business registry).
+    if (completion.token == 0) {
+        EntityEvidence evidence;
+        evidence.token = completion.token;
+        evidence.jetty_id = completion.local_jetty_id;
+        evidence.native_status = completion.native_status;
+        evidence.completed_bytes = completion.completed_bytes;
+        entity_events_.onEntityEvent(local_nic, EntityType::kJfc, jfc_index,
+                                     EntityEventKind::kUnclassified, evidence);
+        return false;
+    }
+    // Step 2: namespace first (probe design §11.2). A probe completion may
+    // carry an error status that the business table would silently drop.
     if (probe_manager_ != nullptr && isProbeToken(completion.token)) {
         (void)probe_manager_->onProbeCompletion(completion);
         return true;
     }
-    if (completion.token != 0) {
-        handleCompletion(completion);
+    // Step 3: business registry. The handler reference brackets the settle
+    // scope so the gate cannot dispose of the record while a poller still
+    // touches reusable state (design §6.5).
+    auto record = findRecord(completion.token);
+    if (record) {
+        gate::HandlerRef handler(record->core, *this, gate_ctx_);
+        gate::onRealCr(record->core, makeWrFacts(completion), *this, gate_ctx_);
         return true;
     }
+    // Step 4: unknown / late / already disposed. Count it, report it, and keep
+    // polling: one stray token never affects any other responsibility (IN-8).
+    gate_ctx_.stats.unknown_token.fetch_add(1, std::memory_order_relaxed);
+    EntityEvidence evidence;
+    evidence.token = completion.token;
+    evidence.jetty_id = completion.local_jetty_id;
+    evidence.native_status = completion.native_status;
+    evidence.completed_bytes = completion.completed_bytes;
+    entity_events_.onEntityEvent(local_nic, EntityType::kJfc, jfc_index,
+                                 EntityEventKind::kUnknownToken, evidence);
     return false;
 }
 
@@ -516,7 +565,7 @@ void UbWorkers::deferPending(const PendingSlice& pending) {
     }
     // Capacity pressure is not a transfer failure. A short bounded backoff
     // prevents a posting lane from exhausting CPU while completions release
-    // quota; releaseInflight() also wakes the queue condition variable.
+    // quota; releaseOwnerResources() also wakes the queue condition variable.
     {
         std::unique_lock<std::mutex> lock(queue_mutex_);
         (void)queue_cv_.wait_for(lock, std::chrono::microseconds(50), [&] {
@@ -937,30 +986,40 @@ void UbWorkers::processPending(const PendingSlice& pending,
         return;
     }
 
+    // t0 publish: the token enters the registry and this call stack owns one
+    // handler reference until the native post returns (design §2.2/§6.5).
     const uint64_t completion_token = nextCompletionToken();
-    auto inflight = std::make_shared<Inflight>();
-    inflight->completion_token = completion_token;
-    inflight->pending = pending;
-    inflight->attempt = *attempt;
-    inflight->path = path;
-    inflight->endpoint = endpoint;
-    inflight->local_segment = local.segment;
-    inflight->remote_segment = remote.segment;
-    inflight->quota = reservation;
-    inflight->posted_ns = steadyNowNs();
-    inflight->deadline_ns = deadlineAfter(
-        inflight->posted_ns,
+    auto record = std::make_shared<BusinessRecord>();
+    record->core.token = completion_token;
+    record->core.kind = RecordKind::kBusiness;
+    record->core.attempt_id = attempt->slice_id;
+    record->core.attempt_serial = attempt->attempt;
+    record->core.path = makeBusinessRecordPath(path);
+    record->core.jetty_generation = path.endpoint_generation;
+    record->core.owner = record.get();
+    record->pending = pending;
+    record->attempt = *attempt;
+    record->path = path;
+    record->endpoint = endpoint;
+    record->local_segment = local.segment;
+    record->remote_segment = remote.segment;
+    record->quota = reservation;
+    record->posted_ns = steadyNowNs();
+    record->deadline_ns = deadlineAfter(
+        record->posted_ns,
         static_cast<uint64_t>(params_.slice_timeout_ms) * 1'000'000ULL);
 
-    if (!pending.slice->tryCommitPost(*attempt, inflight->posted_ns)) {
+    if (!pending.slice->tryCommitPost(*attempt, record->posted_ns)) {
         endpoint->releaseOutstanding(pending.slice->spec().length);
         (void)quota_->release(reservation);
         return;
     }
-    {
-        std::lock_guard<std::mutex> lock(inflight_mutex_);
-        inflight_.emplace(completion_token, inflight);
-    }
+    // §5.1 status bit, not a gate: it records that this side took the attempt's
+    // single post right, so a future local double post stays detectable. The
+    // authority for "may we post at all" belongs to the pooling-side
+    // tryClaimPost (W3), which is why nothing reads it back in W2. Published to
+    // the registry under the lock below.
+    record->core.post_claimed.store(true, std::memory_order_release);
 
     WorkRequest work;
     work.operation =
@@ -972,39 +1031,64 @@ void UbWorkers::processPending(const PendingSlice& pending,
     work.token = completion_token;
     work.local_segment = local.segment;
     work.remote_segment = remote.segment;
-    auto jetty = endpoint->jetty(worker_index);
-    size_t posted_count = 0;
-    status = jetty ? adapter_->post(jetty, {work}, posted_count)
-                   : Status::InternalError("UB endpoint has no Jetty" LOC_MARK);
-    if (posted_count == 1) {
-        rail_monitor_->registerPath(path);
-        if (!status.ok()) {
-            LOG_EVERY_N(WARNING, 1000)
-                << "UB post returned an error after accepting the WR: "
-                << status.ToString();
-        }
-        return;
-    }
-
-    if (status.ok()) {
-        status = Status::InternalError(
-            "URMA adapter accepted an unexpected WR count" LOC_MARK);
-    }
-
     {
-        std::lock_guard<std::mutex> lock(inflight_mutex_);
-        auto it = inflight_.find(completion_token);
-        if (it != inflight_.end() && it->second == inflight)
-            inflight_.erase(it);
-    }
-    inflight_cv_.notify_all();
-    releaseInflight(inflight);
-    rail_monitor_->recordError(path);
-    if (endpoint_retirer_) endpoint_retirer_(endpoint);
-    const auto resolution = pending.slice->resolveAttempt(
-        *attempt, FAILED, 0, retryableStatus(status));
-    if (resolution == UbAttemptResolution::kRetryScheduled) {
-        enqueueRetry(pending);
+        // The post-stack reference spans the blocking native call, and it is
+        // taken *before* the record becomes visible to the timeout scan: a
+        // published record with zero references would let a scan fence a post
+        // that has not even started (D-7). The guard releases the reference on
+        // every exit path; when it is the last one the gate advances with both
+        // facts available.
+        gate::HandlerRef post_handler(record->core, *this, gate_ctx_);
+        // Publish before the native post: a completion may legally arrive
+        // before post() returns. Only the completion claimant ever erases
+        // (D-3), so a CQE racing with this insert still finds its record.
+        {
+            std::lock_guard<std::mutex> lock(records_mutex_);
+            records_.emplace(completion_token, record);
+        }
+        gate_ctx_.stats.record_published.fetch_add(1,
+                                                   std::memory_order_relaxed);
+        auto jetty = endpoint->jetty(worker_index);
+        size_t posted_count = 0;
+        status =
+            jetty ? adapter_->post(jetty, {work}, posted_count)
+                  : Status::InternalError("UB endpoint has no Jetty" LOC_MARK);
+        if (posted_count != 1 && status.ok()) {
+            // The adapter claimed a count it cannot have for one WR.
+            status = Status::InternalError(
+                "URMA adapter accepted an unexpected WR count" LOC_MARK);
+        }
+        const PostAcceptance acceptance =
+            legacyAcceptance(status, posted_count);
+        if (acceptance == PostAcceptance::kUnknown) {
+            // The adapter claims more WRs than were submitted, so this side
+            // cannot prove what is in flight. Nothing is released on a guess:
+            // the record drains until the timeout fence proves the old DMA
+            // stopped (upstream §1.2.4), and every blocked pass is counted as
+            // gate_blocked_by_acceptance.
+            LOG_EVERY_N(WARNING, 100)
+                << "UB adapter reported an impossible posted_count "
+                << posted_count << " for one WR; token " << completion_token
+                << " drains until a fence proves responsibility";
+        }
+        if (acceptance == PostAcceptance::kAccepted) {
+            rail_monitor_->registerPath(path);
+            if (!status.ok()) {
+                LOG_EVERY_N(WARNING, 1000)
+                    << "UB post returned an error after accepting the WR: "
+                    << status.ToString();
+            }
+        }
+        gate::onPostReturn(record->core,
+                           PostReturn{acceptance,
+                                      acceptance == PostAcceptance::kAccepted
+                                          ? pending.slice->spec().length
+                                          : 0,
+                                      retryableStatus(status)},
+                           gate_ctx_);
+        // A rejected post needs no extra work here: the reject disposition
+        // performs the legacy rollback exactly once when the guard above
+        // releases the last reference.
     }
 }
 
@@ -1049,219 +1133,336 @@ void UbWorkers::progressLocalDeviceFailure(const UbContextPtr& context) {
         << status.ToString();
 }
 
-void UbWorkers::handleCompletion(const Completion& completion) {
-    std::shared_ptr<Inflight> inflight;
-    {
-        std::lock_guard<std::mutex> lock(inflight_mutex_);
-        auto it = inflight_.find(completion.token);
-        if (it == inflight_.end()) return;
-        inflight = std::move(it->second);
-        inflight_.erase(it);
-    }
-    inflight_cv_.notify_all();
-    releaseInflight(inflight);
-    if (inflight->timed_out.load(std::memory_order_acquire)) {
-        // A natural or flush completion proves that this particular WR can no
-        // longer touch memory. Whichever side wins the timeout/drain race may
-        // advance the logical attempt; attempt matching makes the other call
-        // an idempotent no-op.
-        const uint64_t now = steadyNowNs();
-        recordTimeoutOnce(inflight, now);
-        resolveInflight(inflight, TIMEOUT, 0, true);
-        return;
-    }
-
-    const uint64_t now = steadyNowNs();
-    const uint64_t latency =
-        now >= inflight->posted_ns ? now - inflight->posted_ns : 0;
+WrFacts UbWorkers::makeWrFacts(const Completion& completion) {
+    WrFacts facts;
+    facts.completion_ns = steadyNowNs();
+    facts.native_status = completion.native_status;
+    facts.completed_bytes = completion.completed_bytes;
     switch (completion.category) {
         case CompletionCategory::SUCCESS:
-            if (probe_manager_ != nullptr) {
-                probe_manager_->onBusinessPathSuccess(inflight->path, now);
-            }
-            rail_monitor_->recordSuccess(inflight->path,
-                                         inflight->pending.slice->spec().length,
-                                         latency, now);
-            resolveInflight(inflight, COMPLETED,
-                            inflight->pending.slice->spec().length, false);
+            facts.outcome = CompletionOutcome::kSuccess;
             break;
         case CompletionCategory::TIMEOUT:
-            if (probe_manager_ != nullptr) {
-                probe_manager_->onBusinessPathError(
-                    inflight->path, BusinessErrorKind::kPathFault, now);
-            }
-            rail_monitor_->recordTimeout(inflight->path, now);
-            if (endpoint_retirer_) endpoint_retirer_(inflight->endpoint);
-            resolveInflight(inflight, TIMEOUT, 0, true);
+            facts.outcome = CompletionOutcome::kTimeout;
             break;
         case CompletionCategory::LOCAL_DEVICE_ERROR:
-            if (inflight->endpoint && inflight->endpoint->context()) {
-                handleLocalDeviceFailure(inflight->endpoint->context());
+            facts.outcome = CompletionOutcome::kLocalDeviceError;
+            break;
+        case CompletionCategory::REMOTE_PATH_ERROR:
+            facts.outcome = CompletionOutcome::kRemotePathError;
+            break;
+        case CompletionCategory::ENDPOINT_ERROR:
+            facts.outcome = CompletionOutcome::kEndpointError;
+            break;
+        case CompletionCategory::MEMORY_ERROR:
+            facts.outcome = CompletionOutcome::kMemoryError;
+            break;
+        case CompletionCategory::UNKNOWN_ERROR:
+            facts.outcome = CompletionOutcome::kUnknownError;
+            break;
+    }
+    return facts;
+}
+
+void UbWorkers::onSettle(CompletionRecord& record, LogicalOutcome outcome) {
+    // The verdict is already published in the record. Delivery deliberately
+    // waits for onOwners(): a retry must never be queued before the old owners
+    // were released (D-8 / IN-7).
+    LOG_EVERY_N(INFO, 1000)
+        << "UB completion settled: token=" << record.token
+        << " kind=" << recordKindName(record.kind)
+        << " path=" << recordPathText(record.path)
+        << " generation=" << record.jetty_generation << " acceptance="
+        << postAcceptanceName(record.acceptance.load(std::memory_order_relaxed))
+        << " terminal=" << completionOutcomeName(record.terminal.outcome)
+        << " outcome=" << logicalOutcomeName(outcome);
+}
+
+void UbWorkers::onFault(CompletionRecord& record, FaultKind kind) {
+    // Called at most once per record; whichever exit claims fault_reported
+    // first owns the health side effects (design §6.3).
+    auto* business = static_cast<BusinessRecord*>(record.owner);
+    if (business == nullptr) return;
+    const uint64_t now = steadyNowNs();
+    if (kind == FaultKind::kTimeout) {
+        // Deadline evidence without a placeable completion. A late completion
+        // resolves the same one-shot, so the rail sees exactly one timeout.
+        rail_monitor_->recordTimeout(business->path, now);
+        return;
+    }
+    switch (record.terminal.outcome) {
+        case CompletionOutcome::kLocalDeviceError:
+            if (business->endpoint && business->endpoint->context()) {
+                handleLocalDeviceFailure(business->endpoint->context());
             }
             if (probe_manager_ != nullptr) {
                 // kContextFailure disables every path on the port; the PLM fans
                 // it out to onContextUnavailable().
                 probe_manager_->onBusinessPathError(
-                    inflight->path, BusinessErrorKind::kContextFailure, now);
+                    business->path, BusinessErrorKind::kContextFailure, now);
             }
-            rail_monitor_->recordError(inflight->path, now);
-            if (endpoint_retirer_) endpoint_retirer_(inflight->endpoint);
-            resolveInflight(inflight, FAILED, 0, true);
-            break;
-        case CompletionCategory::REMOTE_PATH_ERROR:
+            rail_monitor_->recordError(business->path, now);
+            if (endpoint_retirer_) endpoint_retirer_(business->endpoint);
+            return;
+        case CompletionOutcome::kRemotePathError:
             if (probe_manager_ != nullptr) {
                 probe_manager_->onBusinessPathError(
-                    inflight->path, BusinessErrorKind::kPathFault, now);
+                    business->path, BusinessErrorKind::kPathFault, now);
             }
-            rail_monitor_->recordError(inflight->path, now);
-            if (endpoint_retirer_) endpoint_retirer_(inflight->endpoint);
-            resolveInflight(inflight, FAILED, 0, true);
-            break;
-        case CompletionCategory::ENDPOINT_ERROR:
+            rail_monitor_->recordError(business->path, now);
+            if (endpoint_retirer_) endpoint_retirer_(business->endpoint);
+            return;
+        case CompletionOutcome::kEndpointError:
             if (probe_manager_ != nullptr) {
                 probe_manager_->onBusinessPathError(
-                    inflight->path, BusinessErrorKind::kLaneError, now);
+                    business->path, BusinessErrorKind::kLaneError, now);
             }
-            rail_monitor_->recordError(inflight->path, now);
-            if (endpoint_retirer_) endpoint_retirer_(inflight->endpoint);
-            resolveInflight(inflight, FAILED, 0, true);
-            break;
-        case CompletionCategory::MEMORY_ERROR:
+            rail_monitor_->recordError(business->path, now);
+            if (endpoint_retirer_) endpoint_retirer_(business->endpoint);
+            return;
+        case CompletionOutcome::kMemoryError:
             if (probe_manager_ != nullptr) {
                 probe_manager_->onBusinessPathError(
-                    inflight->path, BusinessErrorKind::kParamError, now);
+                    business->path, BusinessErrorKind::kParamError, now);
             }
-            rail_monitor_->recordError(inflight->path, now);
-            resolveInflight(inflight, FAILED, 0, false);
-            break;
-        case CompletionCategory::UNKNOWN_ERROR:
+            rail_monitor_->recordError(business->path, now);
+            return;
+        case CompletionOutcome::kUnknownError:
             if (probe_manager_ != nullptr) {
                 probe_manager_->onBusinessPathError(
-                    inflight->path, BusinessErrorKind::kUnknown, now);
+                    business->path, BusinessErrorKind::kUnknown, now);
             }
-            rail_monitor_->recordError(inflight->path, now);
-            resolveInflight(inflight, FAILED, 0, false);
+            rail_monitor_->recordError(business->path, now);
+            return;
+        case CompletionOutcome::kTimeout:
+            // Adapter-level TIMEOUT category (not the deadline scan).
+            if (probe_manager_ != nullptr) {
+                probe_manager_->onBusinessPathError(
+                    business->path, BusinessErrorKind::kPathFault, now);
+            }
+            rail_monitor_->recordTimeout(business->path, now);
+            if (endpoint_retirer_) endpoint_retirer_(business->endpoint);
+            return;
+        case CompletionOutcome::kSuccess:
+            return;
+    }
+}
+
+void UbWorkers::onOwners(CompletionRecord& record,
+                         OwnerDisposition disposition) {
+    auto* business = static_cast<BusinessRecord*>(record.owner);
+    if (business == nullptr) return;
+    switch (disposition) {
+        case OwnerDisposition::kReturn:
+            // §6.8 order: release the lease/outstanding accounting first, then
+            // the quota, then the segment references, and only then deliver the
+            // logical result. Anything else could admit a new attempt while the
+            // old one still holds capacity.
+            releaseOwnerResources(*business);
+            recordSuccessEvidence(*business);
+            break;
+        case OwnerDisposition::kFinalize:
+            releaseOwnerResources(*business);
+            break;
+        case OwnerDisposition::kReject:
+            // The legacy not-accepted rollback: free the accounting, bill the
+            // rail, retire the endpoint, then deliver FAILED/retryable.
+            releaseOwnerResources(*business);
+            rail_monitor_->recordError(business->path, steadyNowNs());
+            if (endpoint_retirer_) endpoint_retirer_(business->endpoint);
             break;
     }
+    // §6.8 steps 3-4: drop the target/segment/buffer references after the quota
+    // accounting and before the slice may be resubmitted.
+    business->local_segment.reset();
+    business->remote_segment.reset();
+    business->endpoint.reset();
+    // Registry erase belongs to the completion claimant, never to the post side
+    // (D-3 / IN-4). Duplicate completions that arrive after this point are
+    // accounted as unknown tokens.
+    eraseRecord(record.token, business);
+    deliverSettlement(*business);
+}
+
+void UbWorkers::onBlocked(CompletionRecord& record, BlockReason reason) {
+    // Observational only: the gate already maintains gate_blocked_by_*.
+    // W3 hangs the defer/backpressure wake-up here, W4 the classified logging.
+    (void)record;
+    (void)reason;
+}
+
+void UbWorkers::onDuplicate(CompletionRecord& record) {
+    LOG_EVERY_N(WARNING, 1000)
+        << "UB duplicate completion ignored: token=" << record.token
+        << " path=" << recordPathText(record.path)
+        << " generation=" << record.jetty_generation;
 }
 
 void UbWorkers::scanTimeouts() {
     std::lock_guard<std::mutex> drain_lock(endpoint_drain_mutex_);
     if (!timeout_scans_enabled_.load(std::memory_order_acquire)) return;
     const uint64_t now = steadyNowNs();
-    std::vector<std::shared_ptr<Inflight>> expired;
+    std::vector<std::shared_ptr<BusinessRecord>> expired;
     {
-        std::lock_guard<std::mutex> lock(inflight_mutex_);
-        for (const auto& [_, inflight] : inflight_) {
-            bool expected = false;
-            if (inflight->deadline_ns <= now &&
-                inflight->timed_out.compare_exchange_strong(
-                    expected, true, std::memory_order_acq_rel)) {
-                expired.push_back(inflight);
+        std::lock_guard<std::mutex> lock(records_mutex_);
+        for (const auto& [_, record] : records_) {
+            if (record->deadline_ns <= now &&
+                !record->core.timed_out.load(std::memory_order_acquire)) {
+                expired.push_back(record);
             }
         }
     }
-    for (const auto& inflight : expired) {
+    for (const auto& record : expired) {
+        // D-7: a record whose native post has not returned is not fenced yet.
+        // Marking it now would let the scan race a post call that is still
+        // using the record's segments; the next scan picks it up.
+        if (record->core.handler_refs.load(std::memory_order_acquire) != 0) {
+            gate_ctx_.stats.timeout_deferred_by_post_return.fetch_add(
+                1, std::memory_order_relaxed);
+            continue;
+        }
+        // One-shot mark. The fault side effects stay unclaimed until there is
+        // evidence: a revoked timeout must not swallow the real fault (IN-11).
+        if (!gate::onTimeout(record->core)) continue;
         std::vector<Completion> drained;
         auto status =
-            inflight->endpoint
-                ? inflight->endpoint->quiesce(params_.slice_timeout_ms, drained)
+            record->endpoint
+                ? record->endpoint->quiesce(params_.slice_timeout_ms, drained)
                 : Status::InvalidArgument(
                       "Timed-out UB WR has no endpoint" LOC_MARK);
         // Even a partial/failed fence may have returned valid WR completions;
-        // they must never be lost.
-        for (const auto& completion : drained) dispatchCompletion(completion);
+        // they must never be lost and must be settled by the same dispatcher.
+        for (const auto& completion : drained) {
+            dispatchCompletion(completion, record->core.path.local_nic);
+        }
         if (!status.ok()) {
-            rememberEndpointDrain(inflight->endpoint);
+            rememberEndpointDrain(record->endpoint);
             LOG_EVERY_N(ERROR, 100)
                 << "Cannot establish UB timeout drain fence: "
                 << status.ToString();
             // Leave the token and all resource references alive. A natural
             // completion can still resolve it safely; otherwise a later scan
             // retries the native fence.
-            bool still_inflight = false;
+            bool still_registered = false;
             {
-                std::lock_guard<std::mutex> lock(inflight_mutex_);
-                auto it = inflight_.find(inflight->completion_token);
-                still_inflight =
-                    it != inflight_.end() && it->second == inflight;
+                std::lock_guard<std::mutex> lock(records_mutex_);
+                auto it = records_.find(record->core.token);
+                still_registered = it != records_.end() && it->second == record;
             }
-            if (still_inflight) {
-                inflight->timed_out.store(false, std::memory_order_release);
-            }
+            if (still_registered) gate::onFenceFailed(record->core);
             continue;
         }
-        forgetEndpointDrain(inflight->endpoint);
-        if (endpoint_retirer_) endpoint_retirer_(inflight->endpoint);
-        recordTimeoutOnce(inflight, now);
-        // quiesce() is the proof that retry cannot overlap old DMA. Reclaim a
-        // provider-lost token here: the successful fence proves the old WR can
-        // no longer touch memory, so releasing outstanding/quota accounting is
-        // safe. releaseInflight() is idempotent against a racing completion.
-        bool erased = false;
-        {
-            std::lock_guard<std::mutex> lock(inflight_mutex_);
-            auto it = inflight_.find(inflight->completion_token);
-            if (it != inflight_.end() && it->second == inflight) {
-                inflight_.erase(it);
-                erased = true;
-            }
-        }
-        if (erased) {
-            inflight_cv_.notify_all();
-            releaseInflight(inflight);
-        }
-        resolveInflight(inflight, TIMEOUT, 0, true);
+        forgetEndpointDrain(record->endpoint);
+        if (endpoint_retirer_) endpoint_retirer_(record->endpoint);
+        // The erase and the "is this record still mine?" check happen in one
+        // critical section: if a drained completion already claimed and
+        // disposed of the record, the scan must not release the owners again
+        // (IN-4).
+        eraseRecord(record->core.token, record.get());
+        // quiesce() is the proof that retry cannot overlap old DMA. The fence
+        // evidence then settles TIMEOUT and finalizes once (§6.7).
+        gate::onFenceProven(record->core, *this, gate_ctx_);
     }
 }
 
-void UbWorkers::releaseInflight(const std::shared_ptr<Inflight>& inflight) {
-    bool expected = false;
-    if (!inflight || !inflight->resources_released.compare_exchange_strong(
-                         expected, true, std::memory_order_acq_rel)) {
-        return;
+std::shared_ptr<UbWorkers::BusinessRecord> UbWorkers::findRecord(
+    uint64_t token) const {
+    // The registry lock is only held to take a shared_ptr; every consumer works
+    // on the reference outside the lock (design §5.6 rule 2).
+    std::lock_guard<std::mutex> lock(records_mutex_);
+    auto it = records_.find(token);
+    return it == records_.end() ? nullptr : it->second;
+}
+
+void UbWorkers::releaseOwnerResources(BusinessRecord& record) {
+    // Exactly one call per record: the gate's claim bit already guaranteed it.
+    // §6.8 steps 1-2, in this order: the endpoint accounting first (W3 replaces
+    // this with pool->release(lease)), then the quota, both before the logical
+    // result is delivered.
+    if (record.endpoint) {
+        record.endpoint->releaseOutstanding(
+            record.pending.slice->spec().length);
     }
-    if (inflight->endpoint) {
-        inflight->endpoint->releaseOutstanding(
-            inflight->pending.slice->spec().length);
-    }
-    if (inflight->quota.valid()) (void)quota_->release(inflight->quota);
+    if (record.quota.valid()) (void)quota_->release(record.quota);
+    // A posting lane may be backing off on capacity; wake it (§5.4).
     queue_cv_.notify_all();
 }
 
-void UbWorkers::recordTimeoutOnce(const std::shared_ptr<Inflight>& inflight,
-                                  uint64_t now_ns) {
-    bool expected = false;
-    if (inflight && inflight->timeout_recorded.compare_exchange_strong(
-                        expected, true, std::memory_order_acq_rel)) {
-        rail_monitor_->recordTimeout(inflight->path, now_ns);
+void UbWorkers::eraseRecord(uint64_t token, const BusinessRecord* record) {
+    bool erased = false;
+    {
+        std::lock_guard<std::mutex> lock(records_mutex_);
+        auto it = records_.find(token);
+        if (it != records_.end() && it->second.get() == record) {
+            records_.erase(it);
+            erased = true;
+        }
     }
+    if (erased) inflight_cv_.notify_all();
+}
+
+void UbWorkers::deliverSettlement(BusinessRecord& record) {
+    // The verdict was decided under the settle claim; this is delivery only
+    // (D-8 / IN-7), so a retry can never be queued before the memory is safe.
+    TransferStatusEnum outcome = FAILED;
+    size_t bytes = 0;
+    bool retryable = false;
+    switch (record.core.logical_outcome) {
+        case LogicalOutcome::kCompleted:
+            outcome = COMPLETED;
+            bytes = record.pending.slice->spec().length;
+            break;
+        case LogicalOutcome::kTimeout:
+            outcome = TIMEOUT;
+            retryable = record.core.logical_retryable;
+            break;
+        case LogicalOutcome::kFailed:
+        case LogicalOutcome::kCanceled:
+            // A provably unposted WR keeps the legacy wire result: upstream §8
+            // freezes "post definitely not accepted" as FAILED/NotExecuted, so
+            // W2 does not turn it into CANCELED even though the gate classifies
+            // the logical result as not executed.
+            outcome = FAILED;
+            retryable = record.core.logical_retryable;
+            break;
+        case LogicalOutcome::kPending:
+            return;
+    }
+    const auto resolution = record.pending.slice->resolveAttempt(
+        record.attempt, outcome, bytes, retryable);
+    if (resolution == UbAttemptResolution::kRetryScheduled) {
+        enqueueRetry(record.pending);
+    }
+}
+
+void UbWorkers::recordSuccessEvidence(BusinessRecord& record) {
+    // Success evidence feeds the probe health state machine and the rail EWMA.
+    // It is recorded once, under the normal-return claim, in the same order the
+    // baseline used (owners released first, then resolve).
+    const uint64_t now = steadyNowNs();
+    const uint64_t latency =
+        now >= record.posted_ns ? now - record.posted_ns : 0;
+    if (probe_manager_ != nullptr) {
+        probe_manager_->onBusinessPathSuccess(record.path, now);
+    }
+    rail_monitor_->recordSuccess(
+        record.path, record.pending.slice->spec().length, latency, now);
 }
 
 void UbWorkers::rememberEndpointDrain(
     const std::shared_ptr<UbEndpoint>& endpoint) {
     if (!endpoint) return;
-    std::lock_guard<std::mutex> lock(inflight_mutex_);
+    std::lock_guard<std::mutex> lock(records_mutex_);
     draining_endpoints_[endpoint->generation()] = endpoint;
 }
 
 void UbWorkers::forgetEndpointDrain(
     const std::shared_ptr<UbEndpoint>& endpoint) {
     if (!endpoint) return;
-    std::lock_guard<std::mutex> lock(inflight_mutex_);
+    std::lock_guard<std::mutex> lock(records_mutex_);
     auto it = draining_endpoints_.find(endpoint->generation());
     if (it != draining_endpoints_.end() && it->second == endpoint) {
         draining_endpoints_.erase(it);
-    }
-}
-
-void UbWorkers::resolveInflight(const std::shared_ptr<Inflight>& inflight,
-                                TransferStatusEnum outcome, size_t bytes,
-                                bool retryable) {
-    const auto resolution = inflight->pending.slice->resolveAttempt(
-        inflight->attempt, outcome, bytes, retryable);
-    if (resolution == UbAttemptResolution::kRetryScheduled) {
-        enqueueRetry(inflight->pending);
     }
 }
 

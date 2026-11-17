@@ -369,13 +369,23 @@ class FakeUrmaAdapter final : public UrmaAdapter {
                         request.length);
                 }
             }
-            fake->jfc()->push(
-                Completion{category, 0, request.token,
-                           category == CompletionCategory::SUCCESS
-                               ? static_cast<uint32_t>(request.length)
-                               : 0,
-                           fake->id()});
+            const Completion completion{
+                category, 0, request.token,
+                category == CompletionCategory::SUCCESS
+                    ? static_cast<uint32_t>(request.length)
+                    : 0,
+                fake->id()};
+            fake->jfc()->push(completion);
             ++posted_count;
+            std::function<void(uint64_t)> gate;
+            {
+                std::lock_guard<std::mutex> lock(hook_mutex_);
+                gate = post_gate_;
+            }
+            // The hook runs inside the post call, after the completion is
+            // visible to the poller and before post() returns. Tests use it to
+            // hold the post call stack open across an early completion.
+            if (gate) gate(request.token);
         }
         return Status::OK();
     }
@@ -398,7 +408,38 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         auto fake = std::dynamic_pointer_cast<FakeJfc>(jfc);
         if (!fake || !fake->valid()) return Status::InvalidArgument("bad JFC");
         fake->poll(maximum, completions);
+        delivered_completions_.fetch_add(completions.size(),
+                                         std::memory_order_relaxed);
         return Status::OK();
+    }
+
+    // Completion-gate hooks (W2 design §11.2). All of them are fake-only: none
+    // of them exists on the real adapter.
+    //
+    // Runs inside post(), after the completion was pushed into the JFC and
+    // before post() returns, so a test can hold the post call stack open while
+    // the poller settles the early completion. The hook must not throw.
+    void setPostGate(std::function<void(uint64_t token)> gate) {
+        std::lock_guard<std::mutex> lock(hook_mutex_);
+        post_gate_ = std::move(gate);
+    }
+    void clearPostGate() { setPostGate({}); }
+    // Push an arbitrary completion into a JFC (unknown/late token injection).
+    void injectCompletion(
+        const JfcPtr& jfc, uint64_t token,
+        CompletionCategory category = CompletionCategory::SUCCESS,
+        uint32_t completed_bytes = 0) {
+        auto fake = std::dynamic_pointer_cast<FakeJfc>(jfc);
+        if (!fake) return;
+        fake->push(Completion{category, 0, token, completed_bytes, 0});
+        injected_completions_.fetch_add(1, std::memory_order_relaxed);
+    }
+    uint64_t injectedCompletionCount() const {
+        return injected_completions_.load(std::memory_order_relaxed);
+    }
+    // Completions handed to the poller by poll() so far.
+    uint64_t completionDeliveredCount() const {
+        return delivered_completions_.load(std::memory_order_relaxed);
     }
 
     void failNextCompletion(CompletionCategory category) {
@@ -498,6 +539,10 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     std::atomic<size_t> live_jetties_{0};
     std::atomic<size_t> live_local_segments_{0};
     std::atomic<size_t> live_remote_segments_{0};
+    mutable std::mutex hook_mutex_;
+    std::function<void(uint64_t)> post_gate_;
+    std::atomic<uint64_t> injected_completions_{0};
+    std::atomic<uint64_t> delivered_completions_{0};
     WorkRequest last_post_;
     RemoteJettyInfo last_post_target_;
     bool last_post_had_target_{false};

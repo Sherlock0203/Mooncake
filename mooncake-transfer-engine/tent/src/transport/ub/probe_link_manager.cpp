@@ -25,6 +25,34 @@
 namespace mooncake {
 namespace tent {
 namespace ub {
+
+namespace {
+
+// Probe-side identity mapping (design §5.4). Kept on the owner side, exactly
+// like the business counterpart, so neither side's private structures leak into
+// the shared kernel.
+RecordPath makeProbeRecordPath(const PathVersion& version) {
+    return RecordPath{version.path.local_nic, version.path.segment_id,
+                      version.path.remote_nic};
+}
+
+RecordDropReason makeRecordDropReason(OrphanReason reason) {
+    switch (reason) {
+        case OrphanReason::kNone:
+            return RecordDropReason::kNone;
+        case OrphanReason::kTimeout:
+            return RecordDropReason::kTimeout;
+        case OrphanReason::kShutdown:
+            return RecordDropReason::kShutdown;
+        case OrphanReason::kGenerationRetired:
+            // W2 has no dedicated reason: a generation-retired orphan is still
+            // an unresolved responsibility, reported as a completion error.
+            return RecordDropReason::kCompletionError;
+    }
+    return RecordDropReason::kNone;
+}
+
+}  // namespace
 namespace {
 
 // A rejected probe is retried soon, but never in a tight loop: the scheduler
@@ -529,7 +557,15 @@ std::shared_ptr<ProbeRecord> ProbeLinkManager::beginPost(
     key.area_epoch = edge->area_epoch;
 
     auto record = std::make_shared<ProbeRecord>();
-    record->token = token;
+    record->core.token = token;
+    record->core.kind = RecordKind::kProbe;
+    record->core.attempt_id = key.probe_seq;
+    // Probe records carry the full generational identity (design §5.4).
+    record->core.path = makeProbeRecordPath(key.version);
+    record->core.jetty_generation = key.jetty_generation;
+    record->core.topology_epoch = key.version.topology_epoch;
+    record->core.target_epoch = key.version.target_epoch;
+    record->core.fault_epoch = key.fault_epoch;
     record->key = key;
     record->peer = runtime->peer;
     record->posted_ns = now;
@@ -567,8 +603,8 @@ void ProbeLinkManager::onPostResult(const std::shared_ptr<ProbeRecord>& record,
         // not release the slot, peer budget or segments a second time.
         if (record->state == RecordState::kOrphan ||
             record->state == RecordState::kRejected ||
-            (inflight_.find(record->token) == inflight_.end() &&
-             !record->settled.load(std::memory_order_acquire))) {
+            (inflight_.find(record->core.token) == inflight_.end() &&
+             !record->core.finalize_claimed.load(std::memory_order_acquire))) {
             return;
         }
         switch (outcome) {
@@ -576,7 +612,9 @@ void ProbeLinkManager::onPostResult(const std::shared_ptr<ProbeRecord>& record,
                 // The completion may legally have arrived before the post
                 // returned; the WR was still accepted, so count it either way.
                 ++stats_.probe_posted;
-                if (record->settled.load(std::memory_order_acquire)) return;
+                if (record->core.finalize_claimed.load(
+                        std::memory_order_acquire))
+                    return;
                 record->state = RecordState::kAwaiting;
                 record->posted_ns = now;
                 record->deadline_ns = now + params_.timeoutNs();
@@ -586,7 +624,9 @@ void ProbeLinkManager::onPostResult(const std::shared_ptr<ProbeRecord>& record,
                 // accepted, never resend (design §8.6).
                 ++stats_.probe_posted;
                 ++stats_.probe_post_unknown;
-                if (record->settled.load(std::memory_order_acquire)) return;
+                if (record->core.finalize_claimed.load(
+                        std::memory_order_acquire))
+                    return;
                 record->state = RecordState::kAwaiting;
                 record->posted_ns = now;
                 record->deadline_ns = now + params_.timeoutNs();
@@ -595,7 +635,7 @@ void ProbeLinkManager::onPostResult(const std::shared_ptr<ProbeRecord>& record,
                 break;
         }
 
-        if (record->settled.exchange(true)) {
+        if (record->core.finalize_claimed.exchange(true)) {
             // A real completion already claimed this record even though the
             // provider reported "not accepted": the resource is
             // self-contradictory, so retire the probe lane without rolling
@@ -616,7 +656,7 @@ void ProbeLinkManager::onPostResult(const std::shared_ptr<ProbeRecord>& record,
             LOG_EVERY_N(WARNING, 100)
                 << "UB probe post rejected: " << probeKeyText(record->key);
             record->state = RecordState::kRejected;
-            const uint64_t token = record->token;
+            const uint64_t token = record->core.token;
             inflight_.erase(token);
             inflight_cv_.notify_all();
             PortRuntime* port =
@@ -701,7 +741,7 @@ bool ProbeLinkManager::onProbeCompletion(const Completion& completion,
                 return true;
             }
             auto record = orphan->second;
-            if (!record->settled.exchange(true)) {
+            if (!record->core.finalize_claimed.exchange(true)) {
                 orphans_.erase(orphan);
                 record->state = RecordState::kSettled;
                 ++stats_.probe_orphan_settled;
@@ -710,7 +750,7 @@ bool ProbeLinkManager::onProbeCompletion(const Completion& completion,
             }
         } else {
             auto record = inflight->second;
-            if (record->settled.exchange(true)) return true;
+            if (record->core.finalize_claimed.exchange(true)) return true;
             inflight_.erase(inflight);
             record->state = RecordState::kSettled;
 
@@ -903,7 +943,7 @@ void ProbeLinkManager::applyLocked(const Completion& completion,
 
 void ProbeLinkManager::releaseSlotLocked(PortRuntime& port,
                                          const ProbeRecord& record) {
-    if (port.slot_token == record.token &&
+    if (port.slot_token == record.core.token &&
         port.slot_generation == record.key.jetty_generation) {
         port.slot_token = 0;
         if (port.inflight > 0) --port.inflight;
@@ -1272,7 +1312,7 @@ void ProbeLinkManager::moveToOrphansLocked(
     // Copy first: callers pass the mapped value of inflight_, and the erase
     // below destroys that node.
     auto record = record_ref;
-    const uint64_t token = record->token;
+    const uint64_t token = record->core.token;
     // Fixed order (design §9.5): campaign accounting, task slot, peer budget,
     // state, orphan table. The port slot is intentionally kept: no resend may
     // ever overlap this WR, and a new generation resets it.
@@ -1281,6 +1321,10 @@ void ProbeLinkManager::moveToOrphansLocked(
     releaseBudgetLocked(record->peer);
     record->state = RecordState::kOrphan;
     record->orphan_reason = reason;
+    // Interface 5 note 3: the shared kernel carries a neutral drop reason so
+    // both sides speak the same vocabulary (W6 unifies the enums).
+    record->core.orphan_reason.store(makeRecordDropReason(reason),
+                                     std::memory_order_relaxed);
     inflight_.erase(token);
     orphans_[token] = record;
     ++stats_.probe_orphan_added;
@@ -1604,11 +1648,12 @@ void ProbeLinkManager::scanTimeouts(uint64_t now_ns) {
         std::lock_guard<std::mutex> lock(mutex_);
         std::vector<std::shared_ptr<ProbeRecord>> expired;
         for (auto& [token, record] : inflight_) {
-            if (record->settled.load(std::memory_order_acquire)) continue;
+            if (record->core.finalize_claimed.load(std::memory_order_acquire))
+                continue;
             if (record->deadline_ns > now) continue;
             // One-shot: a record is scanned for timeout exactly once even if
             // the scheduler calls again before a late completion arrives.
-            if (record->timed_out.exchange(true)) continue;
+            if (record->core.timed_out.exchange(true)) continue;
             expired.push_back(record);
         }
         for (auto& record : expired) {
@@ -1714,7 +1759,8 @@ ProbeDrainResult ProbeLinkManager::drainBeforePollStop(uint64_t deadline_ns) {
         for (uint64_t token : unresolved) {
             auto record = inflight_.find(token);
             if (record != inflight_.end() &&
-                !record->second->settled.load(std::memory_order_acquire)) {
+                !record->second->core.finalize_claimed.load(
+                    std::memory_order_acquire)) {
                 moveToOrphansLocked(record->second, OrphanReason::kShutdown,
                                     now);
             }
@@ -1724,12 +1770,12 @@ ProbeDrainResult ProbeLinkManager::drainBeforePollStop(uint64_t deadline_ns) {
         // includes the records just moved). Claim each record once.
         for (auto it = orphans_.begin(); it != orphans_.end();) {
             auto record = it->second;
-            if (record->settled.exchange(true)) {
+            if (record->core.finalize_claimed.exchange(true)) {
                 it = orphans_.erase(it);
                 continue;
             }
             ProbeHandoff handoff;
-            handoff.token = record->token;
+            handoff.token = record->core.token;
             handoff.lane = LaneKey{record->key.version.path.local_nic, 0,
                                    record->key.jetty_generation};
             auto port = ports_.find(record->key.version.path.local_nic);
@@ -1741,7 +1787,7 @@ ProbeDrainResult ProbeLinkManager::drainBeforePollStop(uint64_t deadline_ns) {
             handoff.posted_ns = record->posted_ns;
             handoff.deadline_ns = record->deadline_ns;
             handoff.timed_out =
-                record->timed_out.load(std::memory_order_acquire);
+                record->core.timed_out.load(std::memory_order_acquire);
             handoff.orphan_reason = record->orphan_reason;
             handoff.source = std::move(record->source);
             handoff.area = std::move(record->area);

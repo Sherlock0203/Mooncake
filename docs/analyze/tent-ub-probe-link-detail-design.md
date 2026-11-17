@@ -204,7 +204,7 @@ A 侧的表记录 A→B 的 8 条，B 侧的表记录 B→A 的 8 条；两侧�
 | W1 做 | W1 不做（后续里程碑） |
 | --- | --- |
 | ProbeLinkManager：健康状态机、campaign、门禁、结算 | 健康过滤接入业务选路（W3） |
-| ProbeScheduler：定时、公平、直接 post、超时、关闭 drain | CompletionRecord / 完成门统一（W2） |
+| ProbeScheduler：定时、公平、直接 post、超时、关闭 drain | ~~CompletionRecord / 完成门统一~~（**W2 已完成**：`ProbeRecord.core`） |
 | **ProbeResources：本端物理口发现（非 bonding）、自建 Context/JFC/Jetty/源页、自退役重建** | 十类事件分类完整版、marker/AE 上报（W4） |
 | poller 三处接缝（槽位、分派、证据喂给）+ 两个启停钩子 | 探测区 descriptor 的 bootstrap v2 正式发布（控制面阶段零） |
 | 探测配置键、统计、日志、单测与集成测试 | **RM per-WR target 的 adapter 改造仍依赖 P0-B**（W1 用 fake 承接） |
@@ -368,13 +368,14 @@ struct PathRuntime {                   // 键：PathVersion
 enum class RecordState  : uint8_t { kPosting, kAwaiting, kRejected, kSettled, kOrphan, kHandedOff };
 enum class OrphanReason : uint8_t { kNone, kTimeout, kChannelRetired, kShutdown };
 
-struct ProbeRecord {                   // W1 临时结构；W2 的 CompletionRecord 落地后改为其子集视图
-    uint64_t        token;             // probe namespace
-    ProbeKey        key;
+struct ProbeRecord {                   // W2 已落地：core 即共享 CompletionRecord（§5.5）
+    CompletionRecord core;             // token / 身份 / 一次性事实位：
+                                       //   settled → core.finalize_claimed
+                                       //   timed_out / token → core.timed_out / core.token
+    ProbeKey        key;               // 完整探测身份（fault_epoch/campaign/probe_seq）
+    ProbePeerKey    peer;              // 预算释放用（PathVersion 行被删后仍需）
     uint64_t        posted_ns{0};
     uint64_t        deadline_ns{0};
-    std::atomic<bool> settled{false};  // 本侧责任终结（资源结清或已移交；一次性 CAS）
-    std::atomic<bool> timed_out{false};// 完成超时（一次性标记；资源仍保留，≠ 结清）
     RecordState     state{kPosting};
     OrphanReason    orphan_reason{kNone};
     LocalSegmentPtr source;            // 持引用 ⇒ 源页不会在 record 前注销
@@ -710,6 +711,8 @@ apply(cr, cur, edge):
 `releaseRefs(...)`：锁外释放 `source`/`area`/`credit`——`RealLocalSegment`/`RealRemoteSegment` 的析构会调 adapter 的 `close()`，不能持 PLM 锁执行。
 
 `releaseSlot(port, rec)`：仅当 `port.slot_token == rec.token && port.slot_generation == rec.key.jetty_generation` 时清槽并 `inflight--`；否则只记 `probe_slot_anomaly`（旧代迟到完成不得动新代的槽）。
+
+> **W2 落地后的命名**：本节伪码沿用 W1 的 `rec.settled` / `rec.timed_out` / `rec.token`；实现上它们是 `rec.core.finalize_claimed` / `rec.core.timed_out` / `rec.core.token`（共享内核，语义与一次性保证不变）。伪码保留 W1 命名以对应本节的结算语境。
 
 `releaseTaskSlot(rec)`：**先按 `probe_seq` 短路**——`cur` 为空或 `cur.inflight_seq != rec.key.probe_seq` 直接 return（非归属者整个函数不动）。否则清 `inflight_seq`，按该 peer campaign 里该版本条目的最终状态决定：
 

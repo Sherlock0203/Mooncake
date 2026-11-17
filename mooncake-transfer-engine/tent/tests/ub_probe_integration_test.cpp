@@ -322,7 +322,8 @@ TEST(UbProbeIntegrationTest,
     auto record = env.plm->beginPost(actions.front(), makeProbeToken(1), now);
     ASSERT_NE(record, nullptr);
     env.probe_jfc->push(Completion{CompletionCategory::SUCCESS, 0,
-                                   record->token, 1, env.probe_jetty->id()});
+                                   record->core.token, 1,
+                                   env.probe_jetty->id()});
 
     ASSERT_TRUE(pt::waitUntil([&] {
         return pt::healthOf(*env.plm, env.version).health ==
@@ -357,8 +358,8 @@ TEST(UbProbeIntegrationTest, SharedModeRoutesProbeCompletionOnBusinessJfc) {
     ASSERT_NE(business_jfc, nullptr);
     const uint32_t business_jfc_id =
         static_cast<uint32_t>(business_jfc->pollCount());
-    business_jfc->push(Completion{CompletionCategory::SUCCESS, 0, record->token,
-                                  1, business_jfc_id});
+    business_jfc->push(Completion{CompletionCategory::SUCCESS, 0,
+                                  record->core.token, 1, business_jfc_id});
 
     ASSERT_TRUE(pt::waitUntil([&] {
         return pt::healthOf(*env.plm, env.version).health ==
