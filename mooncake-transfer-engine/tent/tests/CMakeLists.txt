@@ -579,11 +579,61 @@ if(USE_UB)
   add_test(NAME tent_ub_completion_record_test
            COMMAND tent_ub_completion_record_test)
 
+  # W3a/W3b/W3c: bounded queue arithmetic, the five-bucket defer registry and
+  # the task-level K gate. Header-only pieces plus slice.h, so the target needs
+  # no adapter, workers or segment manager.
+  add_executable(tent_ub_admission_test ub_admission_test.cpp)
+  target_link_libraries(tent_ub_admission_test PRIVATE tent_common gtest
+                                                         gtest_main)
+  target_include_directories(tent_ub_admission_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_admission_test COMMAND tent_ub_admission_test)
+
+  # W3d: the PLM business routing gate and the per-path in-flight ledger.
+  add_executable(
+    tent_ub_path_selection_test
+    ub_path_selection_test.cpp ../src/transport/ub/path_load_ledger.cpp
+    ../src/transport/ub/probe_link_manager.cpp)
+  target_link_libraries(tent_ub_path_selection_test PRIVATE tent_common gtest
+                                                           gtest_main)
+  target_include_directories(tent_ub_path_selection_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_path_selection_test
+           COMMAND tent_ub_path_selection_test)
+
+  # W3e: claim/return semantics against the real SendJettyPool.
+  add_executable(
+    tent_ub_post_claim_test
+    ub_post_claim_test.cpp ../src/transport/ub/send_jetty_pool.cpp
+    ../src/transport/ub/admission.cpp ../src/transport/ub/native_budget.cpp
+    ../src/transport/ub/jfc.cpp ../src/transport/ub/probe_link_manager.cpp)
+  target_link_libraries(tent_ub_post_claim_test PRIVATE tent_common gtest
+                                                        gtest_main)
+  target_include_directories(tent_ub_post_claim_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_post_claim_test COMMAND tent_ub_post_claim_test)
+
+  # W3e integration: real workers + real pool + fake adapter. Covers the three
+  # required interleavings (early CQE, first error, timeout fence under a
+  # stopping pool) end to end.
+  add_executable(tent_ub_pool_integration_test
+                 ub_pool_integration_test.cpp)
+  target_link_libraries(tent_ub_pool_integration_test PRIVATE gtest gtest_main
+                                                              tent_link_group)
+  target_include_directories(tent_ub_pool_integration_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_pool_integration_test
+           COMMAND tent_ub_pool_integration_test)
+
   add_executable(
     tent_ub_teardown_test
     ub_teardown_test.cpp ../src/transport/ub/buffers.cpp
     ../src/transport/ub/context.cpp ../src/transport/ub/endpoint.cpp
-    ../src/transport/ub/endpoint_store.cpp ../src/transport/ub/jfc.cpp)
+    ../src/transport/ub/endpoint_store.cpp ../src/transport/ub/jfc.cpp
+    # M8: a Context drains its own pooled send Jetties before closing its JFCs,
+    # so the teardown target needs the pool module too.
+    ../src/transport/ub/send_jetty_pool.cpp ../src/transport/ub/native_budget.cpp
+    ../src/transport/ub/admission.cpp)
   target_link_libraries(tent_ub_teardown_test PRIVATE tent_common gtest
                                                       gtest_main)
   target_include_directories(tent_ub_teardown_test

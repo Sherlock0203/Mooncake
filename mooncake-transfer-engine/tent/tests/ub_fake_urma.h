@@ -14,6 +14,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -273,11 +274,30 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         auto fake_jfc = std::dynamic_pointer_cast<FakeJfc>(jfc);
         if (!fake_jfc) return Status::InvalidArgument("bad JFC");
         last_jetty_transport_mode_ = options.transport_mode;
-        jetty = std::make_shared<FakeJetty>(next_jetty_id_++, fake_jfc);
+        if (create_jetty_failures_.load(std::memory_order_acquire) != 0 &&
+            create_jetty_failures_.fetch_sub(1, std::memory_order_acq_rel) >
+                0) {
+            return Status::InternalError("injected createJetty failure");
+        }
+        auto created = std::make_shared<FakeJetty>(next_jetty_id_++, fake_jfc);
+        // A pooled send Jetty is never bound by the endpoint logic: the pooling
+        // side creates it, leases it and posts through it. Production RM mode
+        // carries a per-WR target instead of a binding; an RC-shaped fake has
+        // no such thing, so tests may opt into "created means usable" to
+        // exercise the pooled success path.
+        if (auto_bind_created_jetties_.load(std::memory_order_acquire)) {
+            created->bind();
+        }
+        jetty = std::move(created);
         live_jetties_.fetch_add(1, std::memory_order_relaxed);
         return Status::OK();
     }
     Status deleteJetty(JettyPtr& jetty) override {
+        if (delete_jetty_failures_.load(std::memory_order_acquire) != 0 &&
+            delete_jetty_failures_.fetch_sub(1, std::memory_order_acq_rel) >
+                0) {
+            return Status::InternalError("injected deleteJetty failure");
+        }
         if (auto fake = std::dynamic_pointer_cast<FakeJetty>(jetty)) {
             fake->close();
             decrement(live_jetties_);
@@ -320,7 +340,7 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         if (!quiesce_drops_completions_.load(std::memory_order_acquire)) {
             auto it = pending_.begin();
             while (it != pending_.end()) {
-                if (it->jetty_id != fake->id()) {
+                if (!it->jetty || it->jetty->id() != fake->id()) {
                     ++it;
                     continue;
                 }
@@ -332,6 +352,7 @@ class FakeUrmaAdapter final : public UrmaAdapter {
                 it = pending_.erase(it);
             }
         }
+        last_quiesced_jetty_id_.store(fake->id(), std::memory_order_release);
         quiesce_calls_.fetch_add(1, std::memory_order_relaxed);
         return Status::OK();
     }
@@ -341,6 +362,22 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         auto fake = std::dynamic_pointer_cast<FakeJetty>(jetty);
         if (!fake || !fake->valid() || !fake->bound()) {
             return Status::InvalidArgument("unbound Jetty");
+        }
+        recordPostJetty(fake->id());
+        // A test may force the whole post result (NotAccepted / Unknown), which
+        // a real provider only produces on contradictory paths.
+        if (auto forced = takeForcedPostOutcome(requests.size())) {
+            posted_count = forced->posted_count;
+            for (size_t i = 0; i < forced->posted_count && i < requests.size();
+                 ++i) {
+                if (!requests[i].local_segment || !requests[i].remote_segment ||
+                    requests[i].token == 0 || requests[i].length == 0) {
+                    return Status::InvalidArgument("bad WR");
+                }
+                deliverCompletion(fake, requests[i],
+                                  CompletionCategory::SUCCESS);
+            }
+            return forced->status;
         }
         for (const auto& request : requests) {
             if (!request.local_segment || !request.remote_segment ||
@@ -352,49 +389,49 @@ class FakeUrmaAdapter final : public UrmaAdapter {
             if (hold_next_completion_.exchange(false,
                                                std::memory_order_acq_rel)) {
                 std::lock_guard<std::mutex> lock(pending_mutex_);
-                pending_.push_back(Pending{fake->id(), request});
+                pending_.push_back(Pending{fake, request});
                 ++posted_count;
                 continue;
             }
-            if (category == CompletionCategory::SUCCESS) {
-                if (request.operation == Operation::WRITE) {
-                    std::memcpy(
-                        reinterpret_cast<void*>(request.remote_address),
-                        reinterpret_cast<const void*>(request.local_address),
-                        request.length);
-                } else {
-                    std::memcpy(
-                        reinterpret_cast<void*>(request.local_address),
-                        reinterpret_cast<const void*>(request.remote_address),
-                        request.length);
-                }
-            }
-            const Completion completion{
-                category, 0, request.token,
-                category == CompletionCategory::SUCCESS
-                    ? static_cast<uint32_t>(request.length)
-                    : 0,
-                fake->id()};
-            fake->jfc()->push(completion);
+            deliverCompletion(fake, request, category);
             ++posted_count;
-            std::function<void(uint64_t)> gate;
-            {
-                std::lock_guard<std::mutex> lock(hook_mutex_);
-                gate = post_gate_;
-            }
-            // The hook runs inside the post call, after the completion is
-            // visible to the poller and before post() returns. Tests use it to
-            // hold the post call stack open across an early completion.
-            if (gate) gate(request.token);
         }
         return Status::OK();
     }
     Status post(const JettyPtr& jetty, const RemoteJettyInfo& target,
                 const WorkRequest& request, size_t& posted) override {
-        (void)jetty;
+        auto fake = std::dynamic_pointer_cast<FakeJetty>(jetty);
+        if (!fake || !fake->valid()) {
+            posted = 0;
+            return Status::InvalidArgument("bad Jetty");
+        }
         last_post_ = request;
         last_post_target_ = target;
         last_post_had_target_ = true;
+        recordPostJetty(fake->id(), target.id);
+        if (auto forced = takeForcedPostOutcome(1)) {
+            posted = forced->posted_count == 0 ? 0 : 1;
+            if (posted != 0) {
+                deliverCompletion(fake, request, CompletionCategory::SUCCESS);
+            }
+            return forced->status;
+        }
+        // The probe poster relies on the historical stub contract: accepted,
+        // one WR, no completion (probe evidence is injected by its provider).
+        // The pooled data path opts into real completion delivery.
+        if (!rm_post_delivers_completion_.load(std::memory_order_acquire)) {
+            posted = 1;
+            return Status::OK();
+        }
+        if (hold_next_completion_.exchange(false, std::memory_order_acq_rel)) {
+            std::lock_guard<std::mutex> lock(pending_mutex_);
+            pending_.push_back(Pending{fake, request});
+            posted = 1;
+            return Status::OK();
+        }
+        deliverCompletion(fake, request,
+                          next_completion_.exchange(CompletionCategory::SUCCESS,
+                                                    std::memory_order_acq_rel));
         posted = 1;
         return Status::OK();
     }
@@ -445,6 +482,67 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     void failNextCompletion(CompletionCategory category) {
         next_completion_.store(category, std::memory_order_release);
     }
+    // Test hook for the pooled data path: make createJetty() return an already
+    // usable (bound) Jetty so a pool member can post without the endpoint bind
+    // step. Production never does this for RM mode.
+    void setAutoBindCreatedJetties(bool auto_bind) {
+        auto_bind_created_jetties_.store(auto_bind, std::memory_order_release);
+    }
+    // W3 review M3: the RM post overload historically only recorded the target.
+    // The pooled data path needs it to behave like the RC one (memcpy +
+    // completion + hooks), so that behavior is opt-in and the probe poster's
+    // contract stays untouched.
+    void setRmPostDeliversCompletion(bool deliver) {
+        rm_post_delivers_completion_.store(deliver, std::memory_order_release);
+    }
+    // Forces the result of the next post() (either overload) so a test can
+    // construct the two contradictory states the tristate exists for:
+    //   NotAccepted: status !ok, posted_count 0
+    //   Unknown:     status ok with 0 posted, or !ok with a posted WR
+    void setNextPostOutcome(Status status, size_t posted_count) {
+        std::lock_guard<std::mutex> lock(hook_mutex_);
+        forced_post_outcome_ = PostOutcome{std::move(status), posted_count};
+    }
+    // Releases every held completion as a SUCCESS (late-CQE injection).
+    size_t completePending() {
+        std::vector<Pending> pending;
+        {
+            std::lock_guard<std::mutex> lock(pending_mutex_);
+            pending.swap(pending_);
+        }
+        for (const auto& entry : pending) {
+            if (!entry.jetty) continue;
+            deliverCompletion(entry.jetty, entry.request,
+                              CompletionCategory::SUCCESS);
+        }
+        return pending.size();
+    }
+    void failNextCreateJetty() {
+        create_jetty_failures_.fetch_add(1, std::memory_order_acq_rel);
+    }
+    // Fails the next `count` deleteJetty() calls. Two consecutive failures are
+    // needed to observe a quarantined member, because shutdown retries once.
+    void failJettyDeletes(size_t count) {
+        delete_jetty_failures_.fetch_add(count, std::memory_order_acq_rel);
+    }
+    void failNextDeleteJetty() { failJettyDeletes(1); }
+    // The last Jetty passed to quiesceJetty(). Fence-target assertions
+    // (D-14 / W3-IN-10) compare it with the Jetty the WR rode.
+    uint32_t lastQuiescedJettyId() const {
+        return last_quiesced_jetty_id_.load(std::memory_order_acquire);
+    }
+    // Jetty ids in post() call order: the "assert the call sequence" surface
+    // §15.1 asks for.
+    std::vector<uint32_t> postJettyIds() const {
+        std::lock_guard<std::mutex> lock(sequence_mutex_);
+        return post_jetty_ids_;
+    }
+    // Per-WR RM target ids in post() call order (M6: the slot must follow the
+    // posting lane, not the member's JFC rotation).
+    std::vector<uint32_t> postTargetIds() const {
+        std::lock_guard<std::mutex> lock(sequence_mutex_);
+        return post_target_ids_;
+    }
     void holdNextCompletion() {
         hold_next_completion_.store(true, std::memory_order_release);
     }
@@ -454,7 +552,7 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         std::lock_guard<std::mutex> lock(pending_mutex_);
         WorkRequest request;
         request.token = token;
-        pending_.push_back(Pending{fake->id(), request});
+        pending_.push_back(Pending{fake, request});
     }
     void dropNextQuiescedCompletion() {
         drop_next_quiesced_completion_.store(true, std::memory_order_release);
@@ -512,9 +610,63 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     }
 
     struct Pending {
-        uint32_t jetty_id{0};
+        std::shared_ptr<FakeJetty> jetty;
         WorkRequest request;
     };
+
+    struct PostOutcome {
+        Status status = Status::OK();
+        size_t posted_count = 0;
+    };
+
+    void recordPostJetty(uint32_t id, uint32_t target_id = 0) {
+        std::lock_guard<std::mutex> lock(sequence_mutex_);
+        post_jetty_ids_.push_back(id);
+        post_target_ids_.push_back(target_id);
+    }
+
+    // Returns the forced outcome when one was installed, consuming it.
+    std::optional<PostOutcome> takeForcedPostOutcome(size_t request_count) {
+        (void)request_count;
+        std::lock_guard<std::mutex> lock(hook_mutex_);
+        if (!forced_post_outcome_.has_value()) return std::nullopt;
+        PostOutcome outcome = std::move(*forced_post_outcome_);
+        forced_post_outcome_.reset();
+        return outcome;
+    }
+
+    // The single delivery path: copy the payload for a successful WR, push the
+    // completion into the Jetty's JFC and run the post gate hook.
+    void deliverCompletion(const std::shared_ptr<FakeJetty>& fake,
+                           const WorkRequest& request,
+                           CompletionCategory category) {
+        if (category == CompletionCategory::SUCCESS) {
+            if (request.operation == Operation::WRITE) {
+                std::memcpy(
+                    reinterpret_cast<void*>(request.remote_address),
+                    reinterpret_cast<const void*>(request.local_address),
+                    request.length);
+            } else {
+                std::memcpy(
+                    reinterpret_cast<void*>(request.local_address),
+                    reinterpret_cast<const void*>(request.remote_address),
+                    request.length);
+            }
+        }
+        fake->jfc()->push(Completion{category, 0, request.token,
+                                     category == CompletionCategory::SUCCESS
+                                         ? static_cast<uint32_t>(request.length)
+                                         : 0,
+                                     fake->id()});
+        std::function<void(uint64_t)> gate;
+        {
+            std::lock_guard<std::mutex> lock(hook_mutex_);
+            gate = post_gate_;
+        }
+        // The hook runs inside the post call, after the completion is visible
+        // to the poller and before post() returns.
+        if (gate) gate(request.token);
+    }
 
     DeviceInfo device_;
     std::vector<DeviceInfo> discovered_devices_;
@@ -522,6 +674,15 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     uint32_t next_jetty_id_{1};
     std::atomic<CompletionCategory> next_completion_{
         CompletionCategory::SUCCESS};
+    std::atomic<bool> auto_bind_created_jetties_{false};
+    std::atomic<bool> rm_post_delivers_completion_{false};
+    std::atomic<size_t> create_jetty_failures_{0};
+    std::atomic<size_t> delete_jetty_failures_{0};
+    std::atomic<uint32_t> last_quiesced_jetty_id_{0};
+    std::optional<PostOutcome> forced_post_outcome_;
+    mutable std::mutex sequence_mutex_;
+    std::vector<uint32_t> post_jetty_ids_;
+    std::vector<uint32_t> post_target_ids_;
     std::atomic<bool> hold_next_completion_{false};
     std::atomic<bool> drop_next_quiesced_completion_{false};
     std::atomic<bool> fail_next_quiesce_{false};

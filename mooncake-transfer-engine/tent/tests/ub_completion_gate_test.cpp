@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "tent/transport/ub/completion_record.h"
+#include "tent/transport/ub/urma_adapter.h"
 
 namespace mooncake::tent::ub {
 namespace {
@@ -557,21 +558,30 @@ TEST(UbCompletionGateTest, RevokedTimeoutReportsLaterFaultOnce) {
 }
 
 // ---------------------------------------------------------------------------
-// G-15: legacy acceptance mapping (D-5). W3 replaces this function body only.
-TEST(UbCompletionGateTest, LegacyAcceptanceMapping) {
+// G-15: tristate acceptance mapping (D-12). W3 moved the single normalization
+// point into the adapter (classifyPostAcceptance) and deleted the W2
+// legacyAcceptance() helper, so this covers the identical contract.
+TEST(UbCompletionGateTest, TristateAcceptanceMapping) {
     const Status ok = Status::OK();
     const Status failed = Status::InternalError("post failed");
 
-    EXPECT_EQ(legacyAcceptance(ok, 1), PostAcceptance::kAccepted);
+    EXPECT_EQ(classifyPostAcceptance(ok, 1, 1), PostAcceptance::kAccepted);
     // The WR crossed the boundary before the error was reported.
-    EXPECT_EQ(legacyAcceptance(failed, 1), PostAcceptance::kAccepted);
-    EXPECT_EQ(legacyAcceptance(ok, 0), PostAcceptance::kNotAccepted);
-    EXPECT_EQ(legacyAcceptance(failed, 0), PostAcceptance::kNotAccepted);
-    // An over-reporting adapter is self-contradictory: the gate must neither
+    EXPECT_EQ(classifyPostAcceptance(failed, 1, 1), PostAcceptance::kAccepted);
+    // Definite zero acceptance is the only rollback case.
+    EXPECT_EQ(classifyPostAcceptance(failed, 0, 1),
+              PostAcceptance::kNotAccepted);
+    // Success with nothing posted is contradictory: the gate must neither
     // accept nor roll back on a guess, it drains (see
     // UnknownAcceptanceDrainsUntilFence).
-    EXPECT_EQ(legacyAcceptance(ok, 2), PostAcceptance::kUnknown);
-    EXPECT_EQ(legacyAcceptance(failed, 2), PostAcceptance::kUnknown);
+    EXPECT_EQ(classifyPostAcceptance(ok, 0, 1), PostAcceptance::kUnknown);
+    // An over-reporting adapter is self-contradictory too.
+    EXPECT_EQ(classifyPostAcceptance(ok, 2, 1), PostAcceptance::kUnknown);
+    EXPECT_EQ(classifyPostAcceptance(failed, 2, 1), PostAcceptance::kUnknown);
+    // A partially accepted batch is never a definite rejection.
+    EXPECT_EQ(classifyPostAcceptance(failed, 1, 2), PostAcceptance::kUnknown);
+    // An empty batch has nothing to wait for.
+    EXPECT_EQ(classifyPostAcceptance(ok, 0, 0), PostAcceptance::kAccepted);
 }
 
 // ---------------------------------------------------------------------------

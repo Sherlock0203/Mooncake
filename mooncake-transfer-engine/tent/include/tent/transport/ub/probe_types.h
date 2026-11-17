@@ -390,6 +390,13 @@ struct ProbeStats {
     uint64_t business_error_while_disabled{0};
     uint64_t probe_event_duplicate{0};
     uint64_t probe_event_stale_epoch{0};
+
+    // W3 business-routing gate (design §7.1 / RK8). A path that selection asked
+    // about but the probe graph does not model is treated as USABLE, and
+    // counted here: a growing value means the adjacency configuration is
+    // incomplete rather than that traffic is being filtered.
+    uint64_t business_path_not_in_graph{0};
+    uint64_t business_path_health_blocked{0};
 };
 
 }  // namespace ub

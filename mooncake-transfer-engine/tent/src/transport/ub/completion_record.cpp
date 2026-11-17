@@ -264,21 +264,6 @@ std::string recordPathText(const RecordPath& path) {
     return std::string(buffer);
 }
 
-PostAcceptance legacyAcceptance(const Status& status, size_t posted_count) {
-    if (posted_count == 1) {
-        // The WR crossed the native boundary. A status that reports an error
-        // afterwards does not undo the acceptance.
-        return PostAcceptance::kAccepted;
-    }
-    if (posted_count == 0) {
-        return PostAcceptance::kNotAccepted;
-    }
-    // The adapter claimed more WRs than were submitted. W2 cannot classify
-    // this, so it stays unknown instead of silently rejecting work.
-    (void)status;
-    return PostAcceptance::kUnknown;
-}
-
 CompletionStatsSnapshot CompletionStats::snapshot() const {
     CompletionStatsSnapshot out;
     out.record_published = record_published.load(std::memory_order_relaxed);
@@ -306,6 +291,8 @@ CompletionStatsSnapshot CompletionStats::snapshot() const {
     out.gate_claim_race = gate_claim_race.load(std::memory_order_relaxed);
     out.not_accepted_with_completion =
         not_accepted_with_completion.load(std::memory_order_relaxed);
+    out.completion_length_mismatch =
+        completion_length_mismatch.load(std::memory_order_relaxed);
     out.one_shot_violations =
         one_shot_violations.load(std::memory_order_relaxed);
     out.handler_ref_leak_on_finalize =

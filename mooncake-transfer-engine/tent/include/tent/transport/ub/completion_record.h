@@ -59,12 +59,12 @@ enum class RecordKind : uint8_t {
     kProbe = 1,
 };
 
-// Three-state post acceptance (interface 5). W2 derives it from the legacy
-// posted_count through legacyAcceptance(). kUnknown is only produced by a
-// self-contradictory adapter (it claimed more WRs than were submitted); such a
-// record is never released on a guess - it drains until a fence proves that
-// responsibility ended (upstream §1.2.4 "Unknown 交排空"). P0-B replaces the
-// mapping with a real tristate post result (D-5).
+// Three-state post acceptance (interface 5). W3 sources it from the adapter's
+// real tristate result through classifyPostAcceptance() (urma_adapter.h, D-12);
+// the W2 heuristic that inferred it from posted_count is gone. kUnknown is
+// produced by a self-contradictory adapter; such a record is never released on
+// a guess - it drains until a fence proves that responsibility ended
+// (upstream §1.2.4 "Unknown 交排空").
 enum class PostAcceptance : uint8_t {
     kNotAccepted = 0,
     kAccepted = 1,
@@ -278,26 +278,9 @@ struct CompletionRecord {
     }
 };
 
-// Derives the W2 acceptance state from the legacy post result (D-5). This is
-// the single adapter-mapping point: W3 replaces exactly this function when the
-// pooling side supplies the real tristate PostResult.
-//
-//   posted_count == 1        -> Accepted   (the WR crossed the native boundary,
-//                                           even if post() reported an error
-//                                           afterwards)
-//   posted_count == 0        -> NotAccepted (definite zero acceptance: the only
-//                                           case the post side may roll back)
-//   posted_count >  1        -> Unknown     (one WR can only produce one
-//                                           record, so this is a
-//                                           self-contradictory adapter. Nothing
-//                                           is released on a guess: the record
-//                                           drains until the timeout fence
-//                                           proves the old DMA stopped, bounded
-//                                           by slice_timeout_ms, and every
-//                                           blocked pass is counted as
-//                                           gate_blocked_by_acceptance.)
-[[nodiscard]] PostAcceptance legacyAcceptance(const Status& status,
-                                              size_t posted_count);
+// W3 D-12: `legacyAcceptance()` was deleted. acceptance always arrives from the
+// adapter's tristate post through classifyPostAcceptance() (urma_adapter.h), so
+// no caller may reconstruct it from posted_count.
 
 // ---------------------------------------------------------------------------
 // Counters (design §9). Same shape as ProbeStats: atomics written by the gate
@@ -324,6 +307,11 @@ struct CompletionStatsSnapshot {
     // acceptance: a contradiction that is isolated (the reject disposition
     // retires the endpoint) and must stay visible.
     uint64_t not_accepted_with_completion{0};
+    // W3 D-15: the completion reported a byte count that differs from the
+    // submitted length. Recorded only - the W2 settlement predicate and the
+    // pool return predicate stay untouched, so this must stay at zero on a
+    // healthy build and never changes a verdict.
+    uint64_t completion_length_mismatch{0};
     // Invariant counters; always zero on a healthy build.
     uint64_t one_shot_violations{0};
     uint64_t handler_ref_leak_on_finalize{0};
@@ -352,6 +340,7 @@ class CompletionStats {
     std::atomic<uint64_t> gate_blocked_by_acceptance{0};
     std::atomic<uint64_t> gate_claim_race{0};
     std::atomic<uint64_t> not_accepted_with_completion{0};
+    std::atomic<uint64_t> completion_length_mismatch{0};
     std::atomic<uint64_t> one_shot_violations{0};
     std::atomic<uint64_t> handler_ref_leak_on_finalize{0};
     std::atomic<uint64_t> timeout_deferred_by_post_return{0};

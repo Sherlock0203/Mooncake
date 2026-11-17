@@ -215,6 +215,7 @@ Status ProbeLinkManager::initialize(const ProbeGraph& graph) {
         edges_.emplace(supply.version, supply);
         PathRuntime runtime;
         runtime.peer = supply.peer;
+        path_index_[supply.version.path] = supply.version;
         paths_.emplace(supply.version, std::move(runtime));
         port->second.paths.push_back(supply.version);
         ++stats_.path_state_eligible;
@@ -1124,6 +1125,41 @@ void ProbeLinkManager::cancelCampaignEntriesLocked(const PathVersion& version) {
 
 std::optional<PathVersion> ProbeLinkManager::resolveVersionLocked(
     const UbPostPath& evidence, bool require_matching_generation) {
+    // W3 M4: the business routing gate asks this question once per candidate
+    // (local x remote) on every attempt, and once more at claim time. A linear
+    // scan over every path row under the global PLM lock made that O(paths) per
+    // candidate, so the (local_nic, segment, remote_nic) -> PathVersion index
+    // is consulted first. The index is maintained wherever a row is created or
+    // dropped, and the scan below stays as the fallback/miss path.
+    const ProbePathKey key{evidence.local_topology_id,
+                           evidence.remote_segment_id,
+                           evidence.remote_device_id};
+    auto resolveOne =
+        [&](const PathVersion& version) -> std::optional<PathVersion> {
+        auto edge = edges_.find(version);
+        if (edge == edges_.end()) return std::nullopt;
+        const uint64_t anchor = edge->second.endpoint_generation;
+        if (anchor == 0 || anchor == evidence.endpoint_generation) {
+            return version;
+        }
+        // L-7: an unmappable fault is attributed to the rail's current
+        // version anyway, so a real fault is never lost; a success, however,
+        // must not promote a path version it does not belong to.
+        LOG_EVERY_N(WARNING, 100)
+            << "UB probe business evidence generation does not map: "
+            << pathText(version) << " anchor=" << anchor
+            << " evidence=" << evidence.endpoint_generation;
+        ++stats_.probe_evidence_unmapped;
+        if (require_matching_generation) return std::nullopt;
+        return version;
+    };
+
+    auto indexed = path_index_.find(key);
+    if (indexed != path_index_.end() &&
+        paths_.find(indexed->second) != paths_.end()) {
+        return resolveOne(indexed->second);
+    }
+
     bool found = false;
     std::optional<PathVersion> resolved;
     for (const auto& [version, runtime] : paths_) {
@@ -1391,6 +1427,10 @@ void ProbeLinkManager::removePathLocked(const PathVersion& version) {
         list.erase(std::remove(list.begin(), list.end(), version), list.end());
         if (port->second.rr_cursor > list.size()) port->second.rr_cursor = 0;
     }
+    auto indexed = path_index_.find(version.path);
+    if (indexed != path_index_.end() && indexed->second == version) {
+        path_index_.erase(indexed);
+    }
     paths_.erase(it);
 }
 
@@ -1416,6 +1456,7 @@ Status ProbeLinkManager::upsertEdgeLocked(const ProbeEdgeSupply& edge) {
     edges_.emplace(edge.version, edge);
     PathRuntime runtime;
     runtime.peer = edge.peer;
+    path_index_[edge.version.path] = edge.version;
     paths_.emplace(edge.version, std::move(runtime));
     port->second.paths.push_back(edge.version);
     ++stats_.path_state_eligible;

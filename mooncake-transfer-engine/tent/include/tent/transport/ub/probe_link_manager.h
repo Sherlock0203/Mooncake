@@ -254,6 +254,22 @@ class ProbeLinkManager final : public ProbeAvailabilitySink {
     // is not recovered by probing (design §6.2).
     void onContextUnavailable(Topology::NicID local_nic, uint64_t now_ns = 0);
 
+    // ---- W3 business-routing gate (design §7.1 / D-10) --------------------
+    // Read-only queries used by path selection; they never mutate health and
+    // never create a campaign.
+    //
+    // `businessPathUsable` performs subtraction only: HEALTHY and
+    // ELIGIBLE_UNVERIFIED pass, ISOLATED/RECOVERING/DISABLED do not, and a path
+    // that is not in the probe graph PASSES. Excluding unknown paths would let
+    // an incomplete adjacency configuration starve business traffic, which W1
+    // deliberately avoided by staying a side channel (W3-IN-6 / RK8).
+    //
+    // `businessFaultEpoch` is the claim anchor of the admission path: it is
+    // snapshotted before the lease and compared after it, so an attempt that
+    // was selected before its path became isolated does not post (design §8.2).
+    [[nodiscard]] bool businessPathUsable(const UbPostPath& path);
+    [[nodiscard]] uint64_t businessFaultEpoch(const UbPostPath& path);
+
     // ---- interface 7 (design §12.3) --------------------------------------
     // Synchronous, bounded update. A repeated (graph_epoch, event_seq) is
     // acknowledged without being applied. A gap or a malformed payload is
@@ -366,8 +382,7 @@ class ProbeLinkManager final : public ProbeAvailabilitySink {
                    uint64_t now_ns) const;
     bool schedulableLocked(const PathVersion& version,
                            const PathRuntime& runtime, uint64_t now_ns) const;
-    bool testEligibleLocked(const PathRuntime& runtime,
-                            uint64_t now_ns) const;
+    bool testEligibleLocked(const PathRuntime& runtime, uint64_t now_ns) const;
     bool testSchedulableLocked(const PathRuntime& runtime,
                                uint64_t now_ns) const;
     bool peerBudgetAvailableLocked(const ProbePeerKey& peer) const;
@@ -436,6 +451,10 @@ class ProbeLinkManager final : public ProbeAvailabilitySink {
 
     PortMap ports_;
     PathMap paths_;
+    // W3 M4: (local_nic, segment, remote_nic) -> current PathVersion.
+    // Maintained by every row creation/removal so the business routing gate
+    // answers in O(1) instead of scanning every path under the PLM lock.
+    std::unordered_map<ProbePathKey, PathVersion, ProbePathKeyHash> path_index_;
     EdgeMap edges_;
     CampaignMap campaigns_;
     RecordMap inflight_;

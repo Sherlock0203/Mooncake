@@ -391,8 +391,8 @@ TEST(UbPathSelectionScoreTest, AppliesCapacityLocalityPressureAndBandwidth) {
     base.topology_rank = 0;
     base.normalized_inflight = 0.5;
     base.normalized_quota_wrs = 0.5;
-    base.endpoint_outstanding_wrs = 2;
-    base.endpoint_outstanding_bytes = 128;
+    base.path_inflight_wrs = 2;
+    base.path_inflight_bytes = 128;
     base.has_bandwidth_sample = true;
     base.ewma_bandwidth_bytes_per_second = 100.0;
 
@@ -411,9 +411,11 @@ TEST(UbPathSelectionScoreTest, AppliesCapacityLocalityPressureAndBandwidth) {
     busier.normalized_inflight = 0.75;
     EXPECT_TRUE(betterUbPathScore(base, busier));
 
-    auto endpoint_busier = base;
-    endpoint_busier.endpoint_outstanding_wrs = 3;
-    EXPECT_TRUE(betterUbPathScore(base, endpoint_busier));
+    // W3 D-11: the tie-break is the per-path in-flight ledger, not the
+    // endpoint counter.
+    auto path_busier = base;
+    path_busier.path_inflight_wrs = 3;
+    EXPECT_TRUE(betterUbPathScore(base, path_busier));
 
     auto slower = base;
     slower.ewma_bandwidth_bytes_per_second = 50.0;
