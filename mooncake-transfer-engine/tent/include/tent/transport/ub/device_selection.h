@@ -46,6 +46,20 @@ inline bool parseDeviceKind(std::string_view value, DeviceKind& kind) {
     return true;
 }
 
+inline bool parseDeviceKindSource(std::string_view value,
+                                  DeviceKindSource& source) {
+    if (value == "none") {
+        source = DeviceKindSource::NONE;
+    } else if (value == "explicit_config") {
+        source = DeviceKindSource::EXPLICIT_CONFIG;
+    } else if (value == "validated_metadata") {
+        source = DeviceKindSource::VALIDATED_METADATA;
+    } else {
+        return false;
+    }
+    return true;
+}
+
 inline Status validateDeviceIdentityRecord(const DeviceIdentity& identity) {
     if (identity.native_device_name.empty() ||
         identity.native_device_path.empty() || identity.eid.empty()) {

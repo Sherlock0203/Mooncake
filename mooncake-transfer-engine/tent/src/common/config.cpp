@@ -75,6 +75,38 @@ Status Config::loadFile(const std::string& file_path) {
     return load(content);
 }
 
+Status Config::saveFile(const std::string& file_path) const {
+    const std::string content = dump(2);
+    const std::filesystem::path target(file_path);
+    const std::filesystem::path tmp_path(file_path + ".tmp");
+    std::error_code ec;
+    {
+        std::ofstream ofs(tmp_path, std::ios::trunc);
+        if (!ofs.is_open()) {
+            return Status::InvalidArgument(
+                "Cannot open config file for writing: " + tmp_path.string() +
+                LOC_MARK);
+        }
+        ofs << content << std::endl;
+        ofs.flush();
+        if (!ofs.good()) {
+            return Status::InvalidArgument(
+                "Failed to write config file: " + tmp_path.string() +
+                LOC_MARK);
+        }
+    }
+    // std::filesystem::rename replaces an existing target on both POSIX and
+    // Windows, keeping the swap atomic for concurrent readers.
+    std::filesystem::rename(tmp_path, target, ec);
+    if (ec) {
+        std::filesystem::remove(tmp_path);
+        return Status::InvalidArgument("Cannot replace config file " +
+                                       file_path + ": " + ec.message() +
+                                       LOC_MARK);
+    }
+    return Status::OK();
+}
+
 std::string Config::dump(int indent) const {
     std::lock_guard<std::mutex> lock(mutex_);
     return config_data_.dump(indent);
@@ -190,6 +222,10 @@ Status ConfigHelper::loadFromEnv(Config& config) {
                     << ": " << status.ToString();
             } else {
                 LOG(INFO) << "Loaded tent config from file: " << conf;
+                // Remember the source file so auto-imported records (for
+                // example UB device identities) can be persisted back with
+                // the exact schema the manual flow used.
+                config.set("config_source_file", conf);
             }
         } else {
             status = config.load(conf);
@@ -219,9 +255,10 @@ Status ConfigHelper::loadFromEnv(Config& config) {
     // trans_mode hardcoded in the JSON config; an unset or empty env keeps
     // the JSON value. Invalid values fail fast here with a clear error
     // instead of surfacing later as a confusing runtime-mode rejection deep
-    // inside install(). RM profiles are physical-only and still require
-    // device_identities from MC_TENT_CONF; that is enforced with a clear
-    // error by UbParams::FromConfig.
+    // inside install(). RM profiles are physical-only; when MC_TENT_CONF
+    // provides no device_identities, the UB transport auto-imports them
+    // from provider discovery at install time (explicit configuration still
+    // wins).
     if (const char* trans_mode = std::getenv("MC_URMA_TRANS_MODE")) {
         if (*trans_mode != '\0') {
             std::string mode(trans_mode);

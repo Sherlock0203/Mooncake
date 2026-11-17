@@ -587,12 +587,28 @@ std::vector<UbWorkers::LocalDeviceCandidate> UbWorkers::orderedLocalDevices(
             append(context->topologyId());
         }
     }
+    // Snapshot inflight bytes before sorting. The live counters change on
+    // other posting/polling threads; reading them inside the comparator makes
+    // the sorting non-deterministic, which violates the strict weak ordering
+    // requirements of std::stable_sort and can drive it out of bounds.
+    std::unordered_map<Topology::NicID, uint64_t> inflight_snapshot;
+    for (const auto& candidate : ordered) {
+        auto found = context_by_topology_id_.find(candidate.id);
+        if (found != context_by_topology_id_.end() && found->second) {
+            inflight_snapshot[candidate.id] = found->second->inflightBytes();
+        }
+    }
     std::stable_sort(
         ordered.begin(), ordered.end(), [&](const auto& lhs, const auto& rhs) {
             if (lhs.topology_rank != rhs.topology_rank)
                 return lhs.topology_rank < rhs.topology_rank;
-            return context_by_topology_id_.at(lhs.id)->inflightBytes() <
-                   context_by_topology_id_.at(rhs.id)->inflightBytes();
+            auto lhs_inflight = inflight_snapshot.find(lhs.id);
+            auto rhs_inflight = inflight_snapshot.find(rhs.id);
+            const uint64_t lhs_inflight_bytes =
+                lhs_inflight == inflight_snapshot.end() ? 0 : lhs_inflight->second;
+            const uint64_t rhs_inflight_bytes =
+                rhs_inflight == inflight_snapshot.end() ? 0 : rhs_inflight->second;
+            return lhs_inflight_bytes < rhs_inflight_bytes;
         });
     return ordered;
 }

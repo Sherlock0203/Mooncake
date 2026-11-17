@@ -605,6 +605,14 @@ if(USE_UB)
   add_test(NAME tent_ub_native_data_path_test
            COMMAND tent_ub_native_data_path_test)
 
+  add_executable(tent_ub_rm_auto_import_test ub_rm_auto_import_test.cpp)
+  target_link_libraries(tent_ub_rm_auto_import_test PRIVATE gtest gtest_main
+                                                            tent_link_group)
+  target_include_directories(tent_ub_rm_auto_import_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_rm_auto_import_test
+           COMMAND tent_ub_rm_auto_import_test)
+
   if(TENT_UB_REAL_DEVICE_TESTS)
     add_executable(tent_ub_real_device_test ub_real_device_test.cpp)
     target_link_libraries(tent_ub_real_device_test

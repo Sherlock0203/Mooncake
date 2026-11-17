@@ -31,6 +31,7 @@
 #include "tent/transport/ub/device_selection.h"
 #include "tent/transport/ub/endpoint.h"
 #include "tent/transport/ub/endpoint_store.h"
+#include "tent/transport/ub/identity_import.h"
 #include "tent/transport/ub/native_budget.h"
 #include "tent/transport/ub/params.h"
 #include "tent/transport/ub/quota.h"
@@ -66,44 +67,78 @@ uint64_t generationSeed() {
     return seed == 0 ? 1 : seed;
 }
 
-std::string encodeDeviceMetadata(Topology::NicID topology_id,
-                                 const ub::DeviceInfo& device) {
-    const auto& caps = device.capabilities;
-    return nlohmann::json{{"schema_version", 1},
-                          {"topology_id", topology_id},
-                          {"native_device_name", device.native_device_name},
-                          {"native_device_path", device.native_device_path},
-                          {"eid_index", device.eid_index},
-                          {"eid", device.eid},
-                          {"active", device.active},
-                          {"device_kind", ub::deviceKindName(device.kind)},
-                          {"device_kind_source",
-                           ub::deviceKindSourceName(device.kind_source)},
-                          {"capabilities",
-                           {{"max_jfc", caps.max_jfc},
-                            {"max_jfc_depth", caps.max_jfc_depth},
-                            {"max_jfr_depth", caps.max_jfr_depth},
-                            {"max_jetty", caps.max_jetty},
-                            {"max_jetty_depth", caps.max_jetty_depth},
-                            {"max_send_sge", caps.max_send_sge},
-                            {"max_remote_sge", caps.max_remote_sge},
-                            {"max_message_size", caps.max_message_size},
-                            {"max_read_size", caps.max_read_size},
-                            {"max_write_size", caps.max_write_size},
-                            {"feature_flags", caps.feature_flags},
-                            {"transport_modes", caps.transport_modes},
-                            {"rm_tp_cap", caps.rm_tp_cap},
-                            {"priority_tp_type_masks",
-                             caps.priority_tp_type_masks}}}}
-        .dump();
-}
-
 }  // namespace
 
 struct UbTransport::Impl {
     explicit Impl(std::shared_ptr<ub::UrmaAdapter> injected)
         : adapter(injected ? std::move(injected)
                            : ub::createDefaultUrmaAdapter()) {}
+
+    // Automatically collects local device identities from the provider and
+    // injects them into transports/ub/device_identities when the config
+    // requests physical-only selection (the RM family gate) without explicit
+    // identities. Explicit configuration always wins; RC installs and
+    // disabled transports are never touched. On success the discovery
+    // snapshot is cached so install verifies the injected records against
+    // the exact data they were collected from.
+    Status autoImportDeviceIdentities(Config& config) {
+        const auto existing = config.get<nlohmann::json>(
+            "transports/ub/device_identities", nlohmann::json());
+        if (existing.is_array() && !existing.empty()) {
+            return Status::OK();
+        }
+        if (!config.get("transports/ub/enable", false)) {
+            return Status::OK();
+        }
+        if (!config.get("transports/ub/physical_only", false)) {
+            return Status::OK();
+        }
+
+        auto status = adapter->initialize();
+        if (!status.ok()) return status;
+        adapter_initialized = true;
+
+        std::vector<ub::DeviceInfo> discovered;
+        status = adapter->discoverDevices(discovered);
+        if (!status.ok()) return status;
+
+        std::vector<ub::DeviceIdentity> identities;
+        status = ub::collectLocalDeviceIdentities(discovered, identities);
+        if (!status.ok()) return status;
+
+        config.set("transports/ub/device_identities",
+                   ub::deviceIdentitiesToJson(identities));
+        auto_import_snapshot = discovered;
+        auto_import_snapshot_valid = true;
+        LOG(INFO) << "UB auto-imported " << identities.size()
+                  << " device identities from provider discovery; manual "
+                     "transports/ub/device_identities configuration is no "
+                     "longer required";
+        persistAutoImportedIdentities(config);
+        return Status::OK();
+    }
+
+    // Best-effort write-back so the collected identities survive restarts
+    // and stay visible to external tooling using the exact manual schema.
+    // Only configs loaded from a file (MC_TENT_CONF path) are persisted;
+    // programmatic configs (for example the benchmark's in-memory config)
+    // rely on the injected in-memory records alone. A write failure never
+    // fails the install: the injected records already remove the need for
+    // manual editing in this process.
+    void persistAutoImportedIdentities(const Config& config) {
+        const auto source_file =
+            config.get<std::string>("config_source_file", "");
+        if (source_file.empty()) return;
+        auto status = config.saveFile(source_file);
+        if (!status.ok()) {
+            LOG(WARNING) << "UB auto-import could not persist device "
+                            "identities to "
+                         << source_file << ": " << status.ToString();
+        } else {
+            LOG(INFO) << "UB auto-import persisted device identities to "
+                      << source_file;
+        }
+    }
 
     Status install(const std::string& segment_name,
                    std::shared_ptr<ControlService> control,
@@ -129,19 +164,46 @@ struct UbTransport::Impl {
                 "A real or injected URMA adapter is unavailable" LOC_MARK);
         }
         if (!config) config = std::make_shared<Config>();
+
+        // RM auto-import pre-pass: when physical-only selection is requested
+        // without explicit identities, collect them from the provider and
+        // inject them into the config before the FromConfig gate, so RM
+        // installs no longer require hand-edited device_identities. The
+        // pre-pass may initialize the adapter; every early failure below
+        // must roll that back because failInstall() is not wired yet.
+        auto abort_after_auto_import = [this](Status failure) {
+            if (adapter_initialized) {
+                auto shutdown_status = adapter->shutdown();
+                adapter_initialized = false;
+                if (!shutdown_status.ok()) {
+                    LOG(WARNING)
+                        << "UB adapter shutdown after a failed auto-import "
+                           "install returned "
+                        << shutdown_status.ToString();
+                }
+            }
+            return failure;
+        };
+        auto import_status = autoImportDeviceIdentities(*config);
+        if (!import_status.ok()) {
+            return abort_after_auto_import(import_status);
+        }
+
         ub::UbParams parsed;
-        CHECK_STATUS(ub::UbParams::FromConfig(*config, parsed));
+        auto parse_status = ub::UbParams::FromConfig(*config, parsed);
+        if (!parse_status.ok()) return abort_after_auto_import(parse_status);
         if (!parsed.enable) {
-            return Status::InvalidArgument(
-                "UB transport is disabled by configuration" LOC_MARK);
+            return abort_after_auto_import(Status::InvalidArgument(
+                "UB transport is disabled by configuration" LOC_MARK));
         }
         if (parsed.enable_notifications) {
-            return Status::NotImplemented(
+            return abort_after_auto_import(Status::NotImplemented(
                 "UB notifications are not supported by protocol version "
-                "1" LOC_MARK);
+                "1" LOC_MARK));
         }
         ub::UbRuntimeMode selected_mode = ub::UbRuntimeMode::kRcLegacy;
-        CHECK_STATUS(ub::resolveUbRuntimeMode(parsed, selected_mode));
+        auto mode_status = ub::resolveUbRuntimeMode(parsed, selected_mode);
+        if (!mode_status.ok()) return abort_after_auto_import(mode_status);
         LOG(INFO) << "UB runtime selection: mode="
                   << ub::ubRuntimeModeName(selected_mode)
                   << " profile="
@@ -162,13 +224,23 @@ struct UbTransport::Impl {
         params = parsed;
         runtime_mode = selected_mode;
 
-        auto status = adapter->initialize();
-        if (!status.ok()) return failInstall(status);
-        adapter_initialized = true;
+        if (!adapter_initialized) {
+            auto init_status = adapter->initialize();
+            if (!init_status.ok()) return failInstall(init_status);
+            adapter_initialized = true;
+        }
 
+        // The auto-import pre-pass already took a discovery snapshot when it
+        // injected identities; reuse it so the injected records are verified
+        // against exactly the same snapshot they were collected from.
         std::vector<ub::DeviceInfo> discovered;
-        status = adapter->discoverDevices(discovered);
-        if (!status.ok()) return failInstall(status);
+        Status status;
+        if (auto_import_snapshot_valid) {
+            discovered = auto_import_snapshot;
+        } else {
+            status = adapter->discoverDevices(discovered);
+            if (!status.ok()) return failInstall(status);
+        }
         status = ub::resolveDeviceKindIdentities(params.device_identities,
                                                  discovered);
         if (!status.ok()) return failInstall(status);
@@ -628,6 +700,8 @@ struct UbTransport::Impl {
         local_topology.reset();
         conf.reset();
         local_segment_name.clear();
+        auto_import_snapshot.clear();
+        auto_import_snapshot_valid = false;
         shutting_down.store(false, std::memory_order_release);
         return Status::OK();
     }
@@ -658,8 +732,8 @@ struct UbTransport::Impl {
                         device.lid = 0;
                         device.gid.clear();
                         device.transport_attrs[TransportType::UB] =
-                            encodeDeviceMetadata(context->topologyId(),
-                                                 context->deviceInfo());
+                            ub::encodeDeviceMetadata(context->topologyId(),
+                                                     context->deviceInfo());
                         detail.devices.push_back(std::move(device));
                     }
                 }
@@ -739,26 +813,19 @@ struct UbTransport::Impl {
             request.remote_segment->rpc_server_addr, bootstrap, response);
         if (status.ok()) {
             if (rm_endpoint_runtime) {
-                // Trusted anchors for the peer identity: the registered remote
-                // segment name and the locally constructed peer NIC path. The
-                // remaining device fields are anchored by the control-plane
-                // mediated handshake at the same trust level as the RC v1
-                // endpoint; a mismatch fails closed before any import.
+                // Trusted anchor for the peer identity: the device metadata
+                // the peer published into its registered segment descriptor
+                // at install time (validated remote segment metadata), never
+                // the peer's self-asserted bootstrap fields. Every field the
+                // manual flow used to configure is validated here; any
+                // mismatch or missing metadata fails closed before import.
                 ub::UbExpectedPeerIdentity expected;
-                expected.segment_name = request.remote_segment->name;
-                expected.local_nic_path = peer_path;
-                expected.native_device_name = response.local_device_name;
-                expected.device_id = response.local_device_id;
-                expected.eid_index = response.local_eid_index;
-                expected.eid = response.local_eid;
-                expected.physical_device_identity =
-                    response.rm.has_value()
-                        ? response.rm->physical_device_identity
-                        : "";
-                expected.transport_modes = response.rm.has_value()
-                                               ? response.rm->transport_modes
-                                               : 0;
-                status = endpoint->bindRm(response, expected);
+                status = ub::anchorPeerIdentityFromSegment(
+                    *request.remote_segment, request.remote_topology_id,
+                    expected);
+                if (status.ok()) {
+                    status = endpoint->bindRm(response, expected);
+                }
             } else {
                 status = endpoint->bind(response);
             }
@@ -834,21 +901,40 @@ struct UbTransport::Impl {
     int onBootstrapRm(const UbBootstrapDesc& request, UbBootstrapDesc& response,
                       const ub::UbContextPtr& context) {
         // Server-side consumer of the peer's v2 request descriptor. The
-        // identity anchors are the fields the control-plane-mediated
-        // handshake carries (same trust level as the RC v1 request); every
-        // strict v2 validation and the RM target profile checks run in
-        // bindRm before any native import.
+        // trusted identity anchor is the requester's registered segment
+        // metadata (the device entry its publishLocalDevices published at
+        // install time), never the self-asserted request fields; every
+        // strict v2 validation and the RM target profile checks still run
+        // in bindRm before any native import.
+        SegmentDescRef requester_segment;
+        Status anchor_status;
+        if (request.segment_name == local_segment_name) {
+            // Self/loopback bootstrap: the local snapshot is authoritative
+            // and no registry round-trip is required.
+            requester_segment = metadata->segmentManager().getLocal();
+        } else {
+            anchor_status = metadata->segmentManager().getRemote(
+                requester_segment, request.segment_name);
+        }
+        if (anchor_status.ok() && !requester_segment) {
+            anchor_status = Status::InvalidArgument(
+                "UB RM bootstrap cannot resolve the requester segment '" +
+                request.segment_name + "'" LOC_MARK);
+        }
         ub::UbExpectedPeerIdentity expected;
-        expected.segment_name = request.segment_name;
-        expected.local_nic_path = request.local_nic_path;
-        expected.native_device_name = request.local_device_name;
-        expected.device_id = request.local_device_id;
-        expected.eid_index = request.local_eid_index;
-        expected.eid = request.local_eid;
-        expected.physical_device_identity =
-            request.rm.has_value() ? request.rm->physical_device_identity : "";
-        expected.transport_modes =
-            request.rm.has_value() ? request.rm->transport_modes : 0;
+        if (anchor_status.ok()) {
+            anchor_status = ub::anchorPeerIdentityFromSegment(
+                *requester_segment, request.local_device_id, expected);
+        }
+        if (!anchor_status.ok()) {
+            response = UbBootstrapDesc{};
+            response.protocol_version = 2;
+            response.reply_msg =
+                "UB RM bootstrap rejected: requester identity could not be "
+                "anchored from registered segment metadata: " +
+                anchor_status.ToString();
+            return -1;
+        }
 
         ub::UbEndpointKey key{context->topologyId(), LOCAL_SEGMENT_ID,
                               request.local_device_id, request.local_nic_path};
@@ -884,6 +970,10 @@ struct UbTransport::Impl {
     mutable std::mutex lifecycle_mutex;
     std::shared_ptr<ub::UrmaAdapter> adapter;
     bool adapter_initialized{false};
+    // Discovery snapshot taken by the auto-import pre-pass; reused by
+    // install so injected identities are verified against their source.
+    std::vector<ub::DeviceInfo> auto_import_snapshot;
+    bool auto_import_snapshot_valid{false};
     bool callback_installed{false};
     std::atomic<bool> installed{false};
     std::atomic<bool> shutting_down{false};
