@@ -905,16 +905,29 @@ void ProbeLinkManager::applyLocked(const Completion& completion,
                 << "UB probe path error: " << pathText(version)
                 << " failures=" << runtime.consecutive_failures
                 << " backoff_ns=" << runtime.backoff_ns;
-            laneRetireLocked(port, now_ns, version,
-                             Status::RdmaError("probe remote path error"),
-                             effects);
+            if (!test_probe) {
+                laneRetireLocked(port, now_ns, version,
+                                 Status::RdmaError("probe remote path error"),
+                                 effects);
+            }
             return;
         }
         case CompletionCategory::MEMORY_ERROR:
             // Probe area/token mismatch is a lane/configuration problem, never
             // evidence that the path is bad (design §9.3 / L-3).
             ++stats_.probe_area_config_error;
-            if (test_probe) ++stats_.probe_test_fail;
+            if (test_probe) {
+                ++stats_.probe_test_fail;
+                // Test mode has a static peer descriptor source; retiring the
+                // lane would rotate the probe target/area and make the next
+                // test fail for a descriptor reason, not a link reason. Keep
+                // the lane and let the next interval re-check the link.
+                if (runtime.health != LinkHealth::kIsolated) {
+                    ++runtime.fault_epoch;
+                    setHealthLocked(runtime, LinkHealth::kIsolated, effects);
+                }
+                return;
+            }
             LOG_EVERY_N(WARNING, 100)
                 << "UB probe area configuration error: " << pathText(version)
                 << " jetty_gen=" << port.generation;
@@ -928,7 +941,14 @@ void ProbeLinkManager::applyLocked(const Completion& completion,
         case CompletionCategory::UNKNOWN_ERROR:
         default:
             ++stats_.probe_failure_lane;
-            if (test_probe) ++stats_.probe_test_fail;
+            if (test_probe) {
+                ++stats_.probe_test_fail;
+                if (runtime.health != LinkHealth::kIsolated) {
+                    ++runtime.fault_epoch;
+                    setHealthLocked(runtime, LinkHealth::kIsolated, effects);
+                }
+                return;
+            }
             LOG_EVERY_N(WARNING, 100)
                 << "UB probe lane error: " << pathText(version)
                 << " jetty_gen=" << port.generation
@@ -1231,6 +1251,35 @@ void ProbeLinkManager::onBusinessPathError(const UbPostPath& path,
         mergeOrCreateCampaignLocked(runtime->peer, now);
     }
     emitEffects(effects);
+}
+
+bool ProbeLinkManager::businessPathUsable(const UbPostPath& path) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto version =
+        resolveVersionLocked(path, /*require_matching_generation=*/false);
+    if (!version) {
+        // Not modelled by the probe graph: usable by design (D-10/RK8).
+        ++stats_.business_path_not_in_graph;
+        return true;
+    }
+    const PathRuntime* runtime = findPathLocked(*version);
+    if (runtime == nullptr) {
+        ++stats_.business_path_not_in_graph;
+        return true;
+    }
+    const bool usable = runtime->health == LinkHealth::kHealthy ||
+                        runtime->health == LinkHealth::kEligibleUnverified;
+    if (!usable) ++stats_.business_path_health_blocked;
+    return usable;
+}
+
+uint64_t ProbeLinkManager::businessFaultEpoch(const UbPostPath& path) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto version =
+        resolveVersionLocked(path, /*require_matching_generation=*/false);
+    if (!version) return 0;
+    const PathRuntime* runtime = findPathLocked(*version);
+    return runtime == nullptr ? 0 : runtime->fault_epoch;
 }
 
 void ProbeLinkManager::onContextUnavailable(Topology::NicID local_nic,

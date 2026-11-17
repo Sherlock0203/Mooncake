@@ -807,6 +807,7 @@ Status StandaloneProbeResourceProvider::rebuildPortLocked(
         adapter_->quiesceJetty(port.probe_jetty, timeout_ms, completions);
     if (!status.ok()) return status;
 
+    JettyPtr old_jetty = port.probe_jetty;
     JfcPtr jfc = port.owns_jfc ? port.probe_jfc : port.config.shared_jfc;
     JettyOptions jetty_options;
     jetty_options.depth = probeDepth(port);
@@ -822,7 +823,6 @@ Status StandaloneProbeResourceProvider::rebuildPortLocked(
                          "URMA adapter returned no replacement probe Jetty")
                    : status;
     }
-
     const size_t page = pageSize();
     auto allocate_page = [&](uint32_t access, uint32_t token, int fill,
                              LocalSegmentPtr& segment,
@@ -855,71 +855,58 @@ Status StandaloneProbeResourceProvider::rebuildPortLocked(
     };
 
     LocalSegmentPtr new_source;
-    LocalSegmentPtr new_area;
     void* new_source_memory = nullptr;
-    void* new_area_memory = nullptr;
     status = allocate_page(SEGMENT_ACCESS_LOCAL_ONLY, 0, 0x5A, new_source,
                            new_source_memory);
-    if (status.ok()) {
-        status = allocate_page(SEGMENT_ACCESS_READ | SEGMENT_ACCESS_WRITE,
-                               kProbeAreaToken, 0, new_area, new_area_memory);
-    }
     if (!status.ok()) {
         if (new_source) (void)adapter_->unregisterLocalSegment(new_source);
-        if (new_area) (void)adapter_->unregisterLocalSegment(new_area);
         if (new_source_memory) std::free(new_source_memory);
-        if (new_area_memory) std::free(new_area_memory);
         (void)adapter_->resetJetty(new_jetty);
         (void)adapter_->deleteJetty(new_jetty);
         return status;
     }
 
-    // Quiesce fenced the old lane; reset it before the replacement event, but
-    // keep the handle alive until PLM has dropped its old supply reference.
-    JettyPtr old_jetty = port.probe_jetty;
     status = adapter_->resetJetty(old_jetty);
     if (!status.ok()) {
         if (new_source) (void)adapter_->unregisterLocalSegment(new_source);
-        if (new_area) (void)adapter_->unregisterLocalSegment(new_area);
         if (new_source_memory) std::free(new_source_memory);
-        if (new_area_memory) std::free(new_area_memory);
         (void)adapter_->resetJetty(new_jetty);
         (void)adapter_->deleteJetty(new_jetty);
         return status;
     }
 
-    // Keep the old pages registered: orphan records and the peer may still
-    // reference them. They are released at shutdown, after the quarantine.
+    const uint64_t next_generation = old_generation + 1;
+    PortState next = port;
+    next.probe_jetty = new_jetty;
+    next.source_segment = new_source;
+    next.source_memory = new_source_memory;
+    next.source_size = page;
+    next.config.generation = next_generation;
+    next.source_generation = next_generation;
+    // next.area_* deliberately unchanged: peer descriptors stay valid.
+
+    // Publish only after the new source page and generation are ready. If the
+    // event fails, keep the old port state and release the new source page.
+    status = emitHandleReplacedLocked(makePortSupplyLocked(next));
+    if (!status.ok()) {
+        if (new_source) (void)adapter_->unregisterLocalSegment(new_source);
+        if (new_source_memory) std::free(new_source_memory);
+        (void)adapter_->resetJetty(new_jetty);
+        (void)adapter_->deleteJetty(new_jetty);
+        return status;
+    }
+
     retired_pages_.push_back(RetiredPage{std::move(port.source_segment),
                                          port.source_memory, port.source_size,
                                          old_generation});
-    retired_pages_.push_back(RetiredPage{std::move(port.area_segment),
-                                         port.area_memory, port.area_size,
-                                         old_generation});
     port.source_memory = nullptr;
     port.source_size = 0;
-    port.area_memory = nullptr;
-    port.area_size = 0;
-
     port.probe_jetty = std::move(new_jetty);
     port.source_segment = std::move(new_source);
     port.source_memory = new_source_memory;
     port.source_size = page;
-    port.area_segment = std::move(new_area);
-    port.area_memory = new_area_memory;
-    port.area_size = page;
-
-    const uint64_t next_generation = old_generation + 1;
     port.config.generation = next_generation;
     port.source_generation = next_generation;
-    port.area_epoch = next_generation;
-
-    // Publish the new generation first: the PLM replaces its PortRuntime
-    // supply here, dropping the old Jetty reference. Only then can the adapter
-    // delete the old handle (it refuses handles with use_count != 1).
-    status = emitHandleReplacedLocked(makePortSupplyLocked(port));
-    if (!status.ok()) return status;
-
     auto delete_status = adapter_->deleteJetty(old_jetty);
     if (!delete_status.ok()) {
         LOG(WARNING) << "UB probe: old Jetty deletion deferred: "

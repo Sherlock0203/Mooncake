@@ -127,10 +127,11 @@ TEST(UbProbeRebuildTest, RebuildsLaneAndEmitsHandleReplaced) {
     EXPECT_NE(provider.portViews()[0].native_jetty_id, old_jetty_id);
     EXPECT_EQ(fixture.adapter->liveJettyCount(), 1U);
     EXPECT_EQ(fixture.adapter->liveJfcCount(), 1U);
-    // Current source+area pages plus the retired generation's two pages.
-    EXPECT_EQ(fixture.adapter->liveLocalSegmentCount(), 4U);
-    EXPECT_EQ(provider.retiredPageCount(), 2U);
-    EXPECT_EQ(provider.localAreaViews()[0].epoch, old_generation + 1);
+    // Current source+area pages plus the retired source page. The area page
+    // and probe Jetty identity stay stable across the rebuild.
+    EXPECT_EQ(fixture.adapter->liveLocalSegmentCount(), 3U);
+    EXPECT_EQ(provider.retiredPageCount(), 1U);
+    EXPECT_EQ(provider.localAreaViews()[0].epoch, old_generation);
 
     ASSERT_EQ(completions.size(), 1U);
     EXPECT_EQ(completions[0].token, token);
@@ -166,8 +167,8 @@ TEST(UbProbeRebuildTest, RebuildsLaneAndEmitsHandleReplaced) {
     handoff.area = graph.edges[0].area_segment;
     provider.handoffUnproven(handoff);
     EXPECT_EQ(provider.quarantineCount(), 1U);
-    EXPECT_EQ(provider.retiredPageCount(), 2U);
-    EXPECT_EQ(fixture.adapter->liveLocalSegmentCount(), 4U);
+    EXPECT_EQ(provider.retiredPageCount(), 1U);
+    EXPECT_EQ(fixture.adapter->liveLocalSegmentCount(), 3U);
 
     ASSERT_TRUE(provider.shutdown().ok());
     EXPECT_EQ(provider.quarantineCount(), 0U);
@@ -212,7 +213,7 @@ TEST(UbProbeRebuildTest, RetriesAfterQuiesceFailure) {
     EXPECT_EQ(provider.portViews()[0].generation, old_generation + 1);
     ASSERT_EQ(sink.events.size(), 1U);
     EXPECT_EQ(fixture.adapter->liveJettyCount(), 1U);
-    EXPECT_EQ(provider.retiredPageCount(), 2U);
+    EXPECT_EQ(provider.retiredPageCount(), 1U);
 
     ASSERT_TRUE(provider.shutdown().ok());
     EXPECT_TRUE(fixture.adapter->closeContext(fixture.context).ok());

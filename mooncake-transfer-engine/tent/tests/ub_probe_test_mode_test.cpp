@@ -131,6 +131,39 @@ TEST(UbProbeTestModeTest, RejectedTestPostDoesNotIsolate) {
     EXPECT_FALSE(plm.pendingActions(clock.now()).empty());
 }
 
+TEST(UbProbeTestModeTest, MemoryErrorIsolatesWithoutLaneRebuild) {
+    TestClock clock;
+    ProbeLinkManager plm(testParams(), clock.clock());
+    RecordingReportSink reports;
+    plm.setReportSink(&reports);
+    auto graph = makeGraph({makePortSupply(0, 1)}, {makeEdgeSupply(0, 10, 0)});
+    ASSERT_TRUE(plm.initialize(graph).ok());
+    const PathVersion version{ProbePathKey{0, 10, 0}, 1, 1};
+
+    plm.onBusinessPathSuccess(makeEvidence(0, 10, 0), clock.now());
+    ASSERT_EQ(healthOf(plm, version).health, LinkHealth::kHealthy);
+
+    uint64_t token_seq = 0;
+    clock.advance(kTestIntervalNs);
+    auto probe = postNext(plm, token_seq, clock.now());
+    ASSERT_TRUE(probe.has_value());
+    ASSERT_TRUE(plm.onProbeCompletion(
+        makeCompletion(probe->token, CompletionCategory::MEMORY_ERROR),
+        clock.now()));
+    EXPECT_EQ(healthOf(plm, version).health, LinkHealth::kIsolated);
+    EXPECT_EQ(plm.stats().probe_area_config_error, 1U);
+    EXPECT_EQ(plm.stats().probe_test_fail, 1U);
+    EXPECT_TRUE(reports.retire_calls.empty());
+
+    clock.advance(kTestIntervalNs);
+    auto recovered = postNext(plm, token_seq, clock.now());
+    ASSERT_TRUE(recovered.has_value());
+    ASSERT_TRUE(
+        plm.onProbeCompletion(makeCompletion(recovered->token), clock.now()));
+    EXPECT_EQ(healthOf(plm, version).health, LinkHealth::kHealthy);
+    EXPECT_TRUE(reports.retire_calls.empty());
+}
+
 }  // namespace
 }  // namespace ub
 }  // namespace tent
