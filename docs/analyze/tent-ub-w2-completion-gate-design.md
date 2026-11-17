@@ -805,18 +805,25 @@ ctest --test-dir build -R "tent_ub_" --output-on-failure
 
 ## 15. 对上游文档的回写清单
 
-| 上游位置 | 现状 | 回写 |
+**回写状态（2026-11-17）：下列各项全部已回写。**
+
+| 上游位置 | 回写内容 | 状态 |
 | --- | --- | --- |
-| 总设计 §3 表第 4 行 | "Inflight 仅 token/引用/超时位" | 标注 W2 已替换为 `CompletionRecord` + owner 侧挂 |
-| 总设计 §7.3 | 13 字段列表，未提 `timed_out` / `orphan_reason` | 补两个一次性位；写明"共享内核 + 侧挂 owner"的落地形态（D-2） |
-| 总设计 §7.4 | 未规定 registry 删除权 | 补"删除权归完成认领方，post 侧不删表（`NotAccepted` 除外）"（D-3） |
-| 总设计 §1.3.4 / §7.4 | 归还条件只列事实，未把"责任证据"单列 | 补"`wr_terminal` / `fence_proven` / `NotAccepted` 三选一"；`fault_seen` 单独不足以释放 |
-| 总设计 §7.3 | 未区分"逻辑结果决定"与"投递" | 补 `settle_claimed` 与 owner 处置分离（D-8） |
-| 总设计 §8 超时 | "标记＋上报，无 quiesce"（W5 目标） | 补 W2 过渡态："保留 quiesce，但加 `handler_refs==0` 前置" |
-| 总设计 §13 W2 行 | 只有一句验收 | 补实现状态与 W2a–W2d 切片（本文 §12） |
-| 总设计 §14 异常矩阵 | 无"超时延后"行 | 补 `timeout_deferred_by_post_return` 一行 |
-| 总设计 §15 指标 | 已有 `completion_gate_one_shot_violations` | 补本文 §9 的 `gate_blocked_by_*` / `duplicate_cr` / `handler_ref_leak_on_finalize` |
-| 探测详设 §9.2 | `ProbeRecord` 字段表 | 标注 core 嵌入（D-9），语义不变 |
+| 总设计 §3 表第 4 行 | 标注 W2 已替换为「共享内核 + 侧挂 owner」 | 已回写 |
+| 总设计 §1.3.4 / §7.4 | 归还判据拆三段；责任证据三选一；registry 删除权归完成认领方、post 侧不删表（`NotAccepted` 除外）；`handler_refs` 由 RAII 守卫持有、最后释放者推进门 | 已回写 |
+| 总设计 §6 | Unknown 的 W2 过渡态（接口 2 未接入 → 阻塞到超时 fence）；`legacyAcceptance()` 的 `Unknown` 只来自 `posted_count > 1` | 已回写 |
+| 总设计 §7.3 | 字段块按落地形态重写：身份 / 状态位 / 认领位 / 侧挂 owner 四组，新增 `cr_claimed`/`settle_claimed`/`conflict_claimed`/`timed_out`/`orphan_reason`；补"共享内核 + 侧挂 owner""决定与投递分离" | 已回写 |
+| 总设计 §8 / §13.1 | W2 过渡态（保留 quiesce + `handler_refs==0` 前置、`fault_reported` 延迟到 `onFault`）与"post 永久阻塞则不超时"的 liveness 风险（出口留 W5） | 已回写 |
+| 总设计 §9.4 / §11 接口 5 | `ProbeRecord.core` 已落地；接口 5 的"W2 起…"改为已落地（`PostResult` 三态仍待 P0-B） | 已回写 |
+| 总设计 §13 | W2 实现状态段（W2a–W2d、三处可观察变化） | 已回写 |
+| 总设计 §14 | 新增"超时到期但 native post 未返回"一行 | 已回写 |
+| 总设计 §15 | 新指标组（`record_*`/`duplicate_cr`/`gate_blocked_by_*`/`handler_ref_leak_on_finalize`/`not_accepted_with_completion`/`timeout_deferred_by_post_return`）；源码索引与改造点清单补 `completion_record.*`、`entity_event.h` 与两个测试目标 | 已回写 |
+| 探测详设 §5.2 / §9.2 | `ProbeRecord` 字段块按 `core` 嵌入重写；结算伪码补旧名（`settled`/`timed_out`/`token`）↔ `core.*` 的映射说明 | 已回写 |
+| 探测详设 §3.1 | "CompletionRecord / 完成门统一（W2）"标注已完成 | 已回写 |
+
+注 1：`tent-ub-probe-standalone-supply.md` 无需改动——W2 未触碰探测资源供给（其 `eid` 相关改动属另一项工作）。
+
+注 2：`docs/source/`（Sphinx 站点）不收录 `docs/analyze/`，因此这些回写不需要 `make html` 验证。
 
 ## 16. 术语表
 
