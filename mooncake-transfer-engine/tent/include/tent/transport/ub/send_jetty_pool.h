@@ -259,6 +259,13 @@ class SendJettyPool final {
     [[nodiscard]] std::vector<PoolMemberState> memberStates() const;
     [[nodiscard]] size_t servingCount(const PoolKey& pool_key) const;
 
+    // The JFC credit ledger shared by every lease of this pool. Credits are
+    // released by the caller (completion or rollback path), never by the pool.
+    [[nodiscard]] const std::shared_ptr<JfcCreditLedger>& creditLedger()
+        const {
+        return credits_;
+    }
+
    private:
     friend class SliceJettyLease;  // reports dropped leases
 

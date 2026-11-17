@@ -355,6 +355,32 @@ class UbSlice : public std::enable_shared_from_this<UbSlice> {
         return resolution;
     }
 
+    // Defers a claimed attempt without consuming retry budget. Admission
+    // misses (task permit exhausted, pooled lease unavailable) are capacity
+    // pressure, not transfer failures: the slice returns to kRetryPending so
+    // the posting lane can requeue it. A cancellation that already requested
+    // terminal state wins and terminalizes the slice. Returns true when the
+    // slice was deferred for retry.
+    bool deferAttempt(const UbAttemptToken& token, uint64_t now_ns = 0) {
+        bool canceled = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!matchesActiveAttemptLocked(token) ||
+                state_ != UbSliceState::kPosting) {
+                return false;
+            }
+            if (cancel_requested_.load(std::memory_order_acquire)) {
+                setTerminalLocked(CANCELED, 0, normalizedNow(now_ns));
+                canceled = true;
+            } else {
+                state_ = UbSliceState::kRetryPending;
+                queued_ns_ = normalizedNow(now_ns);
+            }
+        }
+        if (canceled) notifyTaskTerminal(CANCELED, 0);
+        return !canceled;
+    }
+
     // Resolves work that failed (or completed locally) before any adapter post.
     // It deliberately refuses to terminalize kPosting/kPosted work; those must
     // drain through resolveAttempt().

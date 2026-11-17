@@ -37,8 +37,10 @@ namespace ub {
 // RM legacy must be requested explicitly (runtime_profile=rm_legacy,
 // trans_mode=rm, physical_only=true) and passes the config gate only when
 // every structural constraint holds; provider/capability gates still run at
-// install time before any native resource is created. Pooled RM remains
-// rejected until its gates are implemented and verified.
+// install time before any native resource is created. Pooled RM
+// (runtime_profile=rm_pool) additionally requires jetty_pool.enable and
+// probe.enabled, stays fail-closed against jetty_pool.force_disable, and
+// runs its capability/budget gates during install.
 enum class UbRuntimeProfile : uint8_t {
     kRcLegacy,
     kRmLegacy,
@@ -560,11 +562,11 @@ struct UbParams {
 };
 
 // Evaluates the default-off matrix before any adapter or native resource is
-// created. Structural conflicts are rejected as invalid configuration; a
-// well-formed request for a mode whose gates are not implemented is rejected
-// as NotImplemented so TENT can fall back instead of silently running RC under
-// an RM label. `jetty_pool/enable=false` alone is not a failure: it simply
-// selects the RC legacy baseline.
+// created. Structural conflicts are rejected as invalid configuration; every
+// accepted mode still runs its provider/capability gates during install
+// before any native resource is created, and those gates fail closed instead
+// of silently running RC under an RM label. `jetty_pool/enable=false` alone
+// is not a failure: it simply selects the RC legacy baseline.
 inline Status resolveUbRuntimeMode(const UbParams& params,
                                    UbRuntimeMode& mode) {
     const bool pool = params.jetty_pool.enable;
@@ -656,10 +658,25 @@ inline Status resolveUbRuntimeMode(const UbParams& params,
         return reject(Status::InvalidArgument(
             "runtime_profile=rm_pool requires probe.enabled=true"));
     }
-    return reject(Status::NotImplemented(
-        "pooled RM is unsupported: trusted physical, rm_legacy_baseline, "
-        "topology/probe, shared target fence, async recovery and role budget "
-        "gates are not verified"));
+    if (!params.physical_only) {
+        return reject(Status::InvalidArgument(
+            "runtime_profile=rm_pool requires physical_only=true"));
+    }
+    if (params.jetty_pool.force_disable) {
+        // The runtime brake stays fail-closed: an operator that forced the
+        // pool off must not be overridden by a profile selection.
+        return reject(Status::InvalidArgument(
+            "runtime_profile=rm_pool is rejected while "
+            "jetty_pool.force_disable=true"));
+    }
+    // A well-formed pooled RM configuration passes the config gate. The
+    // provider/capability gate (trusted PHYSICAL identity, RM/RTP priority
+    // masks), the device-level native budget and the JFC credit ledger are
+    // installed during transport install before any pooled Jetty is created,
+    // and every one of them fails closed.
+    mode = UbRuntimeMode::kPooledRm;
+    VLOG(1) << "UB runtime selection accepted: mode=rm_pool " << snapshot();
+    return Status::OK();
 }
 
 }  // namespace ub

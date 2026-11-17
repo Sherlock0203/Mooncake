@@ -322,9 +322,9 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         import_calls_.fetch_add(1, std::memory_order_relaxed);
         if (trans_mode != kUrmaTransportModeRm ||
             target_type != kUrmaTargetTypeJetty ||
-            tp_type != kUrmaTpTypeRtp) {
+            tp_type != kUrmaTpTypeCtp) {
             return Status::InvalidArgument(
-                "RM target profile must be RM/JETTY/RTP");
+                "RM target profile must be RM/JETTY/CTP");
         }
         if (id == 0) {
             return Status::InvalidArgument("RM target Jetty ID is zero");
@@ -1367,6 +1367,9 @@ TEST(UbNativeDataPathTest,
     const std::string segment_name =
         "127.0.0.1:" + std::to_string(static_cast<unsigned>(port));
 
+    // The pooled profile is structurally incomplete here (no physical_only
+    // identities): the config gate must fail closed before any native
+    // resource is allocated.
     auto config = std::make_shared<Config>();
     config->set("transports/ub/enable", true);
     config->set("transports/ub/runtime_profile", "rm_pool");
@@ -1378,7 +1381,7 @@ TEST(UbNativeDataPathTest,
     std::string mutable_segment_name = segment_name;
     const auto status =
         transport.install(mutable_segment_name, control, topology, config);
-    EXPECT_TRUE(status.IsNotImplemented()) << status.ToString();
+    EXPECT_TRUE(status.IsInvalidArgument()) << status.ToString();
     EXPECT_EQ(adapter->openContextCalls(), 0U)
         << "pooled RM gate ran after opening a native context";
     EXPECT_EQ(adapter->createJettyCalls(), 0U)
@@ -2408,7 +2411,6 @@ TEST(UbRmLegacyTest, TransportRunsSelfReadWriteWithPooledJettys) {
     for (size_t i = 0; i < source.size(); ++i) {
         source[i] = static_cast<char>(100 - i);
     }
-    const auto expected = source;
     BufferDesc source_desc{};
     source_desc.addr = reinterpret_cast<uint64_t>(source.data());
     source_desc.length = source.size();
@@ -2666,6 +2668,196 @@ TEST(UbRmLegacyTest, UnknownPostAcceptanceNeverReplaysAndFenceSettles) {
 
     ASSERT_TRUE(transport.freeSubBatch(batch).ok());
     EXPECT_TRUE(transport.uninstall().ok());
+}
+
+// rm_pool full-link wiring: the config gate opens for a well-formed pooled
+// profile, install attaches one SendJettyPool per context plus the admission
+// ledgers, and the data path leases/returns pooled members end to end
+// (C01/C05/C06, INV16 opened for this install generation).
+TEST(UbRmPoolTest, RuntimeGateOpensAndStaysFailClosedOnMissingGuards) {
+    auto device = rmCapableDevice();
+    auto config = std::make_shared<Config>();
+    config->set("transports/ub/enable", true);
+    config->set("transports/ub/runtime_profile", "rm_pool");
+    config->set("transports/ub/trans_mode", "rm");
+    config->set("transports/ub/jetty_pool/enable", true);
+    config->set("transports/ub/probe/enabled", true);
+    setPhysicalOnlyIdentity(*config, device);
+    UbParams params;
+    ASSERT_TRUE(UbParams::FromConfig(*config, params).ok());
+    UbRuntimeMode mode = UbRuntimeMode::kRcLegacy;
+    ASSERT_TRUE(resolveUbRuntimeMode(params, mode).ok());
+    EXPECT_EQ(mode, UbRuntimeMode::kPooledRm);
+
+    // Without physical_only the pooled profile fails closed: it never falls
+    // back to name-based device classification.
+    auto loose_config = std::make_shared<Config>();
+    loose_config->set("transports/ub/enable", true);
+    loose_config->set("transports/ub/runtime_profile", "rm_pool");
+    loose_config->set("transports/ub/trans_mode", "rm");
+    loose_config->set("transports/ub/jetty_pool/enable", true);
+    loose_config->set("transports/ub/probe/enabled", true);
+    UbParams loose_params;
+    ASSERT_TRUE(UbParams::FromConfig(*loose_config, loose_params).ok());
+    EXPECT_TRUE(resolveUbRuntimeMode(loose_params, mode).IsInvalidArgument());
+
+    // force_disable is the runtime brake: it overrides an otherwise
+    // well-formed pooled request.
+    params.jetty_pool.force_disable = true;
+    EXPECT_TRUE(resolveUbRuntimeMode(params, mode).IsInvalidArgument());
+}
+
+TEST(UbRmPoolTest, TransportRunsSelfReadWriteThroughPooledSendPool) {
+    auto device = rmCapableDevice();
+    auto adapter = std::make_shared<FakeUrmaAdapter>(device);
+    auto topology = fakeTopology(false);
+    auto control = std::make_shared<ControlService>("p2p", "", nullptr);
+    uint16_t port = 0;
+    ASSERT_TRUE(control->start(port).ok());
+    const std::string segment_name =
+        "127.0.0.1:" + std::to_string(static_cast<unsigned>(port));
+    ASSERT_TRUE(control->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        segment.name = segment_name;
+                        segment.rpc_server_addr = segment_name;
+                        segment.machine_id = "fake-machine";
+                        segment.type = SegmentType::Memory;
+                        segment.detail = MemorySegmentDesc{};
+                        std::get<MemorySegmentDesc>(segment.detail).topology =
+                            *topology;
+                        return Status::OK();
+                    })
+                    .ok());
+
+    auto config = std::make_shared<Config>();
+    config->set("transports/ub/enable", true);
+    config->set("transports/ub/runtime_profile", "rm_pool");
+    config->set("transports/ub/trans_mode", "rm");
+    config->set("transports/ub/worker_count", 1);
+    config->set("transports/ub/poller_count", 1);
+    config->set("transports/ub/jfc_per_context", 1);
+    config->set("transports/ub/jetty_per_endpoint", 1);
+    config->set("transports/ub/max_endpoints", 16);
+    config->set("transports/ub/slice_size", 16);
+    config->set("transports/ub/max_slices_per_task", 8);
+    config->set("transports/ub/max_retries", 1);
+    config->set("transports/ub/slice_timeout_ms", 1000);
+    config->set("transports/ub/endpoint_cooldown_ms", 100);
+    config->set("transports/ub/jetty_pool/enable", true);
+    config->set("transports/ub/probe/enabled", true);
+    setPhysicalOnlyIdentity(*config, device);
+
+    UbTransport transport(adapter);
+    std::string mutable_segment_name = segment_name;
+    const auto install_status =
+        transport.install(mutable_segment_name, control, topology, config);
+    ASSERT_TRUE(install_status.ok()) << install_status.ToString();
+    EXPECT_EQ(adapter->openContextCalls(), 1U);
+
+    // Install creates no Jetty: the endpoint set and pooled members are both
+    // created lazily on first use.
+    EXPECT_EQ(adapter->createJettyCalls(), 0U);
+
+    std::array<char, 64> source{};
+    std::array<char, 64> target{};
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>(100 - i);
+    }
+    const auto expected = source;
+    BufferDesc source_desc{};
+    source_desc.addr = reinterpret_cast<uint64_t>(source.data());
+    source_desc.length = source.size();
+    source_desc.location = kWildcardLocation;
+    BufferDesc target_desc{};
+    target_desc.addr = reinterpret_cast<uint64_t>(target.data());
+    target_desc.length = target.size();
+    target_desc.location = kWildcardLocation;
+    MemoryOptions options;
+    options.perm = kGlobalReadWrite;
+    std::vector<BufferDesc> descriptors{source_desc, target_desc};
+    ASSERT_TRUE(transport.addMemoryBuffer(descriptors, options).ok());
+    ASSERT_TRUE(control->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        std::get<MemorySegmentDesc>(segment.detail).buffers =
+                            descriptors;
+                        return Status::OK();
+                    })
+                    .ok());
+
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 3).ok());
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = source.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(target.data());
+    request.length = source.size();
+    ASSERT_TRUE(transport.submitTransferTasks(batch, {request}).ok());
+
+    TransferStatus transfer{PENDING, 0};
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (transfer.s == PENDING &&
+           std::chrono::steady_clock::now() < deadline) {
+        ASSERT_TRUE(transport.getTransferStatus(batch, 0, transfer).ok());
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(transfer.s, COMPLETED);
+    EXPECT_EQ(transfer.transferred_bytes, source.size());
+    EXPECT_EQ(source, target);
+    EXPECT_GE(adapter->rmPostCalls(), 1U)
+        << "the pooled data plane must post with an explicit target";
+    EXPECT_EQ(adapter->bindJettyCalls(), 0U)
+        << "pooled posts must not rely on bound remote Jettys";
+    ASSERT_FALSE(adapter->importedIds().empty());
+    EXPECT_EQ(adapter->lastPostedTargetId(), adapter->importedIds().front());
+    const uint64_t after_first_write = adapter->createJettyCalls();
+    EXPECT_GE(after_first_write, 2U)
+        << "the first pooled attempt creates the endpoint Jetty and a pool "
+           "member";
+
+    // Second WRITE: the returned member is leased again (LIFO reuse); no new
+    // Jetty may be created.
+    target.fill(0);
+    ASSERT_TRUE(transport.submitTransferTasks(batch, {request}).ok());
+    transfer = TransferStatus{PENDING, 0};
+    const auto second_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (transfer.s == PENDING &&
+           std::chrono::steady_clock::now() < second_deadline) {
+        ASSERT_TRUE(transport.getTransferStatus(batch, 1, transfer).ok());
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(transfer.s, COMPLETED);
+    EXPECT_EQ(source, target);
+    EXPECT_EQ(adapter->createJettyCalls(), after_first_write)
+        << "the second attempt must reuse the returned pool member";
+
+    // READ back through the pooled path.
+    source.fill(0);
+    Request read_request = request;
+    read_request.opcode = Request::READ;
+    ASSERT_TRUE(transport.submitTransferTasks(batch, {read_request}).ok());
+    transfer = TransferStatus{PENDING, 0};
+    const auto read_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (transfer.s == PENDING &&
+           std::chrono::steady_clock::now() < read_deadline) {
+        ASSERT_TRUE(transport.getTransferStatus(batch, 2, transfer).ok());
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(transfer.s, COMPLETED);
+    EXPECT_EQ(transfer.transferred_bytes, source.size());
+    EXPECT_EQ(source, expected);
+    EXPECT_EQ(adapter->createJettyCalls(), after_first_write)
+        << "the read must reuse the pooled member too";
+
+    ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+    EXPECT_TRUE(transport.uninstall().ok());
+    EXPECT_EQ(adapter->deleteJettyCalls(), adapter->createJettyCalls())
+        << "every pooled member and endpoint Jetty is deleted on uninstall";
+    EXPECT_GE(adapter->unimportCalls(), adapter->importCalls())
+        << "every imported target must be unimported before uninstall ends";
 }
 
 }  // namespace

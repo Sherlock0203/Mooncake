@@ -155,6 +155,12 @@ class UbEndpoint final : public std::enable_shared_from_this<UbEndpoint> {
     [[nodiscard]] bool rmMode() const noexcept {
         return jetty_options_.trans_mode == kUrmaTransportModeRm;
     }
+    // The Jetty profile this endpoint incarnation was created with. The
+    // pooled data path derives its PoolKey (trans_mode/priority/bind mask)
+    // from it so pooled members never mix profiles.
+    [[nodiscard]] JettyOptions jettyOptions() const noexcept {
+        return jetty_options_;
+    }
     // RM Legacy: the explicit imported target a WR on jetty(index) must use.
     // Returns nullptr before a successful bindRm() or after retirement.
     [[nodiscard]] RemoteTargetPtr rmTarget(size_t jetty_index) const;

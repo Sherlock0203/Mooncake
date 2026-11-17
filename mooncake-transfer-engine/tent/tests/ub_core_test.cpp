@@ -93,10 +93,10 @@ TEST(UbParamsTest, ParsesDormantPoolAndProbeKeysWithoutStartingResources) {
     EXPECT_EQ(params.probe.recover_success_threshold, 2U);
     EXPECT_EQ(params.probe.failure_threshold, 4U);
 
-    // The schema is accepted, but the pooled data plane does not exist yet.
-    // Selection must fail instead of silently running RC under a pool label.
+    // The schema is accepted, but force_disable is the runtime brake: the
+    // pooled selection fails closed instead of overriding the operator.
     UbRuntimeMode mode = UbRuntimeMode::kRcLegacy;
-    EXPECT_TRUE(resolveUbRuntimeMode(params, mode).IsNotImplemented());
+    EXPECT_TRUE(resolveUbRuntimeMode(params, mode).IsInvalidArgument());
 }
 
 TEST(UbParamsTest, RuntimeMatrixRejectsInconsistentOrUnsupportedModes) {
@@ -147,9 +147,15 @@ TEST(UbParamsTest, RuntimeMatrixRejectsInconsistentOrUnsupportedModes) {
     EXPECT_TRUE(evaluate(UbRuntimeProfile::kRmPool, UbTransportMode::kRm,
                          true, false, true)
                     .IsInvalidArgument());
+    // A well-formed pooled configuration passes the config gate; install-time
+    // capability/budget gates still fail closed before native resources.
     EXPECT_TRUE(evaluate(UbRuntimeProfile::kRmPool, UbTransportMode::kRm,
                          true, true, true)
-                    .IsNotImplemented());
+                    .ok());
+    // rm_pool is physical-only: no bonding device may be selected.
+    EXPECT_TRUE(evaluate(UbRuntimeProfile::kRmPool, UbTransportMode::kRm,
+                         true, true, false)
+                    .IsInvalidArgument());
 }
 
 TEST(UbParamsTest, RmLegacyResolvesToRmRuntimeMode) {
@@ -410,7 +416,7 @@ TEST(UbBootstrapTest, ValidatesRmIdentityProfilesAndProbeReferences) {
     desc.rm->targets[0].profile.target_type = 0;  // URMA_JFR is out of scope.
     EXPECT_TRUE(validateUbBootstrap(desc).IsInvalidArgument());
     desc = makeValidRmBootstrap();
-    desc.rm->targets[0].profile.tp_type = kUrmaTpTypeCtp;  // CTP is outside the first RM/RTP profile.
+    desc.rm->targets[0].profile.tp_type = kUrmaTpTypeRtp;  // RM binds CTP targets only.
     EXPECT_TRUE(validateUbBootstrap(desc).IsInvalidArgument());
     desc = makeValidRmBootstrap();
     desc.rm->targets[0].id = 0;

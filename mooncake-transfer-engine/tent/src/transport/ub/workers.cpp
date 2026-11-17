@@ -65,6 +65,18 @@ struct UbWorkers::Inflight {
     std::atomic<bool> timed_out{false};
     std::atomic<bool> timeout_recorded{false};
     std::atomic<bool> resources_released{false};
+    // rm_pool data-path owners. pooled_pool is null on legacy paths; the
+    // lease/permit/gate/credit fields are only meaningful when it is set.
+    // The lease is settled exactly once through settlePooledAttempt(); a
+    // dropped lease would be counted as a leak by the pool, so every exit
+    // path must route through the settlement helper.
+    std::shared_ptr<SendJettyPool> pooled_pool;
+    SliceJettyLease pooled_lease;
+    TaskPermitTicket pooled_permit;
+    uint64_t gate_token{0};
+    uint64_t jfc_credit_token{0};
+    size_t pooled_jfc_index{0};
+    std::atomic<bool> pooled_settled{false};
 };
 
 UbWorkers::UbWorkers(std::shared_ptr<UrmaAdapter> adapter,
@@ -74,7 +86,9 @@ UbWorkers::UbWorkers(std::shared_ptr<UrmaAdapter> adapter,
                      RailMonitor* rail_monitor, QuotaManager* quota,
                      UbParams params, EndpointResolver endpoint_resolver,
                      EndpointRetirer endpoint_retirer,
-                     LocalDeviceFailureHandler local_device_failure_handler)
+                     LocalDeviceFailureHandler local_device_failure_handler,
+                     std::shared_ptr<TaskPermitLedger> task_permits,
+                     std::shared_ptr<AttemptGate> attempt_gate)
     : adapter_(std::move(adapter)),
       contexts_(std::move(contexts)),
       local_topology_(std::move(local_topology)),
@@ -85,7 +99,9 @@ UbWorkers::UbWorkers(std::shared_ptr<UrmaAdapter> adapter,
       params_(std::move(params)),
       endpoint_resolver_(std::move(endpoint_resolver)),
       endpoint_retirer_(std::move(endpoint_retirer)),
-      local_device_failure_handler_(std::move(local_device_failure_handler)) {
+      local_device_failure_handler_(std::move(local_device_failure_handler)),
+      task_permits_(std::move(task_permits)),
+      attempt_gate_(std::move(attempt_gate)) {
     for (const auto& context : contexts_) {
         if (!context) continue;
         context_by_topology_id_[context->topologyId()] = context;
@@ -191,12 +207,19 @@ Status UbWorkers::stop() {
     // safely; fixed sleeps are never treated as proof that DMA stopped.
     std::vector<std::shared_ptr<Inflight>> still_inflight;
     std::vector<std::shared_ptr<UbEndpoint>> endpoints_to_fence;
+    std::vector<std::shared_ptr<Inflight>> pooled_to_fence;
     {
         std::lock_guard<std::mutex> lock(inflight_mutex_);
         still_inflight.reserve(inflight_.size());
         for (const auto& [_, inflight] : inflight_) {
             still_inflight.push_back(inflight);
-            if (inflight && inflight->endpoint) {
+            if (!inflight) continue;
+            if (inflight->pooled_pool && inflight->pooled_lease.valid() &&
+                inflight->pooled_lease.member()) {
+                // The WR rode a pooled member; the fence must quiesce the
+                // member's Jetty, not the endpoint's Jetty set.
+                pooled_to_fence.push_back(inflight);
+            } else if (inflight->endpoint) {
                 endpoints_to_fence.push_back(inflight->endpoint);
             }
         }
@@ -228,6 +251,23 @@ Status UbWorkers::stop() {
         }
         forgetEndpointDrain(endpoint);
         if (endpoint_retirer_) endpoint_retirer_(endpoint);
+    }
+    for (const auto& inflight : pooled_to_fence) {
+        // The shutdown fence proves no more DMA from the pooled member before
+        // context teardown destroys native resources.
+        std::vector<Completion> drained;
+        auto status = adapter_->quiesceJetty(
+            inflight->pooled_lease.member()->jetty, params_.slice_timeout_ms,
+            drained);
+        for (const auto& completion : drained) {
+            if (completion.token != 0) handleCompletion(completion);
+        }
+        if (!status.ok()) {
+            if (fence_error.ok()) fence_error = status;
+            continue;
+        }
+        settlePooledAttempt(inflight, PooledSettleKind::kFence, 0,
+                            "shutdown fence");
     }
     if (!fence_error.ok()) {
         return fence_error;
@@ -263,6 +303,10 @@ Status UbWorkers::stop() {
         inflight_.clear();
     }
     for (const auto& inflight : still_inflight) {
+        // Idempotent: a fence-drained completion may have settled the pooled
+        // attempt already; this only covers still-unsettled leases.
+        settlePooledAttempt(inflight, PooledSettleKind::kFence, 0,
+                            "provider-lost token");
         releaseInflight(inflight);
         (void)inflight->pending.slice->resolveAttempt(inflight->attempt, FAILED,
                                                       0, false);
@@ -866,6 +910,61 @@ void UbWorkers::processPending(const PendingSlice& pending,
         return;
     }
 
+    // rm_pool data path (C06): admission runs before any inflight state is
+    // published. A permit/lease miss is capacity pressure - the attempt is
+    // deferred without charging retry budget and every owner acquired so far
+    // is released. A hard lease error fails the attempt through the normal
+    // retryable resolution instead.
+    std::shared_ptr<SendJettyPool> pooled_pool =
+        endpoint->context() ? endpoint->context()->pooledSendPool() : nullptr;
+    TaskPermitTicket pooled_permit;
+    LeaseWithCredit pooled_lease;
+    uint64_t gate_token = 0;
+    if (pooled_pool) {
+        auto defer_pooled_attempt = [&] {
+            (void)pending.slice->deferAttempt(*attempt);
+            endpoint->releaseOutstanding(pending.slice->spec().length);
+            (void)quota_->release(reservation);
+            deferPending(pending);
+        };
+        if (task_permits_) {
+            pooled_permit = task_permits_->tryAcquire();
+            if (!pooled_permit.valid()) {
+                defer_pooled_attempt();
+                return;
+            }
+        }
+        const JettyOptions profile = endpoint->jettyOptions();
+        const PoolKey pool_key{endpoint->context()->incarnation(),
+                               profile.trans_mode,
+                               static_cast<uint8_t>(profile.priority),
+                               profile.bind_tp_type_mask};
+        const AttemptKey attempt_key{
+            reinterpret_cast<uint64_t>(pending.task.get()), attempt->slice_id,
+            attempt->attempt};
+        const auto lease_status =
+            pooled_pool->tryLease(pool_key, attempt_key, pooled_lease);
+        if (lease_status.IsTooManyRequests()) {
+            defer_pooled_attempt();
+            return;
+        }
+        if (!lease_status.ok()) {
+            endpoint->releaseOutstanding(pending.slice->spec().length);
+            (void)quota_->release(reservation);
+            const auto resolution = pending.slice->resolveAttempt(
+                *attempt, FAILED, 0, retryableStatus(lease_status));
+            if (resolution == UbAttemptResolution::kRetryScheduled) {
+                enqueueRetry(pending);
+            }
+            return;
+        }
+        if (attempt_gate_) {
+            gate_token = attempt_gate_->registerAttempt(
+                attempt_key, pooled_lease.lease.lane(),
+                pending.slice->spec().length);
+        }
+    }
+
     const uint64_t completion_token = nextCompletionToken();
     auto inflight = std::make_shared<Inflight>();
     inflight->completion_token = completion_token;
@@ -880,11 +979,33 @@ void UbWorkers::processPending(const PendingSlice& pending,
     inflight->deadline_ns = deadlineAfter(
         inflight->posted_ns,
         static_cast<uint64_t>(params_.slice_timeout_ms) * 1'000'000ULL);
+    inflight->pooled_pool = pooled_pool;
+    inflight->pooled_permit = std::move(pooled_permit);
+    inflight->gate_token = gate_token;
 
     if (!pending.slice->tryCommitPost(*attempt, inflight->posted_ns)) {
         endpoint->releaseOutstanding(pending.slice->spec().length);
         (void)quota_->release(reservation);
+        if (pooled_pool) {
+            // Cancellation won before the native boundary: no WR crossed, so
+            // the member is clean and returns to the pool. The gate record
+            // never saw a post and is dropped; the credit is released here
+            // because the pool never releases caller credits.
+            if (attempt_gate_ && gate_token != 0) {
+                attempt_gate_->discard(gate_token);
+            }
+            if (auto credits = pooled_pool->creditLedger()) {
+                credits->release(pooled_lease.jfc_index,
+                                 pooled_lease.jfc_credit_token);
+            }
+            (void)pooled_pool->returnOnce(std::move(pooled_lease.lease), true);
+        }
         return;
+    }
+    if (pooled_pool) {
+        inflight->pooled_jfc_index = pooled_lease.jfc_index;
+        inflight->jfc_credit_token = pooled_lease.jfc_credit_token;
+        inflight->pooled_lease = std::move(pooled_lease.lease);
     }
     {
         std::lock_guard<std::mutex> lock(inflight_mutex_);
@@ -906,16 +1027,30 @@ void UbWorkers::processPending(const PendingSlice& pending,
     // substituted by a bound remote Jetty.
     const bool rm_endpoint = endpoint->rmMode();
     if (rm_endpoint) work.target = endpoint->rmTarget(worker_index);
-    auto jetty = endpoint->jetty(worker_index);
+    JettyPtr jetty;
+    if (inflight->pooled_pool) {
+        // rm_pool data path: the WR rides the leased pool member, never an
+        // endpoint-owned Jetty. The imported target still comes from the
+        // endpoint incarnation that owns the peer relationship.
+        const auto& member = inflight->pooled_lease.member();
+        jetty = member ? member->jetty : nullptr;
+    } else {
+        jetty = endpoint->jetty(worker_index);
+    }
     size_t posted_count = 0;
     PostAcceptance acceptance = PostAcceptance::kNotAccepted;
     if (!jetty) {
-        status = Status::InternalError("UB endpoint has no Jetty" LOC_MARK);
+        status = Status::InternalError(
+            inflight->pooled_pool ? "Pooled send Jetty is unavailable" LOC_MARK
+                                  : "UB endpoint has no Jetty" LOC_MARK);
     } else if (rm_endpoint && !work.target) {
         status = Status::InternalError(
             "RM endpoint has no imported target for this Jetty" LOC_MARK);
     } else {
         status = adapter_->post(jetty, {work}, posted_count, acceptance);
+    }
+    if (inflight->pooled_pool && attempt_gate_ && inflight->gate_token != 0) {
+        attempt_gate_->onPostReturn(inflight->gate_token, status, acceptance);
     }
     if (posted_count == 1) {
         rail_monitor_->registerPath(path);
@@ -960,7 +1095,15 @@ void UbWorkers::processPending(const PendingSlice& pending,
     inflight_cv_.notify_all();
     releaseInflight(inflight);
     rail_monitor_->recordError(path);
-    if (endpoint_retirer_) endpoint_retirer_(endpoint);
+    if (inflight->pooled_pool) {
+        // Definitive zero acceptance: the attempt gate decides whether the
+        // member returns to the pool (INV07 rollback) or retires on
+        // contradiction; the endpoint incarnation is not at fault.
+        settlePooledAttempt(inflight, PooledSettleKind::kZeroAccept, 0,
+                            "post rejected: " + status.ToString());
+    } else {
+        if (endpoint_retirer_) endpoint_retirer_(endpoint);
+    }
     const auto resolution = pending.slice->resolveAttempt(
         *attempt, FAILED, 0, retryableStatus(status));
     if (resolution == UbAttemptResolution::kRetryScheduled) {
@@ -1033,12 +1176,18 @@ void UbWorkers::handleCompletion(const Completion& completion) {
             rail_monitor_->recordSuccess(inflight->path,
                                          inflight->pending.slice->spec().length,
                                          latency, now);
+            settlePooledAttempt(inflight, PooledSettleKind::kRealSuccess,
+                                inflight->pending.slice->spec().length, "");
             resolveInflight(inflight, COMPLETED,
                             inflight->pending.slice->spec().length, false);
             break;
         case CompletionCategory::TIMEOUT:
             rail_monitor_->recordTimeout(inflight->path, now);
-            if (endpoint_retirer_) endpoint_retirer_(inflight->endpoint);
+            settlePooledAttempt(inflight, PooledSettleKind::kRealError, 0,
+                                "native completion timeout");
+            if (!inflight->pooled_pool && endpoint_retirer_) {
+                endpoint_retirer_(inflight->endpoint);
+            }
             resolveInflight(inflight, TIMEOUT, 0, true);
             break;
         case CompletionCategory::LOCAL_DEVICE_ERROR:
@@ -1046,18 +1195,30 @@ void UbWorkers::handleCompletion(const Completion& completion) {
                 handleLocalDeviceFailure(inflight->endpoint->context());
             }
             rail_monitor_->recordError(inflight->path, now);
+            settlePooledAttempt(inflight, PooledSettleKind::kRealError, 0,
+                                "local device completion error");
             if (endpoint_retirer_) endpoint_retirer_(inflight->endpoint);
             resolveInflight(inflight, FAILED, 0, true);
             break;
         case CompletionCategory::REMOTE_PATH_ERROR:
         case CompletionCategory::ENDPOINT_ERROR:
             rail_monitor_->recordError(inflight->path, now);
+            settlePooledAttempt(inflight, PooledSettleKind::kRealError, 0,
+                                completion.category ==
+                                        CompletionCategory::ENDPOINT_ERROR
+                                    ? "endpoint completion error"
+                                    : "remote path completion error");
             if (endpoint_retirer_) endpoint_retirer_(inflight->endpoint);
             resolveInflight(inflight, FAILED, 0, true);
             break;
         case CompletionCategory::MEMORY_ERROR:
         case CompletionCategory::UNKNOWN_ERROR:
             rail_monitor_->recordError(inflight->path, now);
+            settlePooledAttempt(inflight, PooledSettleKind::kRealError, 0,
+                                completion.category ==
+                                        CompletionCategory::MEMORY_ERROR
+                                    ? "memory completion error"
+                                    : "unknown completion error");
             resolveInflight(inflight, FAILED, 0, false);
             break;
     }
@@ -1081,18 +1242,30 @@ void UbWorkers::scanTimeouts() {
     }
     for (const auto& inflight : expired) {
         std::vector<Completion> drained;
-        auto status =
-            inflight->endpoint
-                ? inflight->endpoint->quiesce(params_.slice_timeout_ms, drained)
-                : Status::InvalidArgument(
-                      "Timed-out UB WR has no endpoint" LOC_MARK);
+        const bool pooled = inflight->pooled_pool &&
+                            inflight->pooled_lease.valid() &&
+                            inflight->pooled_lease.member();
+        Status status;
+        if (pooled) {
+            // The WR rode a pooled member, not an endpoint Jetty: the fence
+            // must quiesce the member's Jetty to prove no more DMA.
+            status = adapter_->quiesceJetty(
+                inflight->pooled_lease.member()->jetty,
+                params_.slice_timeout_ms, drained);
+        } else {
+            status = inflight->endpoint
+                         ? inflight->endpoint->quiesce(params_.slice_timeout_ms,
+                                                       drained)
+                         : Status::InvalidArgument(
+                               "Timed-out UB WR has no endpoint" LOC_MARK);
+        }
         // Even a partial/failed fence may have returned valid WR completions;
         // they must never be lost.
         for (const auto& completion : drained) {
             if (completion.token != 0) handleCompletion(completion);
         }
         if (!status.ok()) {
-            rememberEndpointDrain(inflight->endpoint);
+            if (!pooled) rememberEndpointDrain(inflight->endpoint);
             LOG_EVERY_N(ERROR, 100)
                 << "Cannot establish UB timeout drain fence: "
                 << status.ToString();
@@ -1111,8 +1284,16 @@ void UbWorkers::scanTimeouts() {
             }
             continue;
         }
-        forgetEndpointDrain(inflight->endpoint);
-        if (endpoint_retirer_) endpoint_retirer_(inflight->endpoint);
+        if (pooled) {
+            // The fence proved no more DMA from the member. If a drained
+            // completion already settled the attempt this is a no-op;
+            // otherwise the unsettled attempt retires the member (INV07).
+            settlePooledAttempt(inflight, PooledSettleKind::kFence, 0,
+                                "slice timeout fence");
+        } else {
+            forgetEndpointDrain(inflight->endpoint);
+            if (endpoint_retirer_) endpoint_retirer_(inflight->endpoint);
+        }
         recordTimeoutOnce(inflight, now);
         // quiesce() is the proof that retry cannot overlap old DMA. Reclaim a
         // provider-lost token here: the successful fence proves the old WR can
@@ -1188,6 +1369,78 @@ void UbWorkers::resolveInflight(const std::shared_ptr<Inflight>& inflight,
 void UbWorkers::failUnposted(const PendingSlice& pending,
                              TransferStatusEnum outcome) {
     if (pending.slice) (void)pending.slice->tryResolveBeforePost(outcome);
+}
+
+void UbWorkers::settlePooledAttempt(const std::shared_ptr<Inflight>& inflight,
+                                    PooledSettleKind kind,
+                                    uint64_t completed_length,
+                                    const std::string& reason) {
+    if (!inflight || !inflight->pooled_pool ||
+        !inflight->pooled_lease.valid()) {
+        return;
+    }
+    bool expected = false;
+    if (!inflight->pooled_settled.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
+        return;
+    }
+    const auto& pool = inflight->pooled_pool;
+    AttemptGate::Settlement settlement;
+    bool settled = false;
+    if (attempt_gate_ && inflight->gate_token != 0) {
+        switch (kind) {
+            case PooledSettleKind::kRealSuccess:
+                attempt_gate_->onRealCompletion(inflight->gate_token, true,
+                                                completed_length);
+                break;
+            case PooledSettleKind::kRealError:
+                attempt_gate_->onRealCompletion(inflight->gate_token, false,
+                                                0);
+                attempt_gate_->reportFault(inflight->gate_token, reason);
+                break;
+            case PooledSettleKind::kZeroAccept:
+                // onPostReturn already recorded the definitive rejection; a
+                // rollback must not add a fault or the member would retire.
+                break;
+            case PooledSettleKind::kFence:
+                attempt_gate_->reportFault(inflight->gate_token, reason);
+                break;
+        }
+        settled = attempt_gate_->tryFinalize(inflight->gate_token,
+                                             !pool->stopping(), settlement);
+    }
+    if (settled &&
+        (settlement.return_to_pool || settlement.rollback_return)) {
+        (void)pool->returnOnce(std::move(inflight->pooled_lease), true);
+    } else {
+        const char* fallback = "pooled attempt unsettled";
+        switch (kind) {
+            case PooledSettleKind::kRealSuccess:
+                fallback = "pooled member retired before reuse";
+                break;
+            case PooledSettleKind::kRealError:
+                fallback = "pooled attempt completion error";
+                break;
+            case PooledSettleKind::kZeroAccept:
+                fallback = "pooled rollback rejected by gate";
+                break;
+            case PooledSettleKind::kFence:
+                fallback = "pooled attempt fenced";
+                break;
+        }
+        (void)pool->retireFaulted(std::move(inflight->pooled_lease),
+                                  reason.empty() ? std::string(fallback)
+                                                 : reason);
+    }
+    if (attempt_gate_ && inflight->gate_token != 0) {
+        attempt_gate_->discard(inflight->gate_token);
+    }
+    // The pool never releases caller credits; the settlement path owns the
+    // exactly-once release.
+    if (auto credits = pool->creditLedger()) {
+        credits->release(inflight->pooled_jfc_index,
+                         inflight->jfc_credit_token);
+    }
 }
 
 uint64_t UbWorkers::nextCompletionToken() {

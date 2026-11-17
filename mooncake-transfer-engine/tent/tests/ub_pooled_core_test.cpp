@@ -1389,9 +1389,11 @@ TEST(UbParamsPooledTest, RejectsInvalidPoolKeys) {
                      .ok());
 }
 
-TEST(UbParamsPooledTest, PooledProfileRemainsFailClosed) {
-    // The pooled components exist, but the rm_pool promotion gate stays
-    // fail-closed until the full gate matrix is verified (INV16).
+TEST(UbParamsPooledTest, PooledProfileOpensForWellFormedConfig) {
+    // The rm_pool promotion gate accepts a structurally complete
+    // configuration (INV16 opened): provider/capability, native budget and
+    // JFC credit gates still run during install before any pooled Jetty is
+    // created.
     UbParams params;
     ASSERT_TRUE(parseUbParams(R"({
                         "transports": {
@@ -1416,7 +1418,8 @@ TEST(UbParamsPooledTest, PooledProfileRemainsFailClosed) {
                     .ok());
     UbRuntimeMode mode;
     const Status status = resolveUbRuntimeMode(params, mode);
-    EXPECT_TRUE(status.IsNotImplemented());
+    EXPECT_TRUE(status.ok());
+    EXPECT_EQ(mode, UbRuntimeMode::kPooledRm);
 }
 
 // ---------------------------------------------------------------------------
