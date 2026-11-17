@@ -200,39 +200,74 @@ Status ConfigHelper::loadFromEnv(Config& config) {
         }
     }
 
-    // UB transport mode override for benchmarks: MC_URMA_TRANS_MODE=rc|rm
-    // (case-insensitive). Applied after MC_TENT_CONF so the env var takes
-    // precedence over the trans_mode hardcoded in the JSON config; an unset
-    // or empty env keeps the JSON value. Invalid values fail fast here with
-    // a clear error instead of surfacing later as a confusing runtime-mode
-    // rejection deep inside install().
+    // UB transport mode override for benchmarks: MC_URMA_TRANS_MODE
+    // (case-insensitive). Accepted values:
+    //   rc        -> trans_mode=rc, runtime_profile=rc_legacy;
+    //   rm        -> trans_mode=rm; an RM-family runtime_profile already
+    //                chosen by the JSON config (rm_pool or rm_legacy,
+    //                including its pool tuning) is preserved, and only
+    //                RC-oriented configs default to rm_legacy;
+    //   rm_pool   -> trans_mode=rm, runtime_profile=rm_pool plus the gate
+    //                keys the pooled profile requires (jetty_pool.enable,
+    //                probe.enabled); the jetty_pool.force_disable brake is
+    //                left untouched and still wins;
+    //   rm_legacy -> trans_mode=rm, runtime_profile=rm_legacy; the dedicated
+    //                escape channel from rm_pool, which neutralizes the
+    //                pooled keys so a pooled JSON config can never conflict
+    //                with the escaped rm_legacy runtime.
+    // Applied after MC_TENT_CONF so the env var takes precedence over the
+    // trans_mode hardcoded in the JSON config; an unset or empty env keeps
+    // the JSON value. Invalid values fail fast here with a clear error
+    // instead of surfacing later as a confusing runtime-mode rejection deep
+    // inside install(). RM profiles are physical-only and still require
+    // device_identities from MC_TENT_CONF; that is enforced with a clear
+    // error by UbParams::FromConfig.
     if (const char* trans_mode = std::getenv("MC_URMA_TRANS_MODE")) {
         if (*trans_mode != '\0') {
             std::string mode(trans_mode);
             std::transform(mode.begin(), mode.end(), mode.begin(),
                            [](unsigned char c) { return std::tolower(c); });
-            if (mode != "rc" && mode != "rm") {
+            if (mode != "rc" && mode != "rm" && mode != "rm_legacy" &&
+                mode != "rm_pool") {
                 return Status::InvalidArgument(
                     "Invalid MC_URMA_TRANS_MODE \"" +
                     std::string(trans_mode) +
-                    "\": expected \"rc\" or \"rm\"");
+                    "\": expected \"rc\", \"rm\", \"rm_legacy\" or "
+                    "\"rm_pool\"");
             }
-            config.setFromString("transports/ub/trans_mode", mode);
-            // The env var is the authoritative UB runtime mode selector, so
-            // also align the runtime-profile keys that the
-            // resolveUbRuntimeMode matrix requires to stay consistent with
-            // the selected mode. Without this, MC_URMA_TRANS_MODE=rm over
-            // an RC-oriented config would be rejected by the matrix instead
-            // of switching modes. RM Legacy is physical-only and still
-            // requires device_identities from MC_TENT_CONF; that is
-            // enforced with a clear error by UbParams::FromConfig.
-            if (mode == "rm") {
-                config.setFromString("transports/ub/runtime_profile",
-                                     "rm_legacy");
-                config.set("transports/ub/physical_only", true);
-            } else {
+            if (mode == "rc") {
+                config.setFromString("transports/ub/trans_mode", "rc");
                 config.setFromString("transports/ub/runtime_profile",
                                      "rc_legacy");
+            } else {
+                config.setFromString("transports/ub/trans_mode", "rm");
+                if (mode == "rm_pool") {
+                    config.setFromString("transports/ub/runtime_profile",
+                                         "rm_pool");
+                    config.set("transports/ub/jetty_pool/enable", true);
+                    config.set("transports/ub/probe/enabled", true);
+                } else if (mode == "rm_legacy") {
+                    config.setFromString("transports/ub/runtime_profile",
+                                         "rm_legacy");
+                    config.set("transports/ub/jetty_pool/enable", false);
+                    config.set("transports/ub/probe/enabled", false);
+                } else {
+                    // mode == "rm": keep the RM-family profile selected by
+                    // the JSON config; the default for RC-oriented configs
+                    // is rm_legacy. The rm branch never assigns rc_legacy.
+                    // The key is always materialized so downstream readers
+                    // see the effective profile even when the JSON omitted
+                    // it.
+                    const std::string profile = config.get(
+                        "transports/ub/runtime_profile", "rm_legacy");
+                    const std::string effective =
+                        (profile == "rm_legacy" || profile == "rm_pool")
+                            ? profile
+                            : "rm_legacy";
+                    config.setFromString("transports/ub/runtime_profile",
+                                         effective);
+                }
+                config.set("transports/ub/physical_only", true);
             }
         }
     }
