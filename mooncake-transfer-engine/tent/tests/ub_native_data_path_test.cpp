@@ -2744,6 +2744,11 @@ TEST(UbRmPoolTest, TransportRunsSelfReadWriteThroughPooledSendPool) {
     config->set("transports/ub/slice_timeout_ms", 1000);
     config->set("transports/ub/endpoint_cooldown_ms", 100);
     config->set("transports/ub/jetty_pool/enable", true);
+    // pin the pool ceiling so the test observes strict reuse:one endpoint
+    // jetty plus one pooled member is enough for a serial 3-transfer sequence
+    // with the default desired_per_context=6 an in-flight lease triggers a legal
+    // deficit creation,making the createJettyCalls assertion depend on poller timing.
+    config->set("transports/ub/send_pool/desired_per_context", 2);
     config->set("transports/ub/probe/enabled", true);
     setPhysicalOnlyIdentity(*config, device);
 

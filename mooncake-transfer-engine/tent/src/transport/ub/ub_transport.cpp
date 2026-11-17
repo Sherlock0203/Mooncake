@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <future>
 
 #include <glog/logging.h>
 
@@ -913,8 +914,21 @@ struct UbTransport::Impl {
             // and no registry round-trip is required.
             requester_segment = metadata->segmentManager().getLocal();
         } else {
-            anchor_status = metadata->segmentManager().getRemote(
-                requester_segment, request.segment_name);
+            // fetching the requester's descriptor goes to the metadata
+            // registry over RPC, this handler runs on an RPC thread where
+            // nested synchronous RPC is forbidden. so hop to a worker
+            // thread for the fetch and block this handler on the result.
+            auto fetch = std::async(
+                std::launch::async,
+                [this, name = request.segment_name]() {
+                    SegmentDescRef seg;
+                    auto st = metadata->segmentManager().getRemote(seg, name);
+                    return std::make_pair(st, std::move(seg));
+                }
+            );
+            auto fetched = fetch.get();
+            anchor_status = fetched.first;
+            requester_segment = std::move(fetched.second);
         }
         if (anchor_status.ok() && !requester_segment) {
             anchor_status = Status::InvalidArgument(
