@@ -1153,7 +1153,7 @@ ProbeResources：发现物理口（过滤 bond），自建 Context/JFC/Jetty/源
 
 ## 16. 尚待确认的契约点
 
-1. **远端描述符**：bootstrap v2 的字段（对端 probe jetty 的 id/uasid/eid/token、探测页 address/length/token/epoch）与 v1 兼容/回退策略。
+1. **远端描述符**：bootstrap v2 的字段（对端 probe jetty 的 id/uasid/eid/token、探测页 address/length/token/epoch）与 v1 兼容/回退策略。**路线 B 的落地设计见《tent-ub-probe-peer-bootstrap-design》**（每节点 `GetProbeBootstrap` + `peer_segments` 同名配对）。
 2. **per-WR target**：adapter 落地时间（P0-B）；W1 期间由 fake 承接。
 3. **send-only JFC**：adapter 是否支持只建发送 JFC（省 JFR/降低 `max_jfc` 压力）；本侧创建。
 4. **非 bonding 环境**：bond 设备识别规则（名字启发式是否足够）、探测启用时发现 bonded 环境的失败语义（install 失败 + 提示）。
