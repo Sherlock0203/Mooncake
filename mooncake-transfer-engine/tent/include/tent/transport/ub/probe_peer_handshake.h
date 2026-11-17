@@ -88,6 +88,8 @@ class HandshakeProbePeerDirectory final : public ProbePeerDirectory {
         delete;
 
     Status snapshotEdges(std::vector<ProbeEdgeSupply>& edges) override;
+    Status refresh(std::vector<ProbeEvent>& events) override;
+    Status commitRefresh(bool success, size_t delivered_events = 0) override;
 
     // Releases every imported peer probe area. Idempotent; the provider is
     // shut down before the directory in the transport teardown order.
@@ -104,14 +106,12 @@ class HandshakeProbePeerDirectory final : public ProbePeerDirectory {
         SegmentID peer_segment_id{LOCAL_SEGMENT_ID};
         Topology::NicID remote_nic{-1};
         uint64_t topology_epoch{0};
-        uint64_t target_epoch{0};
 
         bool operator<(const EdgeKey& other) const {
             return std::tie(local_nic, peer_segment_id, remote_nic,
-                            topology_epoch, target_epoch) <
+                            topology_epoch) <
                    std::tie(other.local_nic, other.peer_segment_id,
-                            other.remote_nic, other.topology_epoch,
-                            other.target_epoch);
+                            other.remote_nic, other.topology_epoch);
         }
     };
 
@@ -119,7 +119,17 @@ class HandshakeProbePeerDirectory final : public ProbePeerDirectory {
         ProbeEdgeSupply edge;
         // Descriptor used for the current import; a change forces a re-import.
         std::string descriptor_hex;
+        uint64_t target_epoch{0};
+        uint64_t area_epoch{0};
+        GateBits gates;
     };
+
+    struct RetiredImport {
+        RemoteSegmentPtr segment;
+    };
+
+    Status rebuildLocked(std::vector<ProbeEvent>* events, bool defer_commit);
+    void releaseRetiredLocked(bool force);
 
     mutable std::mutex mutex_;
     const std::shared_ptr<UrmaAdapter> adapter_;
@@ -129,6 +139,13 @@ class HandshakeProbePeerDirectory final : public ProbePeerDirectory {
     size_t unsupported_peer_count_{0};
     size_t import_failure_count_{0};
     size_t import_count_{0};
+    std::vector<RetiredImport> retired_;
+    std::map<EdgeKey, CachedEdge> pending_cache_;
+    std::vector<RetiredImport> pending_retired_;
+    std::vector<RemoteSegmentPtr> pending_new_;
+    std::vector<RemoteSegmentPtr> pending_event_new_;
+    std::vector<ProbeEvent> pending_events_;
+    bool has_pending_{false};
     bool shut_down_{false};
 };
 

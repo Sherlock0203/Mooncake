@@ -2,8 +2,8 @@
 
 > 日期：2026-11-17。
 > 关系：本文是《tent-ub-probe-link-detail-design》§12.2 / §16 #1 的落地子设计，也是《tent-ub-probe-standalone-supply》P6 的前置实现；**不改变** PLM 状态机、探测 WR 格式、poller 接缝与完成/超时语义。
-> 范围：只做**路线 B（最小生产版）**——每节点 `ControlService` 发布/查询 endpoint 描述符，`peer_segments` 同名配对，`UbTransport` 自动接线，area 稳定化；多节点显式 link graph、每 EID 全枚举、随机 token/TLS、ProbeRegistry 留给后续（路线 C）。
-> 状态：待实现。当前代码只有 selftest 静态 source，真实 TENT/tebench 打开探测会在 `UbTransport::install` 失败。
+> 范围：只做**路线 B（最小生产版）**——每节点 `ControlService` 发布/查询 endpoint 描述符，`peer_segments` 同名配对，`UbTransport` 自动接线，area 稳定化；多节点显式 link graph、随机 token/TLS、ProbeRegistry 留给后续（路线 C）。
+> 状态：路线 B 已实现（B0–B4，2026-11-17）。每节点 `GetProbeBootstrap`、`peer_segments` 自动 source、area 稳定化、TTL/target/area/gate 刷新和旧 import 延迟释放均已落地；多节点显式 link graph、随机 token/TLS、中心 registry 仍属路线 C。实机/tebench 联调待验证。
 
 ## 0. 决策与范围
 
@@ -14,7 +14,7 @@
 | B-3 | **source 在 `UbTransport::install` 内自动构造** | tebench 不改代码；`provider=standalone` 且未注入 source 时生效 |
 | B-4 | **area 稳定化** | send-lane 重建只换 probe Jetty/source，不换 area 页 |
 | B-5 | **包含最小 TTL 刷新** | 不刷新则对端 Jetty 重建后 target_epoch 永远不更新；TTL 30s，B 内实现 |
-| B-6 | **不做** | 随机 token、TLS、每 EID 全枚举、显式 link graph、跨控制面 push、ProbeRegistry |
+| B-6 | **不做** | 随机 token、TLS、显式 link graph、跨控制面 push、ProbeRegistry |
 | B-7 | **保留 selftest 静态 source** | 通过注入 source 优先；用于无控制面联调 |
 
 非目标：
@@ -176,7 +176,7 @@ struct ProbeBootstrapResponse {
     uint64_t node_epoch = 0;
     std::string rpc_server_addr;
     uint64_t topology_epoch = 0;
-    bool unchanged = false;          // 请求方 epoch 未变，可省 payload
+    bool unchanged = false;          // 兼容旧服务端；当前服务端总返回完整 endpoints
     std::vector<ProbeEndpointDesc> endpoints;
     std::string reply_msg;           // 非空表示服务端拒绝/暂不可用
 };
@@ -306,7 +306,7 @@ metadata->setProbeBootstrapCallback(
 
 - 锁 `mutex_`；
 - 填 `node_id`（transport 的 `local_segment_name`）、`node_epoch`、`topology_epoch`；
-- 若 `req.known_node_epoch == node_epoch` → `unchanged = true`，直接返回；
+- 不按 `node_epoch` 返回 `unchanged`：同一 node_epoch 内 target_epoch/area_epoch/端口集合都可能变化；服务端总返回完整端点列表，`unchanged` 仅保留兼容旧客户端。
 - 遍历 `ports_` 中 `available` 的端口，产出 `ProbeEndpointDesc`；
 - 任一端点缺 area/jetty/EID → 跳过并计数，不因一个坏口让整个响应失败。
 
@@ -357,7 +357,7 @@ desc.target_epoch = port.config.generation;
 desc.endpoint_generation = port.endpoint_generation; // 可为 0
 ```
 
-B 沿用当前 `discoverLocked()` 的“每设备首 active EID”；多 EID 全枚举留 C。若 `TopologyIdResolver` 返回 -1（设备不在业务 topology），**跳过该端点并计数，不回退到 discovery index**，避免重新引入业务证据错配；全部端点被跳过时 `exportBootstrap` 返回 `reply_msg`。
+B 端点列表包含 `discoverLocked()` 选出的全部 active EID（与当前 no-filter/native-filter 语义一致）；多节点显式 link graph 留 C。若 `TopologyIdResolver` 返回 -1（设备不在业务 topology），**跳过该端点并计数，不回退到 discovery index**，避免重新引入业务证据错配；全部端点被跳过时 `exportBootstrap` 返回 `reply_msg`。
 
 B 阶段 `port.jetty_token`/`area_token` 可继续用 `0xACFE`；C 阶段随机化。
 
@@ -466,7 +466,7 @@ struct PeerCache {
 - 同一 peer 单飞：`in_flight` 时其他调用等待/复用结果；
 - 失败：`backoff_ns = min(backoff*2, 10s)`，不每秒重试；
 - `node_epoch` 变化：立即丢弃该 peer 全部 endpoint，重新配对；
-- 返回 `unchanged=true` 时复用旧 endpoint，仅更新 `fetched_at`。
+- 旧服务端返回 `unchanged=true` 时复用旧 endpoint，仅更新 `fetched_at`；新服务端不会走该分支。
 
 ### 6.4 刷新触发
 
@@ -475,7 +475,10 @@ B 内最小刷新由 provider maintenance 线程驱动：
 - 每 `probe/descriptor_refresh_ms`（默认 30000）调 `directory->refresh(events)`；
 - `refresh` 内部调 source `snapshot()`（TTL 到期才真正发 RPC）；
 - 生成 `ProbeEvent` 通过 `availability_sink_->onPoolAvailabilityChange()` 应用；
-- 失败只记日志/计数，下个周期重试。
+- directory 先构建 pending cache，provider 投递后按 `delivered_events` 提交：
+  - 全部成功 → 提交完整 cache；
+  - 部分成功 → 只提交已投递事件对应的 prefix，未投递的新 import 回滚；
+  - 失败只记日志/计数，下个周期按已提交 prefix 重新 diff。
 
 触发条件（任一）：
 
@@ -591,10 +594,10 @@ B 阶段 `peer_segments` 需手工填 target segment name；后续可给 tebench
 | `probe/peer_segments` | 空 | 字符串数组；空且 provider=standalone → install 失败 |
 | `probe/peer_wait_ms` | 5000 | > 0；首次 snapshot 等待 |
 | `probe/descriptor_ttl_ms` | 30000 | > 0；≥ `peer_rpc_timeout_ms` |
-| `probe/descriptor_refresh_ms` | 30000 | > 0；建议 `<= descriptor_ttl_ms`（到期前刷新） |
+| `probe/descriptor_refresh_ms` | 30000 | >= 0；0 表示关闭周期刷新；建议 `<= descriptor_ttl_ms` |
 | `probe/peer_rpc_timeout_ms` | 1000 | > 0 |
 
-`probe/links`、`probe/eid_level`、`probe/peer_source` 留 C。
+`probe/links`、`probe/peer_source` 留 C；每 EID 端点已由当前 `discoverLocked()` 提供。
 
 ## 10. 失败矩阵与语义
 
@@ -630,7 +633,7 @@ B 阶段 `peer_segments` 需手工填 target segment name；后续可给 tebench
 | --- | --- |
 | `ub_probe_bootstrap_codec_test` | JSON round-trip、schema/epoch/hex 校验、非法字段拒绝 |
 | `ub_probe_peer_source_test` | fake client/resolver/local source：精确配对、native fallback、缺 endpoint、RPC 失败、node_epoch 变 |
-| `ub_probe_control_plane_test` | `ControlService` handler callback、unchanged 响应、无 callback 错误 |
+| `ub_probe_control_plane_test` | `ControlService` handler callback、完整端点响应、无 callback 错误 |
 | `ub_probe_area_stable_test` | rebuild 后 area_descriptor/area_epoch 不变，target_epoch 递增 |
 | `ub_probe_directory_refresh_test` | add/remove/area/target/gate 事件 diff；旧 import 延迟释放 |
 | `tent_probe_selftest` | 保留静态 source；新增 no-JSON 模式可选 |
@@ -665,7 +668,7 @@ B 阶段 `peer_segments` 需手工填 target segment name；后续可给 tebench
 | 旧 area import 释放时序 | 延迟释放 + `use_count`/安全窗口；C 完善 |
 | `node_epoch` 不持久化 | 只做不等判断；重启即变；不依赖顺序 |
 | 控制面 RPC 无 TLS | 与业务 bootstrap 同通道，内网；C 加 TLS/认证 |
-| 多 EID/多节点 | B 不做；C 加 `links`/`eid_level` |
+| 多节点显式 link graph | B 不做；C 加 `links`；每 EID 端点当前已支持 |
 
 ## 15. 验收标准
 

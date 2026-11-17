@@ -196,6 +196,134 @@ TEST(UbProbeHandshakeTest, ChangedAreaIsReimportedAndOldSegmentReleased) {
     EXPECT_TRUE(adapter->shutdown().ok());
 }
 
+TEST(UbProbeHandshakeTest, RefreshReportsTargetEpochAndGateChanges) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+    ContextPtr context;
+    ASSERT_TRUE(adapter->openContext(fakeDevice(), context).ok());
+
+    StubPeerSource source({makePeer(0, 42, 0)});
+    HandshakeProbePeerDirectory directory(adapter, {{0, context}}, &source);
+    std::vector<ProbeEdgeSupply> edges;
+    ASSERT_TRUE(directory.snapshotEdges(edges).ok());
+    ASSERT_EQ(edges.size(), 1U);
+    EXPECT_EQ(directory.importCount(), 1U);
+
+    auto target_changed = makePeer(0, 42, 0);
+    target_changed.target_epoch = 2;
+    source.set({target_changed});
+    std::vector<ProbeEvent> events;
+    ASSERT_TRUE(directory.refresh(events).ok());
+    ASSERT_EQ(events.size(), 1U);
+    EXPECT_EQ(events[0].kind, ProbeEventKind::kTargetEpochChanged);
+    ASSERT_TRUE(events[0].edge.has_value());
+    EXPECT_EQ(events[0].edge->version.target_epoch, 2U);
+    EXPECT_EQ(directory.importCount(), 1U);
+
+    // A refresh cannot start while the previous batch awaits commit.
+    events.clear();
+    EXPECT_TRUE(directory.refresh(events).IsTooManyRequests());
+    // Discard without delivery: the old cache stays and a new diff regenerates
+    // the target change.
+    ASSERT_TRUE(directory.commitRefresh(false).ok());
+    events.clear();
+    ASSERT_TRUE(directory.refresh(events).ok());
+    ASSERT_EQ(events.size(), 1U);
+    EXPECT_EQ(events[0].kind, ProbeEventKind::kTargetEpochChanged);
+    ASSERT_TRUE(directory.commitRefresh(true).ok());
+
+    auto gate_changed = target_changed;
+    gate_changed.port_gate_ok = false;
+    source.set({gate_changed});
+    events.clear();
+    ASSERT_TRUE(directory.refresh(events).ok());
+    ASSERT_EQ(events.size(), 1U);
+    EXPECT_EQ(events[0].kind, ProbeEventKind::kGateChanged);
+    ASSERT_TRUE(events[0].gate.has_value());
+    EXPECT_FALSE(events[0].gate->port_ok);
+    ASSERT_TRUE(directory.commitRefresh(true).ok());
+
+    ASSERT_TRUE(directory.shutdown().ok());
+    EXPECT_TRUE(adapter->closeContext(context).ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
+TEST(UbProbeHandshakeTest, PartialRefreshFailureKeepsDeliveredImport) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+    ContextPtr context;
+    ASSERT_TRUE(adapter->openContext(fakeDevice(), context).ok());
+
+    StubPeerSource source({makePeer(0, 42, 0, 0xA00000)});
+    HandshakeProbePeerDirectory directory(adapter, {{0, context}}, &source);
+    std::vector<ProbeEdgeSupply> edges;
+    ASSERT_TRUE(directory.snapshotEdges(edges).ok());
+    ASSERT_EQ(edges.size(), 1U);
+    EXPECT_EQ(adapter->liveRemoteSegmentCount(), 1U);
+
+    auto target_changed = makePeer(0, 42, 0, 0xA00000);
+    target_changed.target_epoch = 2;
+    source.set({target_changed, makePeer(0, 43, 0, 0xB00000)});
+    std::vector<ProbeEvent> events;
+    ASSERT_TRUE(directory.refresh(events).ok());
+    ASSERT_EQ(events.size(), 2U);
+    // The first event (target change) was delivered; the second (new edge)
+    // was not. Rollback must not unimport the first event's import.
+    ASSERT_TRUE(directory.commitRefresh(false, 1).ok());
+    EXPECT_EQ(adapter->liveRemoteSegmentCount(), 1U);
+
+    // The delivered target change was partially committed; only the
+    // undelivered new edge remains to be regenerated.
+    events.clear();
+    ASSERT_TRUE(directory.refresh(events).ok());
+    ASSERT_EQ(events.size(), 1U);
+    EXPECT_EQ(events[0].kind, ProbeEventKind::kEdgeAdded);
+    ASSERT_TRUE(directory.commitRefresh(true).ok());
+    EXPECT_EQ(adapter->liveRemoteSegmentCount(), 2U);
+
+    ASSERT_TRUE(directory.shutdown().ok());
+    EXPECT_TRUE(adapter->closeContext(context).ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
+TEST(UbProbeHandshakeTest, PartialCommitOfNewEdgeCanBeRemovedLater) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+    ContextPtr context;
+    ASSERT_TRUE(adapter->openContext(fakeDevice(), context).ok());
+
+    StubPeerSource source({makePeer(0, 42, 0, 0xA00000)});
+    HandshakeProbePeerDirectory directory(adapter, {{0, context}}, &source);
+    std::vector<ProbeEdgeSupply> edges;
+    ASSERT_TRUE(directory.snapshotEdges(edges).ok());
+
+    source.set({makePeer(0, 42, 0, 0xA00000), makePeer(0, 43, 0, 0xB00000),
+                makePeer(0, 44, 0, 0xC00000)});
+    std::vector<ProbeEvent> events;
+    ASSERT_TRUE(directory.refresh(events).ok());
+    ASSERT_EQ(events.size(), 2U);
+    // The first new edge was delivered and must be committed to the cache;
+    // the second was not and must be rolled back.
+    ASSERT_TRUE(directory.commitRefresh(false, 1).ok());
+    EXPECT_EQ(adapter->liveRemoteSegmentCount(), 2U);
+
+    // The source now removes the delivered new edge. A correct partial commit
+    // must generate kEdgeRemoved; otherwise the PLM keeps it forever.
+    source.set({makePeer(0, 42, 0, 0xA00000)});
+    events.clear();
+    ASSERT_TRUE(directory.refresh(events).ok());
+    ASSERT_EQ(events.size(), 1U);
+    EXPECT_EQ(events[0].kind, ProbeEventKind::kEdgeRemoved);
+    ASSERT_TRUE(events[0].version.has_value());
+    EXPECT_EQ(events[0].version->path.segment_id, 43U);
+    ASSERT_TRUE(directory.commitRefresh(true).ok());
+    EXPECT_EQ(adapter->liveRemoteSegmentCount(), 1U);
+
+    ASSERT_TRUE(directory.shutdown().ok());
+    EXPECT_TRUE(adapter->closeContext(context).ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
 TEST(UbProbeHandshakeTest, UnknownLocalPortIsRejected) {
     auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
     ASSERT_TRUE(adapter->initialize().ok());

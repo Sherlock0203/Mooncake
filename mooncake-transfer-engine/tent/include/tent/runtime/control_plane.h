@@ -33,6 +33,7 @@
 #include <limits>
 
 #include "tent/runtime/metastore.h"
+#include "tent/runtime/probe_bootstrap.h"
 #include "tent/runtime/segment.h"
 #include "tent/runtime/segment_manager.h"
 #include "tent/rpc/rpc.h"
@@ -139,6 +140,9 @@ using OnReceiveBootstrap =
 using OnReceiveUbBootstrap = std::function<int(const UbBootstrapDesc& request,
                                                UbBootstrapDesc& response)>;
 
+using OnReceiveProbeBootstrap = std::function<int(
+    const ProbeBootstrapRequest& request, ProbeBootstrapResponse& response)>;
+
 using OnNotify = std::function<int(const Notification&)>;
 
 class ControlClient {
@@ -163,6 +167,11 @@ class ControlClient {
     static Status bootstrapUb(const std::string& server_addr,
                               const UbBootstrapDesc& request,
                               UbBootstrapDesc& response);
+
+    static Status getProbeBootstrap(const std::string& server_addr,
+                                    const ProbeBootstrapRequest& request,
+                                    ProbeBootstrapResponse& response,
+                                    uint64_t timeout_ms = 1000);
 
     static Status sendData(const std::string& server_addr,
                            uint64_t peer_mem_addr, void* local_mem_addr,
@@ -224,6 +233,11 @@ class ControlService {
         ub_bootstrap_callback_ = callback;
     }
 
+    void setProbeBootstrapCallback(const OnReceiveProbeBootstrap& callback) {
+        std::lock_guard<std::mutex> lock(probe_bootstrap_callback_mutex_);
+        probe_bootstrap_callback_ = callback;
+    }
+
     void setNotifyCallback(const OnNotify& callback);
 
     Status start(uint16_t& port, bool ipv6_ = false, size_t threads = 1);
@@ -236,6 +250,9 @@ class ControlService {
                          std::string& response);
 
     void onBootstrapUb(const std::string_view& request, std::string& response);
+
+    void onGetProbeBootstrap(const std::string_view& request,
+                             std::string& response);
 
     void onSendData(const std::string_view& request, std::string& response);
 
@@ -276,6 +293,9 @@ class ControlService {
 
     std::mutex ub_bootstrap_callback_mutex_;
     OnReceiveUbBootstrap ub_bootstrap_callback_;
+
+    std::mutex probe_bootstrap_callback_mutex_;
+    OnReceiveProbeBootstrap probe_bootstrap_callback_;
 
     std::mutex notify_cb_mutex_;
     std::condition_variable notify_cb_cv_;

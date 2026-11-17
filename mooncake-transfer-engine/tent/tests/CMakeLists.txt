@@ -666,6 +666,29 @@ if(USE_UB)
   add_test(NAME tent_ub_probe_discovery_test
            COMMAND tent_ub_probe_discovery_test)
 
+  # Route B wire codec: schema/epoch/area validation before import.
+  add_executable(tent_ub_probe_bootstrap_test ub_probe_bootstrap_test.cpp)
+  target_link_libraries(tent_ub_probe_bootstrap_test PRIVATE tent_common gtest
+                                                                 gtest_main)
+  target_include_directories(tent_ub_probe_bootstrap_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_probe_bootstrap_test
+           COMMAND tent_ub_probe_bootstrap_test)
+
+  # Route B peer source: per-peer exact EID pairing, native fallback, RPC
+  # failure and cache behaviour, with fake control-plane interfaces.
+  add_executable(tent_ub_probe_control_plane_test
+                 ub_probe_control_plane_test.cpp
+                 ../src/transport/ub/probe_control_plane.cpp
+                 ../src/transport/ub/probe_provider_standalone.cpp
+                 ../src/transport/ub/probe_peer_handshake.cpp)
+  target_link_libraries(tent_ub_probe_control_plane_test
+                        PRIVATE tent_common gtest gtest_main)
+  target_include_directories(tent_ub_probe_control_plane_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_probe_control_plane_test
+           COMMAND tent_ub_probe_control_plane_test)
+
   # Probe peer handshake seam (P2): descriptor validation, probe-area import
   # and caching. The bootstrap wire that fills the descriptor source lands in
   # P5; these tests drive the source directly.

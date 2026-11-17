@@ -119,6 +119,49 @@ Status ControlClient::bootstrapUb(const std::string& server_addr,
     return Status::OK();
 }
 
+Status ControlClient::getProbeBootstrap(const std::string& server_addr,
+                                        const ProbeBootstrapRequest& request,
+                                        ProbeBootstrapResponse& response,
+                                        uint64_t timeout_ms) {
+    if (server_addr.empty()) {
+        return Status::InvalidArgument(
+            "probe bootstrap server address is empty" LOC_MARK);
+    }
+    struct State {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool done{false};
+        Status status;
+        std::string response;
+    };
+    auto state = std::make_shared<State>();
+    nlohmann::json request_json = request;
+    tl_rpc_agent.callAsync(server_addr, GetProbeBootstrap, request_json.dump(),
+                           [state](Status status, std::string body) {
+                               std::lock_guard<std::mutex> lock(state->mutex);
+                               state->status = status;
+                               state->response = std::move(body);
+                               state->done = true;
+                               state->cv.notify_all();
+                           });
+    std::unique_lock<std::mutex> lock(state->mutex);
+    if (!state->cv.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                            [&] { return state->done; })) {
+        return Status::RpcConnectionError(
+            "probe bootstrap RPC timed out" LOC_MARK);
+    }
+    if (!state->status.ok()) return state->status;
+    try {
+        response = nlohmann::json::parse(state->response)
+                       .get<ProbeBootstrapResponse>();
+    } catch (const std::exception& error) {
+        return Status::MalformedJson(
+            std::string("Malformed probe bootstrap response: ") + error.what() +
+            LOC_MARK);
+    }
+    return ValidateProbeBootstrapResponse(response);
+}
+
 Status ControlClient::sendData(const std::string& server_addr,
                                uint64_t peer_mem_addr, void* local_mem_addr,
                                size_t length) {
@@ -341,6 +384,12 @@ ControlService::ControlService(const std::string& type,
         Probe, [this](const std::string_view& request, std::string& response) {
             onProbe(request, response);
         });
+    rpc_server_->registerFunction(
+        GetProbeBootstrap,
+        [this](const std::string_view& request, std::string& response) {
+            onGetProbeBootstrap(request, response);
+        },
+        /*offload=*/true);
     // onDelegate runs a whole transfer to completion; holding the io_context
     // thread for that long blocked every other RPC on this node.
     rpc_server_->registerFunction(
@@ -375,6 +424,10 @@ ControlService::~ControlService() {
     {
         std::lock_guard<std::mutex> lock(ub_bootstrap_callback_mutex_);
         ub_bootstrap_callback_ = {};
+    }
+    {
+        std::lock_guard<std::mutex> lock(probe_bootstrap_callback_mutex_);
+        probe_bootstrap_callback_ = {};
     }
     rpc_server_.reset();
 }
@@ -517,6 +570,41 @@ void ControlService::onBootstrapUb(const std::string_view& request,
     }
     json j = response_desc;
     response = j.dump();
+}
+
+void ControlService::onGetProbeBootstrap(const std::string_view& request,
+                                         std::string& response) {
+    ProbeBootstrapResponse response_desc;
+    try {
+        auto request_desc = nlohmann::json::parse(std::string(request))
+                                .get<ProbeBootstrapRequest>();
+        if (request_desc.schema_version != kProbeBootstrapSchemaVersion) {
+            response_desc.reply_msg = "unsupported probe bootstrap schema";
+        } else {
+            int ret = -1;
+            {
+                std::lock_guard<std::mutex> lock(
+                    probe_bootstrap_callback_mutex_);
+                if (probe_bootstrap_callback_) {
+                    ret =
+                        probe_bootstrap_callback_(request_desc, response_desc);
+                } else {
+                    response_desc.reply_msg =
+                        "probe bootstrap callback is not registered";
+                }
+            }
+            if (ret != 0 && response_desc.reply_msg.empty()) {
+                response_desc.reply_msg =
+                    "probe bootstrap callback failed, ret=" +
+                    std::to_string(ret);
+            }
+        }
+    } catch (const std::exception& error) {
+        response_desc.reply_msg =
+            std::string("Malformed probe bootstrap request: ") + error.what();
+    }
+    nlohmann::json json_response = response_desc;
+    response = json_response.dump();
 }
 
 void ControlService::onSendData(const std::string_view& request,

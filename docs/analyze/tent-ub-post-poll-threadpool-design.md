@@ -634,7 +634,12 @@ context 初始化（业务 JFC）
 | probe/recover_success_threshold | 固定 1 | 其他值拒绝；恢复还须当前代次和全部门禁通过 |
 | probe/failure_threshold | 3（建议默认） | 连续失败告警/熔断阈值 |
 | probe/jfc_mode | dedicated（W1 默认）/shared | 字符串枚举，仅接受 `dedicated`/`shared`；dedicated 为每 Context 一个专用 JFC，shared 为业务 JFC＋预留 credit；W1 验收 dedicated |
-| probe/provider | pool（默认）/standalone | `pool` 使用注入的 W1 provider/poster；`standalone` 由 transport 基于本端 Context 构造 `StandaloneProbeResourceProvider` + `HandshakeProbePeerDirectory` + `UrmaProbePoster`；需要调用方注入 `ProbePeerDescriptorSource`，且仅支持 dedicated JFC |
+| probe/provider | pool（默认）/standalone | `pool` 使用注入的 W1 provider/poster；`standalone` 由 transport 基于本端 Context 构造 `StandaloneProbeResourceProvider` + `HandshakeProbePeerDirectory` + `UrmaProbePoster`；未注入 `ProbePeerDescriptorSource` 时按 `probe/peer_segments` 自动构造控制面 source，且仅支持 dedicated JFC |
+| probe/peer_segments | 空 | 字符串数组；standalone 自动 source 的对端 segment 名单；为空且未注入 source → install 失败 |
+| probe/peer_wait_ms | 5000 | 首次获取对端 descriptor 的等待预算 |
+| probe/descriptor_ttl_ms | 30000 | 对端 descriptor 缓存 TTL，且必须 ≥ peer_rpc_timeout_ms |
+| probe/descriptor_refresh_ms | 30000 | provider 维护线程的刷新周期；0 表示关闭周期刷新 |
+| probe/peer_rpc_timeout_ms | 1000 | 单次 GetProbeBootstrap RPC 超时 |
 | probe/jfc_depth | 64 | dedicated probe JFC 深度 |
 | probe/credit_reserve | 8 | shared 模式下预留的控制 credit |
 | probe/device_filter | 空（全部非 bonding 物理口） | 字符串或字符串数组；按 native 名、`native:eidN` 或完整 topology 名匹配；只写 native 时枚举该设备全部 active EID，显式 EID 只选该 EID；bond 设备始终排除，有 bonding 时使用剩余非 bonding 设备，仅当没有可用非 bond 设备时失败 |

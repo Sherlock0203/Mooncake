@@ -163,6 +163,30 @@ struct UbParams {
         }
         parsed.probe.source_page_size =
             static_cast<size_t>(source_page_size);
+        CHECK_STATUS(readStringList(config,
+                                    "transports/ub/probe/peer_segments",
+                                    parsed.probe.peer_segments));
+        CHECK_STATUS(readPositive(config, "transports/ub/probe/peer_wait_ms",
+                                  parsed.probe.peer_wait_ms,
+                                  parsed.probe.peer_wait_ms));
+        CHECK_STATUS(readPositive(
+            config, "transports/ub/probe/descriptor_ttl_ms",
+            parsed.probe.descriptor_ttl_ms,
+            parsed.probe.descriptor_ttl_ms));
+        CHECK_STATUS(readNonNegative(
+            config, "transports/ub/probe/descriptor_refresh_ms",
+            parsed.probe.descriptor_refresh_ms,
+            parsed.probe.descriptor_refresh_ms));
+        CHECK_STATUS(readPositive(
+            config, "transports/ub/probe/peer_rpc_timeout_ms",
+            parsed.probe.peer_rpc_timeout_ms,
+            parsed.probe.peer_rpc_timeout_ms));
+        if (parsed.probe.descriptor_ttl_ms <
+            parsed.probe.peer_rpc_timeout_ms) {
+            return Status::InvalidArgument(
+                "transports/ub/probe/descriptor_ttl_ms must be >= "
+                "transports/ub/probe/peer_rpc_timeout_ms");
+        }
         CHECK_STATUS(readBool(config, "transports/ub/probe/test/periodic_all",
                               parsed.probe.test_periodic_all,
                               parsed.probe.test_periodic_all));

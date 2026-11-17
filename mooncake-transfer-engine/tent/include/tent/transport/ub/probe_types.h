@@ -286,6 +286,12 @@ struct ProbeParams {
     uint64_t source_page_size{0};
     uint32_t jfc_depth{64};
     uint32_t credit_reserve{8};
+    // Route B: peer segments discovered through GetProbeBootstrap.
+    std::vector<std::string> peer_segments;
+    uint64_t peer_wait_ms{5000};
+    uint64_t descriptor_ttl_ms{30000};
+    uint64_t descriptor_refresh_ms{30000};
+    uint64_t peer_rpc_timeout_ms{1000};
     // Test mode (validation only; production must keep periodic_all=false).
     bool test_periodic_all{false};
     uint64_t test_interval_ms{5000};
@@ -319,6 +325,12 @@ struct ProbeParams {
         }
         if (test_interval_ms == 0) return false;
         if (test_periodic_all && !enabled) return false;
+        if (peer_wait_ms == 0 || descriptor_ttl_ms == 0 ||
+            peer_rpc_timeout_ms == 0) {
+            return false;
+        }
+        // descriptor_refresh_ms == 0 disables periodic refresh.
+        if (descriptor_ttl_ms < peer_rpc_timeout_ms) return false;
         return true;
     }
 };

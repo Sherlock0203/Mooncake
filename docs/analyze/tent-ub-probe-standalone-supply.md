@@ -144,7 +144,7 @@
 | **P5** | 多口/多 peer/多代次；shared 模式可选 | 矩阵 #4/#6/#16 在真实 adapter 上通过 | P4 |
 | **P6** | 实机：单机双端 → 跨机多口 | 探测完成、超时、关闭移交与日志一致 | 硬件＋池化侧 provider |
 
-**实现状态（2026-11-16）**：P1–P5 已落地；**v1.7 进一步改为本侧自建资源**：`StandaloneProbeResourceProvider::discover()` 枚举物理口、过滤 bond（有 bonding 时使用剩余非 bonding 设备）、支持 `probe/device_filter`，每口自建 probe Context/JFC/Jetty/源页；transport 以发现出的 probe Context 构造远端 directory。测试模式 `probe/test/*` 已实现（periodic_all / interval_ms / apply_health）。剩余：bootstrap 线上字段（描述符交换）、`probe/rc_fallback`、未决资源 Unproven 语义的完整回写。**P6 的对端获取按路线 B 落地，详见《tent-ub-probe-peer-bootstrap-design》**（每节点 `GetProbeBootstrap` + `peer_segments`）。注意：本机默认构建 `TENT_HAS_REAL_URMA=OFF`；RM 原生路径已用仓库内 vendored UMDK 头文件（`build/_deps/urma-src`）以 `-DTENT_HAS_REAL_URMA=1` 完成对象级编译，仍需 real liburma 链接构建与实机验证。
+**实现状态（2026-11-16）**：P1–P5 已落地；**v1.7 进一步改为本侧自建资源**：`StandaloneProbeResourceProvider::discover()` 枚举物理口、过滤 bond（有 bonding 时使用剩余非 bonding 设备）、支持 `probe/device_filter`，每口自建 probe Context/JFC/Jetty/源页；transport 以发现出的 probe Context 构造远端 directory。测试模式 `probe/test/*` 已实现（periodic_all / interval_ms / apply_health）。路线 B 已落地：每节点 `ControlService::GetProbeBootstrap` 发布端点，`peer_segments` 自动构造 `ControlPlaneProbePeerSource`，area 在 lane 重建时保持稳定，provider 维护线程按 TTL 刷新 target/area/gate。B 阶段 `openRemote` 可能返回业务已打开的 peer handle，因此 source 不调用 `closeRemote`；每个配置 peer 最多一个 handle，属于有界泄漏，严格释放留给路线 C 的探测专用 SegmentID。剩余：路线 C（显式多节点 link graph、随机 token/TLS、中心 registry）、`probe/rc_fallback`、未决资源 Unproven 语义的完整回写。**P6 的对端获取按路线 B 落地，详见《tent-ub-probe-peer-bootstrap-design》**（每节点 `GetProbeBootstrap` + `peer_segments`）。注意：本机默认构建 `TENT_HAS_REAL_URMA=OFF`；RM 原生路径已用仓库内 vendored UMDK 头文件（`build/_deps/urma-src`）以 `-DTENT_HAS_REAL_URMA=1` 完成对象级编译，仍需 real liburma 链接构建与实机验证。
 
 新增代码面（预计）：
 

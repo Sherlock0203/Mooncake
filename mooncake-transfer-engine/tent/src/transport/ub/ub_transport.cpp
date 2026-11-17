@@ -1,6 +1,7 @@
 // Copyright 2026 KVCache.AI
 // SPDX-License-Identifier: Apache-2.0
 
+#include "tent/transport/ub/probe_control_plane.h"
 #include "tent/transport/ub/probe_link_manager.h"
 #include "tent/transport/ub/probe_peer_handshake.h"
 #include "tent/transport/ub/probe_poster_urma.h"
@@ -351,11 +352,6 @@ struct UbTransport::Impl {
                         "installed; inject one or set "
                         "transports/ub/probe/provider=standalone" LOC_MARK));
                 }
-                if (probe_peer_source == nullptr) {
-                    return failInstall(Status::InvalidArgument(
-                        "UB probe provider=standalone requires a peer "
-                        "descriptor source" LOC_MARK));
-                }
                 auto standalone =
                     std::make_shared<ub::StandaloneProbeResourceProvider>(
                         adapter, params.probe,
@@ -366,6 +362,55 @@ struct UbTransport::Impl {
                         });
                 auto discover = standalone->discover();
                 if (!discover.ok()) return failInstall(discover);
+                // Publish resources before any peer asks for them. The
+                // probe Jetty/area are created once here; snapshot() below
+                // reuses them.
+                auto prepare = standalone->prepareLocal();
+                if (!prepare.ok()) return failInstall(prepare);
+                standalone->setNodeIdentity(local_segment_name,
+                                            generationSeed());
+                metadata->setProbeBootstrapCallback(
+                    [provider = standalone, control = metadata.get()](
+                        const ProbeBootstrapRequest& request,
+                        ProbeBootstrapResponse& response) {
+                        auto status =
+                            provider->exportBootstrap(request, response);
+                        if (status.ok()) {
+                            auto local = control->segmentManager().getLocal();
+                            if (local) {
+                                response.rpc_server_addr =
+                                    local->rpc_server_addr;
+                            }
+                        }
+                        return status.ok() ? 0 : -1;
+                    });
+                probe_callback_installed = true;
+                if (probe_peer_source == nullptr) {
+                    if (params.probe.peer_segments.empty()) {
+                        return failInstall(Status::InvalidArgument(
+                            "UB probe provider=standalone requires "
+                            "probe/peer_segments or an injected peer "
+                            "source" LOC_MARK));
+                    }
+                    ub::ProbeLinkGraph link_graph;
+                    link_graph.peer_segments = params.probe.peer_segments;
+                    auto source =
+                        std::make_unique<ub::ControlPlaneProbePeerSource>(
+                            std::make_unique<
+                                ub::ControlClientProbeBootstrapClient>(),
+                            std::make_unique<ub::SegmentManagerAddressResolver>(
+                                &metadata->segmentManager()),
+                            std::make_unique<ub::ProviderLocalEndpointSource>(
+                                standalone.get()),
+                            std::move(link_graph), params.probe);
+                    probe_peer_source_owned = std::move(source);
+                    probe_peer_source = probe_peer_source_owned.get();
+                }
+                if (probe_peer_source == nullptr) {
+                    return failInstall(
+                        Status::InvalidArgument("UB probe provider=standalone "
+                                                "has no peer source" LOC_MARK));
+                }
                 probe_directory =
                     std::make_shared<ub::HandshakeProbePeerDirectory>(
                         adapter, standalone->contexts(), probe_peer_source);
@@ -403,12 +448,8 @@ struct UbTransport::Impl {
                     return Status::OK();
                 });
             for (const auto& supply : graph.ports) {
-                if (context_by_topology_id.find(supply.local_nic) ==
-                    context_by_topology_id.end()) {
-                    return failInstall(
-                        Status::InvalidArgument("UB probe port has no matching "
-                                                "local context" LOC_MARK));
-                }
+                // Probe ports own their Context; they do not need a business
+                // context with the same topology id.
                 // nullptr means shared mode: probe completions land on the
                 // business JFC and are routed by token namespace.
                 if (!supply.probe_jfc) continue;
@@ -487,6 +528,10 @@ struct UbTransport::Impl {
             metadata->setBootstrapUbCallback({});
             callback_installed = false;
         }
+        if (probe_callback_installed && metadata) {
+            metadata->setProbeBootstrapCallback({});
+            probe_callback_installed = false;
+        }
         // Stop interface-7 rebuilds before draining workers: a retire during
         // teardown must stay a record, not create resources that are about to
         // be destroyed.
@@ -513,6 +558,10 @@ struct UbTransport::Impl {
         // Unimport remote probe areas while the probe Contexts are still
         // alive; the self-owned provider closes them in its shutdown.
         if (probe_directory) (void)probe_directory->shutdown();
+        // The directory is already shut down; drop the source before the
+        // provider it may reference during teardown.
+        probe_peer_source_owned.reset();
+        probe_peer_source = nullptr;
         probe_provider.reset();
         probe_directory.reset();
         if (endpoints) {
@@ -716,6 +765,7 @@ struct UbTransport::Impl {
     std::shared_ptr<ub::UrmaAdapter> adapter;
     bool adapter_initialized{false};
     bool callback_installed{false};
+    bool probe_callback_installed{false};
     std::atomic<bool> installed{false};
     std::atomic<bool> shutting_down{false};
     std::atomic<uint64_t> segment_generation{generationSeed()};
@@ -737,6 +787,7 @@ struct UbTransport::Impl {
     // probe_directory is declared before probe_provider so it is destroyed
     // after the provider that borrows it.
     ub::ProbePeerDescriptorSource* probe_peer_source{nullptr};
+    std::unique_ptr<ub::ControlPlaneProbePeerSource> probe_peer_source_owned;
     std::shared_ptr<ub::HandshakeProbePeerDirectory> probe_directory;
     std::shared_ptr<ub::ProbeResourceProvider> probe_provider;
     std::shared_ptr<ub::ProbePoster> probe_poster;

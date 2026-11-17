@@ -45,6 +45,7 @@
 #include <vector>
 
 #include "tent/common/status.h"
+#include "tent/runtime/probe_bootstrap.h"
 #include "tent/transport/ub/probe_resources.h"
 #include "tent/transport/ub/urma_adapter.h"
 
@@ -71,6 +72,14 @@ class ProbePeerDirectory {
     virtual ~ProbePeerDirectory() = default;
 
     virtual Status snapshotEdges(std::vector<ProbeEdgeSupply>& edges) = 0;
+
+    // Optional periodic refresh: returns interface-7 events for edge/area/
+    // target/gate changes. The provider stamps graph_epoch/event_seq.
+    virtual Status refresh(std::vector<ProbeEvent>&) { return Status::OK(); }
+
+    // Called after the provider has delivered the refresh events. Only a
+    // successful commit makes the new cache visible.
+    virtual Status commitRefresh(bool, size_t = 0) { return Status::OK(); }
 };
 
 // Creates and owns probe-native resources independently of the business Jetty
@@ -115,6 +124,17 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
 
     // Attaches the remote descriptor source before snapshot().
     void setRemoteDirectory(ProbePeerDirectory* directory);
+
+    // Identity published through GetProbeBootstrap. The transport supplies the
+    // local segment name and a per-install epoch; the provider copies them
+    // under its own lock.
+    void setNodeIdentity(std::string node_id, uint64_t node_epoch);
+    [[nodiscard]] std::string nodeId() const;
+    [[nodiscard]] uint64_t nodeEpoch() const;
+
+    // Control-plane response for this node's currently available endpoints.
+    Status exportBootstrap(const ProbeBootstrapRequest& request,
+                           ProbeBootstrapResponse& response) const;
 
     // Interface 4: creates the local resources once and returns the full
     // graph. A second call after success is rejected; a failed call rolls back
@@ -187,6 +207,12 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
         ProbeLocalPortConfig config;
         std::string topology_name;
         std::string native_device_name;
+        std::string native_device_path;
+        uint32_t eid_index{0};
+        std::string eid;
+        uint32_t area_token{0xACFE};
+        uint32_t jetty_token{0xACFE};
+        uint64_t endpoint_generation{0};
         bool available{true};
         JfcPtr probe_jfc;
         bool owns_jfc{false};
@@ -199,6 +225,9 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
         void* area_memory{nullptr};
         size_t area_size{0};
         uint64_t area_epoch{0};
+        bool rebuilding{false};
+        bool quiesced_for_rebuild{false};
+        bool reset_for_rebuild{false};
     };
 
     struct RetireRequest {
@@ -216,8 +245,20 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
         uint64_t generation{0};
     };
 
+    struct RebuildRetry {
+        RetireRequest request;
+        uint32_t attempt{0};
+        uint64_t next_attempt_ns{0};
+    };
+
     void maintenanceLoop();
-    void processRetire(const RetireRequest& request);
+    Status processRetire(const RetireRequest& request);
+    Status performRebuild(const RetireRequest& request,
+                          std::vector<Completion>& completions);
+    void scheduleRetry(const RetireRequest& request);
+    void refreshPeerEdges();
+    Status emitRefreshEvent(ProbeEvent event);
+    Status emitEvent(ProbeEvent event);
     Status discoverLocked();
     uint32_t probeDepth(const PortState& port) const;
     Status createLocalResourcesLocked();
@@ -229,18 +270,23 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
     void rollbackPortsLocked();
     void releaseQuarantineLocked();
     void releaseRetiredPagesLocked();
-    Status buildGraphLocked(ProbeGraph& graph);
+    Status buildGraphLocked(std::vector<ProbeEdgeSupply>& edges,
+                            ProbeGraph& graph);
     ProbePortSupply makePortSupplyLocked(const PortState& port) const;
     Status rebuildPortLocked(PortState& port, uint64_t error_epoch,
                              std::vector<Completion>& completions);
-    Status emitHandleReplacedLocked(const ProbePortSupply& supply);
 
     mutable std::mutex mutex_;
+    std::mutex snapshot_mutex_;
+    std::mutex event_mutex_;
+    std::string node_id_;
+    uint64_t node_epoch_{0};
     std::thread maintenance_;
     std::mutex rebuild_mutex_;
     std::condition_variable rebuild_cv_;
     std::condition_variable rebuild_idle_cv_;
     std::deque<RetireRequest> rebuild_queue_;
+    std::map<Topology::NicID, RebuildRetry> rebuild_retries_;
     bool rebuild_stopping_{false};
     bool rebuild_active_{false};
     const std::shared_ptr<UrmaAdapter> adapter_;

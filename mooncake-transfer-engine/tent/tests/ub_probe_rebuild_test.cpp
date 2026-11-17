@@ -44,6 +44,21 @@ class StaticDirectory final : public ProbePeerDirectory {
     std::vector<ProbeEdgeSupply> edges_;
 };
 
+class FailingAvailabilitySink final : public ProbeAvailabilitySink {
+   public:
+    Status onPoolAvailabilityChange(const ProbeEvent& event) override {
+        events.push_back(event);
+        if (fail_) {
+            return Status::InternalError("injected event failure");
+        }
+        return Status::OK();
+    }
+
+    void setFail(bool fail) { fail_ = fail; }
+    bool fail_{true};
+    std::vector<ProbeEvent> events;
+};
+
 class RecordingAvailabilitySink final : public ProbeAvailabilitySink {
    public:
     Status onPoolAvailabilityChange(const ProbeEvent& event) override {
@@ -106,6 +121,15 @@ TEST(UbProbeRebuildTest, RebuildsLaneAndEmitsHandleReplaced) {
     ASSERT_EQ(provider.portViews().size(), 1U);
     const uint32_t old_jetty_id = provider.portViews()[0].native_jetty_id;
     const uint64_t old_generation = provider.portViews()[0].generation;
+    const std::string area_descriptor_before =
+        provider.localAreaViews()[0].descriptor.hex;
+    provider.setNodeIdentity("node-a", 7);
+    ProbeBootstrapResponse before_rebuild;
+    ASSERT_TRUE(
+        provider.exportBootstrap(ProbeBootstrapRequest{}, before_rebuild).ok());
+    ASSERT_EQ(before_rebuild.endpoints.size(), 1U);
+    EXPECT_EQ(before_rebuild.endpoints[0].target_epoch, old_generation);
+    EXPECT_EQ(before_rebuild.endpoints[0].area_epoch, old_generation);
 
     RecordingAvailabilitySink sink;
     provider.setAvailabilitySink(&sink);
@@ -127,10 +151,14 @@ TEST(UbProbeRebuildTest, RebuildsLaneAndEmitsHandleReplaced) {
     EXPECT_NE(provider.portViews()[0].native_jetty_id, old_jetty_id);
     EXPECT_EQ(fixture.adapter->liveJettyCount(), 1U);
     EXPECT_EQ(fixture.adapter->liveJfcCount(), 1U);
-    // Current source+area pages plus the retired generation's two pages.
-    EXPECT_EQ(fixture.adapter->liveLocalSegmentCount(), 4U);
-    EXPECT_EQ(provider.retiredPageCount(), 2U);
-    EXPECT_EQ(provider.localAreaViews()[0].epoch, old_generation + 1);
+    // Current source+area pages plus the retired source page. The area page
+    // is stable across a send-lane rebuild, so only one page is retired.
+    EXPECT_EQ(fixture.adapter->liveLocalSegmentCount(), 3U);
+    EXPECT_EQ(provider.retiredPageCount(), 1U);
+    EXPECT_EQ(provider.localAreaViews()[0].epoch, old_generation);
+    EXPECT_EQ(provider.localAreaViews()[0].descriptor.hex,
+              area_descriptor_before);
+    EXPECT_GT(provider.localAreaViews()[0].length, 1U);
 
     ASSERT_EQ(completions.size(), 1U);
     EXPECT_EQ(completions[0].token, token);
@@ -166,8 +194,37 @@ TEST(UbProbeRebuildTest, RebuildsLaneAndEmitsHandleReplaced) {
     handoff.area = graph.edges[0].area_segment;
     provider.handoffUnproven(handoff);
     EXPECT_EQ(provider.quarantineCount(), 1U);
-    EXPECT_EQ(provider.retiredPageCount(), 2U);
-    EXPECT_EQ(fixture.adapter->liveLocalSegmentCount(), 4U);
+    EXPECT_EQ(provider.retiredPageCount(), 1U);
+    EXPECT_EQ(fixture.adapter->liveLocalSegmentCount(), 3U);
+
+    provider.setNodeIdentity("node-a", 7);
+    EXPECT_EQ(provider.nodeId(), "node-a");
+    EXPECT_EQ(provider.nodeEpoch(), 7U);
+    ProbeBootstrapRequest request;
+    ProbeBootstrapResponse response;
+    ASSERT_TRUE(provider.exportBootstrap(request, response).ok());
+    EXPECT_EQ(response.node_id, "node-a");
+    EXPECT_EQ(response.node_epoch, 7U);
+    ASSERT_EQ(response.endpoints.size(), 1U);
+    EXPECT_EQ(response.endpoints[0].key.native_device_name, "fake0");
+    EXPECT_EQ(response.endpoints[0].local_nic, 0);
+    EXPECT_EQ(response.endpoints[0].target_epoch,
+              provider.portViews()[0].generation);
+    EXPECT_EQ(response.endpoints[0].probe_jetty.id,
+              provider.portViews()[0].native_jetty_id);
+    EXPECT_EQ(response.endpoints[0].area.hex,
+              provider.localAreaViews()[0].descriptor.hex);
+    request.known_node_epoch = 7;
+    ProbeBootstrapResponse again;
+    ASSERT_TRUE(provider.exportBootstrap(request, again).ok());
+    // node_epoch does not change across a lane rebuild, so the response must
+    // still carry the new target_epoch instead of declaring "unchanged".
+    EXPECT_FALSE(again.unchanged);
+    ASSERT_EQ(again.endpoints.size(), 1U);
+    EXPECT_EQ(again.endpoints[0].target_epoch,
+              provider.portViews()[0].generation);
+    EXPECT_EQ(again.endpoints[0].area_epoch,
+              provider.localAreaViews()[0].epoch);
 
     ASSERT_TRUE(provider.shutdown().ok());
     EXPECT_EQ(provider.quarantineCount(), 0U);
@@ -199,20 +256,51 @@ TEST(UbProbeRebuildTest, RetriesAfterQuiesceFailure) {
     provider.retireProbeLane(LaneKey{0, old_jetty_id, 1}, old_generation, 7,
                              graph.edges[0].version,
                              Status::InternalError("first attempt"));
-    ASSERT_TRUE(provider.waitForRebuilds(2000));
-    EXPECT_EQ(provider.portViews()[0].generation, old_generation);
-    EXPECT_TRUE(sink.events.empty());
-    EXPECT_EQ(fixture.adapter->liveJettyCount(), 1U);
-    EXPECT_EQ(provider.retiredPageCount(), 0U);
-
-    provider.retireProbeLane(LaneKey{0, old_jetty_id, 1}, old_generation, 7,
-                             graph.edges[0].version,
-                             Status::InternalError("retry"));
-    ASSERT_TRUE(provider.waitForRebuilds(2000));
+    // waitForRebuilds includes the retry queue: the transient quiesce failure
+    // is retried and eventually succeeds.
+    ASSERT_TRUE(provider.waitForRebuilds(3000));
     EXPECT_EQ(provider.portViews()[0].generation, old_generation + 1);
     ASSERT_EQ(sink.events.size(), 1U);
     EXPECT_EQ(fixture.adapter->liveJettyCount(), 1U);
-    EXPECT_EQ(provider.retiredPageCount(), 2U);
+    EXPECT_EQ(provider.retiredPageCount(), 1U);
+
+    ASSERT_TRUE(provider.shutdown().ok());
+    EXPECT_TRUE(fixture.adapter->closeContext(fixture.context).ok());
+    EXPECT_TRUE(fixture.adapter->shutdown().ok());
+}
+
+TEST(UbProbeRebuildTest, EventFailureDoesNotAdvanceGenerationAndRetries) {
+    Fixture fixture;
+    ASSERT_TRUE(fixture.initialize());
+    StandaloneProbeResourceProvider provider(
+        fixture.adapter, makeProbeParams(),
+        {ProbeLocalPortConfig{0, fixture.context, nullptr, 1}},
+        &fixture.directory);
+    ProbeGraph graph;
+    ASSERT_TRUE(provider.snapshot(graph).ok());
+    const uint32_t old_jetty_id = provider.portViews()[0].native_jetty_id;
+    const uint64_t old_generation = provider.portViews()[0].generation;
+
+    FailingAvailabilitySink sink;
+    provider.setAvailabilitySink(&sink);
+    provider.setCompletionSink([](const Completion&) { return Status::OK(); });
+
+    provider.retireProbeLane(LaneKey{0, old_jetty_id, 1}, old_generation, 7,
+                             graph.edges[0].version,
+                             Status::InternalError("injected lane error"));
+    // The first event delivery fails; retries keep running and the generation
+    // must not move until an event is accepted.
+    EXPECT_FALSE(provider.waitForRebuilds(300));
+    EXPECT_EQ(provider.portViews()[0].generation, old_generation);
+    EXPECT_EQ(provider.portViews()[0].native_jetty_id, old_jetty_id);
+    EXPECT_EQ(fixture.adapter->liveJettyCount(), 1U);
+    EXPECT_EQ(provider.retiredPageCount(), 0U);
+
+    sink.setFail(false);
+    ASSERT_TRUE(provider.waitForRebuilds(3000));
+    EXPECT_EQ(provider.portViews()[0].generation, old_generation + 1);
+    EXPECT_EQ(fixture.adapter->liveJettyCount(), 1U);
+    EXPECT_EQ(provider.retiredPageCount(), 1U);
 
     ASSERT_TRUE(provider.shutdown().ok());
     EXPECT_TRUE(fixture.adapter->closeContext(fixture.context).ok());
