@@ -112,6 +112,8 @@ class RailMonitor {
                        uint64_t latency_ns, uint64_t now_ns = 0);
     void recordError(const UbPostPath& path, uint64_t now_ns = 0);
     void recordTimeout(const UbPostPath& path, uint64_t now_ns = 0);
+    // Immediately removes a provider-reported failed path for one cooldown.
+    void quarantine(const UbPostPath& path, uint64_t now_ns = 0);
     // Records at most one rebuild for each endpoint generation on a physical
     // rail. The first generation observed on a rail establishes the baseline
     // and is not itself a rebuild, so a freshly bootstrapped endpoint does not

@@ -378,6 +378,10 @@ enum class CompletionCategory : uint8_t {
     SUCCESS,
     LOCAL_DEVICE_ERROR,
     REMOTE_PATH_ERROR,
+    // The provider reports a local access failure against the active native
+    // path. Treat it as a rail fault so the scheduler can quarantine and
+    // retry on another physical path.
+    LOCAL_ACCESS_ERROR,
     ENDPOINT_ERROR,
     MEMORY_ERROR,
     TIMEOUT,

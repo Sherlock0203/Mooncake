@@ -425,8 +425,24 @@ class FakeUrmaAdapter final : public UrmaAdapter {
                                             std::memory_order_release);
                 rm_post_calls_.fetch_add(1, std::memory_order_relaxed);
             }
-            const auto category = next_completion_.exchange(
-                CompletionCategory::SUCCESS, std::memory_order_acq_rel);
+            CompletionCategory category = CompletionCategory::SUCCESS;
+            int remaining_failures =
+                fail_completions_.load(std::memory_order_acquire);
+            bool failure_injected = false;
+            while (remaining_failures > 0) {
+                if (fail_completions_.compare_exchange_weak(
+                        remaining_failures, remaining_failures - 1,
+                        std::memory_order_acq_rel, std::memory_order_acquire)) {
+                    category = fail_completions_category_.load(
+                        std::memory_order_acquire);
+                    failure_injected = true;
+                    break;
+                }
+            }
+            if (!failure_injected) {
+                category = next_completion_.exchange(
+                    CompletionCategory::SUCCESS, std::memory_order_acq_rel);
+            }
             if (hold_next_completion_.exchange(false,
                                                std::memory_order_acq_rel)) {
                 std::lock_guard<std::mutex> lock(pending_mutex_);
@@ -468,6 +484,13 @@ class FakeUrmaAdapter final : public UrmaAdapter {
 
     void failNextCompletion(CompletionCategory category) {
         next_completion_.store(category, std::memory_order_release);
+    }
+    // Injects the same failure category into the next `count` posted WRs,
+    // modeling several rails hitting a partially failed physical port before
+    // selection converges on a healthy path.
+    void failNextCompletions(int count, CompletionCategory category) {
+        fail_completions_category_.store(category, std::memory_order_release);
+        fail_completions_.store(count, std::memory_order_release);
     }
     // Reject the next post before accepting any WR: posted_count stays zero,
     // which exercises the synchronous rollback path.
@@ -551,6 +574,9 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     bool initialized_{false};
     uint32_t next_jetty_id_{1};
     std::atomic<CompletionCategory> next_completion_{
+        CompletionCategory::SUCCESS};
+    std::atomic<int> fail_completions_{0};
+    std::atomic<CompletionCategory> fail_completions_category_{
         CompletionCategory::SUCCESS};
     std::atomic<bool> hold_next_completion_{false};
     std::atomic<bool> fail_next_post_{false};
@@ -689,6 +715,22 @@ void setDeviceIdentity(Config& config, const DeviceInfo& device,
 
 void setPhysicalOnlyIdentity(Config& config, const DeviceInfo& device) {
     setDeviceIdentity(config, device, "physical");
+}
+
+void setPhysicalOnlyIdentities(Config& config,
+                               const std::vector<DeviceInfo>& devices) {
+    nlohmann::json array = nlohmann::json::array();
+    for (const auto& device : devices) {
+        array.push_back({{"native_device_name", device.native_device_name},
+                         {"native_device_path", device.native_device_path},
+                         {"eid_index", device.eid_index},
+                         {"eid", device.eid},
+                         {"kind", "physical"},
+                         {"transport_modes",
+                          device.capabilities.transport_modes}});
+    }
+    config.set("transports/ub/physical_only", true);
+    config.set("transports/ub/device_identities", array);
 }
 
 // Two UB NICs (device ids 0 and 1) both reachable from the wildcard memory
@@ -1629,6 +1671,16 @@ JettyOptions rmJettyOptions() {
 
 DeviceInfo rmCapableDevice() {
     auto device = fakeDevice();
+    device.capabilities.transport_modes = 3;  // RC|RM
+    device.kind = DeviceKind::PHYSICAL;
+    device.capabilities.rm_tp_cap = kUrmaTpTypeCtpMask;
+    device.capabilities.priority_tp_type_masks[kUrmaMaxPriority] =
+        kUrmaTpTypeCtpMask;
+    return device;
+}
+
+DeviceInfo rmCapableSecondaryDevice() {
+    auto device = fakeSecondaryDevice();
     device.capabilities.transport_modes = 3;  // RC|RM
     device.kind = DeviceKind::PHYSICAL;
     device.capabilities.rm_tp_cap = kUrmaTpTypeCtpMask;
@@ -2875,8 +2927,14 @@ TEST(UbRmPoolTest, TransportRunsSelfReadWriteThroughPooledSendPool) {
 // created member.
 TEST(UbRmPoolTest, PooledMemberRetiresAfterCqeError) {
     auto device = rmCapableDevice();
-    auto adapter = std::make_shared<FakeUrmaAdapter>(device);
-    auto topology = fakeTopology(false);
+    auto second_device = rmCapableDevice();
+    second_device.topology_name = "ub:fake1:eid0";
+    second_device.native_device_name = "fake1";
+    second_device.native_device_path = "/fake/fake1";
+    second_device.eid = "0002:0000:0000:0000:0000:0000:0000:0000";
+    auto adapter = std::make_shared<FakeUrmaAdapter>(
+        std::vector<DeviceInfo>{device, second_device});
+    auto topology = fakeTwoDeviceTopology();
     auto control = std::make_shared<ControlService>("p2p", "", nullptr);
     uint16_t port = 0;
     ASSERT_TRUE(control->start(port).ok());
@@ -2913,6 +2971,16 @@ TEST(UbRmPoolTest, PooledMemberRetiresAfterCqeError) {
     config->set("transports/ub/send_pool/desired_per_context", 1);
     config->set("transports/ub/probe/enabled", true);
     setPhysicalOnlyIdentity(*config, device);
+    auto identities = config->get<nlohmann::json>(
+        "transports/ub/device_identities", nlohmann::json::array());
+    identities.push_back(nlohmann::json{
+        {"native_device_name", second_device.native_device_name},
+        {"native_device_path", second_device.native_device_path},
+        {"eid_index", second_device.eid_index},
+        {"eid", second_device.eid},
+        {"kind", "physical"},
+        {"transport_modes", second_device.capabilities.transport_modes}});
+    config->set("transports/ub/device_identities", identities);
 
     UbTransport transport(adapter);
     std::string mutable_segment_name = segment_name;
@@ -2953,9 +3021,10 @@ TEST(UbRmPoolTest, PooledMemberRetiresAfterCqeError) {
     request.target_id = LOCAL_SEGMENT_ID;
     request.target_offset = reinterpret_cast<uint64_t>(target.data());
     request.length = source.size();
-    // The first attempt completes with a real error CQE; the retry (one
-    // allowed) must run on a replacement member and succeed.
-    adapter->failNextCompletion(CompletionCategory::REMOTE_PATH_ERROR);
+    // A local access error quarantines the first rail. The bounded retry must
+    // select the healthy second rail and succeed after retiring the bad
+    // pooled member.
+    adapter->failNextCompletion(CompletionCategory::LOCAL_ACCESS_ERROR);
     ASSERT_TRUE(transport.submitTransferTasks(batch, {request}).ok());
 
     TransferStatus transfer{PENDING, 0};
@@ -2989,6 +3058,292 @@ TEST(UbRmPoolTest, PooledMemberRetiresAfterCqeError) {
     ASSERT_TRUE(transport.freeSubBatch(batch).ok());
     EXPECT_TRUE(transport.uninstall().ok());
     EXPECT_EQ(adapter->deleteJettyCalls(), adapter->createJettyCalls());
+}
+
+std::shared_ptr<FakeUrmaAdapter> makeTwoDeviceRmAdapter() {
+    return std::make_shared<FakeUrmaAdapter>(
+        std::vector<DeviceInfo>{rmCapableDevice(), rmCapableSecondaryDevice()});
+}
+
+// Installs the pooled RM runtime over two physical ports so a slice has one
+// rail per local x remote port combination. Partial-port-failure scenarios
+// share this setup and only tune the slice retry budget.
+bool installTwoDeviceRmPool(UbTransport& transport,
+                            const std::shared_ptr<FakeUrmaAdapter>& adapter,
+                            const std::shared_ptr<ControlService>& control,
+                            uint32_t max_retries) {
+    auto topology = fakeTwoDeviceTopology();
+    uint16_t port = 0;
+    if (!control->start(port).ok()) return false;
+    const std::string segment_name =
+        "127.0.0.1:" + std::to_string(static_cast<unsigned>(port));
+    if (!control->segmentManager()
+             .updateLocal([&](SegmentDesc& segment) {
+                 segment.name = segment_name;
+                 segment.rpc_server_addr = segment_name;
+                 segment.machine_id = "fake-machine";
+                 segment.type = SegmentType::Memory;
+                 segment.detail = MemorySegmentDesc{};
+                 std::get<MemorySegmentDesc>(segment.detail).topology =
+                     *topology;
+                 return Status::OK();
+             })
+             .ok()) {
+        return false;
+    }
+    auto config = std::make_shared<Config>();
+    config->set("transports/ub/enable", true);
+    config->set("transports/ub/runtime_profile", "rm_pool");
+    config->set("transports/ub/trans_mode", "rm");
+    config->set("transports/ub/worker_count", 1);
+    config->set("transports/ub/poller_count", 1);
+    config->set("transports/ub/jfc_per_context", 1);
+    config->set("transports/ub/jetty_per_endpoint", 1);
+    config->set("transports/ub/max_endpoints", 16);
+    config->set("transports/ub/slice_size", 16);
+    config->set("transports/ub/max_slices_per_task", 4);
+    config->set("transports/ub/max_retries", max_retries);
+    config->set("transports/ub/slice_timeout_ms", 1000);
+    config->set("transports/ub/endpoint_cooldown_ms", 100);
+    config->set("transports/ub/jetty_pool/enable", true);
+    config->set("transports/ub/send_pool/desired_per_context", 1);
+    config->set("transports/ub/probe/enabled", true);
+    setPhysicalOnlyIdentities(*config,
+                              {rmCapableDevice(), rmCapableSecondaryDevice()});
+    std::string mutable_segment_name = segment_name;
+    return transport.install(mutable_segment_name, control, topology, config)
+        .ok();
+}
+
+template <size_t N>
+bool registerSourceTargetBuffers(UbTransport& transport,
+                                 const std::shared_ptr<ControlService>& control,
+                                 std::array<char, N>& source,
+                                 std::array<char, N>& target) {
+    BufferDesc source_desc{};
+    source_desc.addr = reinterpret_cast<uint64_t>(source.data());
+    source_desc.length = source.size();
+    source_desc.location = kWildcardLocation;
+    BufferDesc target_desc{};
+    target_desc.addr = reinterpret_cast<uint64_t>(target.data());
+    target_desc.length = target.size();
+    target_desc.location = kWildcardLocation;
+    MemoryOptions options;
+    options.perm = kGlobalReadWrite;
+    std::vector<BufferDesc> descriptors{source_desc, target_desc};
+    if (!transport.addMemoryBuffer(descriptors, options).ok()) return false;
+    return control->segmentManager()
+        .updateLocal([&](SegmentDesc& segment) {
+            std::get<MemorySegmentDesc>(segment.detail).buffers = descriptors;
+            return Status::OK();
+        })
+        .ok();
+}
+
+TransferStatus pollUntilSettled(UbTransport& transport,
+                                Transport::SubBatchRef batch, size_t index) {
+    TransferStatus transfer{PENDING, 0};
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (transfer.s == PENDING &&
+           std::chrono::steady_clock::now() < deadline) {
+        if (!transport.getTransferStatus(batch, index, transfer).ok()) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return transfer;
+}
+
+// Partial physical-port failure (single port): the first attempt rides a rail
+// whose port reports URMA_CR_LOC_ACCESS_ERR. The errored rail must be
+// quarantined immediately and the slice must retry on a healthy port instead
+// of failing the whole verification flow.
+TEST(UbRmPoolTest, SinglePortFailureQuarantinesRailAndCompletesOnRetry) {
+    auto adapter = makeTwoDeviceRmAdapter();
+    auto control = std::make_shared<ControlService>("p2p", "", nullptr);
+    UbTransport transport(adapter);
+    ASSERT_TRUE(installTwoDeviceRmPool(transport, adapter, control, 1));
+
+    std::array<char, 16> source{};
+    std::array<char, 16> target{};
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>(77 - i);
+    }
+    ASSERT_TRUE(registerSourceTargetBuffers(transport, control, source,
+                                            target));
+
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = source.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(target.data());
+    request.length = source.size();
+    adapter->failNextCompletion(CompletionCategory::LOCAL_ACCESS_ERROR);
+    ASSERT_TRUE(transport.submitTransferTasks(batch, {request}).ok());
+
+    const auto transfer = pollUntilSettled(transport, batch, 0);
+    EXPECT_EQ(transfer.s, COMPLETED)
+        << "a single failed physical port must not fail the transfer";
+    EXPECT_EQ(source, target);
+    EXPECT_GE(adapter->quiesceCalls(), 1U)
+        << "the errored rail must be flush-fenced before retirement";
+
+    ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+    EXPECT_TRUE(transport.uninstall().ok());
+}
+
+// Partial physical-port failure (multiple ports): the first two attempts hit
+// distinct failed rails. Each error quarantines its rail and path selection
+// must converge on a healthy rail within the retry budget.
+TEST(UbRmPoolTest, MultiplePartialPortFailuresStillComplete) {
+    auto adapter = makeTwoDeviceRmAdapter();
+    auto control = std::make_shared<ControlService>("p2p", "", nullptr);
+    UbTransport transport(adapter);
+    ASSERT_TRUE(installTwoDeviceRmPool(transport, adapter, control, 4));
+
+    std::array<char, 16> source{};
+    std::array<char, 16> target{};
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>(55 - i);
+    }
+    ASSERT_TRUE(registerSourceTargetBuffers(transport, control, source,
+                                            target));
+
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = source.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(target.data());
+    request.length = source.size();
+    adapter->failNextCompletions(2, CompletionCategory::LOCAL_ACCESS_ERROR);
+    ASSERT_TRUE(transport.submitTransferTasks(batch, {request}).ok());
+
+    const auto transfer = pollUntilSettled(transport, batch, 0);
+    EXPECT_EQ(transfer.s, COMPLETED)
+        << "partial multi-port failures must be isolated per rail and the "
+           "slice must complete on the remaining healthy rail";
+    EXPECT_EQ(source, target);
+    EXPECT_GE(adapter->quiesceCalls(), 2U)
+        << "every errored rail must be fenced before its member retires";
+
+    ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+    EXPECT_TRUE(transport.uninstall().ok());
+}
+
+// All-healthy baseline over two physical ports: no injected failures, the
+// transfer completes and the data lands intact.
+TEST(UbRmPoolTest, AllHealthyTwoDevicePortsCompleteBaseline) {
+    auto adapter = makeTwoDeviceRmAdapter();
+    auto control = std::make_shared<ControlService>("p2p", "", nullptr);
+    UbTransport transport(adapter);
+    ASSERT_TRUE(installTwoDeviceRmPool(transport, adapter, control, 1));
+
+    std::array<char, 64> source{};
+    std::array<char, 64> target{};
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>(100 - i);
+    }
+    ASSERT_TRUE(registerSourceTargetBuffers(transport, control, source,
+                                            target));
+
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = source.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(target.data());
+    request.length = source.size();
+    ASSERT_TRUE(transport.submitTransferTasks(batch, {request}).ok());
+
+    const auto transfer = pollUntilSettled(transport, batch, 0);
+    EXPECT_EQ(transfer.s, COMPLETED);
+    EXPECT_EQ(transfer.transferred_bytes, source.size());
+    EXPECT_EQ(source, target);
+
+    ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+    EXPECT_TRUE(transport.uninstall().ok());
+}
+
+// Classification regression guard: a pure memory error (the URMA_CR_LOC_LEN_ERR
+// class) stays terminal. Only the local-access class may quarantine its rail
+// and reroute; memory corruption must never be replayed onto another rail.
+TEST(UbRmPoolTest, MemoryErrorCompletionRemainsTerminal) {
+    auto device = rmCapableDevice();
+    auto adapter = std::make_shared<FakeUrmaAdapter>(device);
+    auto topology = fakeTopology(false);
+    auto control = std::make_shared<ControlService>("p2p", "", nullptr);
+    uint16_t port = 0;
+    ASSERT_TRUE(control->start(port).ok());
+    const std::string segment_name =
+        "127.0.0.1:" + std::to_string(static_cast<unsigned>(port));
+    ASSERT_TRUE(control->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        segment.name = segment_name;
+                        segment.rpc_server_addr = segment_name;
+                        segment.machine_id = "fake-machine";
+                        segment.type = SegmentType::Memory;
+                        segment.detail = MemorySegmentDesc{};
+                        std::get<MemorySegmentDesc>(segment.detail).topology =
+                            *topology;
+                        return Status::OK();
+                    })
+                    .ok());
+
+    auto config = std::make_shared<Config>();
+    config->set("transports/ub/enable", true);
+    config->set("transports/ub/runtime_profile", "rm_pool");
+    config->set("transports/ub/trans_mode", "rm");
+    config->set("transports/ub/worker_count", 1);
+    config->set("transports/ub/poller_count", 1);
+    config->set("transports/ub/jfc_per_context", 1);
+    config->set("transports/ub/jetty_per_endpoint", 1);
+    config->set("transports/ub/max_endpoints", 16);
+    config->set("transports/ub/slice_size", 16);
+    config->set("transports/ub/max_slices_per_task", 4);
+    config->set("transports/ub/max_retries", 2);
+    config->set("transports/ub/slice_timeout_ms", 1000);
+    config->set("transports/ub/endpoint_cooldown_ms", 100);
+    config->set("transports/ub/jetty_pool/enable", true);
+    config->set("transports/ub/send_pool/desired_per_context", 1);
+    config->set("transports/ub/probe/enabled", true);
+    setPhysicalOnlyIdentity(*config, device);
+
+    UbTransport transport(adapter);
+    std::string mutable_segment_name = segment_name;
+    const auto install_status =
+        transport.install(mutable_segment_name, control, topology, config);
+    ASSERT_TRUE(install_status.ok()) << install_status.ToString();
+
+    std::array<char, 16> source{};
+    std::array<char, 16> target{};
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>(33 - i);
+    }
+    ASSERT_TRUE(registerSourceTargetBuffers(transport, control, source,
+                                            target));
+
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = source.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(target.data());
+    request.length = source.size();
+    adapter->failNextCompletion(CompletionCategory::MEMORY_ERROR);
+    ASSERT_TRUE(transport.submitTransferTasks(batch, {request}).ok());
+
+    const auto transfer = pollUntilSettled(transport, batch, 0);
+    EXPECT_EQ(transfer.s, FAILED)
+        << "a memory error must stay terminal and never reroute";
+    EXPECT_EQ(transfer.transferred_bytes, 0U);
+
+    ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+    EXPECT_TRUE(transport.uninstall().ok());
 }
 
 // P2 refill executor: a known PoolKey is topped back up to desired_serving

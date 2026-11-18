@@ -183,6 +183,8 @@ Status collectLocalDeviceIdentities(const std::vector<DeviceInfo>& discovered,
             device.native_device_path.empty() || device.eid.empty()) {
             continue;
         }
+        // Do not persist an EID whose backing physical port is currently down.
+        if (!device.active) continue;
         // physical-only RM installs must not import bonding/aggregated
         // virtual devices; injecting them as physical identities 
         // pollutes physical-only device selection.

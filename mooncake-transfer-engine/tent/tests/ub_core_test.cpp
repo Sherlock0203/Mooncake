@@ -791,6 +791,35 @@ TEST(UbRailMonitorTest, PausesOnErrorWindowAndRecoversAfterCooldown) {
     EXPECT_DOUBLE_EQ(monitor.aggregateBandwidth(160), 10'000'000'000.0);
 }
 
+TEST(UbRailMonitorTest, QuarantineImmediatelyRemovesPathFromSelection) {
+    RailMonitor monitor(RailMonitorConfig{/*error_threshold=*/3,
+                                          /*error_window_ns=*/1000,
+                                          /*cooldown_ns=*/50,
+                                          /*ewma_alpha=*/0.5});
+    const auto path = makePath();
+    const auto alternate = makePath(/*local_id=*/1, /*remote_id=*/1);
+    monitor.quarantine(path, 100);
+    EXPECT_FALSE(monitor.available(path, 149));
+    EXPECT_TRUE(monitor.available(alternate, 149));
+    EXPECT_TRUE(monitor.available(path, 150));
+    EXPECT_EQ(monitor.stats(path, 150).recoveries, 1U);
+}
+
+TEST(UbRailMonitorTest, MultipleFailedPathsLeaveHealthyCandidateSelectable) {
+    RailMonitor monitor(RailMonitorConfig{/*error_threshold=*/3,
+                                          /*error_window_ns=*/1000,
+                                          /*cooldown_ns=*/50,
+                                          /*ewma_alpha=*/0.5});
+    const auto failed_local = makePath(/*local_id=*/0, /*remote_id=*/0);
+    const auto failed_remote = makePath(/*local_id=*/1, /*remote_id=*/0);
+    const auto healthy = makePath(/*local_id=*/1, /*remote_id=*/1);
+    monitor.quarantine(failed_local, 100);
+    monitor.quarantine(failed_remote, 100);
+    EXPECT_FALSE(monitor.available(failed_local, 120));
+    EXPECT_FALSE(monitor.available(failed_remote, 120));
+    EXPECT_TRUE(monitor.available(healthy, 120));
+}
+
 TEST(UbRailMonitorTest, ErrorsOutsideWindowDoNotPauseRail) {
     RailMonitor monitor(RailMonitorConfig{/*error_threshold=*/2,
                                           /*error_window_ns=*/10,
@@ -1004,6 +1033,34 @@ TEST(UbDeviceSelectionTest, TrustedKindOverridesLegacyNameHeuristic) {
     EXPECT_FALSE(isBondingDevice(selected[0]));
     EXPECT_TRUE(isBondingDevice(devices[1]));
     EXPECT_EQ(devices[0].kind_source, DeviceKindSource::EXPLICIT_CONFIG);
+}
+
+TEST(UbDeviceSelectionTest, PhysicalOnlyExcludesInactivePorts) {
+    auto active = makeDevice("ub0");
+    auto inactive = makeDevice("ub1");
+    inactive.active = false;
+    auto another_inactive = makeDevice("ub2");
+    another_inactive.active = false;
+    const std::vector<DeviceIdentity> identities = {
+        makeIdentity(active, DeviceKind::PHYSICAL),
+        makeIdentity(inactive, DeviceKind::PHYSICAL),
+        makeIdentity(another_inactive, DeviceKind::PHYSICAL)};
+    std::vector<DeviceInfo> devices = {active, inactive, another_inactive};
+    ASSERT_TRUE(resolveDeviceKindIdentities(identities, devices).ok());
+    const auto selected = physicalDevices(devices);
+    ASSERT_EQ(selected.size(), 1U);
+    EXPECT_EQ(selected.front().native_device_name, "ub0");
+}
+
+TEST(UbDeviceSelectionTest, AllHealthyPhysicalPortsRemainSelectable) {
+    auto first = makeDevice("ub0");
+    auto second = makeDevice("ub1");
+    const std::vector<DeviceIdentity> identities = {
+        makeIdentity(first, DeviceKind::PHYSICAL),
+        makeIdentity(second, DeviceKind::PHYSICAL)};
+    std::vector<DeviceInfo> devices = {first, second};
+    ASSERT_TRUE(resolveDeviceKindIdentities(identities, devices).ok());
+    EXPECT_EQ(physicalDevices(devices).size(), 2U);
 }
 
 TEST(UbDeviceSelectionTest, TrustedIdentityRejectsStalePathAndCapabilities) {

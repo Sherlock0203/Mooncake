@@ -143,7 +143,7 @@ inline std::vector<DeviceInfo> physicalDevices(
     std::vector<DeviceInfo> selected;
     for (const auto& device : devices) {
         if (device.kind == DeviceKind::PHYSICAL &&
-            device.kind_source != DeviceKindSource::NONE) {
+            device.kind_source != DeviceKindSource::NONE && device.active) {
             selected.push_back(device);
         }
     }

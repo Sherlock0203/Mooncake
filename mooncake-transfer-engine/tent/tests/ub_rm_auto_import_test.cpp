@@ -516,6 +516,22 @@ TEST(UbAutoImportTest, CollectSkipsIncompleteAndFailsClosedWhenNone) {
     EXPECT_EQ(identities.front().eid, complete.eid);
 }
 
+TEST(UbAutoImportTest, CollectSkipsInactiveAndKeepsLiveEid) {
+    auto inactive = rmCapableDevice();
+    inactive.eid_index = 0;
+    inactive.active = false;
+    auto active = rmCapableDevice();
+    active.eid_index = 1;
+    active.eid = "fe80::0002";
+    active.active = true;
+    std::vector<DeviceIdentity> identities;
+    ASSERT_TRUE(collectLocalDeviceIdentities({inactive, active}, identities)
+                    .ok());
+    ASSERT_EQ(identities.size(), 1U);
+    EXPECT_EQ(identities.front().eid_index, 1U);
+    EXPECT_EQ(identities.front().eid, active.eid);
+}
+
 TEST(UbAutoImportTest, DeviceIdentitiesToJsonMatchesManualSchema) {
     const auto device = rmCapableDevice();
     std::vector<DeviceIdentity> identities;

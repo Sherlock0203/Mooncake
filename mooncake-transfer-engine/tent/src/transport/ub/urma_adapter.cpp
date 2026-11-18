@@ -1057,9 +1057,10 @@ CompletionCategory classifyCompletion(int status) {
         case URMA_CR_LOC_OPERATION_ERR:
             return CompletionCategory::LOCAL_DEVICE_ERROR;
         case URMA_CR_LOC_LEN_ERR:
-        case URMA_CR_LOC_ACCESS_ERR:
         case URMA_CR_LOC_DATA_POISON:
             return CompletionCategory::MEMORY_ERROR;
+        case URMA_CR_LOC_ACCESS_ERR:
+            return CompletionCategory::LOCAL_ACCESS_ERROR;
         case URMA_CR_REM_RESP_LEN_ERR:
         case URMA_CR_REM_UNSUPPORTED_REQ_ERR:
         case URMA_CR_REM_OPERATION_ERR:

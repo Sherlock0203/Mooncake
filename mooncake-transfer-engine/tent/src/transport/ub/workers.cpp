@@ -1217,16 +1217,26 @@ void UbWorkers::handleCompletion(const Completion& completion) {
             resolveInflight(inflight, FAILED, 0, true);
             break;
         case CompletionCategory::REMOTE_PATH_ERROR:
+        case CompletionCategory::LOCAL_ACCESS_ERROR:
         case CompletionCategory::ENDPOINT_ERROR:
+        {
             rail_monitor_->recordError(inflight->path, now);
+            if (completion.category == CompletionCategory::LOCAL_ACCESS_ERROR) {
+                rail_monitor_->quarantine(inflight->path, now);
+            }
+            const char* reason = "remote path completion error";
+            if (completion.category == CompletionCategory::ENDPOINT_ERROR) {
+                reason = "endpoint completion error";
+            } else if (completion.category ==
+                       CompletionCategory::LOCAL_ACCESS_ERROR) {
+                reason = "local access error; rail quarantined for retry";
+            }
             settlePooledAttempt(inflight, PooledSettleKind::kRealError, 0,
-                                completion.category ==
-                                        CompletionCategory::ENDPOINT_ERROR
-                                    ? "endpoint completion error"
-                                    : "remote path completion error");
+                                reason);
             if (endpoint_retirer_) endpoint_retirer_(inflight->endpoint);
             resolveInflight(inflight, FAILED, 0, true);
             break;
+        }
         case CompletionCategory::MEMORY_ERROR:
         case CompletionCategory::UNKNOWN_ERROR:
             rail_monitor_->recordError(inflight->path, now);

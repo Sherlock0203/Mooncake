@@ -287,6 +287,7 @@ struct UbTransport::Impl {
                     preferred_topology_names.end()) {
                     continue;
                 }
+                if (!device.active) continue;
                 if (!filterAllows(params.device_filter, device)) continue;
                 if (device.kind != ub::DeviceKind::PHYSICAL) {
                     return failInstall(Status::NotImplemented(
