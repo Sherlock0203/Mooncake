@@ -28,6 +28,7 @@
 #include "error.h"
 #include "transport/rdma_twosided/ctrl_channel.h"
 #include "transport/rdma_twosided/ctrl_frame.h"
+#include "transport/rdma_transport/rdma_context.h"
 
 namespace mooncake {
 
@@ -86,7 +87,14 @@ int RdmaTwoSidedTransport::onSetupCtrlChannel(const HandShakeDesc &peer_desc,
         return ERR_INVALID_ARGUMENT;
     }
     const auto &contexts = getContextList();
-    if (contexts.empty()) {
+    RdmaContext *ctrl_context = nullptr;
+    for (auto &context : contexts) {
+        if (context && context->active()) {
+            ctrl_context = context.get();
+            break;
+        }
+    }
+    if (!ctrl_context) {
         local_desc.reply_msg = "No local RDMA context for CtrlChannel";
         return ERR_DEVICE_NOT_FOUND;
     }
@@ -109,7 +117,7 @@ int RdmaTwoSidedTransport::onSetupCtrlChannel(const HandShakeDesc &peer_desc,
     if (it != ctrl_channels_.end()) old = it->second;
 
     auto channel =
-        std::make_shared<CtrlChannel>(*this, *contexts[0], peer_server_name);
+        std::make_shared<CtrlChannel>(*this, *ctrl_context, peer_server_name);
     // Publishes the placeholder; retracted automatically unless we succeed.
     ConnectScope scope(*this, peer_server_name, channel);
     int ret = 0;
@@ -128,7 +136,16 @@ std::shared_ptr<CtrlChannel> RdmaTwoSidedTransport::ensureCtrlChannel(
     if (!globalConfig().rdma_notify_enabled || contexts.empty()) {
         return nullptr;
     }
-
+    RdmaContext *ctrl_context = nullptr;
+    for (auto &context : contexts) {
+        if (context && context->active()) {
+            ctrl_context = context.get();
+            break;
+        }
+    }
+    if (!ctrl_context) {
+        return nullptr;
+    }
     // Absolute deadline for the whole call, so retries and repeated waits
     // cannot extend it. On expiry we return nullptr and the caller falls back
     // to OOB notify instead of blocking forever.
@@ -156,7 +173,7 @@ std::shared_ptr<CtrlChannel> RdmaTwoSidedTransport::ensureCtrlChannel(
                 continue;
             }
         } else if (!connect_in_flight) {
-            auto channel = std::make_shared<CtrlChannel>(*this, *contexts[0],
+            auto channel = std::make_shared<CtrlChannel>(*this, *ctrl_context,
                                                          peer_server_name);
             ConnectScope scope(*this, peer_server_name, channel);
             int ret = 0;

@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -530,6 +531,38 @@ TEST(UbTeardown, ContextShutdownRetainsContextAfterCloseFailure) {
     EXPECT_EQ(context->state(), UbContext::State::kClosed);
     EXPECT_FALSE(context->handle());
     EXPECT_EQ(adapter->live_contexts, 0);
+}
+
+TEST(UbTeardown, ContextCountsEachSliceOnceAndDrainsToZero) {
+    auto adapter = std::make_shared<FailOnceAdapter>();
+    auto context = makeActiveContext(adapter, 0);
+    // Every assertion prints both counters plus the lifecycle state, so a CI
+    // failure shows whether the WR count or the byte count drifted and whether
+    // the context was already draining.
+    const auto snapshot = [&] {
+        std::ostringstream out;
+        out << "context_state=" << static_cast<int>(context->state())
+            << " outstanding_wrs=" << context->outstandingWrs()
+            << " inflight_bytes=" << context->inflightBytes();
+        return out.str();
+    };
+
+    // One addInflight per admitted slice; one removeInflight per completion.
+    context->addInflight(64);
+    context->addInflight(128);
+    EXPECT_EQ(context->outstandingWrs(), 2U) << snapshot();
+    EXPECT_EQ(context->inflightBytes(), 192U) << snapshot();
+
+    context->removeInflight(64);
+    EXPECT_EQ(context->outstandingWrs(), 1U) << snapshot();
+    EXPECT_EQ(context->inflightBytes(), 128U) << snapshot();
+
+    context->removeInflight(128);
+    EXPECT_EQ(context->outstandingWrs(), 0U) << snapshot();
+    EXPECT_EQ(context->inflightBytes(), 0U) << snapshot();
+    EXPECT_TRUE(context->shutdown().ok())
+        << "context shutdown failed after the inflight pair drained; "
+        << snapshot();
 }
 
 TEST(UbTeardown, ContextRequiresCleanupDrainAndEveryJfcBeforeRecovery) {

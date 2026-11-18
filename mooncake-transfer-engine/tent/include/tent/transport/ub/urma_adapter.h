@@ -15,10 +15,12 @@
 #ifndef TENT_TRANSPORT_UB_URMA_ADAPTER_H_
 #define TENT_TRANSPORT_UB_URMA_ADAPTER_H_
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "tent/common/status.h"
@@ -26,6 +28,68 @@
 namespace mooncake {
 namespace tent {
 namespace ub {
+
+// URMA does not expose a provider-independent device-kind attribute. Discovery
+// therefore starts at UNKNOWN; only validated configuration or metadata may
+// attach a different kind through DeviceKindSource.
+enum class DeviceKind : uint8_t {
+    UNKNOWN = 0,
+    PHYSICAL,
+    BONDING,
+    VIRTUAL,
+    AGGREGATE,
+};
+
+enum class DeviceKindSource : uint8_t {
+    NONE = 0,
+    EXPLICIT_CONFIG,
+    VALIDATED_METADATA,
+};
+
+inline std::string_view deviceKindName(DeviceKind kind) {
+    switch (kind) {
+        case DeviceKind::PHYSICAL:
+            return "physical";
+        case DeviceKind::BONDING:
+            return "bonding";
+        case DeviceKind::VIRTUAL:
+            return "virtual";
+        case DeviceKind::AGGREGATE:
+            return "aggregate";
+        case DeviceKind::UNKNOWN:
+            return "unknown";
+    }
+    return "unknown";
+}
+
+inline std::string_view deviceKindSourceName(DeviceKindSource source) {
+    switch (source) {
+        case DeviceKindSource::EXPLICIT_CONFIG:
+            return "explicit_config";
+        case DeviceKindSource::VALIDATED_METADATA:
+            return "validated_metadata";
+        case DeviceKindSource::NONE:
+            return "none";
+    }
+    return "none";
+}
+
+// Adapter-neutral constants mirroring the public UMDK ABI. Native builds
+// static_assert these values against the UMDK headers.
+inline constexpr uint16_t kUrmaTransportModeRm = 0x1;
+inline constexpr uint16_t kUrmaTransportModeRc = 0x1 << 1;
+inline constexpr uint16_t kUrmaTransportModeUm = 0x1 << 2;
+inline constexpr uint16_t kUrmaTransportModeMask =
+    kUrmaTransportModeRm | kUrmaTransportModeRc | kUrmaTransportModeUm;
+inline constexpr uint8_t kUrmaMaxPriority = 15;
+inline constexpr size_t kUrmaPriorityCount = 16;
+inline constexpr uint8_t kUrmaTargetTypeJetty = 1;
+inline constexpr uint8_t kUrmaTpTypeRtp = 0;
+inline constexpr uint8_t kUrmaTpTypeCtp = 1;
+inline constexpr uint32_t kUrmaTpTypeRtpMask = 1U << kUrmaTpTypeRtp;
+inline constexpr uint32_t kUrmaTpTypeCtpMask = 1U << kUrmaTpTypeCtp;
+// Default receive-side JFR token shared by the RC and RM import paths.
+inline constexpr uint32_t kUrmaJfrDefaultToken = 0xACFE;
 
 // Adapter-neutral subset of the capabilities needed by the TENT UB data
 // plane. Values of zero mean that the provider did not report a limit.
@@ -42,6 +106,8 @@ struct DeviceCapabilities {
     uint32_t max_write_size = 0;
     uint32_t feature_flags = 0;
     uint16_t transport_modes = 0;
+    uint32_t rm_tp_cap = 0;
+    std::array<uint32_t, kUrmaPriorityCount> priority_tp_type_masks{};
 };
 
 // One DeviceInfo represents one native URMA device/EID pair. A native device
@@ -54,8 +120,62 @@ struct DeviceInfo {
     uint32_t eid_index = 0;
     std::string eid;
     bool active = false;
+    DeviceKind kind = DeviceKind::UNKNOWN;
+    DeviceKindSource kind_source = DeviceKindSource::NONE;
     DeviceCapabilities capabilities;
 };
+
+// LocalSendProfile is derived only from trusted local provider capabilities.
+// bind_tp_type_mask is never accepted as a peer-supplied JFS configuration.
+struct LocalSendProfile {
+    uint16_t trans_mode = kUrmaTransportModeRm;
+    uint8_t priority = kUrmaMaxPriority;
+    uint32_t bind_tp_type_mask = 0;
+    DeviceCapabilities local_capabilities;
+};
+
+inline Status buildLocalSendProfile(const DeviceInfo& device, int64_t priority,
+                                    LocalSendProfile& output) {
+    const auto& capabilities = device.capabilities;
+    if (priority < 0 || priority > kUrmaMaxPriority) {
+        return Status::InvalidArgument("URMA JFS priority must be in [0, 15]");
+    }
+    if ((capabilities.transport_modes &
+         static_cast<uint16_t>(~kUrmaTransportModeMask)) != 0 ||
+        (capabilities.transport_modes & kUrmaTransportModeRm) == 0) {
+        return Status::InvalidArgument(
+            "URMA device transport_modes must be valid and include RM");
+    }
+    // RM over CTR: rm_tp_cap is advisory here  because some providers leave it
+    // zero while still exposing CPT in the per-priority table.
+    // the per-priority bind mask is the authoritative local signal.
+    uint8_t selected_priority = static_cast<uint8_t>(priority);
+    uint32_t bind_tp_type_mask = capabilities.priority_tp_type_masks[static_cast
+        <size_t>(selected_priority)];
+    if ((bind_tp_type_mask & kUrmaTpTypeCtpMask) == 0) {
+        bool ctp_priority_found = false;
+        for (uint8_t candidate = 0; candidate < kUrmaPriorityCount; ++candidate) {
+            const uint32_t candidate_mask = capabilities.priority_tp_type_masks[candidate];
+            if ((candidate_mask & kUrmaTpTypeCtpMask)!=0) {
+                selected_priority = candidate;
+                bind_tp_type_mask = candidate_mask;
+                ctp_priority_found = true;
+                break;
+            }
+        }
+        if (!ctp_priority_found) {
+            return Status::InvalidArgument(
+                "URMA JFS priority does not support the remote CTP target");
+        }
+    }
+
+    LocalSendProfile profile;
+    profile.priority = selected_priority;
+    profile.bind_tp_type_mask = bind_tp_type_mask;
+    profile.local_capabilities = capabilities;
+    output = profile;
+    return Status::OK();
+}
 
 // The segment descriptor is intentionally an explicit envelope. Raw
 // urma_seg_t bytes are ABI-specific; import must reject a different API
@@ -119,11 +239,24 @@ class Jetty : public OpaqueHandle {
     [[nodiscard]] virtual uint32_t uasid() const noexcept = 0;
 };
 
+// RM Legacy imported remote target. One handle represents one peer Jetty
+// imported into a local context; it is referenced explicitly by each RM WR
+// and is never bound to a local Jetty. Ownership follows the endpoint
+// incarnation: the owner may release the handle only after every WR that
+// referenced it has completed or a provider fence proved it is unreferenced.
+class RemoteTarget : public OpaqueHandle {
+   public:
+    [[nodiscard]] virtual uint32_t id() const noexcept = 0;
+    [[nodiscard]] virtual uint32_t uasid() const noexcept = 0;
+    [[nodiscard]] virtual const std::string& eid() const noexcept = 0;
+};
+
 using ContextPtr = std::shared_ptr<Context>;
 using JfcPtr = std::shared_ptr<Jfc>;
 using LocalSegmentPtr = std::shared_ptr<LocalSegment>;
 using RemoteSegmentPtr = std::shared_ptr<RemoteSegment>;
 using JettyPtr = std::shared_ptr<Jetty>;
+using RemoteTargetPtr = std::shared_ptr<RemoteTarget>;
 
 enum SegmentAccess : uint32_t {
     SEGMENT_ACCESS_READ = 1U << 0,
@@ -143,16 +276,25 @@ struct SegmentOptions {
 struct JfcOptions {
     uint32_t depth = 4096;
     uint32_t receiver_depth = 2048;
-    uint32_t token = 0xACFE;
+    uint32_t token = kUrmaJfrDefaultToken;
     bool enable_completion_events = false;
+    // RM Legacy: drives the native JFR transport mode. Defaults to RC so the
+    // RC legacy baseline is byte-for-byte unchanged.
+    uint16_t trans_mode = kUrmaTransportModeRc;
 };
 
 struct JettyOptions {
     uint32_t depth = 256;
-    uint8_t priority = 15;
+    uint32_t priority = kUrmaMaxPriority;
     uint8_t max_sge = 1;
     uint8_t rnr_retry = 7;
     uint8_t error_timeout = 17;
+    // RM Legacy: drives the native JFS transport mode and the CTP bind mask.
+    // Both are derived from the trusted LocalSendProfile at install time and
+    // are never taken from peer-supplied bootstrap fields. Defaults keep the
+    // RC legacy creation path unchanged.
+    uint16_t trans_mode = kUrmaTransportModeRc;
+    uint32_t bind_tp_type_mask = 0;
 };
 
 struct RemoteJettyInfo {
@@ -167,6 +309,52 @@ enum class Operation : uint8_t {
     WRITE,
 };
 
+// RM Legacy acceptance classification for a post attempt. The classification
+// decides resource responsibility:
+//  - kNotAccepted: the provider definitively rejected the WR before accepting
+//    it. The caller may roll back the pre-registered responsibility exactly
+//    once and retry as a new attempt.
+//  - kAccepted: the WR crossed the native boundary. The caller must wait for
+//    a real CQE or a successful fence; it must never roll back early.
+//  - kUnknown: acceptance cannot be established (contradictory status/count
+//    or an unclassifiable provider error). The caller must not replay the WR
+//    and must keep the token, buffer, segment and endpoint owners alive until
+//    a synchronous fence settles the responsibility.
+enum class PostAcceptance : uint8_t {
+    kAccepted,
+    kNotAccepted,
+    kUnknown,
+};
+
+inline const char* postAcceptanceName(PostAcceptance acceptance) noexcept {
+    switch (acceptance) {
+        case PostAcceptance::kAccepted:
+            return "accepted";
+        case PostAcceptance::kNotAccepted:
+            return "not_accepted";
+        case PostAcceptance::kUnknown:
+            return "unknown";
+    }
+    return "unknown";
+}
+
+// Maps the legacy post contract (status + accepted prefix count) onto the RM
+// acceptance states for a whole post attempt. A successful post that accepted
+// every request is Accepted; a failed post that accepted nothing is
+// NotAccepted; every contradictory combination (partial acceptance, success
+// with a short count, failure with a nonzero count) is Unknown.
+inline PostAcceptance classifyPostAcceptance(const Status& post_status,
+                                             size_t posted_count,
+                                             size_t request_count) noexcept {
+    if (post_status.ok() && posted_count == request_count) {
+        return PostAcceptance::kAccepted;
+    }
+    if (!post_status.ok() && posted_count == 0) {
+        return PostAcceptance::kNotAccepted;
+    }
+    return PostAcceptance::kUnknown;
+}
+
 struct WorkRequest {
     Operation operation = Operation::READ;
     uint64_t local_address = 0;
@@ -179,6 +367,11 @@ struct WorkRequest {
 
     LocalSegmentPtr local_segment;
     RemoteSegmentPtr remote_segment;
+
+    // RM Legacy: the explicit imported target for this WR. RM posts must set
+    // it; RC posts must leave it null. The adapter never substitutes a bound
+    // remote Jetty for a missing RM target.
+    RemoteTargetPtr target;
 };
 
 enum class CompletionCategory : uint8_t {
@@ -246,10 +439,40 @@ class UrmaAdapter {
                                const JettyOptions& options,
                                JettyPtr& jetty) = 0;
     virtual Status deleteJetty(JettyPtr& jetty) = 0;
+    // RC-only connection operations. RM Legacy never calls bindJetty or
+    // unbindJetty: every RM WR carries its own explicit imported target.
     virtual Status bindJetty(const JettyPtr& jetty,
                              const RemoteJettyInfo& remote) = 0;
     virtual Status unbindJetty(const JettyPtr& jetty) = 0;
     virtual Status resetJetty(const JettyPtr& jetty) = 0;
+
+    // RM Legacy remote target import. The descriptor must be a validated
+    // bootstrap v2 target (RM/JETTY/RTP profile); the adapter maps it onto
+    // the native import call and never derives the target from a local bind.
+    // unimportRemoteTarget follows the same retryable shared_ptr contract as
+    // the other release operations and must only be called after every WR
+    // referencing the target has completed or been fenced.
+    virtual Status importRemoteTarget(const ContextPtr& context,
+                                      const std::string& eid, uint32_t uasid,
+                                      uint32_t id, uint16_t trans_mode,
+                                      uint8_t target_type, uint8_t tp_type,
+                                      RemoteTargetPtr& target) {
+        (void)context;
+        (void)eid;
+        (void)uasid;
+        (void)id;
+        (void)trans_mode;
+        (void)target_type;
+        (void)tp_type;
+        (void)target;
+        return Status::NotImplemented(
+            "RM remote target import is not supported by this adapter");
+    }
+    virtual Status unimportRemoteTarget(RemoteTargetPtr& target) {
+        if (!target) return Status::OK();
+        return Status::NotImplemented(
+            "RM remote target unimport is not supported by this adapter");
+    }
 
     // Synchronously fences one Jetty. A successful return guarantees that no
     // previously posted WR on this Jetty can perform any further DMA. The
@@ -268,6 +491,20 @@ class UrmaAdapter {
     virtual Status post(const JettyPtr& jetty,
                         const std::vector<WorkRequest>& requests,
                         size_t& posted_count) = 0;
+
+    // RM Legacy post with explicit acceptance classification. The default
+    // implementation derives the classification from the legacy post contract
+    // so RC-oriented adapters keep their exact behavior; adapters with native
+    // RM acceptance semantics override it.
+    virtual Status post(const JettyPtr& jetty,
+                        const std::vector<WorkRequest>& requests,
+                        size_t& posted_count, PostAcceptance& acceptance) {
+        auto status = post(jetty, requests, posted_count);
+        acceptance = classifyPostAcceptance(status, posted_count,
+                                            requests.size());
+        return status;
+    }
+
     virtual Status poll(const JfcPtr& jfc, size_t max_completions,
                         std::vector<Completion>& completions) = 0;
 };

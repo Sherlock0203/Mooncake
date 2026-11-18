@@ -544,15 +544,16 @@ TEST_F(RdmaContextReprobeTest, PeerRecoveryPreservesTransientState) {
 }
 
 // Regression tests for the HCA-index / context_list_ alignment invariant.
-// An HCA's id is its position in getHcaList(), and disableDevice() keeps the
-// surviving ids there. initializeRdmaResources() used to append a context only
-// for devices that came up, compacting context_list_ so a later device_id
-// named the wrong RNIC or ran past its end.
+// At installation time (initializeRdmaResources), a device whose context
+// fails to construct is disabled and skipped, then the topology is
+// re-resolved so getHcaList() and context_list_ stay compact and
+// index-aligned with no inert placeholders. At runtime, disableDevice()
+// must keep surviving HCA ids stable (see the test below).
 
 constexpr const char *kAlignmentTopologyJson =
     R"({"cpu:0": [["mlx5_0", "mlx5_1", "mlx5_2"], []]})";
 
-TEST(RdmaHcaIndexAlignmentTest, ContextListKeepsOneSlotPerHcaWhenInitFails) {
+TEST(RdmaHcaIndexAlignmentTest, ContextListStaysEmptyWhenEveryInitFails) {
 #ifndef __linux__
     GTEST_SKIP() << "Requires Linux libibverbs symbol interposition";
 #else
@@ -560,8 +561,7 @@ TEST(RdmaHcaIndexAlignmentTest, ContextListKeepsOneSlotPerHcaWhenInitFails) {
     // devices, so every construct() fails regardless of the host's hardware.
     auto topology = std::make_shared<Topology>();
     ASSERT_EQ(topology->parse(kAlignmentTopologyJson), 0);
-    const auto hca_list = topology->getHcaList();
-    ASSERT_EQ(hca_list.size(), static_cast<size_t>(3));
+    ASSERT_EQ(topology->getHcaList().size(), static_cast<size_t>(3));
 
     auto metadata = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
     RdmaTransport transport;
@@ -569,20 +569,14 @@ TEST(RdmaHcaIndexAlignmentTest, ContextListKeepsOneSlotPerHcaWhenInitFails) {
                                         "local-rdma-segment");
     RdmaTransportTestPeer::bindTopology(transport, topology);
 
-    // Every device fails, so the topology ends up empty -- the slot layout
-    // must line up with getHcaList() anyway.
+    // Every device fails: no placeholder is appended anymore. The topology is
+    // compacted to empty and the install fails closed instead of publishing
+    // segment descriptors whose failed-device slots carry empty gid/lkey/rkey.
     EXPECT_EQ(RdmaTransportTestPeer::initializeResources(transport),
               ERR_DEVICE_NOT_FOUND);
 
-    const auto &contexts = transport.getContextList();
-    ASSERT_EQ(contexts.size(), hca_list.size());
-    for (size_t i = 0; i < contexts.size(); ++i) {
-        ASSERT_NE(contexts[i], nullptr) << "slot " << i << " must be occupied";
-        EXPECT_EQ(contexts[i]->deviceName(), hca_list[i])
-            << "slot " << i << " names the wrong RNIC";
-        EXPECT_FALSE(contexts[i]->active())
-            << "placeholder for a failed RNIC must not report itself active";
-    }
+    EXPECT_TRUE(transport.getContextList().empty());
+    EXPECT_TRUE(topology->getHcaList().empty());
 #endif  // __linux__
 }
 

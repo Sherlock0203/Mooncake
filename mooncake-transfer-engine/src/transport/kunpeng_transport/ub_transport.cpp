@@ -86,7 +86,13 @@ int UbTransport::registerLocalMemory(void* addr, size_t length,
                                      bool update_metadata) {
     (void)remote_accessible;
     BufferDesc buffer_desc;
-    for (auto& context : context_list_) {
+    for (size_t index = 0; index < context_list_.size(); ++index) {
+        auto& context = context_list_[index];
+        if (!context) {
+            buffer_desc.tseg.push_back(std::string());
+            buffer_desc.l_seg_index.push_back(0xFFFFFFFFu);
+            continue;
+        }
         int ret = context->registerMemoryRegion((uint64_t)addr, length);
         if (ret) {
             LOG(ERROR) << "UbTransport: cannot register LocalMemory";
@@ -126,7 +132,10 @@ int UbTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
     int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata);
     if (rc) return rc;
     for (auto& context : context_list_)
+    if (context) {
         context->unregisterMemoryRegion((uint64_t)addr);
+    }
+        
     return 0;
 }
 
@@ -275,7 +284,7 @@ Status UbTransport::submitTransferTask(
                 assert(device_id >= 0 &&
                        static_cast<size_t>(device_id) < context_list_.size());
                 auto& context = context_list_[device_id];
-                assert(context.get());
+                if (!context) continue;
                 if (!context->active()) continue;
                 assert(buffer_id >= 0 &&
                        static_cast<size_t>(buffer_id) <
@@ -304,7 +313,7 @@ Status UbTransport::submitTransferTask(
             }
             // start to submit batch request task
             auto& context = context_list_[device_id];
-            if (!context->active()) {
+            if (!context || !context->active()) {
                 LOG(ERROR) << "Device " << device_id << " is not active";
                 return Status::InvalidArgument(
                     "Device " + std::to_string(device_id) + " is not active");
@@ -372,6 +381,7 @@ int UbTransport::allocateLocalSegmentID() {
     desc->name = local_server_name_;
     desc->protocol = "ub";
     for (auto& context : context_list_) {
+        if (!context) continue;
         TransferMetadata::DeviceDesc device_desc;
         device_desc.name = context->deviceName();
         device_desc.eid = context->getEid();
@@ -389,13 +399,15 @@ int UbTransport::onSetupConnections(const HandShakeDesc& peer_desc,
     if (local_nic_name.empty()) return ERR_INVALID_ARGUMENT;
 
     std::shared_ptr<UbContext> context;
-    int index = 0;
-    for (auto& entry : local_topology_->getHcaList()) {
-        if (entry == local_nic_name) {
-            context = context_list_[index];
+    // Match by name, not by getHcaList() position: context_list_ is compacted
+    // when a device fails to construct (failed devices are never pushed),
+    // so subscripting it with an HCA index misresolves to a nullptr or to a
+    // sibling device's context.
+    for (auto& ctx : context_list_) {
+        if (ctx && ctx->deviceName() == local_nic_name) {
+            context = ctx;
             break;
         }
-        index++;
     }
     if (!context) return ERR_INVALID_ARGUMENT;
 
@@ -451,6 +463,26 @@ int UbTransport::selectDevice(SegmentDesc* desc, uint64_t offset, size_t length,
     }
     return ERR_ADDRESS_NOT_REGISTERED;
 }
+namespace {
+    bool isUrmaDeviceName(const std::string& device_name) {
+        if (device_name == "mock_urma_device") return true;
+        int num_devices = 0;
+        urma_device_t** devices = urma_get_device_list(&num_devices);
+        if (!devices || num_devices <= 0) {
+            if (devices) urma_free_device_list(devices);
+            return false;
+        }
+        bool found = false;
+        for (int i = 0; i < num_devices; ++i) {
+            if (devices[i] && device_name == devices[i]->name) {
+                found = true;
+                break;
+            }
+        }
+        urma_free_device_list(devices);
+        return found;
+    }
+} // namespace
 
 int UbTransport::initializeUbResources(UbTransport* t) {
     auto ret = init(t);
@@ -472,6 +504,12 @@ int UbTransport::initializeUbResources(UbTransport* t) {
     }
 
     for (auto& device_name : hca_list) {
+        if (!isUrmaDeviceName(device_name)) {
+            LOG(INFO) << "Device " << device_name << " is not an URMA device";
+            // keep the context_list_ slot occupied
+            t->context_list_.push_back(nullptr);
+            continue;
+        }
         auto& config = globalConfig();
         auto max_endpoints = config.max_ep_per_ctx;
         auto context = buildContext(t, device_name, max_endpoints);
@@ -481,13 +519,21 @@ int UbTransport::initializeUbResources(UbTransport* t) {
                 t->local_topology_->disableDevice(device_name);
             }
             LOG(WARNING) << "Disable device " << device_name;
+            t->context_list_.push_back(nullptr);
         } else {
             t->context_list_.push_back(context);
             LOG(INFO) << "device " << context->deviceName() << " add to list";
         }
     }
 
-    if (t->context_list_.empty()) {
+    bool has_context = false;
+    for (auto& context : t->context_list_) {
+        if (context) {
+            has_context = true;
+            break;
+        }
+    }
+    if (!has_context) {
         LOG(ERROR) << "UbTransport: No available RNIC";
         return ERR_DEVICE_NOT_FOUND;
     }
