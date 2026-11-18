@@ -128,6 +128,35 @@ struct BudgetDeviceSnapshot {
     std::vector<BudgetRoleStateCount> role_states;
 };
 
+// Derives the per-device Jetty budget when the operator left
+// transports/ub/native_budget/max_jetty_per_device at 0.
+//
+// NativeBudget::configure() enforces
+//   configured_budget + replacement_reserve <= verified_device_limit,
+// so a derived budget must keep the reserve *outside* the device's limit.
+// Deriving it as the limit itself made every device that reports its own limit
+// fail install with a non-zero reserve (observed on a device reporting 65532
+// with the default reserve of 2: 65532 + 2 > 65532).
+//
+// An explicit operator value is authoritative; whether it fits is decided by
+// configure(). Without a reported limit the static Serving target is the
+// smallest truthful answer.
+[[nodiscard]] inline uint64_t deriveNativeBudgetJetties(
+    uint64_t verified_device_limit_jetties, uint64_t configured_budget_jetties,
+    uint64_t replacement_reserve_jetties,
+    uint64_t minimum_jetties) noexcept {
+    if (configured_budget_jetties != 0) return configured_budget_jetties;
+    if (verified_device_limit_jetties == 0) {
+        return minimum_jetties != 0 ? minimum_jetties : 1;
+    }
+    if (verified_device_limit_jetties <= replacement_reserve_jetties) {
+        // A limit this small cannot hold the reserve either; hand the limit
+        // back and let configure() reject it with a precise message.
+        return verified_device_limit_jetties;
+    }
+    return verified_device_limit_jetties - replacement_reserve_jetties;
+}
+
 // Device-level full-role native budget (C05). One physical device is
 // identified by a stable key (normalized device identity + path + EID); all
 // EIDs and context incarnations of the same physical device must share one

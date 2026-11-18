@@ -831,5 +831,46 @@ TEST(UbPoolIntegrationTest, RmTargetSlotFollowsThePostingLane) {
     EXPECT_TRUE(path.stop());
 }
 
+// Regression for the rm_pool install failure observed on a real device:
+// max_jetty_per_device=0 derived the budget as the device's own limit, and
+// NativeBudget::configure() then rejected (limit + reserve) > limit, so the UB
+// transport was skipped entirely ("UB native budget exceeds the verified
+// device Jetty limit").
+TEST(NativeBudgetDerivationTest, DerivedBudgetLeavesRoomForTheReserve) {
+    constexpr uint64_t kVerified = 65532;
+    constexpr uint64_t kReserve = 2;
+    const uint64_t derived = deriveNativeBudgetJetties(
+        kVerified, /*configured=*/0, kReserve, /*minimum=*/6);
+    EXPECT_EQ(derived, kVerified - kReserve);
+
+    NativeBudget budget;
+    // This is the install-time call; it must succeed for a real device that
+    // reports its limit and the default reserve.
+    EXPECT_TRUE(budget.configure("dev", kVerified, derived, kReserve).ok());
+}
+
+TEST(NativeBudgetDerivationTest, ExplicitBudgetIsAuthoritative) {
+    EXPECT_EQ(deriveNativeBudgetJetties(/*verified=*/64, /*configured=*/8,
+                                        /*reserve=*/2, /*minimum=*/6),
+              8U);
+}
+
+TEST(NativeBudgetDerivationTest, NoReportedLimitFallsBackToTheServingTarget) {
+    EXPECT_EQ(deriveNativeBudgetJetties(/*verified=*/0, /*configured=*/0,
+                                        /*reserve=*/2, /*minimum=*/6),
+              6U);
+    // A zero minimum still has to yield a positive budget.
+    EXPECT_EQ(deriveNativeBudgetJetties(0, 0, 2, /*minimum=*/0), 1U);
+}
+
+TEST(NativeBudgetDerivationTest, ZeroReserveStillFitsTheDeviceLimit) {
+    constexpr uint64_t kVerified = 64;
+    const uint64_t derived =
+        deriveNativeBudgetJetties(kVerified, 0, /*reserve=*/0, 6);
+    EXPECT_EQ(derived, kVerified);
+    NativeBudget budget;
+    EXPECT_TRUE(budget.configure("dev", kVerified, derived, 0).ok());
+}
+
 }  // namespace
 }  // namespace mooncake::tent::ub

@@ -542,17 +542,15 @@ struct UbTransport::Impl {
             if (!budget) {
                 budget = std::make_shared<ub::NativeBudget>();
                 const uint64_t verified = device.capabilities.max_jetty;
-                uint64_t configured = parsed.native_budget.max_jetty_per_device;
-                if (configured == 0) {
-                    // Derive the budget when the operator did not state one: a
-                    // device that reports its limit is trusted, otherwise the
-                    // static Serving target is the smallest truthful answer.
-                    configured =
-                        verified != 0
-                            ? verified
-                            : std::max<uint64_t>(
-                                  parsed.send_pool.desired_per_context, 1);
-                }
+                // Derivation keeps the replacement reserve outside the device's
+                // own limit: NativeBudget::configure() checks
+                // (configured + reserve) <= verified, so deriving configured as
+                // `verified` fails install on every device that reports its
+                // limit. See deriveNativeBudgetJetties().
+                const uint64_t configured = ub::deriveNativeBudgetJetties(
+                    verified, parsed.native_budget.max_jetty_per_device,
+                    parsed.native_budget.replacement_reserve,
+                    parsed.send_pool.desired_per_context);
                 // M5: the pooled members alone must fit per device. Endpoint
                 // Jetties stay outside the NativeBudget ledger for now
                 // (RK5/M10), so their share is surfaced instead of being
