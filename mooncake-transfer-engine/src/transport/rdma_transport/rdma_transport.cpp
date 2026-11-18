@@ -1008,6 +1008,11 @@ int RdmaTransport::allocateLocalSegmentID() {
     auto desc = std::make_shared<SegmentDesc>();
     auto old_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     if (old_desc) *desc = *old_desc;
+    // A previously installed transport (UB) may have published devices with
+    // empty gid entries; re-publishing them makes peers reject the whole
+    // segment descriptor as corrupted. Devices are rebuilt below from the
+    // RDMA contexts only, never inherited from the old descriptor.
+    desc->devices.clear();
     desc->name = local_server_name_;
     // Store RDMA server name for dual-NIC setups; when it differs from
     // local_server_name_ the peer will use it for NIC path construction.
@@ -1027,7 +1032,17 @@ int RdmaTransport::allocateLocalSegmentID() {
         device_desc.gid = entry->gid();
         desc->devices.push_back(device_desc);
     }
-    desc->topology = *(local_topology_.get());
+    // Publish a topology rebuilt from the canonical serialization instead of
+    // a direct object copy: the string round-trip guarantees the published
+    // matrix is exactly what peers parse and re-resolve, with no stale
+    // hca_list_/resolved-index snapshots left over from installation-time
+    // compaction.
+    Topology published_topology;
+    if (published_topology.parse(local_topology_->toString()) == 0) {
+        desc->topology = std::move(published_topology);
+    } else {
+        desc->topology = *(local_topology_.get());
+    }
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
                                std::move(desc));
     return 0;
@@ -1543,13 +1558,15 @@ int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
     }
 
     std::shared_ptr<RdmaContext> context;
-    int index = 0;
-    for (auto &entry : local_topology_->getHcaList()) {
-        if (entry == local_nic_name) {
-            context = context_list_[index];
+    // Match by name, not by getHcaList() position: context_list_ is
+    // compacted at installation time and must not be subscripted with an
+    // HCA index when topology compaction and the handshake NIC list can
+    // disagree.
+    for (auto &ctx : context_list_) {
+        if (ctx && ctx->deviceName() == local_nic_name) {
+            context = ctx;
             break;
         }
-        index++;
     }
     if (!context) {
         local_desc.reply_msg =
@@ -1608,20 +1625,31 @@ int RdmaTransport::initializeRdmaResources() {
             cq_per_ctx, config.num_comp_channels_per_ctx, config.port,
             config.gid_index, config.max_cqe, config.max_ep_per_ctx);
         if (ret) {
+            // A context that fails to construct is disabled and skipped: the
+            // previous placeholder kept context_list_ aligned with
+            // getHcaList(), but its never-constructed device leaked empty
+            // gid/lkey/rkey fields into every BufferDesc, and peers rejected
+            // the whole segment descriptor as corrupted. The trailing
+            // resolve() rebuilds hca_list_ from the pruned matrix_, so HCA
+            // indexes become compact and context_list_ stays index-aligned
+            // with them. This is only safe at installation time, before any
+            // buffer is registered or endpoint created; runtime disables must
+            // keep HCA indexes stable (see disableDevice()).
             local_topology_->disableDevice(device_name);
             LOG(WARNING) << "Disable device " << device_name;
-            // Keep context_list_ index-aligned with getHcaList(): both it and
-            // BufferDesc::lkey are subscripted by the HCA index, which
-            // disableDevice() leaves in place. Dropping a slot would make a
-            // later device_id name the wrong RNIC or run off the end. A
-            // never-constructed context is an inert placeholder; the partially
-            // built one is released so it does not pin an open uverbs fd.
-            auto placeholder =
-                std::make_shared<RdmaContext>(*this, device_name);
-            placeholder->set_active(false);
-            context_list_.push_back(std::move(placeholder));
-        } else {
-            context_list_.push_back(context);
+            continue;
+        }
+        context_list_.push_back(context);
+    }
+    // Compact the topology after the disables above: resolve() rebuilds
+    // hca_list_ and the resolved matrix from matrix_ (already pruned by
+    // disableDevice()), so getHcaList() and context_list_ stay index-aligned
+    // without inert placeholders.
+    if (context_list_.size() < hca_list.size()) {
+        if (local_topology_->resolve()) {
+            LOG(ERROR) << "Failed to re-resolve topology after disabling "
+                          "unavailable devices";
+            return ERR_DEVICE_NOT_FOUND;
         }
     }
     if (local_topology_->empty()) {

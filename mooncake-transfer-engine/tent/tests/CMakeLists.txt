@@ -549,91 +549,57 @@ target_include_directories(tent_strict_local_numa_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_strict_local_numa_test COMMAND tent_strict_local_numa_test)
 
+# Real-device UB integration test. Opt-in only: the binary links the full
+# transport (tent_link_group) and exercises the RealUrmaAdapter path, so it
+# requires a build with URMA_LIBRARY and a node exposing /sys/class/ubcore.
+# The binary self-skips at run time on hardware-less nodes; with the gate
+# OFF the target is not created at all and nothing is added to the build.
+option(TENT_UB_REAL_DEVICE_TESTS
+       "Build tent_ub_real_device_test (requires real UB hardware)" OFF)
+
 if(USE_UB)
   add_executable(
-    tent_ub_core_test ub_core_test.cpp ../src/transport/ub/quota.cpp
-                      ../src/transport/ub/rail_monitor.cpp)
+    tent_ub_core_test
+    ub_core_test.cpp ../src/transport/ub/bootstrap.cpp
+    ../src/transport/ub/quota.cpp ../src/transport/ub/rail_monitor.cpp)
   target_link_libraries(tent_ub_core_test PRIVATE tent_common gtest gtest_main)
   target_include_directories(tent_ub_core_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_ub_core_test COMMAND tent_ub_core_test)
 
-  # Completion gate W2a: the shared record, the gate and the counters, linked
-  # against nothing but completion_record.cpp so the gate stays testable
-  # without workers, slices, an adapter or the probe link manager.
-  add_executable(tent_ub_completion_gate_test ub_completion_gate_test.cpp
-                                              ../src/transport/ub/completion_record.cpp)
-  target_link_libraries(tent_ub_completion_gate_test
-                        PRIVATE tent_common gtest gtest_main)
-  target_include_directories(tent_ub_completion_gate_test
-                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
-  add_test(NAME tent_ub_completion_gate_test
-           COMMAND tent_ub_completion_gate_test)
-
-  add_executable(tent_ub_completion_record_test ub_completion_record_test.cpp
-                                                ../src/transport/ub/completion_record.cpp)
-  target_link_libraries(tent_ub_completion_record_test
-                        PRIVATE tent_common gtest gtest_main)
-  target_include_directories(tent_ub_completion_record_test
-                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
-  add_test(NAME tent_ub_completion_record_test
-           COMMAND tent_ub_completion_record_test)
-
-  # W3a/W3b/W3c: bounded queue arithmetic, the five-bucket defer registry and
-  # the task-level K gate. Header-only pieces plus slice.h, so the target needs
-  # no adapter, workers or segment manager.
-  add_executable(tent_ub_admission_test ub_admission_test.cpp)
-  target_link_libraries(tent_ub_admission_test PRIVATE tent_common gtest
+  # Pooled rm_pool core components (C05/C06/C07): budget ledger, admission
+  # tickets, per-attempt send pool and completion gate. Software-only: the
+  # fake adapter needs no provider or NIC.
+  add_executable(
+    tent_ub_pooled_core_test
+    ub_pooled_core_test.cpp
+    ../src/transport/ub/native_budget.cpp
+    ../src/transport/ub/admission.cpp
+    ../src/transport/ub/send_jetty_pool.cpp
+    ../src/transport/ub/attempt_gate.cpp
+    ../src/transport/ub/jfc.cpp
+    ../src/transport/ub/context.cpp
+    ../src/transport/ub/jetty_pool.cpp)
+  target_link_libraries(tent_ub_pooled_core_test PRIVATE tent_common gtest
                                                          gtest_main)
-  target_include_directories(tent_ub_admission_test
+  target_include_directories(tent_ub_pooled_core_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
-  add_test(NAME tent_ub_admission_test COMMAND tent_ub_admission_test)
-
-  # W3d: the PLM business routing gate and the per-path in-flight ledger.
-  add_executable(
-    tent_ub_path_selection_test
-    ub_path_selection_test.cpp ../src/transport/ub/path_load_ledger.cpp
-    ../src/transport/ub/probe_link_manager.cpp)
-  target_link_libraries(tent_ub_path_selection_test PRIVATE tent_common gtest
-                                                           gtest_main)
-  target_include_directories(tent_ub_path_selection_test
-                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
-  add_test(NAME tent_ub_path_selection_test
-           COMMAND tent_ub_path_selection_test)
-
-  # W3e: claim/return semantics against the real SendJettyPool.
-  add_executable(
-    tent_ub_post_claim_test
-    ub_post_claim_test.cpp ../src/transport/ub/send_jetty_pool.cpp
-    ../src/transport/ub/admission.cpp ../src/transport/ub/native_budget.cpp
-    ../src/transport/ub/jfc.cpp ../src/transport/ub/probe_link_manager.cpp)
-  target_link_libraries(tent_ub_post_claim_test PRIVATE tent_common gtest
-                                                        gtest_main)
-  target_include_directories(tent_ub_post_claim_test
-                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
-  add_test(NAME tent_ub_post_claim_test COMMAND tent_ub_post_claim_test)
-
-  # W3e integration: real workers + real pool + fake adapter. Covers the three
-  # required interleavings (early CQE, first error, timeout fence under a
-  # stopping pool) end to end.
-  add_executable(tent_ub_pool_integration_test
-                 ub_pool_integration_test.cpp)
-  target_link_libraries(tent_ub_pool_integration_test PRIVATE gtest gtest_main
-                                                              tent_link_group)
-  target_include_directories(tent_ub_pool_integration_test
-                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
-  add_test(NAME tent_ub_pool_integration_test
-           COMMAND tent_ub_pool_integration_test)
+  add_test(NAME tent_ub_pooled_core_test COMMAND tent_ub_pooled_core_test)
+  set_tests_properties(tent_ub_pooled_core_test PROPERTIES TIMEOUT 300)
 
   add_executable(
     tent_ub_teardown_test
-    ub_teardown_test.cpp ../src/transport/ub/buffers.cpp
-    ../src/transport/ub/context.cpp ../src/transport/ub/endpoint.cpp
-    ../src/transport/ub/endpoint_store.cpp ../src/transport/ub/jfc.cpp
-    # M8: a Context drains its own pooled send Jetties before closing its JFCs,
-    # so the teardown target needs the pool module too.
-    ../src/transport/ub/send_jetty_pool.cpp ../src/transport/ub/native_budget.cpp
-    ../src/transport/ub/admission.cpp)
+    ub_teardown_test.cpp
+    ../src/transport/ub/bootstrap.cpp
+    ../src/transport/ub/buffers.cpp
+    ../src/transport/ub/context.cpp
+    ../src/transport/ub/endpoint.cpp
+    ../src/transport/ub/endpoint_store.cpp
+    ../src/transport/ub/jetty_pool.cpp
+    ../src/transport/ub/jfc.cpp
+    ../src/transport/ub/native_budget.cpp
+    ../src/transport/ub/admission.cpp
+    ../src/transport/ub/send_jetty_pool.cpp)
   target_link_libraries(tent_ub_teardown_test PRIVATE tent_common gtest
                                                       gtest_main)
   target_include_directories(tent_ub_teardown_test
@@ -644,17 +610,17 @@ if(USE_UB)
   # #14, #17). The scheduler/poster seam and the workers integration are
   # separate milestone targets, so these link only the PLM implementation.
   add_executable(
-    tent_ub_probe_plm_test
-    ub_probe_plm_test.cpp ../src/transport/ub/probe_link_manager.cpp)
+    tent_ub_probe_plm_test ub_probe_plm_test.cpp
+                           ../src/transport/ub/probe_link_manager.cpp)
   target_link_libraries(tent_ub_probe_plm_test PRIVATE tent_common gtest
-                                                      gtest_main)
+                                                       gtest_main)
   target_include_directories(tent_ub_probe_plm_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_ub_probe_plm_test COMMAND tent_ub_probe_plm_test)
 
   add_executable(
-    tent_ub_probe_campaign_test
-    ub_probe_campaign_test.cpp ../src/transport/ub/probe_link_manager.cpp)
+    tent_ub_probe_campaign_test ub_probe_campaign_test.cpp
+                                ../src/transport/ub/probe_link_manager.cpp)
   target_link_libraries(tent_ub_probe_campaign_test PRIVATE tent_common gtest
                                                             gtest_main)
   target_include_directories(tent_ub_probe_campaign_test
@@ -667,8 +633,8 @@ if(USE_UB)
     tent_ub_probe_scheduler_test
     ub_probe_scheduler_test.cpp ../src/transport/ub/probe_link_manager.cpp
     ../src/transport/ub/probe_scheduler.cpp)
-  target_link_libraries(tent_ub_probe_scheduler_test
-                        PRIVATE tent_common gtest gtest_main)
+  target_link_libraries(tent_ub_probe_scheduler_test PRIVATE tent_common gtest
+                                                             gtest_main)
   target_include_directories(tent_ub_probe_scheduler_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_ub_probe_scheduler_test
@@ -677,10 +643,10 @@ if(USE_UB)
   # Test mode (probe/test/*): periodic sweep of all links, optional health
   # application, campaign priority.
   add_executable(
-    tent_ub_probe_test_mode_test
-    ub_probe_test_mode_test.cpp ../src/transport/ub/probe_link_manager.cpp)
-  target_link_libraries(tent_ub_probe_test_mode_test
-                        PRIVATE tent_common gtest gtest_main)
+    tent_ub_probe_test_mode_test ub_probe_test_mode_test.cpp
+                                 ../src/transport/ub/probe_link_manager.cpp)
+  target_link_libraries(tent_ub_probe_test_mode_test PRIVATE tent_common gtest
+                                                             gtest_main)
   target_include_directories(tent_ub_probe_test_mode_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_ub_probe_test_mode_test
@@ -709,8 +675,8 @@ if(USE_UB)
     tent_ub_probe_discovery_test
     ub_probe_discovery_test.cpp
     ../src/transport/ub/probe_provider_standalone.cpp)
-  target_link_libraries(tent_ub_probe_discovery_test
-                        PRIVATE tent_common gtest gtest_main)
+  target_link_libraries(tent_ub_probe_discovery_test PRIVATE tent_common gtest
+                                                             gtest_main)
   target_include_directories(tent_ub_probe_discovery_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_ub_probe_discovery_test
@@ -720,20 +686,22 @@ if(USE_UB)
   # and caching. The bootstrap wire that fills the descriptor source lands in
   # P5; these tests drive the source directly.
   add_executable(
-    tent_ub_probe_handshake_test ub_probe_handshake_test.cpp
+    tent_ub_probe_handshake_test
+    ub_probe_handshake_test.cpp
     ../src/transport/ub/probe_provider_standalone.cpp
     ../src/transport/ub/probe_peer_handshake.cpp)
   target_link_libraries(tent_ub_probe_handshake_test PRIVATE tent_common gtest
                                                              gtest_main)
   target_include_directories(tent_ub_probe_handshake_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
-  add_test(NAME tent_ub_probe_handshake_test COMMAND tent_ub_probe_handshake_test)
+  add_test(NAME tent_ub_probe_handshake_test
+           COMMAND tent_ub_probe_handshake_test)
 
   # Probe poster over the RM adapter contract (P3): one-byte WRITE with a
   # per-WR remote target, no bind.
-  add_executable(tent_ub_probe_poster_test
-                 ub_probe_poster_test.cpp
-                 ../src/transport/ub/probe_poster_urma.cpp)
+  add_executable(
+    tent_ub_probe_poster_test ub_probe_poster_test.cpp
+                              ../src/transport/ub/probe_poster_urma.cpp)
   target_link_libraries(tent_ub_probe_poster_test PRIVATE tent_common gtest
                                                           gtest_main)
   target_include_directories(tent_ub_probe_poster_test
@@ -742,10 +710,10 @@ if(USE_UB)
 
   # Lane retire/rebuild, interface-7 event and retired-page quarantine (P4).
   add_executable(
-    tent_ub_probe_rebuild_test ub_probe_rebuild_test.cpp
-    ../src/transport/ub/probe_provider_standalone.cpp)
+    tent_ub_probe_rebuild_test
+    ub_probe_rebuild_test.cpp ../src/transport/ub/probe_provider_standalone.cpp)
   target_link_libraries(tent_ub_probe_rebuild_test PRIVATE tent_common gtest
-                                                            gtest_main)
+                                                           gtest_main)
   target_include_directories(tent_ub_probe_rebuild_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_ub_probe_rebuild_test COMMAND tent_ub_probe_rebuild_test)
@@ -757,8 +725,8 @@ if(USE_UB)
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 
   add_executable(tent_ub_probe_integration_test ub_probe_integration_test.cpp)
-  target_link_libraries(tent_ub_probe_integration_test
-                        PRIVATE gtest gtest_main tent_link_group)
+  target_link_libraries(tent_ub_probe_integration_test PRIVATE gtest gtest_main
+                                                               tent_link_group)
   target_include_directories(tent_ub_probe_integration_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_ub_probe_integration_test
@@ -771,6 +739,22 @@ if(USE_UB)
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_ub_native_data_path_test
            COMMAND tent_ub_native_data_path_test)
+
+  add_executable(tent_ub_rm_auto_import_test ub_rm_auto_import_test.cpp)
+  target_link_libraries(tent_ub_rm_auto_import_test PRIVATE gtest gtest_main
+                                                            tent_link_group)
+  target_include_directories(tent_ub_rm_auto_import_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_rm_auto_import_test COMMAND tent_ub_rm_auto_import_test)
+
+  if(TENT_UB_REAL_DEVICE_TESTS)
+    add_executable(tent_ub_real_device_test ub_real_device_test.cpp)
+    target_link_libraries(tent_ub_real_device_test PRIVATE gtest gtest_main
+                                                           tent_link_group)
+    target_include_directories(tent_ub_real_device_test
+                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+    add_test(NAME tent_ub_real_device_test COMMAND tent_ub_real_device_test)
+  endif()
 endif()
 
 # End-to-end failover test: drives real TransferEngineImpl with

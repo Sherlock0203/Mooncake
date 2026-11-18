@@ -3,32 +3,43 @@
 
 #include "tent/transport/ub/send_jetty_pool.h"
 
+#include <glog/logging.h>
+
+#include <algorithm>
+#include <chrono>
+#include <system_error>
 #include <utility>
 
 namespace mooncake::tent::ub {
 
 SliceJettyLease::SliceJettyLease(SliceJettyLease&& other) noexcept
-    : pool_(other.pool_),
+    : pool_(std::move(other.pool_)),
       member_(std::move(other.member_)),
       attempt_(other.attempt_) {
-    other.pool_ = nullptr;
+    other.pool_.reset();
     other.attempt_ = AttemptKey{};
 }
 
 SliceJettyLease& SliceJettyLease::operator=(SliceJettyLease&& other) noexcept {
     if (this != &other) {
-        if (valid() && pool_ != nullptr) pool_->onLeaseLeaked(member_);
-        pool_ = other.pool_;
+        if (valid()) {
+            if (auto pool = pool_.lock()) pool->onLeaseLeaked(member_);
+        }
+        pool_ = std::move(other.pool_);
         member_ = std::move(other.member_);
         attempt_ = other.attempt_;
-        other.pool_ = nullptr;
+        other.pool_.reset();
         other.attempt_ = AttemptKey{};
     }
     return *this;
 }
 
 SliceJettyLease::~SliceJettyLease() {
-    if (valid() && pool_ != nullptr) pool_->onLeaseLeaked(member_);
+    if (!valid()) return;
+    // RC-04: the pool may already be destroyed; the weak reference turns
+    // the leak notification into a no-op instead of a use-after-free. The
+    // member's JettyPtr still releases its handle best-effort.
+    if (auto pool = pool_.lock()) pool->onLeaseLeaked(member_);
 }
 
 SendJettyPool::SendJettyPool(std::shared_ptr<UrmaAdapter> adapter,
@@ -44,7 +55,31 @@ SendJettyPool::SendJettyPool(std::shared_ptr<UrmaAdapter> adapter,
       budget_(std::move(budget)),
       device_key_(std::move(device_key)),
       credits_(std::move(credits)),
-      options_(options) {}
+      options_(options) {
+    // Executor threads only touch fully initialized members: the initializer
+    // list has already stored every dependency before the body runs.
+    try {
+        if (options_.background_refill) {
+            refill_thread_ = std::thread([this] { refillLoop(); });
+        }
+        if (options_.background_delete) {
+            delete_thread_ = std::thread([this] { deleteLoop(); });
+        }
+    } catch (const std::system_error&) {
+        // RC-06: thread creation can fail under resource pressure. Degrade
+        // to synchronous refill/delete instead of leaving a joinable thread
+        // to std::terminate in the destructor; the stop flags also route
+        // every later retirement to the synchronous path.
+        stopRefillExecutor();
+        stopDeleteExecutor();
+    }
+}
+
+SendJettyPool::~SendJettyPool() {
+    stopRefillExecutor();
+    stopDeleteExecutor();
+    (void)drainQuarantined();
+}
 
 Status SendJettyPool::tryLease(const PoolKey& pool_key,
                                const AttemptKey& attempt,
@@ -99,7 +134,8 @@ Status SendJettyPool::tryLease(const PoolKey& pool_key,
         }
 
         if (chosen != nullptr) {
-            out.lease = SliceJettyLease(this, std::move(chosen), attempt);
+            out.lease =
+                SliceJettyLease(weak_from_this(), std::move(chosen), attempt);
             out.jfc_index = chosen_jfc;
             out.jfc_credit_token = credit_token;
             return Status::OK();
@@ -165,6 +201,10 @@ Status SendJettyPool::createAndPublish(const PoolKey& pool_key) {
         if (jetty) (void)adapter_->deleteJetty(jetty);
         budget_->transition(*reservation, BudgetObjectState::kQuarantined);
         budget_->releaseAfterProvenDestruction(*reservation, true);
+        // partially allocated handle. It was never posted, so it retires
+        // through the RESET-before-delete contract; the budget is released
+        // only when destruction is proven.
+        retireUnpublished(std::move(jetty), std::move(*reservation), pool_key);
         std::lock_guard<std::mutex> lock(mutex_);
         auto bucket = buckets_.find(pool_key);
         if (bucket != buckets_.end() && bucket->second.creating > 0) {
@@ -217,8 +257,47 @@ Status SendJettyPool::createAndPublish(const PoolKey& pool_key) {
         adapter_->deleteJetty(jetty);
         budget_->releaseAfterProvenDestruction(*reservation, true);
     }
+    // object through the RESET-before-delete contract. It never posted a
+    // WR; a failed destruction keeps the handle and budget quarantined.
+    JettyPtr doomed =
+        member != nullptr ? std::move(member->jetty) : std::move(jetty);
+    if (member != nullptr) reservation = std::move(member->budget);
+    retireUnpublished(std::move(doomed), std::move(*reservation), pool_key);
     return Status::TooManyRequests(
         "UB send pool stopped while creating a member" LOC_MARK);
+}
+
+void SendJettyPool::retireUnpublished(JettyPtr jetty,
+                                      BudgetReservation reservation,
+                                      const PoolKey& pool_key) {
+    // Destroys a Jetty that never published (failed or stopped creation).
+    // A live handle must pass the RESET-before-delete contract required by
+    // the provider; a partially allocated handle without a native resource
+    // only needs its wrapper released.
+    budget_->transition(reservation, BudgetObjectState::kQuarantined);
+    Status destroyed = Status::OK();
+    if (jetty != nullptr) {
+        if (jetty->valid()) {
+            const Status reset = adapter_->resetJetty(jetty);
+            destroyed = reset.ok() ? adapter_->deleteJetty(jetty) : reset;
+        } else {
+            destroyed = adapter_->deleteJetty(jetty);
+        }
+    }
+    if (destroyed.ok()) {
+        budget_->releaseAfterProvenDestruction(reservation, true);
+        return;
+    }
+    // Unknown destruction: keep the handle and the budget (INV09/INV10) so
+    // a later drainQuarantined can retry the native delete.
+    auto member = std::make_shared<PoolMember>();
+    member->pool_key = pool_key;
+    member->jetty = std::move(jetty);
+    member->budget = std::move(reservation);
+    member->state = PoolMemberState::kQuarantined;
+    member->retire_reason = "unpublished creation retired";
+    std::lock_guard<std::mutex> lock(mutex_);
+    quarantined_.push_back(std::move(member));
 }
 
 Status SendJettyPool::returnOnce(SliceJettyLease lease,
@@ -295,6 +374,14 @@ void SendJettyPool::retireMemberLocked(std::shared_ptr<PoolMember> member,
     member->retire_reason = reason;
     // First real error retires permanently (INV07): the member never
     // re-enters the idle stack even if the path recovers.
+    if (options_.background_delete && !delete_stop_) {
+        // The delete executor owns the native destruction from here; the
+        // caller returns immediately instead of blocking on the provider.
+        member->state = PoolMemberState::kDeleteReady;
+        delete_ready_.push_back(std::move(member));
+        delete_cv_.notify_one();
+        return;
+    }
     retired_.push_back(std::move(member));
 }
 
@@ -304,7 +391,13 @@ void SendJettyPool::destroyRetired(
     for (auto& member : members) {
         member->state = PoolMemberState::kDeleting;
         JettyPtr jetty = std::move(member->jetty);
-        const Status deleted = adapter_->deleteJetty(jetty);
+        // The native delete requires a RESET Jetty. A clean member has never
+        // been reset, while an errored member is in ERROR after its flush
+        // fence. A reset that fails (for example an ERROR Jetty without a
+        // trusted barrier) keeps the handle quarantined for a later retry.
+        const Status reset = adapter_->resetJetty(jetty);
+        const Status deleted =
+            reset.ok() ? adapter_->deleteJetty(jetty) : reset;
         if (deleted.ok()) {
             member->state = PoolMemberState::kDestroyed;
             budget_->transition(member->budget, BudgetObjectState::kRetiring);
@@ -343,8 +436,15 @@ void SendJettyPool::onLeaseLeaked(const std::shared_ptr<PoolMember>& member) {
 }
 
 void SendJettyPool::beginStop() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    stopping_ = true;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stopping_ = true;
+    }
+    // No creation or native destruction may happen on executor threads after
+    // the stop; joining bounds the window in which an executor owns a
+    // provider call. Retirements after this point destroy synchronously.
+    stopRefillExecutor();
+    stopDeleteExecutor();
 }
 
 bool SendJettyPool::stopping() const {
@@ -353,6 +453,10 @@ bool SendJettyPool::stopping() const {
 }
 
 Status SendJettyPool::drainIdle() {
+    // Shutdown barrier: beginStop joins both executor threads, so after this
+    // call no native create/delete runs on an executor thread and the caller
+    // may close the parent JFC safely.
+    beginStop();
     std::vector<std::shared_ptr<PoolMember>> to_destroy;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -362,6 +466,24 @@ Status SendJettyPool::drainIdle() {
                 to_destroy.push_back(std::move(member));
             }
             entry.second.idle.clear();
+        }
+        // RC-03 guard: with every consumer stopped and both executors
+        // joined, nothing may still be leased or mid-creation. A non-zero
+        // count means the shutdown ordering contract was violated; surface
+        // it instead of silently closing the parent JFC under live members.
+        size_t in_use = 0;
+        size_t creating = 0;
+        for (const auto& entry : buckets_) {
+            in_use += entry.second.in_use;
+            creating += entry.second.creating;
+        }
+        if (in_use != 0 || creating != 0) {
+            LOG(ERROR) << "UB send pool drainIdle found " << in_use
+                       << " in-use and " << creating
+                       << " creating members after the shutdown barrier; "
+                          "stop every posting/polling consumer before the "
+                          "context shutdown"
+                       << LOC_MARK;
         }
     }
     destroyRetired(std::move(to_destroy));
@@ -382,7 +504,12 @@ Status SendJettyPool::drainQuarantined() {
             continue;
         }
         JettyPtr jetty = std::move(member->jetty);
-        const Status deleted = adapter_->deleteJetty(jetty);
+        // The native delete requires a RESET Jetty, exactly like the primary
+        // destroy path. A reset failure (for example an ERROR Jetty without
+        // a trusted flush fence) keeps the handle quarantined for a retry.
+        const Status reset = adapter_->resetJetty(jetty);
+        const Status deleted =
+            reset.ok() ? adapter_->deleteJetty(jetty) : reset;
         if (deleted.ok()) {
             member->state = PoolMemberState::kDestroyed;
             budget_->releaseAfterProvenDestruction(member->budget, true);
@@ -396,6 +523,86 @@ Status SendJettyPool::drainQuarantined() {
     return Status::OK();
 }
 
+void SendJettyPool::refillLoop() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    const auto interval = std::chrono::milliseconds(
+        std::max<uint32_t>(1, options_.refill_interval_ms));
+    while (!refill_stop_) {
+        refill_cv_.wait_for(lock, interval, [this] { return refill_stop_; });
+        if (refill_stop_) break;
+
+        // Claim creation slots under the lock, then call the provider
+        // outside it. Every known PoolKey is topped back up to the static
+        // Serving size even while no business attempt is in flight.
+        std::vector<PoolKey> batch;
+        for (auto& entry : buckets_) {
+            PoolBucket& bucket = entry.second;
+            const size_t serving = bucket.idle.size() + bucket.in_use;
+            if (serving + bucket.creating >= options_.desired_serving) {
+                continue;
+            }
+            if (bucket.creating >= options_.max_creating) continue;
+            size_t slots = options_.desired_serving - serving - bucket.creating;
+            slots = std::min(slots, options_.max_creating - bucket.creating);
+            bucket.creating += slots;
+            for (size_t slot = 0; slot < slots; ++slot) {
+                batch.push_back(entry.first);
+            }
+        }
+        lock.unlock();
+        for (const auto& pool_key : batch) {
+            (void)createAndPublish(pool_key);
+        }
+        lock.lock();
+    }
+}
+
+void SendJettyPool::deleteLoop() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    for (;;) {
+        delete_cv_.wait(
+            lock, [this] { return delete_stop_ || !delete_ready_.empty(); });
+        if (delete_ready_.empty()) {
+            if (delete_stop_) break;
+            continue;
+        }
+        auto batch = std::move(delete_ready_);
+        delete_ready_.clear();
+        lock.unlock();
+        // reset + delete + budget release happen on this executor, never on
+        // the completion/return path.
+        destroyRetired(std::move(batch));
+        lock.lock();
+    }
+}
+
+void SendJettyPool::stopRefillExecutor() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        refill_stop_ = true;
+    }
+    refill_cv_.notify_all();
+    if (refill_thread_.joinable()) refill_thread_.join();
+}
+
+void SendJettyPool::stopDeleteExecutor() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        delete_stop_ = true;
+    }
+    delete_cv_.notify_all();
+    if (delete_thread_.joinable()) delete_thread_.join();
+    // Retirements that raced with the join are drained synchronously so the
+    // pool leaves no delete-ready member behind.
+    std::vector<std::shared_ptr<PoolMember>> pending;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pending = std::move(delete_ready_);
+        delete_ready_.clear();
+    }
+    if (!pending.empty()) destroyRetired(std::move(pending));
+}
+
 SendJettyPoolStats SendJettyPool::stats() const {
     std::lock_guard<std::mutex> lock(mutex_);
     SendJettyPoolStats result{};
@@ -404,7 +611,7 @@ SendJettyPoolStats SendJettyPool::stats() const {
         result.in_use_members += entry.second.in_use;
         result.creating_members += entry.second.creating;
     }
-    result.retired_members = retired_.size();
+    result.retired_members = retired_.size() + delete_ready_.size();
     result.quarantined_members = quarantined_.size();
     result.total_leases = total_leases_;
     result.total_returns = total_returns_;
@@ -428,6 +635,10 @@ std::vector<PoolMemberState> SendJettyPool::memberStates() const {
                       PoolMemberState::kInUse);
     }
     for (const auto& member : retired_) states.push_back(member->state);
+    // delete_ready_ members are owned by the delete executor, which mutates
+    // their state without the pool lock; report the queue state instead.
+    states.insert(states.end(), delete_ready_.size(),
+                  PoolMemberState::kDeleteReady);
     for (const auto& member : quarantined_) states.push_back(member->state);
     return states;
 }

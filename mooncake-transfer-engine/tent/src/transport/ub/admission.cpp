@@ -7,6 +7,8 @@
 #include "tent/transport/ub/admission.h"
 
 #include <string>
+#include <limits>
+#include <utility>
 
 namespace mooncake::tent::ub {
 
@@ -90,6 +92,39 @@ uint64_t JfcCreditLedger::rejectedReleases(size_t jfc_index) const {
     std::lock_guard<std::mutex> lock(mutex_);
     auto jfc = jfcs_.find(jfc_index);
     return jfc == jfcs_.end() ? 0 : jfc->second.rejected_releases;
+}
+void TaskPermitTicket::release() {
+    if (ledger_ != nullptr && permit_id_ != 0) {
+        ledger_->releasePermit(permit_id_);
+    }
+    ledger_ = nullptr;
+    permit_id_ = 0;
+}
+
+TaskPermitTicket TaskPermitLedger::tryAcquire() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (active_.size() >= max_inflight_attempts_) {
+        ++rejected_;
+        return TaskPermitTicket();
+    }
+    const uint64_t permit_id = next_permit_id_++;
+    active_.emplace(permit_id, true);
+    return TaskPermitTicket(this, permit_id);
+}
+
+uint64_t TaskPermitLedger::outstanding() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return active_.size();
+}
+
+uint64_t TaskPermitLedger::rejectedAcquisitions() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return rejected_;
+}
+
+void TaskPermitLedger::releasePermit(uint64_t permit_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    active_.erase(permit_id);
 }
 
 }  // namespace mooncake::tent::ub

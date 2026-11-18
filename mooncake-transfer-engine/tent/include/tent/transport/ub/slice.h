@@ -355,11 +355,12 @@ class UbSlice : public std::enable_shared_from_this<UbSlice> {
         return resolution;
     }
 
-    // W3 defer exit (design §7.3 / W3-IN-3). Capacity pressure is not a
-    // transfer failure, so this returns the slice to kRetryPending WITHOUT
-    // incrementing retry_count_ and without notifying the task. A canceled
-    // slice still terminalizes CANCELED here, because nothing will ever post
-    // it.
+    // Defers a claimed attempt without consuming retry budget. Admission
+    // misses (task permit exhausted, pooled lease unavailable) are capacity
+    // pressure, not transfer failures: the slice returns to kRetryPending so
+    // the posting lane can requeue it. A cancellation that already requested
+    // terminal state wins and terminalizes the slice. Returns true when the
+    // slice was deferred for retry.
     bool deferAttempt(const UbAttemptToken& token, uint64_t now_ns = 0) {
         bool canceled = false;
         {
@@ -377,7 +378,7 @@ class UbSlice : public std::enable_shared_from_this<UbSlice> {
             }
         }
         if (canceled) notifyTaskTerminal(CANCELED, 0);
-        return true;
+        return !canceled;
     }
 
     // Re-admits a slice that was deferred while it was NOT owned by an attempt.

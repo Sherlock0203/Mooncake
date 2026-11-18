@@ -87,7 +87,8 @@ class Topology {
 
     void clear();
 
-    Status discover(const std::vector<Platform*>& platforms);
+    Status discover(const std::vector<Platform*>& platforms,
+                    const Config* conf = nullptr);
 
     Status parse(const std::string& json_content);
 

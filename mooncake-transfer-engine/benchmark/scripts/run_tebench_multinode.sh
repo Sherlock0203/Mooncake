@@ -50,6 +50,7 @@ KEEP_REMOTE=0
 TARGET_ARGS=()
 INITIATOR_ARGS=()
 REMOTE_ENV=()
+TRANS_MODE=""
 
 usage() {
     cat <<'EOF'
@@ -95,6 +96,8 @@ Runtime:
   --target-arg FLAG           Extra target flag; may be repeated.
   --initiator-arg FLAG        Extra initiator flag; may be repeated.
   --env KEY=VALUE             Environment entry passed to tebench; repeatable.
+  --trans-mode MODE           UB transport mode override (rc|rm); exported to
+                              tebench as MC_URMA_TRANS_MODE.
 
 Orchestration:
   --ssh-user USER             Prefix hosts that do not include user@.
@@ -186,6 +189,7 @@ while [[ $# -gt 0 ]]; do
         --target-arg) TARGET_ARGS+=("$value") ;;
         --initiator-arg) INITIATOR_ARGS+=("$value") ;;
         --env) REMOTE_ENV+=("$value") ;;
+        --trans-mode) TRANS_MODE="$value" ;;
         *) die "unknown argument: $option" ;;
     esac
 done
@@ -259,6 +263,24 @@ for entry in "${REMOTE_ENV[@]}"; do
     [[ "$entry" =~ ^[A-Za-z_][A-Za-z0-9_]*=.*$ ]] ||
         die "--env must use KEY=VALUE: $entry"
 done
+
+if [[ -n "$TRANS_MODE" ]]; then
+    # MC_URMA_TRANS_MODE is honored by the tent engine only; the classic
+    # engine ignores it, so refuse the combination instead of letting the
+    # benchmark silently run RC while the caller believes RM is active.
+    [[ "$BACKEND" == "tent" ]] ||
+        die "--trans-mode only applies to --backend tent (the classic engine ignores MC_URMA_TRANS_MODE)"
+    for entry in "${REMOTE_ENV[@]}"; do
+        [[ "$entry" != "MC_URMA_TRANS_MODE="* ]] ||
+            die "--trans-mode conflicts with --env MC_URMA_TRANS_MODE"
+    done
+    TRANS_MODE="${TRANS_MODE,,}"
+    case "$TRANS_MODE" in
+        rc|rm) ;;
+        *) die "--trans-mode must be rc or rm: $TRANS_MODE" ;;
+    esac
+    REMOTE_ENV+=("MC_URMA_TRANS_MODE=$TRANS_MODE")
+fi
 
 TARGETS=()
 INITIATORS=()

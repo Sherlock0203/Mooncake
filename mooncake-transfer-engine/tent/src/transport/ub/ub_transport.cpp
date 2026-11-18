@@ -21,6 +21,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <future>
 
 #include <glog/logging.h>
 
@@ -28,11 +29,16 @@
 #include "tent/runtime/segment.h"
 #include "tent/thirdparty/nlohmann/json.h"
 #include "tent/transport/ub/admission.h"
+#include "tent/transport/ub/bootstrap.h"
 #include "tent/transport/ub/buffers.h"
 #include "tent/transport/ub/context.h"
+
+#include "jetty_pool.h"
+#include "tent/transport/ub/attempt_gate.h"
 #include "tent/transport/ub/device_selection.h"
 #include "tent/transport/ub/endpoint.h"
 #include "tent/transport/ub/endpoint_store.h"
+#include "tent/transport/ub/identity_import.h"
 #include "tent/transport/ub/native_budget.h"
 #include "tent/transport/ub/params.h"
 #include "tent/transport/ub/send_jetty_pool.h"
@@ -68,32 +74,6 @@ uint64_t generationSeed() {
     return seed == 0 ? 1 : seed;
 }
 
-std::string encodeDeviceMetadata(Topology::NicID topology_id,
-                                 const ub::DeviceInfo& device) {
-    const auto& caps = device.capabilities;
-    return nlohmann::json{{"schema_version", 1},
-                          {"topology_id", topology_id},
-                          {"native_device_name", device.native_device_name},
-                          {"native_device_path", device.native_device_path},
-                          {"eid_index", device.eid_index},
-                          {"eid", device.eid},
-                          {"active", device.active},
-                          {"capabilities",
-                           {{"max_jfc", caps.max_jfc},
-                            {"max_jfc_depth", caps.max_jfc_depth},
-                            {"max_jfr_depth", caps.max_jfr_depth},
-                            {"max_jetty", caps.max_jetty},
-                            {"max_jetty_depth", caps.max_jetty_depth},
-                            {"max_send_sge", caps.max_send_sge},
-                            {"max_remote_sge", caps.max_remote_sge},
-                            {"max_message_size", caps.max_message_size},
-                            {"max_read_size", caps.max_read_size},
-                            {"max_write_size", caps.max_write_size},
-                            {"feature_flags", caps.feature_flags},
-                            {"transport_modes", caps.transport_modes}}}}
-        .dump();
-}
-
 }  // namespace
 
 struct UbTransport::Impl {
@@ -106,6 +86,72 @@ struct UbTransport::Impl {
           probe_peer_source(injected_peer_source),
           probe_provider(std::move(injected_probe_provider)),
           probe_poster(std::move(injected_probe_poster)) {}
+
+    // Automatically collects local device identities from the provider and
+    // injects them into transports/ub/device_identities when the config
+    // requests physical-only selection (the RM family gate) without explicit
+    // identities. Explicit configuration always wins; RC installs and
+    // disabled transports are never touched. On success the discovery
+    // snapshot is cached so install verifies the injected records against
+    // the exact data they were collected from.
+    Status autoImportDeviceIdentities(Config& config) {
+        const auto existing = config.get<nlohmann::json>(
+            "transports/ub/device_identities", nlohmann::json());
+        if (existing.is_array() && !existing.empty()) {
+            return Status::OK();
+        }
+        if (!config.get("transports/ub/enable", false)) {
+            return Status::OK();
+        }
+        if (!config.get("transports/ub/physical_only", false)) {
+            return Status::OK();
+        }
+
+        auto status = adapter->initialize();
+        if (!status.ok()) return status;
+        adapter_initialized = true;
+
+        std::vector<ub::DeviceInfo> discovered;
+        status = adapter->discoverDevices(discovered);
+        if (!status.ok()) return status;
+
+        std::vector<ub::DeviceIdentity> identities;
+        status = ub::collectLocalDeviceIdentities(discovered, identities);
+        if (!status.ok()) return status;
+
+        config.set("transports/ub/device_identities",
+                   ub::deviceIdentitiesToJson(identities));
+        auto_import_snapshot = discovered;
+        auto_import_snapshot_valid = true;
+        LOG(INFO) << "UB auto-imported " << identities.size()
+                  << " device identities from provider discovery; manual "
+                     "transports/ub/device_identities configuration is no "
+                     "longer required";
+        persistAutoImportedIdentities(config);
+        return Status::OK();
+    }
+
+    // Best-effort write-back so the collected identities survive restarts
+    // and stay visible to external tooling using the exact manual schema.
+    // Only configs loaded from a file (MC_TENT_CONF path) are persisted;
+    // programmatic configs (for example the benchmark's in-memory config)
+    // rely on the injected in-memory records alone. A write failure never
+    // fails the install: the injected records already remove the need for
+    // manual editing in this process.
+    void persistAutoImportedIdentities(const Config& config) {
+        const auto source_file =
+            config.get<std::string>("config_source_file", "");
+        if (source_file.empty()) return;
+        auto status = config.saveFile(source_file);
+        if (!status.ok()) {
+            LOG(WARNING) << "UB auto-import could not persist device "
+                            "identities to "
+                         << source_file << ": " << status.ToString();
+        } else {
+            LOG(INFO) << "UB auto-import persisted device identities to "
+                      << source_file;
+        }
+    }
 
     Status install(const std::string& segment_name,
                    std::shared_ptr<ControlService> control,
@@ -131,16 +177,42 @@ struct UbTransport::Impl {
                 "A real or injected URMA adapter is unavailable" LOC_MARK);
         }
         if (!config) config = std::make_shared<Config>();
+
+        // RM auto-import pre-pass: when physical-only selection is requested
+        // without explicit identities, collect them from the provider and
+        // inject them into the config before the FromConfig gate, so RM
+        // installs no longer require hand-edited device_identities. The
+        // pre-pass may initialize the adapter; every early failure below
+        // must roll that back because failInstall() is not wired yet.
+        auto abort_after_auto_import = [this](Status failure) {
+            if (adapter_initialized) {
+                auto shutdown_status = adapter->shutdown();
+                adapter_initialized = false;
+                if (!shutdown_status.ok()) {
+                    LOG(WARNING)
+                        << "UB adapter shutdown after a failed auto-import "
+                           "install returned "
+                        << shutdown_status.ToString();
+                }
+            }
+            return failure;
+        };
+        auto import_status = autoImportDeviceIdentities(*config);
+        if (!import_status.ok()) {
+            return abort_after_auto_import(import_status);
+        }
+
         ub::UbParams parsed;
-        CHECK_STATUS(ub::UbParams::FromConfig(*config, parsed));
+        auto parse_status = ub::UbParams::FromConfig(*config, parsed);
+        if (!parse_status.ok()) return abort_after_auto_import(parse_status);
         if (!parsed.enable) {
-            return Status::InvalidArgument(
-                "UB transport is disabled by configuration" LOC_MARK);
+            return abort_after_auto_import(Status::InvalidArgument(
+                "UB transport is disabled by configuration" LOC_MARK));
         }
         if (parsed.enable_notifications) {
-            return Status::NotImplemented(
+            return abort_after_auto_import(Status::NotImplemented(
                 "UB notifications are not supported by protocol version "
-                "1" LOC_MARK);
+                "1" LOC_MARK));
         }
         if (parsed.runtime_profile == ub::UbRuntimeProfile::kRmLegacy) {
             // W3 wires exactly two profiles: the untouched RC legacy baseline
@@ -152,6 +224,18 @@ struct UbTransport::Impl {
                 "runtime_profile=rm_legacy is not wired in W3; use rc_legacy "
                 "or rm_pool" LOC_MARK);
         }
+        ub::UbRuntimeMode selected_mode = ub::UbRuntimeMode::kRcLegacy;
+        auto mode_status = ub::resolveUbRuntimeMode(parsed, selected_mode);
+        if (!mode_status.ok()) return abort_after_auto_import(mode_status);
+        LOG(INFO) << "UB runtime selection: mode="
+                  << ub::ubRuntimeModeName(selected_mode) << " profile="
+                  << ub::ubRuntimeProfileName(parsed.runtime_profile)
+                  << " trans_mode="
+                  << ub::ubTransportModeName(parsed.trans_mode)
+                  << " jetty_pool=" << (parsed.jetty_pool.enable ? "on" : "off")
+                  << " probe=" << (parsed.probe.enabled ? "on" : "off")
+                  << " force_disable="
+                  << (parsed.jetty_pool.force_disable ? "true" : "false");
 
         shutting_down.store(false, std::memory_order_release);
         local_segment_name = segment_name;
@@ -159,20 +243,36 @@ struct UbTransport::Impl {
         local_topology = std::move(topology);
         conf = std::move(config);
         params = parsed;
+        runtime_mode = selected_mode;
 
-        auto status = adapter->initialize();
-        if (!status.ok()) return failInstall(status);
-        adapter_initialized = true;
+        if (!adapter_initialized) {
+            auto init_status = adapter->initialize();
+            if (!init_status.ok()) return failInstall(init_status);
+            adapter_initialized = true;
+        }
 
+        // The auto-import pre-pass already took a discovery snapshot when it
+        // injected identities; reuse it so the injected records are verified
+        // against exactly the same snapshot they were collected from.
         std::vector<ub::DeviceInfo> discovered;
-        status = adapter->discoverDevices(discovered);
+        Status status;
+        if (auto_import_snapshot_valid) {
+            discovered = auto_import_snapshot;
+        } else {
+            status = adapter->discoverDevices(discovered);
+            if (!status.ok()) return failInstall(status);
+        }
+        status = ub::resolveDeviceKindIdentities(params.device_identities,
+                                                 discovered);
         if (!status.ok()) return failInstall(status);
 
         const bool explicit_filter = !params.device_filter.empty();
-        const auto preferred_devices =
-            ub::preferBondingDevicesIfPresent(discovered, explicit_filter);
+        const auto preferred_devices = params.physical_only
+                                           ? ub::physicalDevices(discovered)
+                                           : ub::preferBondingDevicesIfPresent(
+                                                 discovered, explicit_filter);
         const bool prefer_bonding =
-            !explicit_filter &&
+            !params.physical_only && !explicit_filter &&
             std::any_of(discovered.begin(), discovered.end(),
                         [](const ub::DeviceInfo& device) {
                             return ub::isBondingDevice(device);
@@ -187,6 +287,45 @@ struct UbTransport::Impl {
         std::unordered_map<Topology::NicID, uint32_t> jfc_depth_by_device;
         for (auto& device : discovered) {
             by_topology_name.emplace(device.topology_name, std::move(device));
+        }
+
+        // RM capability gate (legacy and pooled): every selectable device
+        // must be a trusted PHYSICAL device whose provider capabilities pass
+        // the LocalSendProfile derivation (RM transport mode, RM/CTP support,
+        // priority bind mask). The gate runs before any native resource
+        // (context, JFC, Jetty) is created and fails closed; there is never a
+        // silent fallback to RC or bonding.
+        const bool rm_runtime = runtime_mode == ub::UbRuntimeMode::kRmLegacy ||
+                                runtime_mode == ub::UbRuntimeMode::kPooledRm;
+        uint32_t rm_capability_bind_tp_type_mask = 0;
+        uint8_t rm_capability_priority = ub::JettyOptions{}.priority;
+        if (rm_runtime) {
+            for (const auto& [name, device] : by_topology_name) {
+                if (preferred_topology_names.find(device.topology_name) ==
+                    preferred_topology_names.end()) {
+                    continue;
+                }
+                if (!filterAllows(params.device_filter, device)) continue;
+                if (device.kind != ub::DeviceKind::PHYSICAL) {
+                    return failInstall(Status::NotImplemented(
+                        "RM runtime requires trusted PHYSICAL devices; "
+                        "device " +
+                        device.native_device_name +
+                        " is not physical" LOC_MARK));
+                }
+                ub::LocalSendProfile profile;
+                const auto profile_status = ub::buildLocalSendProfile(
+                    device, static_cast<uint8_t>(ub::JettyOptions{}.priority),
+                    profile);
+                if (!profile_status.ok()) {
+                    return failInstall(Status::NotImplemented(
+                        "RM capability gate failed for device " +
+                        device.native_device_name + ": " +
+                        profile_status.ToString() + LOC_MARK));
+                }
+                rm_capability_bind_tp_type_mask = profile.bind_tp_type_mask;
+                rm_capability_priority = profile.priority;
+            }
         }
 
         std::vector<std::string> preferred_names;
@@ -216,6 +355,11 @@ struct UbTransport::Impl {
                 jfc_options.transport_mode = ub::JettyTransportMode::kRm;
             }
             const auto& device_caps = found->second.capabilities;
+            if (rm_runtime) {
+                // RM creates an RM receive-side JFR; it never falls
+                // back to RC.
+                jfc_options.trans_mode = ub::kUrmaTransportModeRm;
+            }
             if (device_caps.max_jfc_depth != 0) {
                 jfc_options.depth =
                     std::min(jfc_options.depth, device_caps.max_jfc_depth);
@@ -251,7 +395,10 @@ struct UbTransport::Impl {
 
         {
             std::ostringstream selection_log;
-            if (explicit_filter) {
+            if (params.physical_only) {
+                selection_log << "UB device selection: mode=physical-only";
+                if (explicit_filter) selection_log << "+explicit-filter";
+            } else if (explicit_filter) {
                 selection_log << "UB device selection: mode=explicit-filter";
             } else if (prefer_bonding) {
                 selection_log
@@ -279,12 +426,28 @@ struct UbTransport::Impl {
         }
 
         if (contexts.empty()) {
-            return failInstall(Status::DeviceNotFound(
-                "No UB context initialized successfully" LOC_MARK));
+            // Name the devices that device selection excluded (e.g. bonding
+            // devices under physical-only RM Legacy) so an exhausted-
+            // selection failure is directly attributable instead of a bare
+            // "no context" message.
+            std::string reason = "No UB context initialized successfully";
+            if (!skipped_names.empty()) {
+                reason += "; skipped by device selection:";
+                for (size_t i = 0; i < skipped_names.size(); ++i) {
+                    reason += i == 0 ? " " : ", ";
+                    reason += skipped_names[i];
+                }
+            }
+            return failInstall(Status::DeviceNotFound(reason + LOC_MARK));
         }
 
         size_t safe_slice_size = params.slice_size;
         ub::JettyOptions jetty_options;
+        if (rm_runtime) {
+            jetty_options.trans_mode = ub::kUrmaTransportModeRm;
+            jetty_options.bind_tp_type_mask = rm_capability_bind_tp_type_mask;
+            jetty_options.priority = rm_capability_priority;
+        }
         for (const auto& context : contexts) {
             const auto& device_caps = context->deviceInfo().capabilities;
             auto clamp_slice = [&safe_slice_size](uint64_t limit) {
@@ -293,7 +456,6 @@ struct UbTransport::Impl {
                         std::min<uint64_t>(safe_slice_size, limit));
                 }
             };
-            clamp_slice(device_caps.max_message_size);
             clamp_slice(device_caps.max_read_size);
             clamp_slice(device_caps.max_write_size);
             if (device_caps.max_jetty_depth != 0) {
@@ -332,6 +494,112 @@ struct UbTransport::Impl {
         endpoints = std::make_unique<ub::EndpointStore>(
             adapter, params.max_endpoints, params.jetty_per_endpoint,
             jetty_options);
+        // Simple send-Jetty reuse (RM Legacy only): attach a per-context idle
+        // pool so endpoint incarnations lease Jettys LIFO instead of always
+        // creating and deleting them. RC installs never attach a pool, so the
+        // legacy create/delete path is unchanged.
+        if (runtime_mode == ub::UbRuntimeMode::kRmLegacy &&
+            params.jetty_reuse.enable) {
+            for (auto& context : contexts) {
+                context->attachJettyPool(std::make_shared<ub::UbSendJettyPool>(
+                    adapter, context->handle(), context->jfcs(),
+                    jetty_options));
+            }
+        }
+        // rm_pool data path (C01/C05/C06): attach one SendJettyPool per
+        // context plus the process-wide admission ledgers. Every gate below
+        // fails install closed; nothing is attached partially. The pool is
+        // the only producer of pooled members, and the workers' data path is
+        // the only consumer: a context without an attached pool never enters
+        // the pooled branch.
+        if (runtime_mode == ub::UbRuntimeMode::kPooledRm) {
+            // M9: rm_pool runs the RM transport, so every selected device must
+            // advertise it. Failing here is much cheaper than failing on the
+            // first createJetty.
+            for (const auto& context : contexts) {
+                if (!context) continue;
+                const uint16_t modes =
+                    context->deviceInfo().capabilities.transport_modes;
+                if (modes != 0 && (modes & ub::kUrmaTransportModeRm) == 0) {
+                    return failInstall(Status::InvalidArgument(
+                        "runtime_profile=rm_pool requires devices that support "
+                        "the RM transport mode" LOC_MARK));
+                }
+            }
+            native_budget = std::make_shared<ub::NativeBudget>();
+            std::unordered_set<std::string> configured_devices;
+            for (const auto& context : contexts) {
+                const auto& device = context->deviceInfo();
+                const std::string device_key = ub::makePhysicalDeviceIdentity(
+                    device.native_device_path, device.eid);
+                if (!configured_devices.insert(device_key).second) continue;
+                const uint64_t verified = device.capabilities.max_jetty;
+                uint64_t configured = params.native_budget.max_jetty_per_device;
+                uint64_t reserve = params.native_budget.replacement_reserve;
+                if (configured == 0) {
+                    // Derive the budget from the verified limit while keeping
+                    // headroom for the replacement reserve; the budget
+                    // ceiling (configured + reserve) must never exceed the
+                    // verified device limit.
+                    configured =
+                        verified > reserve ? verified - reserve : verified;
+                    if (verified <= reserve) reserve = 0;
+                }
+                if (configured == 0) {
+                    return failInstall(Status::InvalidArgument(
+                        "rm_pool requires a positive native Jetty budget for "
+                        "device " +
+                        device_key + LOC_MARK));
+                }
+                status = native_budget->configure(device_key, verified,
+                                                  configured, reserve);
+                if (!status.ok()) return failInstall(status);
+            }
+            task_permits = std::make_shared<ub::TaskPermitLedger>(
+                params.send_pool.task_max_inflight_attempts);
+            attempt_gate = std::make_shared<ub::AttemptGate>();
+            for (auto& context : contexts) {
+                const auto& device = context->deviceInfo();
+                const uint32_t depth =
+                    jfc_depth_by_device.at(context->topologyId());
+                auto credits = std::make_shared<ub::JfcCreditLedger>();
+                for (size_t jfc_index = 0; jfc_index < context->jfcs().size();
+                     ++jfc_index) {
+                    const uint64_t capacity =
+                        depth > params.send_pool.jfc_credit_reserve
+                            ? static_cast<uint64_t>(depth) -
+                                  params.send_pool.jfc_credit_reserve
+                            : 0;
+                    if (capacity == 0) {
+                        return failInstall(Status::InvalidArgument(
+                            "rm_pool JFC credit capacity is exhausted on "
+                            "device " +
+                            device.native_device_name + LOC_MARK));
+                    }
+                    status = credits->install(jfc_index, capacity);
+                    if (!status.ok()) return failInstall(status);
+                }
+                ub::SendJettyPoolOptions pool_options;
+                pool_options.desired_serving =
+                    params.send_pool.desired_per_context;
+                pool_options.max_creating =
+                    params.send_pool.max_creating_per_key;
+                pool_options.background_refill =
+                    params.send_pool.background_refill;
+                pool_options.background_delete =
+                    params.send_pool.background_delete;
+                pool_options.refill_interval_ms =
+                    params.send_pool.refill_interval_ms;
+                pool_options.jetty_options = jetty_options;
+                context->attachPooledSendPool(
+                    std::make_shared<ub::SendJettyPool>(
+                        adapter, context->handle(), context->jfcs(),
+                        native_budget,
+                        ub::makePhysicalDeviceIdentity(
+                            device.native_device_path, device.eid),
+                        credits, pool_options));
+            }
+        }
         ub::RailMonitorConfig rail_config;
         rail_config.cooldown_ns =
             static_cast<uint64_t>(params.endpoint_cooldown_ms) * 1'000'000ULL;
@@ -355,31 +623,6 @@ struct UbTransport::Impl {
                 context->topologyId(),
                 ub::QuotaLimits{saturatedProduct(device_wrs, params.slice_size),
                                 device_wrs});
-        }
-
-        // ---- W3 pooled assembly (design §11.1) --------------------------
-        // One SendJettyPool + one JfcCreditLedger per Context, and one
-        // NativeBudget per physical device shared by every Context of that
-        // device. Every step is fail-closed: a pool that cannot be budgeted or
-        // credited must not exist, because a lease without credit accounting
-        // would post WRs the JFC cannot hold.
-        if (parsed.runtime_profile == ub::UbRuntimeProfile::kRmPool) {
-            // M9: rm_pool runs the RM transport, so every selected device must
-            // advertise it. Failing here is much cheaper than failing on the
-            // first createJetty.
-            for (const auto& context : contexts) {
-                if (!context) continue;
-                const uint16_t modes =
-                    context->deviceInfo().capabilities.transport_modes;
-                if (modes != 0 && (modes & ub::kUrmaTransportModeRm) == 0) {
-                    return failInstall(Status::InvalidArgument(
-                        "runtime_profile=rm_pool requires devices that support "
-                        "the RM transport mode" LOC_MARK));
-                }
-            }
-            status = installPooledSendPools(parsed, jetty_options,
-                                            jfc_depth_by_device);
-            if (!status.ok()) return failInstall(status);
         }
 
         status = publishLocalDevices();
@@ -488,7 +731,8 @@ struct UbTransport::Impl {
                 }
                 return endpoints->retireLocalDevice(local_topology_id);
             },
-            probe_manager.get(), std::move(probe_jfcs));
+            probe_manager.get(), std::move(probe_jfcs), task_permits,
+            attempt_gate);
         status = workers->start();
         if (!status.ok()) return failInstall(status);
 
@@ -507,115 +751,6 @@ struct UbTransport::Impl {
         }
 
         installed.store(true, std::memory_order_release);
-        return Status::OK();
-    }
-
-    // W3 pooled assembly (design §11.1). One pool + credit ledger per Context
-    // and one native budget per physical device. Called from install() after
-    // every device gate passed and before any pooled Jetty can be created.
-    Status installPooledSendPools(
-        const ub::UbParams& parsed, const ub::JettyOptions& jetty_options,
-        const std::unordered_map<Topology::NicID, uint32_t>&
-            jfc_depth_by_device) {
-        const uint64_t credit_reserve = parsed.send_pool.jfc_credit_reserve;
-        // M5: a static Serving target that the device budget cannot hold makes
-        // tryLease miss forever (permanent defer instead of fail-fast).
-        std::unordered_map<std::string, uint64_t> contexts_per_device;
-        for (const auto& context : contexts) {
-            if (!context) continue;
-            const auto& device = context->deviceInfo();
-            ++contexts_per_device[device.native_device_name + ":" +
-                                  device.native_device_path + ":" + device.eid];
-        }
-        std::unordered_map<std::string, std::shared_ptr<ub::NativeBudget>>
-            budgets;
-        for (const auto& context : contexts) {
-            if (!context || !context->handle()) continue;
-            const auto& device = context->deviceInfo();
-            // A physical device is identified by name + path + EID, so every
-            // Context sitting on the same device shares one ledger and can
-            // never overcommit the device's Jetty limit (C05).
-            const std::string device_key = device.native_device_name + ":" +
-                                           device.native_device_path + ":" +
-                                           device.eid;
-            auto& budget = budgets[device_key];
-            if (!budget) {
-                budget = std::make_shared<ub::NativeBudget>();
-                const uint64_t verified = device.capabilities.max_jetty;
-                // Derivation keeps the replacement reserve outside the device's
-                // own limit: NativeBudget::configure() checks
-                // (configured + reserve) <= verified, so deriving configured as
-                // `verified` fails install on every device that reports its
-                // limit. See deriveNativeBudgetJetties().
-                const uint64_t configured = ub::deriveNativeBudgetJetties(
-                    verified, parsed.native_budget.max_jetty_per_device,
-                    parsed.native_budget.replacement_reserve,
-                    parsed.send_pool.desired_per_context);
-                // M5: the pooled members alone must fit per device. Endpoint
-                // Jetties stay outside the NativeBudget ledger for now
-                // (RK5/M10), so their share is surfaced instead of being
-                // silently overcommitted.
-                const uint64_t per_context =
-                    static_cast<uint64_t>(parsed.send_pool.desired_per_context);
-                const uint64_t contexts_on_device =
-                    contexts_per_device.count(device_key) != 0
-                        ? contexts_per_device[device_key]
-                        : 1;
-                const uint64_t endpoint_share =
-                    static_cast<uint64_t>(parsed.jetty_per_endpoint);
-                if (configured < per_context * contexts_on_device) {
-                    return Status::InvalidArgument(
-                        "transports/ub/native_budget/max_jetty_per_device is "
-                        "smaller than send_pool/desired_per_context for " +
-                        device_key);
-                }
-                if (verified != 0 && configured + endpoint_share > verified) {
-                    LOG(WARNING)
-                        << "UB rm_pool budget for device " << device_key
-                        << " leaves no room for the endpoint Jetty set: "
-                           "budget="
-                        << configured << " endpoint=" << endpoint_share
-                        << " verified=" << verified
-                        << "; endpoint Jetties remain outside the ledger "
-                           "(RK5)";
-                }
-                auto status =
-                    budget->configure(device_key, verified, configured,
-                                      parsed.native_budget.replacement_reserve);
-                if (!status.ok()) return status;
-            }
-
-            auto credits = std::make_shared<ub::JfcCreditLedger>();
-            const auto depth_it =
-                jfc_depth_by_device.find(context->topologyId());
-            const uint64_t depth =
-                depth_it == jfc_depth_by_device.end() ? 0 : depth_it->second;
-            if (depth <= credit_reserve) {
-                return Status::InvalidArgument(
-                    "transports/ub/send_pool/jfc_credit_reserve must be "
-                    "smaller than the JFC depth" LOC_MARK);
-            }
-            for (const auto& jfc : context->jfcs()) {
-                if (!jfc) continue;
-                // capacity = jfc_depth - jfc_credit_reserve: the reserve
-                // belongs to control records (markers, AE) and business WRs
-                // never see it (C05/C06).
-                auto status =
-                    credits->install(jfc->index(), depth - credit_reserve);
-                if (!status.ok()) return status;
-            }
-
-            ub::SendJettyPoolOptions options;
-            options.desired_serving = parsed.send_pool.desired_per_context;
-            options.max_creating = parsed.send_pool.max_creating_per_key;
-            options.jetty_options = jetty_options;
-            auto pool = std::make_shared<ub::SendJettyPool>(
-                adapter, context->handle(), context->jfcs(), budget, device_key,
-                credits, options);
-            // Attaching the pool is what flips this Context into the W3 path
-            // (D-2). Nothing else in the transport changes behavior.
-            context->attachPooledSendPool(std::move(pool));
-        }
         return Status::OK();
     }
 
@@ -662,7 +797,15 @@ struct UbTransport::Impl {
                 // A failed native drain fence is not permission to destroy
                 // memory registrations, JFCs, Contexts, or the adapter. Keep
                 // the complete ownership graph alive so uninstall can be
-                // retried after a late completion/provider recovery.
+                // retried after a late completion/provider recovery. The
+                // pooled background executors stop anyway: no new Jetty may
+                // be created while the transport is shutting down, and every
+                // later retirement destroys synchronously.
+                for (auto& context : contexts) {
+                    if (context && context->pooledSendPool()) {
+                        context->pooledSendPool()->beginStop();
+                    }
+                }
                 return status;
             }
             workers.reset();
@@ -714,6 +857,12 @@ struct UbTransport::Impl {
         contexts.clear();
         context_by_topology_id.clear();
         context_by_topology_name.clear();
+        // The workers stopped first (settling every pooled lease) and the
+        // contexts just drained their pools; the admission components can be
+        // released now.
+        native_budget.reset();
+        task_permits.reset();
+        attempt_gate.reset();
         rails.reset();
         quota.reset();
         if (adapter_initialized && adapter) {
@@ -730,6 +879,8 @@ struct UbTransport::Impl {
         local_topology.reset();
         conf.reset();
         local_segment_name.clear();
+        auto_import_snapshot.clear();
+        auto_import_snapshot_valid = false;
         shutting_down.store(false, std::memory_order_release);
         return Status::OK();
     }
@@ -760,8 +911,8 @@ struct UbTransport::Impl {
                         device.lid = 0;
                         device.gid.clear();
                         device.transport_attrs[TransportType::UB] =
-                            encodeDeviceMetadata(context->topologyId(),
-                                                 context->deviceInfo());
+                            ub::encodeDeviceMetadata(context->topologyId(),
+                                                     context->deviceInfo());
                         detail.devices.push_back(std::move(device));
                     }
                 }
@@ -817,9 +968,20 @@ struct UbTransport::Impl {
             MakeNicPath(local_segment_name,
                         request.local_context->deviceInfo().topology_name);
         UbBootstrapDesc bootstrap;
-        auto status = endpoint->makeBootstrapDesc(
-            local_segment_name, local_path, peer_path,
-            request.segment_generation, bootstrap);
+        Status status;
+        const bool rm_endpoint_runtime =
+            runtime_mode == ub::UbRuntimeMode::kRmLegacy ||
+            runtime_mode == ub::UbRuntimeMode::kPooledRm;
+        if (rm_endpoint_runtime) {
+            status = endpoint->makeBootstrapDescV2(
+                local_segment_name, local_path, peer_path,
+                currentSegmentGeneration(), node_incarnation, topology_epoch,
+                bootstrap);
+        } else {
+            status = endpoint->makeBootstrapDesc(
+                local_segment_name, local_path, peer_path,
+                request.segment_generation, bootstrap);
+        }
         if (!status.ok()) {
             (void)endpoints->retire(endpoint);
             endpoint.reset();
@@ -828,7 +990,25 @@ struct UbTransport::Impl {
         UbBootstrapDesc response;
         status = ControlClient::bootstrapUb(
             request.remote_segment->rpc_server_addr, bootstrap, response);
-        if (status.ok()) status = endpoint->bind(response);
+        if (status.ok()) {
+            if (rm_endpoint_runtime) {
+                // Trusted anchor for the peer identity: the device metadata
+                // the peer published into its registered segment descriptor
+                // at install time (validated remote segment metadata), never
+                // the peer's self-asserted bootstrap fields. Every field the
+                // manual flow used to configure is validated here; any
+                // mismatch or missing metadata fails closed before import.
+                ub::UbExpectedPeerIdentity expected;
+                status = ub::anchorPeerIdentityFromSegment(
+                    *request.remote_segment, request.remote_topology_id,
+                    expected);
+                if (status.ok()) {
+                    status = endpoint->bindRm(response, expected);
+                }
+            } else {
+                status = endpoint->bind(response);
+            }
+        }
         if (!status.ok()) {
             (void)endpoints->retire(endpoint);
             endpoint.reset();
@@ -843,6 +1023,19 @@ struct UbTransport::Impl {
             response.reply_msg = "UB transport is shutting down";
             return -1;
         }
+        // The mode gate precedes endpoint eviction, Jetty creation and native
+        // import/bind side effects. RC remains on v1; RM requires a strict v2
+        // request with no reply_msg.
+        const bool rm_runtime = runtime_mode == ub::UbRuntimeMode::kRmLegacy ||
+                                runtime_mode == ub::UbRuntimeMode::kPooledRm;
+        auto gate_status = ub::gateUbBootstrapForMode(
+            rm_runtime ? ub::UbBootstrapMode::RM : ub::UbBootstrapMode::RC,
+            request);
+        if (!gate_status.ok()) {
+            response = request;
+            response.reply_msg = gate_status.ToString();
+            return -1;
+        }
         const std::string local_name =
             getNicNameFromNicPath(request.peer_nic_path);
         auto context_it = context_by_topology_name.find(local_name);
@@ -850,6 +1043,9 @@ struct UbTransport::Impl {
             context_it == context_by_topology_name.end()) {
             response.reply_msg = "UB bootstrap selected an unknown local NIC";
             return -1;
+        }
+        if (rm_runtime) {
+            return onBootstrapRm(request, response, context_it->second);
         }
         if (request.local_device_id < 0 || request.local_eid.empty() ||
             request.jetty_ids.empty() || request.endpoint_generation == 0) {
@@ -880,6 +1076,79 @@ struct UbTransport::Impl {
         return 0;
     }
 
+    int onBootstrapRm(const UbBootstrapDesc& request, UbBootstrapDesc& response,
+                      const ub::UbContextPtr& context) {
+        // Server-side consumer of the peer's v2 request descriptor. The
+        // trusted identity anchor is the requester's registered segment
+        // metadata (the device entry its publishLocalDevices published at
+        // install time), never the self-asserted request fields; every
+        // strict v2 validation and the RM target profile checks still run
+        // in bindRm before any native import.
+        SegmentDescRef requester_segment;
+        Status anchor_status;
+        if (request.segment_name == local_segment_name) {
+            // Self/loopback bootstrap: the local snapshot is authoritative
+            // and no registry round-trip is required.
+            requester_segment = metadata->segmentManager().getLocal();
+        } else {
+            // fetching the requester's descriptor goes to the metadata
+            // registry over RPC, this handler runs on an RPC thread where
+            // nested synchronous RPC is forbidden. so hop to a worker
+            // thread for the fetch and block this handler on the result.
+            auto fetch = std::async(
+                std::launch::async, [this, name = request.segment_name]() {
+                    SegmentDescRef seg;
+                    auto st = metadata->segmentManager().getRemote(seg, name);
+                    return std::make_pair(st, std::move(seg));
+                });
+            auto fetched = fetch.get();
+            anchor_status = fetched.first;
+            requester_segment = std::move(fetched.second);
+        }
+        if (anchor_status.ok() && !requester_segment) {
+            anchor_status = Status::InvalidArgument(
+                "UB RM bootstrap cannot resolve the requester segment '" +
+                request.segment_name + "'" LOC_MARK);
+        }
+        ub::UbExpectedPeerIdentity expected;
+        if (anchor_status.ok()) {
+            anchor_status = ub::anchorPeerIdentityFromSegment(
+                *requester_segment, request.local_device_id, expected);
+        }
+        if (!anchor_status.ok()) {
+            response = UbBootstrapDesc{};
+            response.protocol_version = 2;
+            response.reply_msg =
+                "UB RM bootstrap rejected: requester identity could not be "
+                "anchored from registered segment metadata: " +
+                anchor_status.ToString();
+            return -1;
+        }
+
+        ub::UbEndpointKey key{context->topologyId(), LOCAL_SEGMENT_ID,
+                              request.local_device_id, request.local_nic_path};
+        std::shared_ptr<ub::UbEndpoint> endpoint;
+        auto status = endpoints->getOrCreate(key, context, endpoint);
+        if (status.ok()) status = endpoint->bindRm(request, expected);
+        if (status.ok()) {
+            status = endpoint->makeBootstrapDescV2(
+                local_segment_name, request.peer_nic_path,
+                request.local_nic_path, currentSegmentGeneration(),
+                node_incarnation, topology_epoch, response);
+        }
+        if (status.ok()) {
+            recordReadyEndpoint(endpoint);
+        }
+        if (!status.ok()) {
+            if (endpoint) (void)endpoints->retire(endpoint);
+            response = UbBootstrapDesc{};
+            response.protocol_version = 2;
+            response.reply_msg = status.ToString();
+            return -1;
+        }
+        return 0;
+    }
+
     uint64_t currentSegmentGeneration() const {
         // Buffer generations are carried in buffer metadata. The bootstrap
         // field is a peer restart/refresh hint and must still be nonzero even
@@ -890,11 +1159,21 @@ struct UbTransport::Impl {
     mutable std::mutex lifecycle_mutex;
     std::shared_ptr<ub::UrmaAdapter> adapter;
     bool adapter_initialized{false};
+    // Discovery snapshot taken by the auto-import pre-pass; reused by
+    // install so injected identities are verified against their source.
+    std::vector<ub::DeviceInfo> auto_import_snapshot;
+    bool auto_import_snapshot_valid{false};
     bool callback_installed{false};
     std::atomic<bool> installed{false};
     std::atomic<bool> shutting_down{false};
     std::atomic<uint64_t> segment_generation{generationSeed()};
     ub::UbParams params;
+    // Resolved once during install and never switched at runtime. RM Legacy
+    // carries the node incarnation and topology epoch published in bootstrap
+    // v2 descriptors; both are transport-lifetime stable in the P1 baseline.
+    ub::UbRuntimeMode runtime_mode{ub::UbRuntimeMode::kRcLegacy};
+    const uint64_t node_incarnation{generationSeed()};
+    const uint64_t topology_epoch{generationSeed()};
     std::string local_segment_name;
     std::shared_ptr<ControlService> metadata;
     std::shared_ptr<Topology> local_topology;
@@ -918,6 +1197,12 @@ struct UbTransport::Impl {
     std::unique_ptr<ub::ProbeLinkManager> probe_manager;
     std::unique_ptr<ub::ProbeScheduler> probe_scheduler;
     std::unique_ptr<ub::UbWorkers> workers;
+    // rm_pool admission and completion-gate components, owned by the install
+    // generation and shared with the workers. Reset during shutdown after the
+    // workers stop and the contexts (pool owners) are released.
+    std::shared_ptr<ub::NativeBudget> native_budget;
+    std::shared_ptr<ub::TaskPermitLedger> task_permits;
+    std::shared_ptr<ub::AttemptGate> attempt_gate;
 };
 
 UbTransport::UbTransport(

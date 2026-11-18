@@ -73,7 +73,23 @@
             "slice_timeout_ms": 10000,
             "endpoint_cooldown_ms": 30000,
             "enable_bandwidth_estimation": true,
-            "enable_notifications": false
+            "enable_notifications": false,
+            "runtime_profile": "rc_legacy",
+            "trans_mode": "rc",
+            "jetty_pool": {
+                "enable": false,
+                "force_disable": false
+            },
+            "probe": {
+                "enabled": false,
+                "interval": 1000,
+                "timeout": 500,
+                "backoff_max": 30000,
+                "peer_budget": 1,
+                "recover_success_threshold": 1,
+                "failure_threshold": 3,
+                "stop_on_recovery": true
+            }
         },
         "tcp": {
             "enable": true,

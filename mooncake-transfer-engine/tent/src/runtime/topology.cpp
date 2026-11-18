@@ -16,6 +16,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <algorithm>
 #include <iostream>
 #include <map>
 #include <set>
@@ -107,7 +108,8 @@ void Topology::print() const {
     }
 }
 
-Status Topology::discover(const std::vector<Platform*>& platforms) {
+Status Topology::discover(const std::vector<Platform*>& platforms,
+                          const Config* conf) {
     clear();
     for (auto& entry : platforms) {
         CHECK_STATUS(entry->probe(nic_list_, mem_list_));
@@ -116,64 +118,94 @@ Status Topology::discover(const std::vector<Platform*>& platforms) {
     // UB discovery is intentionally adapter-backed instead of inferring UB
     // devices from verbs/sysfs names. One topology NIC is emitted per EID and
     // carries both the globally serialized identity and the native URMA name.
-    auto adapter = ub::createDefaultUrmaAdapter();
-    if (adapter && adapter->available()) {
-        auto status = adapter->initialize();
-        if (status.ok()) {
-            std::vector<ub::DeviceInfo> devices;
-            status = adapter->discoverDevices(devices);
+    if (!platforms.empty()) {
+        std::vector<std::string> ub_whitelist;
+        std::vector<std::string> ub_blacklist;
+        if (conf) {
+            ub_whitelist =
+                conf->getArray<std::string>("topology/rdma_whitelist");
+            ub_blacklist =
+                conf->getArray<std::string>("topology/rdma_blacklist");
+        }
+        const auto ub_device_allowed = [&](const std::string& name) {
+            if (ub_whitelist.empty() && ub_blacklist.empty()) return true;
+            if (!ub_whitelist.empty() &&
+                std::find(ub_whitelist.begin(), ub_whitelist.end(), name) ==
+                    ub_whitelist.end()) {
+                return false;
+            }
+            if (!ub_blacklist.empty() &&
+                std::find(ub_blacklist.begin(), ub_blacklist.end(), name) !=
+                    ub_blacklist.end()) {
+                return false;
+            }
+            return true;
+        };
+        auto adapter = ub::createDefaultUrmaAdapter();
+        if (adapter && adapter->available()) {
+            auto status = adapter->initialize();
             if (status.ok()) {
-                std::unordered_map<std::string, int> native_device_indices;
-                for (const auto& device : devices) {
-                    auto [native_it, inserted] = native_device_indices.emplace(
-                        device.native_device_name,
-                        static_cast<int>(native_device_indices.size()));
-                    (void)inserted;
+                std::vector<ub::DeviceInfo> devices;
+                status = adapter->discoverDevices(devices);
+                if (status.ok()) {
+                    std::unordered_map<std::string, int> native_device_indices;
+                    for (const auto& device : devices) {
+                        if (!ub_device_allowed(device.native_device_name)) {
+                            continue;
+                        }
+                        auto [native_it, inserted] =
+                            native_device_indices.emplace(
+                                device.native_device_name,
+                                static_cast<int>(native_device_indices.size()));
+                        (void)inserted;
 
-                    int numa_node = -1;
-                    std::string pci_bus_id;
-                    if (!device.native_device_path.empty()) {
-                        std::error_code error;
-                        const auto device_path = std::filesystem::canonical(
-                            std::filesystem::path(device.native_device_path) /
-                                "device",
-                            error);
-                        if (!error) {
-                            pci_bus_id = device_path.filename().string();
-                            std::ifstream(device_path / "numa_node") >>
-                                numa_node;
+                        int numa_node = -1;
+                        std::string pci_bus_id;
+                        if (!device.native_device_path.empty()) {
+                            std::error_code error;
+                            const auto device_path = std::filesystem::canonical(
+                                std::filesystem::path(
+                                    device.native_device_path) /
+                                    "device",
+                                error);
+                            if (!error) {
+                                pci_bus_id = device_path.filename().string();
+                                std::ifstream(device_path / "numa_node") >>
+                                    numa_node;
+                            }
+                        }
+
+                        const NicID nic_id =
+                            static_cast<NicID>(nic_list_.size());
+                        NicEntry nic{.name = device.topology_name,
+                                     .pci_bus_id = std::move(pci_bus_id),
+                                     .type = NIC_UB,
+                                     .numa_node = numa_node};
+                        ub::encodeTopologyDeviceAttributes(
+                            device, native_it->second, nic.device_attrs);
+                        nic_list_.push_back(std::move(nic));
+
+                        for (auto& memory : mem_list_) {
+                            const size_t rank =
+                                numa_node >= 0 && memory.numa_node == numa_node
+                                    ? 0
+                                    : DevicePriorityRanks - 1;
+                            memory.device_list[rank].push_back(nic_id);
                         }
                     }
-
-                    const NicID nic_id = static_cast<NicID>(nic_list_.size());
-                    NicEntry nic{.name = device.topology_name,
-                                 .pci_bus_id = std::move(pci_bus_id),
-                                 .type = NIC_UB,
-                                 .numa_node = numa_node};
-                    ub::encodeTopologyDeviceAttributes(
-                        device, native_it->second, nic.device_attrs);
-                    nic_list_.push_back(std::move(nic));
-
-                    for (auto& memory : mem_list_) {
-                        const size_t rank =
-                            numa_node >= 0 && memory.numa_node == numa_node
-                                ? 0
-                                : DevicePriorityRanks - 1;
-                        memory.device_list[rank].push_back(nic_id);
-                    }
+                } else {
+                    LOG(WARNING) << "Unable to discover optional UB devices: "
+                                 << status.ToString();
+                }
+                auto shutdown_status = adapter->shutdown();
+                if (!shutdown_status.ok()) {
+                    LOG(WARNING) << "Unable to release UB discovery runtime: "
+                                 << shutdown_status.ToString();
                 }
             } else {
-                LOG(WARNING) << "Unable to discover optional UB devices: "
+                LOG(WARNING) << "Unable to initialize optional UB discovery: "
                              << status.ToString();
             }
-            auto shutdown_status = adapter->shutdown();
-            if (!shutdown_status.ok()) {
-                LOG(WARNING) << "Unable to release UB discovery runtime: "
-                             << shutdown_status.ToString();
-            }
-        } else {
-            LOG(WARNING) << "Unable to initialize optional UB discovery: "
-                         << status.ToString();
         }
     }
 #endif
@@ -359,7 +391,7 @@ Status Topology::loadFromConfig(const Config& conf,
             LOG(WARNING) << "Failed to parse topology/priority_matrix: "
                          << status.ToString()
                          << ", falling back to auto-discover";
-            return discover(platforms);
+            return discover(platforms, &conf);
         }
     }
 
@@ -378,16 +410,15 @@ Status Topology::loadFromConfig(const Config& conf,
         if (content.empty()) {
             LOG(WARNING) << "Failed to load custom topology from " << path
                          << ", falling back to auto-detect.";
-            return discover(platforms);
+            return discover(platforms, &conf);
         }
         auto status = parseCustomTopology(content);
         if (status.ok()) return Status::OK();
         LOG(WARNING) << "Failed to parse custom topology from " << path << ": "
                      << status.ToString() << ", falling back to auto-detect.";
-        return discover(platforms);
+        return discover(platforms, &conf);
     }
-
-    return discover(platforms);
+    return discover(platforms, &conf);
 }
 
 size_t Topology::getNicCount(NicType type) const {
