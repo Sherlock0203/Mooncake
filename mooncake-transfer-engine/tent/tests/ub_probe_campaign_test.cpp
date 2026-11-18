@@ -248,7 +248,8 @@ TEST(UbProbeCampaignTest, PostRejectionRollsEntryBackToQueued) {
     auto health = healthOf(plm, version);
     EXPECT_EQ(health.health, LinkHealth::kIsolated);
     EXPECT_EQ(health.fault_epoch, 1U);
-    EXPECT_EQ(health.task, TaskState::kQueued);
+    // A rejected post closes the campaign entry instead of requeueing it.
+    EXPECT_EQ(health.task, TaskState::kIdle);
     EXPECT_EQ(health.inflight_seq, 0U);
     EXPECT_EQ(health.next_probe_ns, clock.now() + 100ULL * 1000 * 1000);
     EXPECT_EQ(plm.inflightCount(), 0U);
@@ -256,16 +257,16 @@ TEST(UbProbeCampaignTest, PostRejectionRollsEntryBackToQueued) {
     // Not accepted is not a probe: no completion may follow.
     EXPECT_EQ(plm.stats().probe_scheduled, 1U);
     EXPECT_EQ(plm.stats().probe_posted, 0U);
-
-    auto campaigns = plm.campaignView();
-    ASSERT_EQ(campaigns.size(), 1U);
-    EXPECT_EQ(campaignEntryOf(campaigns[0], version)->state,
-              EntryState::kQueued);
-
-    // The retry is delayed but the campaign is not stranded.
-    clock.advance(50ULL * 1000 * 1000);
+    EXPECT_TRUE(plm.campaignView().empty());
+    const uint64_t seq_after_rejection = health.probe_seq;
     EXPECT_TRUE(plm.pendingActions(clock.now()).empty());
-    clock.advance(100ULL * 1000 * 1000);
+
+    // The next campaign is driven by a new event after the interval, not by
+    // an immediate rejected-post retry.
+    clock.advance(kIntervalNs);
+    EXPECT_EQ(healthOf(plm, version).probe_seq, seq_after_rejection);
+    plm.onBusinessPathError(makeEvidence(0, 10, 0),
+                            BusinessErrorKind::kPathFault, clock.now());
     auto retry = postNext(plm, token_seq, clock.now());
     ASSERT_TRUE(retry.has_value());
     ASSERT_TRUE(

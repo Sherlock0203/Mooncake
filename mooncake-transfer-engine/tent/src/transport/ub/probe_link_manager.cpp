@@ -646,7 +646,7 @@ void ProbeLinkManager::onPostResult(const std::shared_ptr<ProbeRecord>& record,
                                      << probeKeyText(record->key);
             PortRuntime* port =
                 findPortLocked(record->key.version.path.local_nic);
-            if (port != nullptr) {
+            if (port != nullptr && !params_.test_periodic_all) {
                 laneRetireLocked(*port, now, record->key.version,
                                  Status::InternalError(
                                      "probe post rejected after completion"),
@@ -674,9 +674,10 @@ void ProbeLinkManager::onPostResult(const std::shared_ptr<ProbeRecord>& record,
                         std::min(params_.intervalNs(), kPostRejectedRetryCapNs);
                 }
             }
-            // Rejection is not a path fault: hand the task slot back so a
-            // campaign entry returns to kQueued instead of hanging in
-            // kInflight.
+            // A rejected post is not a path fault, but retrying it in a tight
+            // loop burns probe_seq without ever producing a completion. Close
+            // the campaign entry; the next campaign/periodic event retries.
+            campaignProgressLocked(record->key, EntryState::kCanceled);
             releaseTaskSlotLocked(*record);
             source = std::move(record->source);
             area = std::move(record->area);
@@ -801,10 +802,19 @@ bool ProbeLinkManager::onProbeCompletion(const Completion& completion,
             // Campaign accounting is filtered by id/epoch; a stale health
             // result still terminalizes its matching entry so the campaign
             // cannot hang on an in-flight item (design §7.3).
-            if (record->test_probe && runtime != nullptr) {
-                // The test cadence is independent of health and backoff; even a
-                // stale result advances it so the port does not spin.
-                runtime->test_due_ns = now + params_.testIntervalNs();
+            if (runtime != nullptr) {
+                if (record->test_probe) {
+                    // The test cadence is independent of health and backoff;
+                    // even a stale result advances it so the port does not
+                    // spin.
+                    runtime->test_due_ns = now + params_.testIntervalNs();
+                } else if (!current) {
+                    // A stale campaign completion must not make the path
+                    // immediately due again: that spins beginPost() and
+                    // inflates probe_seq without producing a completion.
+                    runtime->next_probe_ns = std::max(
+                        runtime->next_probe_ns, now + params_.intervalNs());
+                }
             }
             campaignProgressLocked(
                 record->key, current ? mapCampaignOutcome(completion.category)
@@ -851,6 +861,10 @@ void ProbeLinkManager::applyLocked(const Completion& completion,
                                    const ProbeEdgeSupply& edge,
                                    PortRuntime& port, uint64_t now_ns,
                                    bool test_probe, Effects& effects) {
+    // test_probe only identifies a periodic test sweep. Campaign probes issued
+    // inside the same selftest are non-test records but still must not rebuild
+    // the lane: the selftest peer descriptor source is static.
+    const bool test_mode = params_.test_periodic_all;
     switch (completion.category) {
         case CompletionCategory::SUCCESS: {
             runtime.consecutive_failures = 0;
@@ -906,10 +920,12 @@ void ProbeLinkManager::applyLocked(const Completion& completion,
                 << "UB probe path error: " << pathText(version)
                 << " failures=" << runtime.consecutive_failures
                 << " backoff_ns=" << runtime.backoff_ns;
-            if (!test_probe) {
+            if (!test_mode) {
                 laneRetireLocked(port, now_ns, version,
                                  Status::RdmaError("probe remote path error"),
                                  effects);
+            } else {
+                runtime.next_probe_ns = now_ns + params_.intervalNs();
             }
             return;
         }
@@ -917,8 +933,8 @@ void ProbeLinkManager::applyLocked(const Completion& completion,
             // Probe area/token mismatch is a lane/configuration problem, never
             // evidence that the path is bad (design §9.3 / L-3).
             ++stats_.probe_area_config_error;
-            if (test_probe) {
-                ++stats_.probe_test_fail;
+            if (test_mode) {
+                if (test_probe) ++stats_.probe_test_fail;
                 // Test mode has a static peer descriptor source; retiring the
                 // lane would rotate the probe target/area and make the next
                 // test fail for a descriptor reason, not a link reason. Keep
@@ -927,6 +943,7 @@ void ProbeLinkManager::applyLocked(const Completion& completion,
                     ++runtime.fault_epoch;
                     setHealthLocked(runtime, LinkHealth::kIsolated, effects);
                 }
+                runtime.next_probe_ns = now_ns + params_.intervalNs();
                 return;
             }
             LOG_EVERY_N(WARNING, 100)
@@ -942,12 +959,13 @@ void ProbeLinkManager::applyLocked(const Completion& completion,
         case CompletionCategory::UNKNOWN_ERROR:
         default:
             ++stats_.probe_failure_lane;
-            if (test_probe) {
-                ++stats_.probe_test_fail;
+            if (test_mode) {
+                if (test_probe) ++stats_.probe_test_fail;
                 if (runtime.health != LinkHealth::kIsolated) {
                     ++runtime.fault_epoch;
                     setHealthLocked(runtime, LinkHealth::kIsolated, effects);
                 }
+                runtime.next_probe_ns = now_ns + params_.intervalNs();
                 return;
             }
             LOG_EVERY_N(WARNING, 100)
@@ -1757,10 +1775,21 @@ void ProbeLinkManager::scanTimeouts(uint64_t now_ns) {
             PortRuntime* port =
                 findPortLocked(record->key.version.path.local_nic);
             if (port != nullptr) {
-                laneRetireLocked(
-                    *port, now, record->key.version,
-                    Status::InternalError("probe completion timeout"), effects);
-                markPortPendingLocked(*port, PendingReason::kLaneRetired, now);
+                if (!params_.test_periodic_all) {
+                    laneRetireLocked(
+                        *port, now, record->key.version,
+                        Status::InternalError("probe completion timeout"),
+                        effects);
+                    markPortPendingLocked(*port, PendingReason::kLaneRetired,
+                                          now);
+                } else if (record->test_probe) {
+                    PathRuntime* test_runtime =
+                        findPathLocked(record->key.version);
+                    if (test_runtime != nullptr) {
+                        test_runtime->test_due_ns =
+                            now + params_.testIntervalNs();
+                    }
+                }
             }
             PathRuntime* runtime = findPathLocked(record->key.version);
             if (runtime != nullptr && record->test_probe) {

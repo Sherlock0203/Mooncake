@@ -18,6 +18,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <vector>
 
 #include "tent/transport/ub/probe_link_manager.h"
@@ -161,6 +162,59 @@ TEST(UbProbeTestModeTest, MemoryErrorIsolatesWithoutLaneRebuild) {
     ASSERT_TRUE(
         plm.onProbeCompletion(makeCompletion(recovered->token), clock.now()));
     EXPECT_EQ(healthOf(plm, version).health, LinkHealth::kHealthy);
+    EXPECT_TRUE(reports.retire_calls.empty());
+}
+
+TEST(UbProbeTestModeTest, CampaignMemoryErrorDoesNotRebuildLane) {
+    TestClock clock;
+    ProbeLinkManager plm(testParams(), clock.clock());
+    RecordingReportSink reports;
+    plm.setReportSink(&reports);
+    auto graph = makeGraph({makePortSupply(0, 1)}, {makeEdgeSupply(0, 10, 0)});
+    ASSERT_TRUE(plm.initialize(graph).ok());
+    const PathVersion version{ProbePathKey{0, 10, 0}, 1, 1};
+
+    plm.onBusinessPathSuccess(makeEvidence(0, 10, 0), clock.now());
+    ASSERT_EQ(healthOf(plm, version).health, LinkHealth::kHealthy);
+    plm.onBusinessPathError(makeEvidence(0, 10, 0),
+                            BusinessErrorKind::kPathFault, clock.now());
+
+    uint64_t token_seq = 0;
+    auto campaign = postNext(plm, token_seq, clock.now());
+    ASSERT_TRUE(campaign.has_value());
+    ASSERT_TRUE(campaign->record != nullptr);
+    EXPECT_FALSE(campaign->record->test_probe);
+    ASSERT_TRUE(plm.onProbeCompletion(
+        makeCompletion(campaign->token, CompletionCategory::MEMORY_ERROR),
+        clock.now()));
+    EXPECT_EQ(plm.stats().probe_area_config_error, 1U);
+    EXPECT_TRUE(reports.retire_calls.empty());
+    EXPECT_TRUE(std::ranges::none_of(
+        plm.pendingActions(clock.now()),
+        [](const ProbeAction& action) { return !action.test; }));
+}
+
+TEST(UbProbeTestModeTest, RejectedCampaignDoesNotSpinProbeSeq) {
+    TestClock clock;
+    ProbeLinkManager plm(testParams(), clock.clock());
+    RecordingReportSink reports;
+    plm.setReportSink(&reports);
+    auto graph = makeGraph({makePortSupply(0, 1)}, {makeEdgeSupply(0, 10, 0)});
+    ASSERT_TRUE(plm.initialize(graph).ok());
+    const PathVersion version{ProbePathKey{0, 10, 0}, 1, 1};
+
+    plm.onBusinessPathError(makeEvidence(0, 10, 0),
+                            BusinessErrorKind::kPathFault, clock.now());
+    uint64_t token_seq = 0;
+    auto campaign = postNext(plm, token_seq, clock.now());
+    ASSERT_TRUE(campaign.has_value());
+    const uint64_t seq_before = healthOf(plm, version).probe_seq;
+    plm.onPostResult(campaign->record, ProbePostOutcome::kRejected,
+                     clock.now());
+    EXPECT_EQ(healthOf(plm, version).probe_seq, seq_before);
+    EXPECT_TRUE(std::ranges::none_of(
+        plm.pendingActions(clock.now()),
+        [](const ProbeAction& action) { return !action.test; }));
     EXPECT_TRUE(reports.retire_calls.empty());
 }
 

@@ -111,13 +111,19 @@ TEST(UbProbeSchedulerTest, RejectionRetriesWithoutMarkingPathBad) {
     }));
     EXPECT_EQ(healthOf(plm, version).health, LinkHealth::kIsolated);
     EXPECT_EQ(healthOf(plm, version).fault_epoch, 1U);
-    EXPECT_EQ(healthOf(plm, version).task, TaskState::kQueued);
+    // Rejection closes the campaign entry; the task slot is released and the
+    // rejected post must not be retried in a tight loop.
+    EXPECT_EQ(healthOf(plm, version).task, TaskState::kIdle);
+    EXPECT_TRUE(plm.campaignView().empty());
+    const uint64_t seq_after_rejection = healthOf(plm, version).probe_seq;
+    EXPECT_EQ(poster.callCount(), 1U);
+    EXPECT_EQ(healthOf(plm, version).probe_seq, seq_after_rejection);
 
-    // The retry is delayed by min(interval, 100ms) instead of spinning.
-    ASSERT_TRUE(poster.waitForCalls(2));
-    EXPECT_EQ(plm.stats().probe_posted, 0U);
-
+    // A later business event starts a new campaign and a fresh accepted post.
     poster.setResult(FakePostResult::kAccepted);
+    plm.onBusinessPathError(makeEvidence(0, 10, 0),
+                            BusinessErrorKind::kPathFault);
+    ASSERT_TRUE(poster.waitForCalls(2));
     ASSERT_TRUE(waitUntil([&] {
         return plm.inflightCount() == 1 && plm.stats().probe_posted >= 1;
     }));
@@ -359,8 +365,15 @@ TEST(UbProbeSchedulerTest, StaleAreaEvidenceBlocksRecovery) {
 
     EXPECT_EQ(plm.stats().probe_stale, 1U);
     EXPECT_EQ(healthOf(plm, version).health, LinkHealth::kIsolated);
-    EXPECT_EQ(healthOf(plm, version).next_probe_ns, clock.now());
+    // Stale campaign evidence must not make the path immediately due again.
+    EXPECT_EQ(healthOf(plm, version).next_probe_ns, clock.now() + kIntervalNs);
+    EXPECT_EQ(healthOf(plm, version).task, TaskState::kIdle);
+    EXPECT_TRUE(plm.campaignView().empty());
+    const uint64_t seq_after_stale = healthOf(plm, version).probe_seq;
+    EXPECT_FALSE(postNext(plm, token_seq, clock.now()).has_value());
+    EXPECT_EQ(healthOf(plm, version).probe_seq, seq_after_stale);
 
+    clock.advance(kIntervalNs);
     probe = postNext(plm, token_seq, clock.now());
     ASSERT_TRUE(probe.has_value());
     EXPECT_EQ(probe->record->key.area_epoch, 2U);
