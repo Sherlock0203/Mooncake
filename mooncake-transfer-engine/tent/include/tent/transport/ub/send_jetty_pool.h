@@ -4,6 +4,7 @@
 #ifndef TENT_TRANSPORT_UB_SEND_JETTY_POOL_H_
 #define TENT_TRANSPORT_UB_SEND_JETTY_POOL_H_
 
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -11,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -130,7 +132,10 @@ class SendJettyPool;
 // exactly once through SendJettyPool::returnOnce() (normal or retire path).
 // The destructor never calls native delete: a dropped lease is a
 // responsibility leak, so the pool keeps the member out of circulation,
-// retains its budget and counts the leak for diagnostics.
+// retains its budget and counts the leak for diagnostics. The pool is held
+// as a weak reference (RC-04): if the pool is destroyed first, the leak
+// notification is skipped instead of dereferencing a dead pool; the member's
+// JettyPtr still releases its handle best-effort.
 class SliceJettyLease {
    public:
     SliceJettyLease() = default;
@@ -153,17 +158,19 @@ class SliceJettyLease {
    private:
     friend class SendJettyPool;
     friend class ::UbSendJettyPoolTest_DoubleReturnRejected_Test;
-    SliceJettyLease(SendJettyPool* pool, std::shared_ptr<PoolMember> member,
-                    AttemptKey attempt)
-        : pool_(pool), member_(std::move(member)), attempt_(attempt) {}
+    SliceJettyLease(std::weak_ptr<SendJettyPool> pool,
+                    std::shared_ptr<PoolMember> member, AttemptKey attempt)
+        : pool_(std::move(pool)),
+          member_(std::move(member)),
+          attempt_(attempt) {}
 
     void detach() noexcept {
-        pool_ = nullptr;
+        pool_.reset();
         member_ = nullptr;
         attempt_ = AttemptKey{};
     }
 
-    SendJettyPool* pool_ = nullptr;
+    std::weak_ptr<SendJettyPool> pool_;
     std::shared_ptr<PoolMember> member_;
     AttemptKey attempt_{};
 };
@@ -184,6 +191,15 @@ struct SendJettyPoolOptions {
     // Bound on concurrent creations per PoolKey so refill cannot storm the
     // provider.
     size_t max_creating = 2;
+    // Background refill executor: periodically tops every known PoolKey back
+    // up to desired_serving while idle and replaces retired members without
+    // waiting for the next business attempt. Disabled by default so
+    // deterministic direct-pool users keep synchronous accounting.
+    bool background_refill = false;
+    // Background delete executor: reset+delete of retired members happens off
+    // the completion/return path. Disabled by default for the same reason.
+    bool background_delete = false;
+    uint32_t refill_interval_ms = 50;
     JettyOptions jetty_options;
 };
 
@@ -210,7 +226,14 @@ struct SendJettyPoolStats {
 // back. JFC credit matching happens inside the LIFO order: the lease scans
 // from the front for the newest member whose JFC credit is available this
 // round. All provider calls happen outside the pool lock.
-class SendJettyPool final {
+//
+// Shutdown ordering contract (RC-03): the transport must stop every
+// posting/polling consumer (workers->stop()) before the owning Context runs
+// beginStop()/drainIdle(); drainIdle() verifies that no lease is outstanding
+// and logs an error when the contract is violated. The pool must be owned by
+// a shared_ptr so leases can hold a weak reference (RC-04).
+class SendJettyPool final
+    : public std::enable_shared_from_this<SendJettyPool> {
    public:
     SendJettyPool(std::shared_ptr<UrmaAdapter> adapter,
                   ContextPtr context_handle,
@@ -222,6 +245,12 @@ class SendJettyPool final {
 
     SendJettyPool(const SendJettyPool&) = delete;
     SendJettyPool& operator=(const SendJettyPool&) = delete;
+
+    // Stops both executors (when enabled), drains any pending asynchronous
+    // deletes and gives quarantined members one last delete attempt. The
+    // context normally calls beginStop()/drainIdle()/drainQuarantined()
+    // first; the destructor is the final safety net.
+    ~SendJettyPool();
 
     // Non-blocking lease for one attempt. Status codes:
     //   OK               lease (and JFC credit) acquired
@@ -241,14 +270,21 @@ class SendJettyPool final {
     // member never returns to the pool, even if the path recovers).
     Status retireFaulted(SliceJettyLease lease, const std::string& reason);
 
-    // Stops new leases/creations. Outstanding leases still settle through
-    // returnOnce()/retireFaulted(); their members are retired, never reused.
+    // Stops new leases/creations and joins both background executors (when
+    // enabled), draining any pending asynchronous deletes synchronously.
+    // Outstanding leases still settle through returnOnce()/retireFaulted();
+    // their members are retired synchronously, never reused.
     void beginStop();
     [[nodiscard]] bool stopping() const;
 
-    // Deletes every idle member (shutdown path). Handles whose delete fails
-    // stay owned by the pool for the next drain attempt; their budget stays
-    // charged until destruction is proven.
+    // Deletes every idle member and acts as the shutdown barrier for the
+    // background executors: the refill and delete threads are joined before
+    // any native destruction here, so the caller may close the parent JFC
+    // afterwards. Precondition (RC-03): every posting/polling consumer must
+    // already be stopped (workers->stop()); drainIdle verifies that no lease
+    // is outstanding or mid-creation and logs an error on violation. Handles
+    // whose delete fails stay owned by the pool for the next drain attempt;
+    // their budget stays charged until destruction is proven.
     Status drainIdle();
 
     // Attempts to delete quarantined members (e.g. during shutdown after
@@ -276,10 +312,19 @@ class SendJettyPool final {
     };
 
     Status createAndPublish(const PoolKey& pool_key);
+    void retireUnpublished(JettyPtr jetty, BudgetReservation reservation,
+                           const PoolKey& pool_key);
     void retireMemberLocked(std::shared_ptr<PoolMember> member,
                             const std::string& reason);
     void destroyRetired(std::vector<std::shared_ptr<PoolMember>> members);
     void onLeaseLeaked(const std::shared_ptr<PoolMember>& member);
+
+    // Background executors (P2/P3). Both loops run outside the pool lock for
+    // every provider call and exit on their stop flag.
+    void refillLoop();
+    void deleteLoop();
+    void stopRefillExecutor();
+    void stopDeleteExecutor();
 
     const std::shared_ptr<UrmaAdapter> adapter_;
     const ContextPtr context_handle_;
@@ -292,10 +337,22 @@ class SendJettyPool final {
     mutable std::mutex mutex_;  // never held across provider calls
     std::unordered_map<PoolKey, PoolBucket, PoolKeyHash> buckets_;
     std::vector<std::shared_ptr<PoolMember>> retired_;
+    // Members handed to the delete executor. RC-08: once a member leaves
+    // this queue inside deleteLoop(), its state/jetty fields mutate outside
+    // the pool lock; diagnostics must report the fixed kDeleteReady state
+    // (see memberStates()) instead of reading member fields lock-free.
+    std::vector<std::shared_ptr<PoolMember>> delete_ready_;
     std::vector<std::shared_ptr<PoolMember>> quarantined_;
     uint64_t next_lane_generation_ = 1;
     size_t next_jfc_rotation_ = 0;
     bool stopping_ = false;
+
+    std::condition_variable refill_cv_;
+    std::condition_variable delete_cv_;
+    std::thread refill_thread_;
+    std::thread delete_thread_;
+    bool refill_stop_ = false;
+    bool delete_stop_ = false;
 
     // Diagnostics counters (protected by mutex_).
     uint64_t total_leases_ = 0;

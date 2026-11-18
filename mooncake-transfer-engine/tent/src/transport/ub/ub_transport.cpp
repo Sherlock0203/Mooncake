@@ -544,6 +544,12 @@ struct UbTransport::Impl {
                     params.send_pool.desired_per_context;
                 pool_options.max_creating =
                     params.send_pool.max_creating_per_key;
+                pool_options.background_refill =
+                    params.send_pool.background_refill;
+                pool_options.background_delete =
+                    params.send_pool.background_delete;
+                pool_options.refill_interval_ms =
+                    params.send_pool.refill_interval_ms;
                 pool_options.jetty_options = jetty_options;
                 context->attachPooledSendPool(
                     std::make_shared<ub::SendJettyPool>(
@@ -650,7 +656,15 @@ struct UbTransport::Impl {
                 // A failed native drain fence is not permission to destroy
                 // memory registrations, JFCs, Contexts, or the adapter. Keep
                 // the complete ownership graph alive so uninstall can be
-                // retried after a late completion/provider recovery.
+                // retried after a late completion/provider recovery. The
+                // pooled background executors stop anyway: no new Jetty may
+                // be created while the transport is shutting down, and every
+                // later retirement destroys synchronously.
+                for (auto& context : contexts) {
+                    if (context && context->pooledSendPool()) {
+                        context->pooledSendPool()->beginStop();
+                    }
+                }
                 return status;
             }
             workers.reset();

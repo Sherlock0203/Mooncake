@@ -115,6 +115,9 @@ Status UbContext::initialize(uint32_t jfc_count, const JfcOptions& options) {
 }
 
 Status UbContext::shutdown() {
+    // Precondition (RC-03): the transport must have stopped every
+    // posting/polling consumer (workers->stop()) first; the pooled send pool
+    // verifies that no lease is still outstanding during drainIdle().
     std::lock_guard<std::mutex> lock(lifecycle_mutex_);
     return shutdownLocked();
 }
