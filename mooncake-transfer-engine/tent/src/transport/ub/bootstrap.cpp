@@ -170,8 +170,32 @@ Status validateUbBootstrap(const UbBootstrapDesc& desc) {
 }
 
 Status gateUbBootstrapForMode(UbBootstrapMode expected,
+                              UbBootstrapProtocol requested,
                               const UbBootstrapDesc& desc) {
     CHECK_STATUS(validateUbBootstrap(desc));
+    switch (requested) {
+        case UbBootstrapProtocol::kV1:
+            if (desc.protocol_version != 1) {
+                return Status::InvalidArgument(
+                    "bootstrap/protocol=v1 rejects a non-v1 peer");
+            }
+            // v1 carries per-lane Jetty ids and no RM target; it can only be
+            // served by the RC legacy runtime. RM (legacy or pooled) is
+            // rejected explicitly instead of degrading to v1.
+            if (expected == UbBootstrapMode::RM) {
+                return Status::NotImplemented(
+                    "bootstrap/protocol=v1 cannot serve an RM runtime");
+            }
+            return Status::OK();
+        case UbBootstrapProtocol::kV2:
+            if (desc.protocol_version != 2) {
+                return Status::InvalidArgument(
+                    "bootstrap/protocol=v2 rejects a non-v2 peer");
+            }
+            break;
+        case UbBootstrapProtocol::kAuto:
+            break;
+    }
     if (expected == UbBootstrapMode::RC) {
         if (desc.protocol_version == 1) return Status::OK();
         return Status::NotImplemented(

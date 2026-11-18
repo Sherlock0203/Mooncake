@@ -173,6 +173,10 @@ struct UbBootstrapDesc {
     std::vector<std::string> capabilities;
     std::string reply_msg;
     std::optional<UbRmBootstrapDesc> rm;
+    // A v1 envelope that also carried a v2 `rm` block. The block is never
+    // parsed and never reaches the runtime (sanitized ignore), but the caller
+    // counts it so a peer that claims v1 while sending v2 fields is visible.
+    bool ignored_v2_payload = false;
 };
 
 inline void to_json(nlohmann::json& j, const UbBootstrapDesc& desc) {
@@ -239,6 +243,9 @@ inline void from_json(const nlohmann::json& j, UbBootstrapDesc& desc) {
         desc.segment_generation = j.value("segment_generation", uint64_t{0});
         desc.capabilities = j.value("capabilities", std::vector<std::string>{});
         desc.reply_msg = j.value("reply_msg", "");
+        // A v1 peer may not carry v2 fields: ignore them for real (they never
+        // reach `rm`) and record the mismatch for the caller to count.
+        desc.ignored_v2_payload = j.contains("rm");
         return;
     }
     if (desc.protocol_version != 2) {

@@ -41,7 +41,12 @@ RecordPath makeBusinessRecordPath(const UbPostPath& path) {
 // excludes the endpoint generation (see UbRailKey). These read-only probes
 // therefore only need a generation that satisfies UbPostPath::valid(); real
 // endpoint generations are monotonic and never below this value.
-constexpr uint64_t kRailProbeEndpointGeneration = 1;
+// W3g-c: pre-resolution health queries are path-level, not generation-level.
+// Zero means "no generation claim" to the PLM, so a bootstrap-published edge
+// with a real endpoint-generation anchor does not report every candidate as
+// `probe_evidence_unmapped`. The claim-time check still uses the real
+// generation and remains strict.
+constexpr uint64_t kRailProbeEndpointGeneration = 0;
 
 // Number of candidates always taken in pre-score order, regardless of which
 // local device they belong to. Two is the floor that keeps tryAcquireFirst from
@@ -81,21 +86,23 @@ struct UbWorkers::BusinessRecord {
     QuotaReservation quota;
     uint64_t posted_ns{0};
     uint64_t deadline_ns{0};
-    std::atomic<bool> timed_out{false};
-    std::atomic<bool> timeout_recorded{false};
-    std::atomic<bool> resources_released{false};
-    // rm_pool data-path owners. pooled_pool is null on legacy paths; the
-    // lease/permit/gate/credit fields are only meaningful when it is set.
-    // The lease is settled exactly once through settlePooledAttempt(); a
-    // dropped lease would be counted as a leak by the pool, so every exit
-    // path must route through the settlement helper.
-    std::shared_ptr<SendJettyPool> pooled_pool;
-    SliceJettyLease pooled_lease;
-    TaskPermitTicket pooled_permit;
-    uint64_t gate_token{0};
-    uint64_t jfc_credit_token{0};
-    size_t pooled_jfc_index{0};
-    std::atomic<bool> pooled_settled{false};
+
+    // ---- W3 pooled ownership (design §5.1) --------------------------------
+    // nullptr means the W2 legacy path: nothing below is touched, and the
+    // member-return code never runs (D-2 mode gate).
+    std::shared_ptr<SendJettyPool> pool;
+    // Handed over exactly once to returnOnce()/retireFaulted() from
+    // onOwners(). A lease still valid at destruction is a responsibility leak
+    // and the pool quarantines the member (diagnostic, not a release path).
+    SliceJettyLease lease;
+    size_t credit_jfc_index{0};
+    uint64_t credit_token{0};
+    // The claim anchor: snapshotted before the lease, compared after it, and
+    // written into core.fault_epoch so business evidence is generation-mapped
+    // (design §5.1/§10.4).
+    uint64_t fault_epoch_snapshot{0};
+    // True while this record owns one task-level K slot (D-6).
+    bool attempt_slot_held{false};
 };
 
 UbWorkers::UbWorkers(std::shared_ptr<UrmaAdapter> adapter,
@@ -108,8 +115,7 @@ UbWorkers::UbWorkers(std::shared_ptr<UrmaAdapter> adapter,
                      LocalDeviceFailureHandler local_device_failure_handler,
                      ProbeLinkManager* probe_manager,
                      std::vector<ProbeJfcSlot> probe_jfcs,
-                     std::shared_ptr<TaskPermitLedger> task_permits,
-                     std::shared_ptr<AttemptGate> attempt_gate)
+                     std::shared_ptr<TombstoneTable> tombstones)
     : adapter_(std::move(adapter)),
       contexts_(std::move(contexts)),
       local_topology_(std::move(local_topology)),
@@ -121,9 +127,8 @@ UbWorkers::UbWorkers(std::shared_ptr<UrmaAdapter> adapter,
       endpoint_resolver_(std::move(endpoint_resolver)),
       endpoint_retirer_(std::move(endpoint_retirer)),
       local_device_failure_handler_(std::move(local_device_failure_handler)),
-      task_permits_(std::move(task_permits)),
-      attempt_gate_(std::move(attempt_gate)),
-      probe_manager_(probe_manager) {
+      probe_manager_(probe_manager),
+      tombstones_(std::move(tombstones)) {
     for (const auto& context : contexts_) {
         if (!context) continue;
         context_by_topology_id_[context->topologyId()] = context;
@@ -256,20 +261,26 @@ Status UbWorkers::stop() {
     // safely; fixed sleeps are never treated as proof that DMA stopped.
     std::vector<std::shared_ptr<BusinessRecord>> still_inflight;
     std::vector<std::shared_ptr<UbEndpoint>> endpoints_to_fence;
-    std::vector<std::shared_ptr<Inflight>> pooled_to_fence;
+    // W3 D-14/W3-IN-10: a pooled record's WR rode a leased member, so its
+    // fence target is that member's Jetty. Fencing the endpoint instead would
+    // prove nothing about the WR that is actually outstanding.
+    std::vector<std::pair<JettyPtr, int>> pooled_jetties_to_fence;
     {
-        std::lock_guard<std::mutex> lock(inflight_mutex_);
-        still_inflight.reserve(inflight_.size());
-        for (const auto& [_, inflight] : inflight_) {
-            still_inflight.push_back(inflight);
-            if (!inflight) continue;
-            if (inflight->pooled_pool && inflight->pooled_lease.valid() &&
-                inflight->pooled_lease.member()) {
-                // The WR rode a pooled member; the fence must quiesce the
-                // member's Jetty, not the endpoint's Jetty set.
-                pooled_to_fence.push_back(inflight);
-            } else if (inflight->endpoint) {
-                endpoints_to_fence.push_back(inflight->endpoint);
+        std::lock_guard<std::mutex> lock(records_mutex_);
+        still_inflight.reserve(records_.size());
+        for (const auto& [_, record] : records_) {
+            still_inflight.push_back(record);
+            if (!record) continue;
+            if (record->pool && record->lease.valid()) {
+                const auto member = record->lease.member();
+                if (member && member->jetty) {
+                    pooled_jetties_to_fence.emplace_back(
+                        member->jetty, record->core.path.local_nic);
+                }
+                continue;
+            }
+            if (record->endpoint) {
+                endpoints_to_fence.push_back(record->endpoint);
             }
         }
         for (const auto& [_, endpoint] : draining_endpoints_) {
@@ -300,23 +311,6 @@ Status UbWorkers::stop() {
         }
         forgetEndpointDrain(endpoint);
         if (endpoint_retirer_) endpoint_retirer_(endpoint);
-    }
-    for (const auto& inflight : pooled_to_fence) {
-        // The shutdown fence proves no more DMA from the pooled member before
-        // context teardown destroys native resources.
-        std::vector<Completion> drained;
-        auto status =
-            adapter_->quiesceJetty(inflight->pooled_lease.member()->jetty,
-                                   params_.slice_timeout_ms, drained);
-        for (const auto& completion : drained) {
-            if (completion.token != 0) handleCompletion(completion);
-        }
-        if (!status.ok()) {
-            if (fence_error.ok()) fence_error = status;
-            continue;
-        }
-        settlePooledAttempt(inflight, PooledSettleKind::kFence, 0,
-                            "shutdown fence");
     }
     if (!fence_error.ok()) {
         return fence_error;
@@ -387,16 +381,17 @@ Status UbWorkers::stop() {
         for (auto& [_, record] : records_) {
             still_inflight.push_back(std::move(record));
         }
-        inflight_.clear();
+        records_.clear();
     }
-    for (const auto& inflight : still_inflight) {
-        // Idempotent: a fence-drained completion may have settled the pooled
-        // attempt already; this only covers still-unsettled leases.
-        settlePooledAttempt(inflight, PooledSettleKind::kFence, 0,
-                            "provider-lost token");
-        releaseInflight(inflight);
-        (void)inflight->pending.slice->resolveAttempt(inflight->attempt, FAILED,
-                                                      0, false);
+    for (const auto& record : still_inflight) {
+        // The bottom-out shares every claim bit with the CQE and timeout exits:
+        // if any of them already disposed of the record, this call only
+        // supplies the missing settlement, so a double release is impossible
+        // (design §6.9). In pooled mode this also settles the lease: an
+        // unposted record finalizes, retires its member and releases its
+        // credit exactly once.
+        gate::onUnposted(record->core, RecordDropReason::kShutdown, *this,
+                         gate_ctx_);
     }
     inflight_cv_.notify_all();
 
@@ -458,8 +453,7 @@ Status UbWorkers::submit(const UbTask::Ptr& task, uint64_t device_mask) {
             // Parked slices count against the same budget: a slice waiting for
             // a lease is just as much queued work as one waiting for a lane.
             if (!businessQueueAdmits(
-                    params_.business_queue_budget,
-                    static_cast<uint64_t>(queued_),
+                    params_.queue_budget, static_cast<uint64_t>(queued_),
                     static_cast<uint64_t>(defer_.parkedTotal()),
                     static_cast<uint64_t>(need))) {
                 budget_exhausted = true;
@@ -548,8 +542,19 @@ UbBusinessStatsSnapshot UbWorkers::businessStats() const {
     out.pool_stop_rejections =
         pool_stop_rejections_.load(std::memory_order_relaxed);
     out.pool_hard_errors = pool_hard_errors_.load(std::memory_order_relaxed);
+    out.claim_rejected_stopping =
+        claim_rejected_stopping_.load(std::memory_order_relaxed);
+    out.claim_rejected_member =
+        claim_rejected_member_.load(std::memory_order_relaxed);
+    out.claim_rejected_generation =
+        claim_rejected_generation_.load(std::memory_order_relaxed);
+    out.claim_rejected_error_epoch =
+        claim_rejected_error_epoch_.load(std::memory_order_relaxed);
+    out.claim_disabled = claim_disabled_.load(std::memory_order_relaxed);
     out.claim_after_isolation =
         claim_after_isolation_.load(std::memory_order_relaxed);
+    out.unknown_token_tombstoned =
+        unknown_token_tombstoned_.load(std::memory_order_relaxed);
     out.post_on_isolated_path =
         post_on_isolated_path_.load(std::memory_order_relaxed);
     out.pooled_return = pooled_return_.load(std::memory_order_relaxed);
@@ -728,12 +733,18 @@ void UbWorkers::logBusinessSummary(uint64_t now_ns) {
               << ",miss=" << stats.pool_lease_misses
               << ",stopped=" << stats.pool_stop_rejections
               << ",hard=" << stats.pool_hard_errors
-              << "} claim_isolated=" << stats.claim_after_isolation
+              << "} claim{stopping=" << stats.claim_rejected_stopping
+              << ",member=" << stats.claim_rejected_member
+              << ",gen=" << stats.claim_rejected_generation
+              << ",epoch=" << stats.claim_rejected_error_epoch
+              << ",disabled=" << stats.claim_disabled
+              << ",isolated=" << stats.claim_after_isolation << "}"
               << " post_isolated=" << stats.post_on_isolated_path
               << " retire=" << stats.pooled_retire
               << " path_peak=" << stats.path_inflight_peak
               << " imbalance=" << stats.path_load_imbalance
-              << " double_return=" << stats.pool_return_double;
+              << " double_return=" << stats.pool_return_double
+              << " unknown_tombstoned=" << stats.unknown_token_tombstoned;
 }
 
 bool UbWorkers::pollBusinessSlot(size_t slot_index) {
@@ -834,6 +845,16 @@ bool UbWorkers::dispatchCompletion(const Completion& completion, int local_nic,
     // Step 4: unknown / late / already disposed. Count it, report it, and keep
     // polling: one stray token never affects any other responsibility (IN-8).
     gate_ctx_.stats.unknown_token.fetch_add(1, std::memory_order_relaxed);
+    // Attribute the token to a retired native entity when the tombstone table
+    // still owns it. The entry proves the Jetty left service, so this is a
+    // late completion of an unproven retirement, not a topology-wide fault.
+    if (tombstones_ != nullptr && completion.local_jetty_id != 0) {
+        const auto stone =
+            tombstones_->lookup(EntityKind::kJetty, completion.local_jetty_id);
+        if (stone.has_value()) {
+            unknown_token_tombstoned_.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     EntityEvidence evidence;
     evidence.token = completion.token;
     evidence.jetty_id = completion.local_jetty_id;
@@ -846,7 +867,7 @@ bool UbWorkers::dispatchCompletion(const Completion& completion, int local_nic,
 
 void UbWorkers::enqueueRetry(const PendingSlice& pending) {
     if (!pending.slice) return;
-    // Deliberately NOT subject to business_queue_budget: a retry is already
+    // Deliberately NOT subject to queue_budget: a retry is already
     // bounded by the slice's own bounded retry budget, and rejecting it here
     // would turn "the queue is momentarily full" into a transfer failure. The
     // budget exists for submit() backpressure (review minor).
@@ -1361,7 +1382,8 @@ bool UbWorkers::poolCandidateUsable(
     // would reject every candidate and business traffic could never start,
     // which is why the literal `servingCount() > 0` pre-screen of design §7.1
     // is relaxed here; tryLease remains the authority.
-    return pool->servingCount(key) < params_.send_pool.desired_per_context;
+    return pool->servingCount(key) <
+           params_.jetty_pool.business_desired_serving;
 }
 
 PoolKey UbWorkers::poolKeyFor(const std::shared_ptr<UbEndpoint>& endpoint) {
@@ -1382,24 +1404,40 @@ PoolKey UbWorkers::poolKeyFor(const std::shared_ptr<UbEndpoint>& endpoint) {
     return key;
 }
 
-bool UbWorkers::claimPost(const std::shared_ptr<SendJettyPool>& pool,
-                          const UbPostPath& path,
-                          uint64_t fault_epoch_snapshot) {
-    // W3 claim review (design §8.2, the R-1 transition shape). Two scalar reads
-    // and no lock held across them: this runs between the last rollback point
-    // and the native post, so it must stay non-blocking (W3-IN-8).
-    //
-    // The window that remains is "review -> tryCommitPost -> publish -> post",
-    // which is a handful of non-blocking instructions. A path isolated inside
-    // that window can leak at most one post per posting thread, and PLM is
-    // idempotent for repeated errors on an already isolated path, so the leak
-    // cannot amplify into a storm (design §8.2, RK1).
-    if (pool && pool->stopping()) return false;
+UbWorkers::ClaimDecision UbWorkers::claimPost(
+    const std::shared_ptr<SendJettyPool>& pool, const PoolKey& pool_key,
+    const AttemptKey& attempt, const LeaseWithCredit& leased,
+    const UbPostPath& path, uint64_t fault_epoch_snapshot) {
+    // W3g R-1. Two independent inputs decide whether the WR may be posted:
+    //   1. the pool's synchronized verdict (stopping / member / generation /
+    //      error epoch), authoritative for the leased resource;
+    //   2. the PLM fault-epoch scalar compared against the pre-lease sample,
+    //      which stays a separate read because the pool must not call the PLM
+    //      while holding its lock (W3g D-4).
+    // Both are lock-free from this thread's perspective and allocation-free;
+    // this runs between the last rollback point and the native post.
+    ClaimDecision decision;
     if (probe_manager_ != nullptr &&
         probe_manager_->businessFaultEpoch(path) != fault_epoch_snapshot) {
-        return false;
+        decision.path_epoch_changed = true;
     }
-    return true;
+    if (!params_.claim.enabled) {
+        // D-9 rollback lever: the pre-W3g recheck only. Counted so a config
+        // accidentally left off is visible in the periodic summary.
+        claim_disabled_.fetch_add(1, std::memory_order_relaxed);
+        if (pool && pool->stopping()) {
+            decision.closed = ClaimClosed::kPoolStopping;
+        }
+        return decision;
+    }
+    if (!pool) return decision;
+    ClaimRequest request;
+    request.attempt = attempt;
+    request.lane_generation = leased.lease.lane().lane_generation;
+    request.error_epoch_snapshot = leased.error_epoch;
+    request.member = leased.lease.member().get();
+    decision.closed = pool->tryClaimPost(pool_key, attempt, request).closed;
+    return decision;
 }
 
 WorkRequest UbWorkers::makeWorkRequest(const PendingSlice& pending,
@@ -1537,245 +1575,220 @@ void UbWorkers::processPending(const PendingSlice& pending,
         return;
     }
 
-    // rm_pool data path (C06): admission runs before any inflight state is
-    // published. A permit/lease miss is capacity pressure - the attempt is
-    // deferred without charging retry budget and every owner acquired so far
-    // is released. A hard lease error fails the attempt through the normal
-    // retryable resolution instead.
-    std::shared_ptr<SendJettyPool> pooled_pool =
-        endpoint->context() ? endpoint->context()->pooledSendPool() : nullptr;
-    TaskPermitTicket pooled_permit;
-    LeaseWithCredit pooled_lease;
-    uint64_t gate_token = 0;
-    if (pooled_pool) {
-        auto defer_pooled_attempt = [&] {
-            (void)pending.slice->deferAttempt(*attempt);
-            endpoint->releaseOutstanding(pending.slice->spec().length);
-            (void)quota_->release(reservation);
-            deferPending(pending);
-        };
-        if (task_permits_) {
-            pooled_permit = task_permits_->tryAcquire();
-            if (!pooled_permit.valid()) {
-                defer_pooled_attempt();
-                return;
-            }
-        }
-        const JettyOptions profile = endpoint->jettyOptions();
-        const PoolKey pool_key{
-            endpoint->context()->incarnation(), profile.trans_mode,
-            static_cast<uint8_t>(profile.priority), profile.bind_tp_type_mask};
-        const AttemptKey attempt_key{
-            reinterpret_cast<uint64_t>(pending.task.get()), attempt->slice_id,
-            attempt->attempt};
-        const auto lease_status =
-            pooled_pool->tryLease(pool_key, attempt_key, pooled_lease);
-        if (lease_status.IsTooManyRequests()) {
-            defer_pooled_attempt();
-            return;
-        }
-        if (!lease_status.ok()) {
-            endpoint->releaseOutstanding(pending.slice->spec().length);
-            (void)quota_->release(reservation);
-            const auto resolution = pending.slice->resolveAttempt(
-                *attempt, FAILED, 0, retryableStatus(lease_status));
-            if (resolution == UbAttemptResolution::kRetryScheduled) {
-                enqueueRetry(pending);
-            }
-            return;
-        }
-        if (attempt_gate_) {
-            gate_token = attempt_gate_->registerAttempt(
-                attempt_key, pooled_lease.lease.lane(),
-                pending.slice->spec().length);
-        }
+    // ---- D-2 mode gate ----------------------------------------------------
+    // `pooledSendPool() != nullptr` selects the W3 pool-aware admission below;
+    // otherwise the W2 path runs byte for byte, touching no lease, credit or K
+    // slot (RK10).
+    if (pooledPoolFor(endpoint)) {
+        processPendingPooled(pending, worker_index, route, endpoint, path,
+                             reservation, local, remote, *attempt);
+        return;
     }
+    postLegacy(pending, worker_index, endpoint, path, reservation, local,
+               remote, *attempt);
+}
 
-    const uint64_t completion_token = nextCompletionToken();
-    auto inflight = std::make_shared<Inflight>();
-    inflight->completion_token = completion_token;
-    inflight->pending = pending;
-    inflight->attempt = *attempt;
-    inflight->path = path;
-    inflight->endpoint = endpoint;
-    inflight->local_segment = local.segment;
-    inflight->remote_segment = remote.segment;
-    inflight->quota = reservation;
-    inflight->posted_ns = steadyNowNs();
-    inflight->deadline_ns = deadlineAfter(
-        inflight->posted_ns,
-        static_cast<uint64_t>(params_.slice_timeout_ms) * 1'000'000ULL);
-    inflight->pooled_pool = pooled_pool;
-    inflight->pooled_permit = std::move(pooled_permit);
-    inflight->gate_token = gate_token;
+void UbWorkers::postLegacy(const PendingSlice& pending, size_t worker_index,
+                           const std::shared_ptr<UbEndpoint>& endpoint,
+                           const UbPostPath& path,
+                           const QuotaReservation& reservation,
+                           const LocalSegmentRef& local,
+                           const ImportedSegmentRef& remote,
+                           const UbAttemptToken& attempt) {
+    auto record = makeRecord(pending, endpoint, path, reservation, local,
+                             remote, attempt);
+    const size_t length = pending.slice->spec().length;
 
-    void UbWorkers::postLegacy(
-        const PendingSlice& pending, size_t worker_index,
-        const std::shared_ptr<UbEndpoint>& endpoint, const UbPostPath& path,
-        const QuotaReservation& reservation, const LocalSegmentRef& local,
-        const ImportedSegmentRef& remote, const UbAttemptToken& attempt) {
-        auto record = makeRecord(pending, endpoint, path, reservation, local,
-                                 remote, attempt);
-        const size_t length = pending.slice->spec().length;
-
-        if (!pending.slice->tryCommitPost(attempt, record->posted_ns)) {
-            endpoint->releaseOutstanding(length);
-            (void)quota_->release(reservation);
-            if (pooled_pool) {
-                // Cancellation won before the native boundary: no WR crossed,
-                // so the member is clean and returns to the pool. The gate
-                // record never saw a post and is dropped; the credit is
-                // released here because the pool never releases caller credits.
-                if (attempt_gate_ && gate_token != 0) {
-                    attempt_gate_->discard(gate_token);
-                }
-                if (auto credits = pooled_pool->creditLedger()) {
-                    credits->release(pooled_lease.jfc_index,
-                                     pooled_lease.jfc_credit_token);
-                }
-                (void)pooled_pool->returnOnce(std::move(pooled_lease.lease),
-                                              true);
-            }
-            return;
-        }
-        if (pooled_pool) {
-            inflight->pooled_jfc_index = pooled_lease.jfc_index;
-            inflight->jfc_credit_token = pooled_lease.jfc_credit_token;
-            inflight->pooled_lease = std::move(pooled_lease.lease);
-        }
-        {
-            // The post-stack reference spans the blocking native call, and it
-            // is taken *before* the record becomes visible to the timeout scan:
-            // a published record with zero references would let a scan fence a
-            // post that has not even started (D-7). The guard releases the
-            // reference on every exit path; when it is the last one the gate
-            // advances with both facts available.
-            gate::HandlerRef post_handler(record->core, *this, gate_ctx_);
-            {
-                std::lock_guard<std::mutex> lock(records_mutex_);
-                records_.emplace(record->core.token, record);
-            }
-            gate_ctx_.stats.record_published.fetch_add(
-                1, std::memory_order_relaxed);
-            path_load_.onPublish(path, length);
-            auto jetty = endpoint->jetty(worker_index);
-            size_t posted_count = 0;
-            PostAcceptance acceptance = PostAcceptance::kNotAccepted;
-            Status status =
-                jetty ? adapter_->post(jetty, {work}, posted_count, acceptance)
-                      : Status::InternalError(
-                            "UB endpoint has no Jetty" LOC_MARK);
-            if (posted_count > 1) {
-                // One WR can only produce one record, so more than one accepted
-                // WR is a contradictory adapter result. It is counted, and it
-                // must never be used as a reason to roll back (D-12).
-                LOG_EVERY_N(WARNING, 100)
-                    << "UB adapter reported an impossible posted_count "
-                    << posted_count << " for one WR; token "
-                    << record->core.token
-                    << " drains until a fence proves responsibility";
-            }
-            if (acceptance == PostAcceptance::kUnknown) {
-                // Nothing is released on a guess: the record drains until the
-                // timeout fence proves the old DMA stopped (upstream §1.2.4).
-                LOG_EVERY_N(WARNING, 100) << "UB post acceptance is unknown; "
-                                             "retaining WR owners until a "
-                                             "CQE or fence settles token "
-                                          << record->core.token;
-            }
-            if (acceptance == PostAcceptance::kAccepted) {
-                rail_monitor_->registerPath(path);
-                if (!status.ok()) {
-                    LOG_EVERY_N(WARNING, 1000)
-                        << "UB post returned an error after accepting the WR: "
-                        << status.ToString();
-                }
-            }
-            gate::onPostReturn(
-                record->core,
-                PostReturn{acceptance,
-                           acceptance == PostAcceptance::kAccepted ? length : 0,
-                           retryableStatus(status)},
-                gate_ctx_);
-            // A rejected post needs no extra work here: the reject disposition
-            // performs the legacy rollback exactly once when the guard above
-            // releases the last reference.
-        }
+    if (!pending.slice->tryCommitPost(attempt, record->posted_ns)) {
+        endpoint->releaseOutstanding(length);
+        (void)quota_->release(reservation);
+        return;
     }
+    // §5.1 status bit, not a gate: it records that this side took the attempt's
+    // single post right, so a future local double post stays detectable.
+    record->core.post_claimed.store(true, std::memory_order_release);
 
-    WorkRequest work;
-    work.operation =
-        pending.opcode == Request::READ ? Operation::READ : Operation::WRITE;
-    work.local_address =
-        reinterpret_cast<uint64_t>(pending.slice->spec().local_address);
-    work.remote_address = pending.slice->spec().remote_address;
-    work.length = pending.slice->spec().length;
-    work.token = completion_token;
-    work.local_segment = local.segment;
-    work.remote_segment = remote.segment;
+    WorkRequest work =
+        makeWorkRequest(pending, record->core.token, local, remote);
     // RM Legacy: one slice attempt is one native WR that must reference the
     // imported target positional with this Jetty; the target is never
     // substituted by a bound remote Jetty.
     const bool rm_endpoint = endpoint->rmMode();
-    if (rm_endpoint) work.target = endpoint->rmTarget(worker_index);
-    JettyPtr jetty;
-    if (inflight->pooled_pool) {
-        // rm_pool data path: the WR rides the leased pool member, never an
-        // endpoint-owned Jetty. The imported target still comes from the
-        // endpoint incarnation that owns the peer relationship.
-        const auto& member = inflight->pooled_lease.member();
-        jetty = member ? member->jetty : nullptr;
-    } else {
-        jetty = endpoint->jetty(worker_index);
+    if (rm_endpoint) {
+        work.target = endpoint->rmTarget(
+            worker_index % std::max<size_t>(1, endpoint->jettyCount()));
     }
-    size_t posted_count = 0;
-    PostAcceptance acceptance = PostAcceptance::kNotAccepted;
-    if (!jetty) {
-        status = Status::InternalError(
-            inflight->pooled_pool ? "Pooled send Jetty is unavailable" LOC_MARK
-                                  : "UB endpoint has no Jetty" LOC_MARK);
-    } else if (rm_endpoint && !work.target) {
-        status = Status::InternalError(
-            "RM endpoint has no imported target for this Jetty" LOC_MARK);
-    } else {
-        status = adapter_->post(jetty, {work}, posted_count, acceptance);
-    }
-    if (inflight->pooled_pool && attempt_gate_ && inflight->gate_token != 0) {
-        attempt_gate_->onPostReturn(inflight->gate_token, status, acceptance);
-    }
-    if (posted_count == 1) {
-        rail_monitor_->registerPath(path);
-        if (acceptance == PostAcceptance::kUnknown) {
-            // A contradictory native result cannot prove the WR was rejected:
-            // never roll back or replay; the CQE or the timeout fence settles
-            // the pre-registered owners.
-            LOG(WARNING)
-                << "UB post acceptance is unknown; retaining WR owners until "
-                   "a CQE or fence settles: "
-                << status.ToString();
-        } else if (!status.ok()) {
-            LOG_EVERY_N(WARNING, 1000)
-                << "UB post returned an error after accepting the WR: "
-                << status.ToString();
+    {
+        // The post-stack reference spans the blocking native call, and it is
+        // taken *before* the record becomes visible to the timeout scan: a
+        // published record with zero references would let a scan fence a post
+        // that has not even started (D-7). The guard releases the reference on
+        // every exit path; when it is the last one the gate advances with both
+        // facts available.
+        gate::HandlerRef post_handler(record->core, *this, gate_ctx_);
+        {
+            std::lock_guard<std::mutex> lock(records_mutex_);
+            records_.emplace(record->core.token, record);
         }
+        gate_ctx_.stats.record_published.fetch_add(1,
+                                                   std::memory_order_relaxed);
+        path_load_.onPublish(path, length);
+        auto jetty = endpoint->jetty(worker_index);
+        size_t posted_count = 0;
+        PostAcceptance acceptance = PostAcceptance::kNotAccepted;
+        Status status;
+        if (!jetty) {
+            status = Status::InternalError("UB endpoint has no Jetty" LOC_MARK);
+        } else if (rm_endpoint && !work.target) {
+            status = Status::InternalError(
+                "RM endpoint has no imported target for this Jetty" LOC_MARK);
+        } else {
+            status = adapter_->post(jetty, {work}, posted_count, acceptance);
+        }
+        if (posted_count > 1) {
+            // One WR can only produce one record, so more than one accepted WR
+            // is a contradictory adapter result. It is counted, and it must
+            // never be used as a reason to roll back (D-12).
+            LOG_EVERY_N(WARNING, 100)
+                << "UB adapter reported an impossible posted_count "
+                << posted_count << " for one WR; token " << record->core.token
+                << " drains until a fence proves responsibility";
+        }
+        if (acceptance == PostAcceptance::kUnknown) {
+            // Nothing is released on a guess: the record drains until the
+            // timeout fence proves the old DMA stopped (upstream §1.2.4).
+            LOG_EVERY_N(WARNING, 100)
+                << "UB post acceptance is unknown; retaining WR owners until a "
+                   "CQE or fence settles token "
+                << record->core.token;
+        }
+        if (acceptance == PostAcceptance::kAccepted) {
+            rail_monitor_->registerPath(path);
+            if (!status.ok()) {
+                LOG_EVERY_N(WARNING, 1000)
+                    << "UB post returned an error after accepting the WR: "
+                    << status.ToString();
+            }
+        }
+        gate::onPostReturn(
+            record->core,
+            PostReturn{acceptance,
+                       acceptance == PostAcceptance::kAccepted ? length : 0,
+                       retryableStatus(status)},
+            gate_ctx_);
+        // A rejected post needs no extra work here: the reject disposition
+        // performs the legacy rollback exactly once when the guard above
+        // releases the last reference.
+    }
+}
+
+void UbWorkers::processPendingPooled(
+    const PendingSlice& pending, size_t worker_index, const Route& route,
+    const std::shared_ptr<UbEndpoint>& endpoint, const UbPostPath& path,
+    const QuotaReservation& reservation, const LocalSegmentRef& local,
+    const ImportedSegmentRef& remote, const UbAttemptToken& attempt) {
+    (void)route;
+    const size_t length = pending.slice->spec().length;
+    auto pool = pooledPoolFor(endpoint);
+    if (!pool) {
+        // The gate above only calls this with a pool; defensive rollback.
+        endpoint->releaseOutstanding(length);
+        (void)quota_->release(reservation);
         return;
     }
-    if (acceptance == PostAcceptance::kUnknown) {
-        // Zero-count but contradictory: the WR may still have crossed. Keep
-        // the token, buffer, segment and endpoint owners; the timeout fence
-        // settles responsibility. Never replay here.
-        LOG(WARNING)
-            << "UB post acceptance is unknown with no posted WR; retaining "
-               "WR owners until a fence settles: "
-            << status.ToString();
-        rail_monitor_->registerPath(path);
+    const DeferEpochs epochs = readDeferEpochs();
+
+    // ④ K (D-6): the task-level concurrency ticket. K exhausted is capacity
+    // pressure, never a failure: no retry is consumed, no path fault is
+    // recorded and no slice is marked failed (W3-IN-3).
+    if (!pending.task->tryAcquireAttemptSlot()) {
+        task_K_wait_.fetch_add(1, std::memory_order_relaxed);
+        endpoint->releaseOutstanding(length);
+        (void)quota_->release(reservation);
+        (void)pending.slice->deferAttempt(attempt);
+        deferPending(pending, DeferReason::kTaskPermit, epochs.task_permit);
         return;
     }
 
-    // ⑦ Claim review. The member is exclusively leased, so only the pool's stop
-    // flag and the path health can have changed since selection.
-    if (!claimPost(pool, path, fault_epoch_snapshot)) {
-        claim_after_isolation_.fetch_add(1, std::memory_order_relaxed);
+    // ⑤ The claim anchor is sampled *before* the lease. Comparing it after the
+    // lease covers the longest window in the attempt (selection -> lease), see
+    // design §8.1 note 2.
+    const uint64_t fault_epoch_snapshot =
+        probe_manager_ != nullptr ? probe_manager_->businessFaultEpoch(path)
+                                  : 0;
+
+    // ⑥ Lease (+ JFC credit). tryLease is non-blocking and already performs the
+    // LIFO scan, the credit reservation and the budget gate, so this side never
+    // keeps a second credit ledger.
+    const PoolKey pool_key = poolKeyFor(endpoint);
+    const AttemptKey attempt_key{reinterpret_cast<uint64_t>(pending.task.get()),
+                                 attempt.slice_id, attempt.attempt};
+    LeaseWithCredit leased;
+    pool_lease_attempts_.fetch_add(1, std::memory_order_relaxed);
+    const Status lease_status = pool->tryLease(pool_key, attempt_key, leased);
+    if (!lease_status.ok()) {
+        // Quota, endpoint counter and the K slot are already held: undo them in
+        // reverse order before deciding what the attempt becomes.
+        endpoint->releaseOutstanding(length);
+        (void)quota_->release(reservation);
+        pending.task->releaseAttemptSlot();
+        if (lease_status.IsTooManyRequests()) {
+            // D-5: the pooling side returns the same status for "stopping" and
+            // "no capacity", so the verdict is re-read here. A stopped pool
+            // must cancel instead of parking, otherwise the slice would wait
+            // for a wake-up that can never come (RK2).
+            if (pool->stopping()) {
+                pool_stop_rejections_.fetch_add(1, std::memory_order_relaxed);
+                pending.slice->requestCancellation();
+                return;
+            }
+            pool_lease_misses_.fetch_add(1, std::memory_order_relaxed);
+            (void)pending.slice->deferAttempt(attempt);
+            // A return/retire normally bumps this bucket, but a pool whose
+            // member creation keeps failing has no release site at all, so the
+            // wait is bounded as well.
+            deferPending(pending, DeferReason::kPoolIdle, epochs.pool_idle,
+                         deadlineAfter(steadyNowNs(), kTimedDeferNs));
+            return;
+        }
+        // A hard lease error is a real failure: it consumes retry budget like
+        // every other native error.
+        pool_hard_errors_.fetch_add(1, std::memory_order_relaxed);
+        const auto resolution = pending.slice->resolveAttempt(
+            attempt, FAILED, 0, retryableStatus(lease_status));
+        if (resolution == UbAttemptResolution::kRetryScheduled) {
+            enqueueRetry(pending);
+        }
+        return;
+    }
+
+    // ⑦ W3g claim (R-1). The pool synchronizes the verdict with retirement and
+    // stop; the PLM fault epoch remains a separate scalar input.
+    const ClaimDecision claim = claimPost(pool, pool_key, attempt_key, leased,
+                                          path, fault_epoch_snapshot);
+    if (!claim.claimed()) {
+        switch (claim.closed) {
+            case ClaimClosed::kPoolStopping:
+                claim_rejected_stopping_.fetch_add(1,
+                                                   std::memory_order_relaxed);
+                break;
+            case ClaimClosed::kMemberRetired:
+                claim_rejected_member_.fetch_add(1, std::memory_order_relaxed);
+                break;
+            case ClaimClosed::kGenerationMoved:
+                claim_rejected_generation_.fetch_add(1,
+                                                     std::memory_order_relaxed);
+                break;
+            case ClaimClosed::kErrorEpochMoved:
+                claim_rejected_error_epoch_.fetch_add(
+                    1, std::memory_order_relaxed);
+                break;
+            case ClaimClosed::kNone:
+                break;
+        }
+        if (claim.path_epoch_changed) {
+            claim_after_isolation_.fetch_add(1, std::memory_order_relaxed);
+        }
         // Reverse order again: credit (bound to the member's JFC) after the
         // member, then quota, outstanding counter and the K slot. No WR was
         // posted, so the member is clean and goes straight back to the LIFO
@@ -1825,22 +1838,78 @@ void UbWorkers::processPending(const PendingSlice& pending,
         pending.task->releaseAttemptSlot();
         return;
     }
-    inflight_cv_.notify_all();
-    releaseInflight(inflight);
-    rail_monitor_->recordError(path);
-    if (inflight->pooled_pool) {
-        // Definitive zero acceptance: the attempt gate decides whether the
-        // member returns to the pool (INV07 rollback) or retires on
-        // contradiction; the endpoint incarnation is not at fault.
-        settlePooledAttempt(inflight, PooledSettleKind::kZeroAccept, 0,
-                            "post rejected: " + status.ToString());
-    } else {
-        if (endpoint_retirer_) endpoint_retirer_(endpoint);
-    }
-    const auto resolution = pending.slice->resolveAttempt(
-        *attempt, FAILED, 0, retryableStatus(status));
-    if (resolution == UbAttemptResolution::kRetryScheduled) {
-        enqueueRetry(pending);
+    record->core.post_claimed.store(true, std::memory_order_release);
+
+    // ⑨ publish + ⑩ post. The record is visible before the native call because
+    // a completion may legally arrive first.
+    WorkRequest work =
+        makeWorkRequest(pending, record->core.token, local, remote);
+    {
+        gate::HandlerRef post_handler(record->core, *this, gate_ctx_);
+        {
+            std::lock_guard<std::mutex> lock(records_mutex_);
+            records_.emplace(record->core.token, record);
+        }
+        gate_ctx_.stats.record_published.fetch_add(1,
+                                                   std::memory_order_relaxed);
+        path_load_.onPublish(path, length);
+
+        const auto member = record->lease.member();
+        JettyPtr jetty = member ? member->jetty : nullptr;
+        size_t posted_count = 0;
+        PostAcceptance acceptance = PostAcceptance::kNotAccepted;
+        Status status;
+        if (!jetty) {
+            status = Status::InternalError(
+                "UB pooled send Jetty is unavailable" LOC_MARK);
+        } else if (endpoint->rmMode()) {
+            // RM: the WR carries the peer target explicitly; the leased member
+            // is never bound to a remote Jetty. The target slot follows the
+            // posting lane, not the member's JFC rotation index - the rotation
+            // index is a pool-internal detail unrelated to the peer's Jetty
+            // topology (review M6).
+            const size_t target_slot =
+                worker_index % std::max<size_t>(1, endpoint->jettyCount());
+            work.target = endpoint->rmTarget(target_slot);
+            if (!work.target) {
+                // Never post an RM WR without a valid target: the adapter would
+                // otherwise build a WR with no remote Jetty.
+                status = Status::InternalError(
+                    "UB RM endpoint has no imported target for this "
+                    "slot" LOC_MARK);
+            } else {
+                status =
+                    adapter_->post(jetty, {work}, posted_count, acceptance);
+            }
+        } else {
+            status = adapter_->post(jetty, {work}, posted_count, acceptance);
+        }
+        if (posted_count > 1) {
+            LOG_EVERY_N(WARNING, 100)
+                << "UB adapter reported an impossible posted_count "
+                << posted_count << " for one WR; token " << record->core.token
+                << " drains until a fence proves responsibility";
+        }
+        if (acceptance == PostAcceptance::kAccepted) {
+            rail_monitor_->registerPath(path);
+            if (!status.ok()) {
+                LOG_EVERY_N(WARNING, 1000)
+                    << "UB post returned an error after accepting the WR: "
+                    << status.ToString();
+            }
+        }
+        // Observation only: how often the claim window actually leaked a post
+        // onto a path that had just been isolated (design §8.2, RK1 urgency).
+        if (probe_manager_ != nullptr &&
+            probe_manager_->businessFaultEpoch(path) != fault_epoch_snapshot) {
+            post_on_isolated_path_.fetch_add(1, std::memory_order_relaxed);
+        }
+        gate::onPostReturn(
+            record->core,
+            PostReturn{acceptance,
+                       acceptance == PostAcceptance::kAccepted ? length : 0,
+                       retryableStatus(status)},
+            gate_ctx_);
     }
 }
 
@@ -1892,59 +1961,25 @@ WrFacts UbWorkers::makeWrFacts(const Completion& completion) {
     facts.completed_bytes = completion.completed_bytes;
     switch (completion.category) {
         case CompletionCategory::SUCCESS:
-            rail_monitor_->recordSuccess(inflight->path,
-                                         inflight->pending.slice->spec().length,
-                                         latency, now);
-            settlePooledAttempt(inflight, PooledSettleKind::kRealSuccess,
-                                inflight->pending.slice->spec().length, "");
-            resolveInflight(inflight, COMPLETED,
-                            inflight->pending.slice->spec().length, false);
+            facts.outcome = CompletionOutcome::kSuccess;
             break;
         case CompletionCategory::TIMEOUT:
-            rail_monitor_->recordTimeout(inflight->path, now);
-            settlePooledAttempt(inflight, PooledSettleKind::kRealError, 0,
-                                "native completion timeout");
-            if (!inflight->pooled_pool && endpoint_retirer_) {
-                endpoint_retirer_(inflight->endpoint);
-            }
-            resolveInflight(inflight, TIMEOUT, 0, true);
+            facts.outcome = CompletionOutcome::kTimeout;
             break;
         case CompletionCategory::LOCAL_DEVICE_ERROR:
-            if (inflight->endpoint && inflight->endpoint->context()) {
-                handleLocalDeviceFailure(inflight->endpoint->context());
-            }
-            rail_monitor_->recordError(inflight->path, now);
-            settlePooledAttempt(inflight, PooledSettleKind::kRealError, 0,
-                                "local device completion error");
-            if (endpoint_retirer_) endpoint_retirer_(inflight->endpoint);
-            resolveInflight(inflight, FAILED, 0, true);
+            facts.outcome = CompletionOutcome::kLocalDeviceError;
             break;
         case CompletionCategory::REMOTE_PATH_ERROR:
             facts.outcome = CompletionOutcome::kRemotePathError;
             break;
         case CompletionCategory::ENDPOINT_ERROR:
             facts.outcome = CompletionOutcome::kEndpointError;
-            rail_monitor_->recordError(inflight->path, now);
-            settlePooledAttempt(
-                inflight, PooledSettleKind::kRealError, 0,
-                completion.category == CompletionCategory::ENDPOINT_ERROR
-                    ? "endpoint completion error"
-                    : "remote path completion error");
-            if (endpoint_retirer_) endpoint_retirer_(inflight->endpoint);
-            resolveInflight(inflight, FAILED, 0, true);
             break;
         case CompletionCategory::MEMORY_ERROR:
             facts.outcome = CompletionOutcome::kMemoryError;
             break;
         case CompletionCategory::UNKNOWN_ERROR:
             facts.outcome = CompletionOutcome::kUnknownError;
-            rail_monitor_->recordError(inflight->path, now);
-            settlePooledAttempt(
-                inflight, PooledSettleKind::kRealError, 0,
-                completion.category == CompletionCategory::MEMORY_ERROR
-                    ? "memory completion error"
-                    : "unknown completion error");
-            resolveInflight(inflight, FAILED, 0, false);
             break;
     }
     return facts;
@@ -2111,20 +2146,25 @@ void UbWorkers::scanTimeouts() {
         // evidence: a revoked timeout must not swallow the real fault (IN-11).
         if (!gate::onTimeout(record->core)) continue;
         std::vector<Completion> drained;
-        const bool pooled = inflight->pooled_pool &&
-                            inflight->pooled_lease.valid() &&
-                            inflight->pooled_lease.member();
         Status status;
-        if (pooled) {
-            // The WR rode a pooled member, not an endpoint Jetty: the fence
-            // must quiesce the member's Jetty to prove no more DMA.
-            status =
-                adapter_->quiesceJetty(inflight->pooled_lease.member()->jetty,
-                                       params_.slice_timeout_ms, drained);
+        JettyPtr pooled_jetty;
+        if (record->pool && record->lease.valid()) {
+            // D-14 / W3-IN-10: in pooled mode the fence target is the leased
+            // member's Jetty. `endpoint->jetty(worker_index)` belongs to
+            // another, unused Jetty set and fencing it would prove nothing.
+            const auto member = record->lease.member();
+            pooled_jetty = member ? member->jetty : nullptr;
+        }
+        if (pooled_jetty) {
+            status = adapter_->quiesceJetty(pooled_jetty,
+                                            params_.slice_timeout_ms, drained);
+        } else if (record->pool) {
+            status = Status::InvalidArgument(
+                "Timed-out pooled UB WR has no leased Jetty" LOC_MARK);
         } else {
-            status = inflight->endpoint
-                         ? inflight->endpoint->quiesce(params_.slice_timeout_ms,
-                                                       drained)
+            status = record->endpoint
+                         ? record->endpoint->quiesce(params_.slice_timeout_ms,
+                                                     drained)
                          : Status::InvalidArgument(
                                "Timed-out UB WR has no endpoint" LOC_MARK);
         }
@@ -2134,7 +2174,10 @@ void UbWorkers::scanTimeouts() {
             dispatchCompletion(completion, record->core.path.local_nic);
         }
         if (!status.ok()) {
-            if (!pooled) rememberEndpointDrain(inflight->endpoint);
+            // The pooled path keeps the endpoint alive: the member is the only
+            // resource that can be at fault, and the record stays registered so
+            // a later scan retries the fence.
+            if (!record->pool) rememberEndpointDrain(record->endpoint);
             LOG_EVERY_N(ERROR, 100)
                 << "Cannot establish UB timeout drain fence: "
                 << status.ToString();
@@ -2150,29 +2193,73 @@ void UbWorkers::scanTimeouts() {
             if (still_registered) gate::onFenceFailed(record->core);
             continue;
         }
-        if (pooled) {
-            // The fence proved no more DMA from the member. If a drained
-            // completion already settled the attempt this is a no-op;
-            // otherwise the unsettled attempt retires the member (INV07).
-            settlePooledAttempt(inflight, PooledSettleKind::kFence, 0,
-                                "slice timeout fence");
-        } else {
-            forgetEndpointDrain(inflight->endpoint);
-            if (endpoint_retirer_) endpoint_retirer_(inflight->endpoint);
+        if (!record->pool) {
+            forgetEndpointDrain(record->endpoint);
+            if (endpoint_retirer_) endpoint_retirer_(record->endpoint);
         }
-        recordTimeoutOnce(inflight, now);
-        // quiesce() is the proof that retry cannot overlap old DMA. Reclaim a
-        // provider-lost token here: the successful fence proves the old WR can
-        // no longer touch memory, so releasing outstanding/quota accounting is
-        // safe. releaseInflight() is idempotent against a racing completion.
-        bool erased = false;
-        {
-            std::lock_guard<std::mutex> lock(inflight_mutex_);
-            auto it = inflight_.find(inflight->completion_token);
-            if (it != inflight_.end() && it->second == inflight) {
-                inflight_.erase(it);
-                erased = true;
-            }
+        // The erase and the "is this record still mine?" check happen in one
+        // critical section: if a drained completion already claimed and
+        // disposed of the record, the scan must not release the owners again
+        // (IN-4).
+        eraseRecord(record->core.token, record.get());
+        // quiesce() is the proof that retry cannot overlap old DMA. The fence
+        // evidence then settles TIMEOUT and finalizes once (§6.7).
+        gate::onFenceProven(record->core, *this, gate_ctx_);
+    }
+}
+
+std::shared_ptr<UbWorkers::BusinessRecord> UbWorkers::findRecord(
+    uint64_t token) const {
+    // The registry lock is only held to take a shared_ptr; every consumer works
+    // on the reference outside the lock (design §5.6 rule 2).
+    std::lock_guard<std::mutex> lock(records_mutex_);
+    auto it = records_.find(token);
+    return it == records_.end() ? nullptr : it->second;
+}
+
+void UbWorkers::releaseOwnerResources(BusinessRecord& record,
+                                      OwnerDisposition disposition) {
+    // Exactly one call per record: the gate's claim bit already guaranteed it
+    // (W3-IN-1). Order is fixed: endpoint accounting, quota, pool member,
+    // credit, K slot (design §10.1).
+    const size_t length =
+        record.pending.slice ? record.pending.slice->spec().length : 0;
+    if (record.endpoint) record.endpoint->releaseOutstanding(length);
+    if (record.quota.valid()) (void)quota_->release(record.quota);
+    bool pool_woken = false;
+    if (record.pool && record.lease.valid()) {
+        if (disposition == OwnerDisposition::kFinalize) {
+            // A first real error, a proven timeout or a shutdown bottom-out:
+            // the member is retired permanently and never re-enters the LIFO
+            // stack (INV07). The pool is the arbiter, so a pool that is already
+            // stopping also ends here.
+            const RecordDropReason drop =
+                record.core.orphan_reason.load(std::memory_order_acquire);
+            const std::string reason =
+                drop != RecordDropReason::kNone
+                    ? recordDropReasonName(drop)
+                    : completionOutcomeName(record.core.terminal.outcome);
+            // A real error completion must pass the hardware retirement fence
+            // (modify ERROR -> flush-done -> software flush) before the member
+            // may be reset and deleted (design §7.2 rule 5). A proven timeout
+            // fence and the shutdown bottom-out already fenced the member, so
+            // they must not pay for a second, blocking provider call.
+            const bool hardware_fault =
+                drop == RecordDropReason::kCompletionError ||
+                (drop == RecordDropReason::kNone &&
+                 record.core.terminal.outcome != CompletionOutcome::kSuccess &&
+                 record.core.terminal.outcome != CompletionOutcome::kTimeout);
+            (void)record.pool->retireFaulted(std::move(record.lease), reason,
+                                             hardware_fault);
+            pooled_retire_.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            // kReturn and kReject both hand the member back: a rejected post
+            // never crossed the native boundary, so the member is clean
+            // (W3-IN-2). The pool turns a return into a retirement by itself
+            // when it is stopping.
+            (void)record.pool->returnOnce(std::move(record.lease),
+                                          /*gate_passed=*/true);
+            pooled_return_.fetch_add(1, std::memory_order_relaxed);
         }
         // Credit is released after the member: the token is bound to the
         // member's JFC, so releasing it first would let the ledger admit a new
@@ -2285,102 +2372,6 @@ void UbWorkers::forgetEndpointDrain(
 void UbWorkers::failUnposted(const PendingSlice& pending,
                              TransferStatusEnum outcome) {
     if (pending.slice) (void)pending.slice->tryResolveBeforePost(outcome);
-}
-
-void UbWorkers::settlePooledAttempt(const std::shared_ptr<Inflight>& inflight,
-                                    PooledSettleKind kind,
-                                    uint64_t completed_length,
-                                    const std::string& reason) {
-    if (!inflight || !inflight->pooled_pool ||
-        !inflight->pooled_lease.valid()) {
-        return;
-    }
-    bool expected = false;
-    if (!inflight->pooled_settled.compare_exchange_strong(
-            expected, true, std::memory_order_acq_rel)) {
-        return;
-    }
-    // Hardware retirement fence (C08): a real error completion, including the
-    // pinned provider's native status 9 class, takes the member out of
-    // hardware service before it is retired. quiesceJetty moves the Jetty to
-    // URMA_JETTY_STATE_ERROR (urma_modify_jetty), waits for that ERROR
-    // epoch's flush-done marker and drains the remaining WRs with
-    // urma_flush_jetty. Only then does the pool reset and delete the member.
-    // A failed fence leaves the member in ERROR without a trusted barrier, so
-    // the pool's reset is rejected and the handle stays quarantined instead
-    // of re-entering circulation.
-    if (kind == PooledSettleKind::kRealError) {
-        const auto& member = inflight->pooled_lease.member();
-        if (member && member->jetty) {
-            std::vector<Completion> drained;
-            const Status fence = adapter_->quiesceJetty(
-                member->jetty, params_.slice_timeout_ms, drained);
-            for (const auto& completion : drained) {
-                if (completion.token != 0) handleCompletion(completion);
-            }
-            if (!fence.ok()) {
-                LOG_EVERY_N(WARNING, 100) << "UB pooled member could not be "
-                                             "fenced before retirement; "
-                                             "it stays quarantined: "
-                                          << fence.ToString();
-            }
-        }
-    }
-    const auto& pool = inflight->pooled_pool;
-    AttemptGate::Settlement settlement;
-    bool settled = false;
-    if (attempt_gate_ && inflight->gate_token != 0) {
-        switch (kind) {
-            case PooledSettleKind::kRealSuccess:
-                attempt_gate_->onRealCompletion(inflight->gate_token, true,
-                                                completed_length);
-                break;
-            case PooledSettleKind::kRealError:
-                attempt_gate_->onRealCompletion(inflight->gate_token, false, 0);
-                attempt_gate_->reportFault(inflight->gate_token, reason);
-                break;
-            case PooledSettleKind::kZeroAccept:
-                // onPostReturn already recorded the definitive rejection; a
-                // rollback must not add a fault or the member would retire.
-                break;
-            case PooledSettleKind::kFence:
-                attempt_gate_->reportFault(inflight->gate_token, reason);
-                break;
-        }
-        settled = attempt_gate_->tryFinalize(inflight->gate_token,
-                                             !pool->stopping(), settlement);
-    }
-    if (settled && (settlement.return_to_pool || settlement.rollback_return)) {
-        (void)pool->returnOnce(std::move(inflight->pooled_lease), true);
-    } else {
-        const char* fallback = "pooled attempt unsettled";
-        switch (kind) {
-            case PooledSettleKind::kRealSuccess:
-                fallback = "pooled member retired before reuse";
-                break;
-            case PooledSettleKind::kRealError:
-                fallback = "pooled attempt completion error";
-                break;
-            case PooledSettleKind::kZeroAccept:
-                fallback = "pooled rollback rejected by gate";
-                break;
-            case PooledSettleKind::kFence:
-                fallback = "pooled attempt fenced";
-                break;
-        }
-        (void)pool->retireFaulted(
-            std::move(inflight->pooled_lease),
-            reason.empty() ? std::string(fallback) : reason);
-    }
-    if (attempt_gate_ && inflight->gate_token != 0) {
-        attempt_gate_->discard(inflight->gate_token);
-    }
-    // The pool never releases caller credits; the settlement path owns the
-    // exactly-once release.
-    if (auto credits = pool->creditLedger()) {
-        credits->release(inflight->pooled_jfc_index,
-                         inflight->jfc_credit_token);
-    }
 }
 
 uint64_t UbWorkers::nextCompletionToken() {

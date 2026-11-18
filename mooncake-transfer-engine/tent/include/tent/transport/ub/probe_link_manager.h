@@ -284,6 +284,17 @@ class ProbeLinkManager final : public ProbeAvailabilitySink {
     [[nodiscard]] size_t inflightCount() const;
     [[nodiscard]] size_t orphanCount() const;
     [[nodiscard]] uint64_t graphEpoch() const;
+    // Number of path rows in the health table (one row per legal adjacency
+    // edge), not the number of healthy rows. This is the `probe_link_count`
+    // metric of design §12.1.
+    [[nodiscard]] size_t pathCount() const;
+    // Campaigns that still have an unresolved entry.
+    [[nodiscard]] size_t campaignCount() const;
+    // True after stopPosting(): no new probe can be claimed.
+    [[nodiscard]] bool postingStopped() const;
+    // Monotonic identity of the current probe graph generation; logs carry it
+    // so evidence from different topology epochs cannot be confused.
+    [[nodiscard]] uint64_t probeGeneration() const;
     [[nodiscard]] const ProbeParams& params() const { return params_; }
 
    private:

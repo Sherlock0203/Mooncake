@@ -4,6 +4,8 @@
 #ifndef TENT_TRANSPORT_UB_UB_TRANSPORT_H_
 #define TENT_TRANSPORT_UB_UB_TRANSPORT_H_
 
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -77,6 +79,19 @@ class UbTransport final : public Transport {
     double getEstimatedBandwidth() const override;
     Status getNicLoadStats(std::vector<NicLoadStats>& stats) const override;
     bool supportNotification() const override { return false; }
+
+    // ---- observation (design §12.1) --------------------------------------
+    // Number of probe path rows: legal adjacency edges, not healthy rows.
+    [[nodiscard]] size_t probeLinkCount() const;
+    // Campaigns with at least one unresolved entry.
+    [[nodiscard]] size_t probeCampaignCount() const;
+    // True once the probe manager stopped accepting new probes.
+    [[nodiscard]] bool probeStopped() const;
+    // Current probe graph generation, for log correlation.
+    [[nodiscard]] uint64_t probeGeneration() const;
+    // Largest installed Context incarnation. Pool members are keyed by it, so
+    // a summary that prints it can be correlated with a pool generation.
+    [[nodiscard]] uint64_t poolGeneration() const;
 
    private:
     struct Impl;

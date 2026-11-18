@@ -162,40 +162,22 @@ class UbEndpoint final : public std::enable_shared_from_this<UbEndpoint> {
     [[nodiscard]] const JettyOptions& jettyOptions() const noexcept {
         return jetty_options_;
     }
-    // RM endpoints never bind a local Jetty: every WR carries its own imported
-    // target (RM Legacy). The pooled data path polls this flag to choose the
-    // per-WR post overload.
-    [[nodiscard]] bool rmMode() const noexcept {
-        return jetty_options_.transport_mode == JettyTransportMode::kRm;
-    }
-    // The peer target for one posted WR: the peer's EID plus its advertised
-    // Jetty id/UASID for this slot. RM posts must reference it explicitly and
-    // the adapter never substitutes a bound remote Jetty for it.
-    //
-    // W3 adaptation note (M-4): the pooling side provides bootstrap-v2 target
-    // import (`importRemoteTarget`, `bindRm`). This baseline already carries
-    // the same identity in the v1 bootstrap descriptor, and the adapter imports
-    // the target lazily and caches it per Jetty, so W3 only consumes this
-    // accessor instead of duplicating the import machinery.
-    [[nodiscard]] RemoteJettyInfo rmTarget(size_t jetty_index) const;
-    [[nodiscard]] size_t jfcIndex(size_t jetty_index) const;
-    [[nodiscard]] std::vector<JettyPtr> jetties() const;
-    [[nodiscard]] Status lifecycleStatus() const;
-
-    // RM Legacy: true when this incarnation runs the RM transport profile.
+    // RM Legacy and rm_pool both run the RM transport profile; RM endpoints
+    // never bind a local Jetty and every WR carries its own imported target.
+    // The canonical test is the native `trans_mode`, which is set for both RM
+    // runtime profiles, not `transport_mode`, which only rm_pool sets.
     [[nodiscard]] bool rmMode() const noexcept {
         return jetty_options_.trans_mode == kUrmaTransportModeRm;
     }
-    // The Jetty profile this endpoint incarnation was created with. The
-    // pooled data path derives its PoolKey (trans_mode/priority/bind mask)
-    // from it so pooled members never mix profiles.
-    [[nodiscard]] JettyOptions jettyOptions() const noexcept {
-        return jetty_options_;
-    }
-    // RM Legacy: the explicit imported target a WR on jetty(index) must use.
-    // Returns nullptr before a successful bindRm() or after retirement.
+    // The explicit imported target a WR on jetty(index) must use. RM posts
+    // must reference it and the adapter never substitutes a bound remote
+    // Jetty for it. Returns nullptr before a successful bindRm() or after
+    // retirement.
     [[nodiscard]] RemoteTargetPtr rmTarget(size_t jetty_index) const;
     [[nodiscard]] size_t importedTargetCount() const;
+    [[nodiscard]] size_t jfcIndex(size_t jetty_index) const;
+    [[nodiscard]] std::vector<JettyPtr> jetties() const;
+    [[nodiscard]] Status lifecycleStatus() const;
 
    private:
     static uint64_t allocateGeneration() noexcept;
@@ -207,7 +189,10 @@ class UbEndpoint final : public std::enable_shared_from_this<UbEndpoint> {
     // Unimports every imported RM target in reverse import order. Only called
     // after the Jetty set is fenced and deleted, so no WR can still reference
     // a target. Failed handles stay owned for a later retry.
-    Status unimportTargetsLocked();
+    // `retry_retained` is false on the failure rollback (a retained unimport
+    // waits for a later retire) and true on the retire path (the retry that
+    // drains the registry quarantine).
+    Status unimportTargetsLocked(bool retry_retained);
     static void rememberFirstError(const Status& candidate, Status& first);
 
     const UbEndpointKey key_;

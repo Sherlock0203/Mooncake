@@ -15,7 +15,8 @@
 #include "tent/transport/ub/admission.h"
 #include "tent/transport/ub/jfc.h"
 #include "tent/transport/ub/native_budget.h"
-#include "tent/transport/ub/send_jetty_pool.h"
+#include "tent/transport/ub/business_jetty_pool.h"
+#include "tent/transport/ub/tombstone.h"
 #include "tent/transport/ub/urma_adapter.h"
 #include "ub_fake_urma.h"
 
@@ -27,7 +28,9 @@ namespace pool_test {
 class PoolFixture {
    public:
     explicit PoolFixture(size_t jfc_count = 1, size_t desired_serving = 1,
-                         uint64_t credit_capacity = 8) {
+                         uint64_t credit_capacity = 8,
+                         size_t quarantine_budget = 64,
+                         std::shared_ptr<TombstoneTable> tombstones = nullptr) {
         adapter_ = std::make_shared<fake::FakeUrmaAdapter>(fake::fakeDevice());
         (void)adapter_->initialize();
         adapter_->setAutoBindCreatedJetties(true);
@@ -49,6 +52,8 @@ class PoolFixture {
         SendJettyPoolOptions options;
         options.desired_serving = desired_serving;
         options.max_creating = 2;
+        options.quarantine_budget = quarantine_budget;
+        options.tombstones = std::move(tombstones);
         pool_ = std::make_shared<SendJettyPool>(adapter_, context_handle_,
                                                 jfcs_, budget_, kDeviceKey,
                                                 credits_, options);
@@ -70,6 +75,9 @@ class PoolFixture {
     }
     [[nodiscard]] const std::shared_ptr<JfcCreditLedger>& creditsPtr() const {
         return credits_;
+    }
+    [[nodiscard]] const std::shared_ptr<NativeBudget>& budget() const {
+        return budget_;
     }
     [[nodiscard]] static PoolKey key() {
         PoolKey key;

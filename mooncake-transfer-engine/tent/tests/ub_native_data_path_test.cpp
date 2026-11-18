@@ -1668,7 +1668,9 @@ TEST(UbRmLegacyTest, EndpointProducesV2AndImportsPeerTargets) {
     EXPECT_EQ(local.protocol_version, 2U);
     ASSERT_TRUE(local.rm.has_value());
     EXPECT_TRUE(validateUbBootstrap(local).ok());
-    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::RM, local).ok());
+    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::RM,
+                                       UbBootstrapProtocol::kAuto, local)
+                    .ok());
     EXPECT_EQ(local.rm->targets.size(), 1U);
     EXPECT_EQ(local.rm->targets[0].id, endpoint->jetty(0)->id());
     EXPECT_EQ(local.rm->targets[0].target_epoch, local.endpoint_generation);
@@ -1786,6 +1788,60 @@ TEST(UbRmLegacyTest, BindRmRejectsBadDescriptorsAndRollsBackImports) {
     EXPECT_TRUE(adapter->shutdown().ok());
 }
 
+// A remote RM target is a node-wide resource shared by every endpoint on one
+// Context: the registry imports it once and reference-counts each user, so a
+// second endpoint incarnation must not create a second native import (design
+// §5.1).
+TEST(UbRmLegacyTest, SharedPeerTargetIsImportedOncePerContext) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(rmCapableDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+    auto context = std::make_shared<UbContext>(0, rmCapableDevice(), adapter);
+    ASSERT_TRUE(context->initialize(1, JfcOptions{}).ok());
+
+    auto make_endpoint = [&](uint64_t peer_segment_id) {
+        return std::make_shared<UbEndpoint>(
+            UbEndpointKey{0, peer_segment_id, 9, "peer/ub:fake0:eid0"}, context,
+            adapter, 2, rmJettyOptions());
+    };
+    auto make_peer = [](const std::shared_ptr<UbEndpoint>& endpoint,
+                        UbBootstrapDesc& peer) {
+        UbBootstrapDesc local;
+        EXPECT_TRUE(endpoint
+                        ->makeBootstrapDescV2("seg-a", "seg-a/ub:fake0:eid0",
+                                              "seg-b/ub:fake0:eid0", 5, 1, 1,
+                                              local)
+                        .ok());
+        peer = local;
+        peer.segment_name = "seg-b";
+        peer.local_nic_path = "seg-b/ub:fake0:eid0";
+        peer.peer_nic_path = "seg-a/ub:fake0:eid0";
+    };
+
+    auto first = make_endpoint(123);
+    auto second = make_endpoint(456);
+    ASSERT_TRUE(first->prepare().ok());
+    ASSERT_TRUE(second->prepare().ok());
+    UbBootstrapDesc peer;
+    make_peer(first, peer);
+    ASSERT_TRUE(first->bindRm(peer, expectedForRmPeer(peer)).ok());
+    // Both local endpoints reference the same peer descriptor, so the target
+    // identities (and epochs) are identical.
+    ASSERT_TRUE(second->bindRm(peer, expectedForRmPeer(peer)).ok());
+    // One peer device, two targets: the second endpoint only adds references.
+    EXPECT_EQ(adapter->importCalls(), 2U)
+        << "a shared peer target must be imported once per Context";
+    EXPECT_EQ(adapter->unimportCalls(), 0U);
+
+    // Releasing one endpoint keeps the target alive for the other.
+    ASSERT_TRUE(first->retire().ok());
+    EXPECT_EQ(adapter->unimportCalls(), 0U);
+    ASSERT_TRUE(second->retire().ok());
+    EXPECT_EQ(adapter->unimportCalls(), 2U);
+
+    EXPECT_TRUE(context->shutdown().ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
 TEST(UbRmLegacyTest, RetireRetainsTargetWhenUnimportFailsAndRetries) {
     auto adapter = std::make_shared<FakeUrmaAdapter>(rmCapableDevice());
     ASSERT_TRUE(adapter->initialize().ok());
@@ -1814,7 +1870,9 @@ TEST(UbRmLegacyTest, RetireRetainsTargetWhenUnimportFailsAndRetries) {
     adapter->failNextUnimports(1);
     EXPECT_TRUE(endpoint->retire().IsRdmaError());
     EXPECT_NE(endpoint->state(), UbEndpoint::State::kDestroyed);
-    EXPECT_EQ(endpoint->importedTargetCount(), 1U)
+    EXPECT_EQ(endpoint->importedTargetCount(), 0U);
+    ASSERT_NE(context->targetRegistry(), nullptr);
+    EXPECT_EQ(context->targetRegistry()->retainedCount(), 1U)
         << "the failed unimport must retain its target handle";
     EXPECT_EQ(adapter->unimportCalls(), 2U)
         << "the successful sibling unimport still completes";
@@ -1899,7 +1957,9 @@ TEST(UbRmLegacyTest, BindRmRollbackRetainsTargetWhenUnimportFails) {
     EXPECT_EQ(endpoint->state(), UbEndpoint::State::kFailed);
     EXPECT_EQ(adapter->importCalls(), 2U);
     EXPECT_EQ(adapter->unimportCalls(), 1U);
-    EXPECT_EQ(endpoint->importedTargetCount(), 1U)
+    EXPECT_EQ(endpoint->importedTargetCount(), 0U);
+    ASSERT_NE(context->targetRegistry(), nullptr);
+    EXPECT_EQ(context->targetRegistry()->retainedCount(), 1U)
         << "the failed rollback unimport retains its target handle";
 
     // A retry completes the release: no target survives kDestroyed.
@@ -2731,11 +2791,10 @@ TEST(UbRmPoolTest, TransportRunsSelfReadWriteThroughPooledSendPool) {
     // with the default desired_per_context=6 an in-flight lease triggers a
     // legal deficit creation,making the createJettyCalls assertion depend on
     // poller timing.
-    config->set("transports/ub/send_pool/desired_per_context", 2);
+    config->set("transports/ub/jetty_pool/business_desired_serving", 2);
     // This test pins exact createJettyCalls counters; keep the pool
     // demand-driven so the background refill cannot top up asynchronously.
     config->set("transports/ub/send_pool/background_refill", false);
-    config->set("transports/ub/probe/enabled", true);
     setPhysicalOnlyIdentity(*config, device);
 
     UbTransport transport(adapter);
@@ -2893,8 +2952,7 @@ TEST(UbRmPoolTest, PooledMemberRetiresAfterCqeError) {
     config->set("transports/ub/slice_timeout_ms", 1000);
     config->set("transports/ub/endpoint_cooldown_ms", 100);
     config->set("transports/ub/jetty_pool/enable", true);
-    config->set("transports/ub/send_pool/desired_per_context", 1);
-    config->set("transports/ub/probe/enabled", true);
+    config->set("transports/ub/jetty_pool/business_desired_serving", 1);
     setPhysicalOnlyIdentity(*config, device);
 
     UbTransport transport(adapter);
@@ -3014,11 +3072,10 @@ TEST(UbRmPoolTest, BackgroundRefillTopsUpKnownPoolKey) {
     config->set("transports/ub/slice_timeout_ms", 1000);
     config->set("transports/ub/endpoint_cooldown_ms", 100);
     config->set("transports/ub/jetty_pool/enable", true);
-    config->set("transports/ub/send_pool/desired_per_context", 2);
+    config->set("transports/ub/jetty_pool/business_desired_serving", 2);
     config->set("transports/ub/send_pool/background_refill", true);
     config->set("transports/ub/send_pool/background_delete", true);
-    config->set("transports/ub/send_pool/refill_interval_ms", 5);
-    config->set("transports/ub/probe/enabled", true);
+    config->set("transports/ub/jetty_pool/refill_interval_ms", 5);
     setPhysicalOnlyIdentity(*config, device);
 
     UbTransport transport(adapter);

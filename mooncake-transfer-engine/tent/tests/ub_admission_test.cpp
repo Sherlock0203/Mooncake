@@ -94,11 +94,11 @@ TEST(UbAdmissionTest, QueueBudgetMustAdmitOneMaximalTask) {
     Config config;
     UbParams params;
     config.set("transports/ub/max_slices_per_task", static_cast<int64_t>(64));
-    config.set("transports/ub/business_queue_budget", static_cast<int64_t>(63));
+    config.set("transports/ub/queue_budget", static_cast<int64_t>(63));
     EXPECT_FALSE(UbParams::FromConfig(config, params).ok());
-    config.set("transports/ub/business_queue_budget", static_cast<int64_t>(64));
+    config.set("transports/ub/queue_budget", static_cast<int64_t>(64));
     ASSERT_TRUE(UbParams::FromConfig(config, params).ok());
-    EXPECT_EQ(params.business_queue_budget, 64U);
+    EXPECT_EQ(params.queue_budget, 64U);
     EXPECT_EQ(params.task_max_inflight_attempts, 4U);
     EXPECT_EQ(params.defer_reflow_batch, 256U);
 }

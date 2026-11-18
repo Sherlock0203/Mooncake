@@ -15,18 +15,23 @@
 #ifndef TENT_TRANSPORT_UB_PARAMS_H_
 #define TENT_TRANSPORT_UB_PARAMS_H_
 
+#include <glog/logging.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
 #include <limits>
+#include <map>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "tent/common/config.h"
 #include "tent/common/status.h"
+#include "tent/transport/ub/bootstrap.h"
 #include "tent/transport/ub/probe_types.h"
 #include "tent/transport/ub/device_selection.h"
 
@@ -59,6 +64,19 @@ enum class UbTransportMode : uint8_t {
 struct UbJettyPoolParams {
     bool enable = false;
     bool force_disable = false;
+    // Static Serving target per PoolKey (IDLE + IN_USE). The first pooled
+    // version is static, so initial/min/max are accepted for the forward
+    // compatible schema but never trigger adaptive resizing.
+    uint32_t business_desired_serving = 6;
+    uint32_t business_initial_size = 6;
+    uint32_t business_min_size = 6;
+    uint32_t business_max_size = 6;
+    uint32_t refill_interval_ms = 50;
+    // Upper bound for the hardware retirement fence.
+    uint32_t retire_timeout_ms = 1000;
+    // Creation-backoff cap (design §7.3 BACKOFF). Distinct from
+    // endpoint_cooldown_ms, which throttles endpoint re-resolution.
+    uint32_t cooldown_ms = 1000;
 };
 
 // Simple send-Jetty reuse for RM Legacy: endpoints lease their Jetty set
@@ -71,15 +89,20 @@ struct UbJettyReuseParams {
     bool enable = false;
 };
 
-// Pooled send-path parameters (C01). Both knobs are explicit positive
-// integers and are never derived from jetty_per_endpoint:
-//  - desired_per_context is the static Serving (IDLE + IN_USE) target per
-//    Context/LocalSendProfile pool key;
-//  - task_max_inflight_attempts is K, the maximum inflight attempts of one
-//    network UbTask across all contexts.
+// Pool claim review (design §5.2 rule 3 / §5.6). When disabled, the pooled
+// post path falls back to the pre-claim "pool->stopping() only" recheck and
+// counts `claim_disabled`, which is the documented bisection lever. It is not
+// a way to skip the verdict silently: the counter makes a left-off switch
+// visible in the periodic summary.
+struct UbClaimParams {
+    bool enabled = true;
+};
+
+// Pooled send-path parameters (C01). Every knob is an explicit value and is
+// never derived from jetty_per_endpoint. The business serving target and the
+// refill interval now live in UbJettyPoolParams, because their config keys are
+// normalized to transports/ub/jetty_pool/* (design §9.1).
 struct UbSendPoolParams {
-    uint32_t desired_per_context = 6;
-    uint32_t task_max_inflight_attempts = 4;
     // Bound on concurrent Jetty creations per pool key so refill cannot
     // storm the provider.
     uint32_t max_creating_per_key = 2;
@@ -92,7 +115,6 @@ struct UbSendPoolParams {
     // release off the completion path.
     bool background_refill = true;
     bool background_delete = true;
-    uint32_t refill_interval_ms = 50;
 };
 
 // Device-level native budget parameters (C01/C05).
@@ -112,6 +134,20 @@ enum class UbRuntimeMode : uint8_t {
     kRmLegacy,
     kPooledRm,
 };
+
+// Stable spelling for logs and diagnostics. Never derive a runtime decision
+// from this string; it exists so human-facing summaries do not change shape.
+inline const char* ubRuntimeModeName(UbRuntimeMode mode) noexcept {
+    switch (mode) {
+        case UbRuntimeMode::kRcLegacy:
+            return "rc_legacy";
+        case UbRuntimeMode::kRmLegacy:
+            return "rm_legacy";
+        case UbRuntimeMode::kPooledRm:
+            return "rm_pool";
+    }
+    return "unknown";
+}
 
 inline bool parseUbRuntimeProfile(std::string_view value,
                                   UbRuntimeProfile& profile) {
@@ -178,7 +214,12 @@ struct UbParams {
     // Defaults are the verified RC legacy baseline; pool and probe stay off.
     UbRuntimeProfile runtime_profile = UbRuntimeProfile::kRcLegacy;
     UbTransportMode trans_mode = UbTransportMode::kRc;
+    // Explicit bootstrap protocol selector (design §6). kAuto derives the
+    // version from the runtime mode; v1/v2 force one version and reject the
+    // other instead of silently switching.
+    UbBootstrapProtocol bootstrap_protocol = UbBootstrapProtocol::kAuto;
     UbJettyPoolParams jetty_pool;
+    UbClaimParams claim;
     UbJettyReuseParams jetty_reuse;
     // Pooled data-path knobs; dormant until the rm_pool gate matrix passes.
     UbSendPoolParams send_pool;
@@ -190,7 +231,13 @@ struct UbParams {
     // ---- W3 business queue / defer / K (design §12) ----
     // Capacity of the bounded business queue in slices: queued + parked.
     // submit() is all-or-nothing per Task, so this must admit one maximal Task.
-    uint64_t business_queue_budget = 65536;
+    uint64_t queue_budget = 65536;
+    // Bound on quarantined business members. Reaching it stops admission
+    // instead of dropping responsibility (design §11.4).
+    uint32_t quarantine_budget = 64;
+    // Bound on unerased tombstones. Reaching it backpressures refill and tags
+    // every new retirement; entries are never TTL-evicted (design §7.2).
+    uint32_t tombstone_budget = 1024;
     // K: the maximum inflight attempts of one UbTask across all contexts
     // (D-6). Named differently from send_pool/task_max_inflight_attempts on
     // purpose: that key configures the unused process-wide ledger.
@@ -274,17 +321,82 @@ struct UbParams {
         CHECK_STATUS(readBool(config, "transports/ub/jetty_reuse/enable",
                               parsed.jetty_reuse.enable,
                               parsed.jetty_reuse.enable));
+        // Explicit bootstrap protocol selector. Unset keeps the historical
+        // mode-derived behavior.
+        std::string bootstrap_protocol;
+        CHECK_STATUS(readStringEnum(config, "transports/ub/bootstrap/protocol",
+                                    "auto", {"auto", "v1", "v2"},
+                                    bootstrap_protocol));
+        parsed.bootstrap_protocol =
+            bootstrap_protocol == "v1"
+                ? UbBootstrapProtocol::kV1
+                : (bootstrap_protocol == "v2" ? UbBootstrapProtocol::kV2
+                                              : UbBootstrapProtocol::kAuto);
 
-        // Pooled send-path knobs: explicit positive integers, never derived
-        // from jetty_per_endpoint (C01).
-        CHECK_STATUS(readPositive(config,
-                                  "transports/ub/send_pool/desired_per_context",
-                                  parsed.send_pool.desired_per_context,
-                                  parsed.send_pool.desired_per_context));
+        // ---- Pooled business pool (design §9.1) ---------------------------
+        // Keys are normalized to jetty_pool/*. Legacy names stay readable with
+        // a deprecation warning, and a conflicting old/new pair is rejected
+        // instead of silently picking one (no silent compatibility).
+        uint32_t desired_serving = parsed.jetty_pool.business_desired_serving;
+        CHECK_STATUS(readRenamedPositive(
+            config, "transports/ub/jetty_pool/business_desired_serving",
+            "transports/ub/send_pool/desired_per_context", desired_serving));
+        parsed.jetty_pool.business_desired_serving = desired_serving;
+
+        uint32_t initial_size = desired_serving;
         CHECK_STATUS(readPositive(
-            config, "transports/ub/send_pool/task_max_inflight_attempts",
-            parsed.send_pool.task_max_inflight_attempts,
-            parsed.send_pool.task_max_inflight_attempts));
+            config, "transports/ub/jetty_pool/business_initial_size",
+            initial_size, initial_size));
+        parsed.jetty_pool.business_initial_size = initial_size;
+
+        // business_min_size is the compatibility mapping of the legacy
+        // jetty_per_endpoint. When both are present they must agree; a
+        // conflicting pair is an operator error, not a preference.
+        uint32_t min_size = desired_serving;
+        const json min_json = config.get<json>(
+            "transports/ub/jetty_pool/business_min_size", json());
+        const json legacy_endpoints_json =
+            config.get<json>("transports/ub/jetty_per_endpoint", json());
+        if (!min_json.is_null()) {
+            CHECK_STATUS(readPositive(
+                config, "transports/ub/jetty_pool/business_min_size", min_size,
+                min_size));
+            if (!legacy_endpoints_json.is_null() &&
+                legacy_endpoints_json.is_number_integer() &&
+                legacy_endpoints_json.get<int64_t>() >= 0 &&
+                static_cast<uint64_t>(legacy_endpoints_json.get<int64_t>()) !=
+                    static_cast<uint64_t>(min_size)) {
+                return Status::InvalidArgument(
+                    "transports/ub/jetty_pool/business_min_size conflicts with "
+                    "the legacy transports/ub/jetty_per_endpoint");
+            }
+        } else if (!legacy_endpoints_json.is_null()) {
+            // jetty_per_endpoint is only a compatibility input: the first
+            // pooled version never uses it to size a lease set.
+            min_size = parsed.jetty_per_endpoint;
+        }
+        parsed.jetty_pool.business_min_size = min_size;
+
+        uint32_t max_size = desired_serving;
+        CHECK_STATUS(readPositive(config,
+                                  "transports/ub/jetty_pool/business_max_size",
+                                  max_size, max_size));
+        parsed.jetty_pool.business_max_size = max_size;
+
+        CHECK_STATUS(readPositive(config,
+                                  "transports/ub/jetty_pool/retire_timeout_ms",
+                                  parsed.jetty_pool.retire_timeout_ms,
+                                  parsed.jetty_pool.retire_timeout_ms));
+        CHECK_STATUS(readPositive(
+            config, "transports/ub/jetty_pool/cooldown_ms",
+            parsed.jetty_pool.cooldown_ms, parsed.jetty_pool.cooldown_ms));
+        CHECK_STATUS(readRenamedPositive(
+            config, "transports/ub/jetty_pool/refill_interval_ms",
+            "transports/ub/send_pool/refill_interval_ms",
+            parsed.jetty_pool.refill_interval_ms));
+
+        // Non-renamed pooled knobs: explicit positive integers, never derived
+        // from jetty_per_endpoint (C01).
         CHECK_STATUS(
             readPositive(config, "transports/ub/send_pool/max_creating_per_key",
                          parsed.send_pool.max_creating_per_key,
@@ -301,10 +413,6 @@ struct UbParams {
                               "transports/ub/send_pool/background_delete",
                               parsed.send_pool.background_delete,
                               parsed.send_pool.background_delete));
-        CHECK_STATUS(readPositive(config,
-                                  "transports/ub/send_pool/refill_interval_ms",
-                                  parsed.send_pool.refill_interval_ms,
-                                  parsed.send_pool.refill_interval_ms));
         CHECK_STATUS(readNonNegative(
             config, "transports/ub/native_budget/max_jetty_per_device",
             parsed.native_budget.max_jetty_per_device,
@@ -338,29 +446,33 @@ struct UbParams {
         CHECK_STATUS(readBool(config, "transports/ub/jetty_pool/force_disable",
                               parsed.jetty_pool.force_disable,
                               parsed.jetty_pool.force_disable));
-        CHECK_STATUS(readPositive(config,
-                                  "transports/ub/send_pool/desired_per_context",
-                                  parsed.send_pool.desired_per_context,
-                                  parsed.send_pool.desired_per_context));
-        CHECK_STATUS(
-            readPositive(config, "transports/ub/send_pool/max_creating_per_key",
-                         parsed.send_pool.max_creating_per_key,
-                         parsed.send_pool.max_creating_per_key));
-        CHECK_STATUS(readNonNegative(
-            config, "transports/ub/send_pool/jfc_credit_reserve",
-            parsed.send_pool.jfc_credit_reserve,
-            parsed.send_pool.jfc_credit_reserve));
-        CHECK_STATUS(readNonNegative(
-            config, "transports/ub/native_budget/max_jetty_per_device",
-            parsed.native_budget.max_jetty_per_device,
-            parsed.native_budget.max_jetty_per_device));
-        CHECK_STATUS(readNonNegative(
-            config, "transports/ub/native_budget/replacement_reserve",
-            parsed.native_budget.replacement_reserve,
-            parsed.native_budget.replacement_reserve));
+        CHECK_STATUS(readBool(config, "transports/ub/jetty_pool/claim/enabled",
+                              parsed.claim.enabled, parsed.claim.enabled));
+        // Queue and recovery budgets (design §9.1/§11.4).
+        CHECK_STATUS(readRenamedPositive(config, "transports/ub/queue_budget",
+                                         "transports/ub/business_queue_budget",
+                                         parsed.queue_budget));
+        CHECK_STATUS(readPositive(config, "transports/ub/quarantine_budget",
+                                  parsed.quarantine_budget,
+                                  parsed.quarantine_budget));
+        CHECK_STATUS(readPositive(config, "transports/ub/tombstone_budget",
+                                  parsed.tombstone_budget,
+                                  parsed.tombstone_budget));
+        CHECK_STATUS(readProbeTopology(config, parsed.probe));
+
         // K belongs to UbTask (D-6). The pooling side's process-wide
-        // send_pool/task_max_inflight_attempts is accepted for compatibility
-        // but never wired, so it is not read here.
+        // send_pool/task_max_inflight_attempts is removed (design §7.1): it is
+        // ignored, with a warning, instead of being silently reinterpreted.
+        if (!config
+                 .get<json>(
+                     "transports/ub/send_pool/task_max_inflight_attempts",
+                     json())
+                 .is_null()) {
+            LOG(WARNING)
+                << "deprecated UB config key "
+                   "transports/ub/send_pool/task_max_inflight_attempts is "
+                   "ignored; use transports/ub/task_max_inflight_attempts";
+        }
         CHECK_STATUS(readPositive(config,
                                   "transports/ub/task_max_inflight_attempts",
                                   parsed.task_max_inflight_attempts,
@@ -368,9 +480,6 @@ struct UbParams {
         CHECK_STATUS(readPositive(config, "transports/ub/defer_reflow_batch",
                                   parsed.defer_reflow_batch,
                                   parsed.defer_reflow_batch));
-        CHECK_STATUS(readPositive(config, "transports/ub/business_queue_budget",
-                                  parsed.business_queue_budget,
-                                  parsed.business_queue_budget));
 
         CHECK_STATUS(readBool(config, "transports/ub/probe/enabled",
                               parsed.probe.enabled, parsed.probe.enabled));
@@ -478,11 +587,29 @@ struct UbParams {
         // The queue budget must admit one maximal Task, because submit() is
         // all-or-nothing: a smaller budget would reject every large Task
         // forever (design §5.1 and its note).
-        if (parsed.business_queue_budget <
+        if (parsed.queue_budget <
             static_cast<uint64_t>(parsed.max_slices_per_task)) {
             return Status::InvalidArgument(
-                "transports/ub/business_queue_budget must be >= "
+                "transports/ub/queue_budget must be >= "
                 "transports/ub/max_slices_per_task");
+        }
+        // The first pooled version is static: initial/min/max must agree with
+        // the serving target instead of implying an unsupported resize path.
+        if (parsed.jetty_pool.business_min_size >
+                parsed.jetty_pool.business_desired_serving ||
+            parsed.jetty_pool.business_desired_serving >
+                parsed.jetty_pool.business_max_size) {
+            return Status::InvalidArgument(
+                "transports/ub/jetty_pool business sizes must satisfy "
+                "min_size <= desired_serving <= max_size");
+        }
+        if (parsed.jetty_pool.business_initial_size <
+                parsed.jetty_pool.business_min_size ||
+            parsed.jetty_pool.business_initial_size >
+                parsed.jetty_pool.business_max_size) {
+            return Status::InvalidArgument(
+                "transports/ub/jetty_pool/business_initial_size must be within "
+                "[business_min_size, business_max_size]");
         }
         if (parsed.task_max_inflight_attempts < 1) {
             return Status::InvalidArgument(
@@ -524,10 +651,10 @@ struct UbParams {
                     "runtime_profile=rm_pool is rejected while "
                     "jetty_pool/force_disable=true");
             }
-            if (parsed.send_pool.desired_per_context < 1) {
+            if (parsed.jetty_pool.business_desired_serving < 1) {
                 return Status::InvalidArgument(
                     "runtime_profile=rm_pool requires "
-                    "send_pool/desired_per_context >= 1");
+                    "jetty_pool/business_desired_serving >= 1");
             }
         } else if (parsed.jetty_pool.enable) {
             return Status::InvalidArgument(
@@ -843,6 +970,137 @@ struct UbParams {
                                    std::vector<std::string>& output) {
         return readStringList(config, "transports/ub/device_filter", output);
     }
+
+    // Renamed keys follow "new key wins, old key warns, conflicting pair is
+    // rejected". Never silently pick one value.
+    template <typename T>
+    static Status readRenamedPositive(const Config& config, const char* new_key,
+                                      const char* old_key, T& output) {
+        const json new_value = config.get<json>(new_key, json());
+        const json old_value = config.get<json>(old_key, json());
+        if (new_value.is_null() && old_value.is_null()) return Status::OK();
+        if (!new_value.is_null() && !old_value.is_null() &&
+            new_value != old_value) {
+            return Status::InvalidArgument(
+                std::string("conflicting UB config: ") + new_key +
+                " and the "
+                "deprecated " +
+                old_key + " disagree");
+        }
+        if (!new_value.is_null()) {
+            return readPositive(config, new_key, output, output);
+        }
+        LOG(WARNING) << "deprecated UB config key " << old_key << ", use "
+                     << new_key;
+        return readPositive(config, old_key, output, output);
+    }
+
+    // Declared probe topology (design §9.1): fail-closed validation, because a
+    // malformed adjacency becomes a silently wrong path set at runtime.
+    static Status readProbeTopology(const Config& config, ProbeParams& probe) {
+        std::vector<std::string> ports;
+        CHECK_STATUS(
+            readStringList(config, "transports/ub/probe/local_ports", ports));
+        std::unordered_set<std::string> unique_ports;
+        for (const auto& port : ports) {
+            if (port.empty()) {
+                return Status::InvalidArgument(
+                    "transports/ub/probe/local_ports contains an empty port");
+            }
+            if (!unique_ports.insert(port).second) {
+                return Status::InvalidArgument(
+                    "transports/ub/probe/local_ports contains a duplicate "
+                    "port");
+            }
+        }
+        probe.local_ports = ports;
+
+        std::map<std::string, std::vector<std::string>> adjacency;
+        CHECK_STATUS(readStringListMap(config, "transports/ub/probe/adjacency",
+                                       adjacency));
+        for (const auto& [port, peers] : adjacency) {
+            if (port.empty() || peers.empty()) {
+                return Status::InvalidArgument(
+                    "transports/ub/probe/adjacency has an empty port or edge "
+                    "list");
+            }
+            if (!unique_ports.empty() && unique_ports.count(port) == 0) {
+                return Status::InvalidArgument(
+                    "transports/ub/probe/adjacency references an undeclared "
+                    "local port '" +
+                    port + "'");
+            }
+            std::unordered_set<std::string> unique_peers;
+            for (const auto& peer : peers) {
+                if (peer.empty() || !unique_peers.insert(peer).second) {
+                    return Status::InvalidArgument(
+                        "transports/ub/probe/adjacency has an empty or "
+                        "duplicate peer");
+                }
+            }
+        }
+        probe.adjacency = std::move(adjacency);
+
+        std::map<std::string, std::vector<std::string>> target_map;
+        CHECK_STATUS(readStringListMap(config, "transports/ub/probe/target_map",
+                                       target_map));
+        for (const auto& [port, targets] : target_map) {
+            if (port.empty() || targets.empty()) {
+                return Status::InvalidArgument(
+                    "transports/ub/probe/target_map has an empty port or "
+                    "target list");
+            }
+            if (!unique_ports.empty() && unique_ports.count(port) == 0) {
+                return Status::InvalidArgument(
+                    "transports/ub/probe/target_map references an undeclared "
+                    "local port '" +
+                    port + "'");
+            }
+            std::unordered_set<std::string> unique_targets;
+            for (const auto& target : targets) {
+                if (target.empty() || !unique_targets.insert(target).second) {
+                    return Status::InvalidArgument(
+                        "transports/ub/probe/target_map has an empty or "
+                        "duplicate target");
+                }
+            }
+        }
+        probe.target_map = std::move(target_map);
+        return Status::OK();
+    }
+
+    // JSON object whose values are string arrays. Used for the declared probe
+    // adjacency/target map; a wrong shape is a config error.
+    static Status readStringListMap(
+        const Config& config, const char* key,
+        std::map<std::string, std::vector<std::string>>& output) {
+        const json value = config.get<json>(key, json());
+        if (value.is_null()) return Status::OK();
+        if (!value.is_object()) {
+            return Status::InvalidArgument(std::string(key) +
+                                           " must be an object of arrays");
+        }
+        std::map<std::string, std::vector<std::string>> parsed;
+        for (const auto& item : value.items()) {
+            if (!item.value().is_array()) {
+                return Status::InvalidArgument(std::string(key) + "/" +
+                                               item.key() +
+                                               " must be an array of strings");
+            }
+            std::vector<std::string> entries;
+            for (const auto& entry : item.value()) {
+                if (!entry.is_string()) {
+                    return Status::InvalidArgument(
+                        std::string(key) + "/" + item.key() +
+                        " must contain only strings");
+                }
+                entries.push_back(entry.get<std::string>());
+            }
+            parsed.emplace(item.key(), std::move(entries));
+        }
+        output = std::move(parsed);
+        return Status::OK();
+    }
 };
 
 // Evaluates the default-off matrix before any adapter or native resource is
@@ -889,10 +1147,6 @@ inline Status resolveUbRuntimeMode(const UbParams& params,
             return reject(Status::InvalidArgument(
                 "jetty_reuse.enable requires runtime_profile=rm_legacy"));
         }
-        if (probe) {
-            return reject(Status::InvalidArgument(
-                "probe.enabled requires runtime_profile=rm_pool"));
-        }
         mode = UbRuntimeMode::kRcLegacy;
         VLOG(1) << "UB runtime selection accepted: mode=rc_legacy "
                 << snapshot();
@@ -907,10 +1161,6 @@ inline Status resolveUbRuntimeMode(const UbParams& params,
         if (pool) {
             return reject(Status::InvalidArgument(
                 "runtime_profile=rm_legacy must not enable jetty_pool"));
-        }
-        if (probe) {
-            return reject(Status::InvalidArgument(
-                "probe.enabled requires runtime_profile=rm_pool"));
         }
         if (!params.physical_only) {
             return reject(Status::InvalidArgument(
@@ -935,10 +1185,6 @@ inline Status resolveUbRuntimeMode(const UbParams& params,
         return reject(Status::InvalidArgument(
             "jetty_reuse.enable requires runtime_profile=rm_legacy and is "
             "not part of rm_pool"));
-    }
-    if (!probe) {
-        return reject(Status::InvalidArgument(
-            "runtime_profile=rm_pool requires probe.enabled=true"));
     }
     if (!params.physical_only) {
         return reject(Status::InvalidArgument(

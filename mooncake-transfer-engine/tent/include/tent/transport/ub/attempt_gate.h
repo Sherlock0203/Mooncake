@@ -10,7 +10,7 @@
 #include <unordered_map>
 
 #include "tent/common/status.h"
-#include "tent/transport/ub/send_jetty_pool.h"
+#include "tent/transport/ub/business_jetty_pool.h"
 
 namespace mooncake::tent::ub {
 
@@ -102,7 +102,7 @@ class AttemptGate final {
 
     // Registers one attempt; returns the gate token. expected_length is the
     // business length the single real SUCCESS completion must carry.
-    uint64_t registerAttempt(const AttemptKey& attempt, const LaneKey& lane,
+    uint64_t registerAttempt(const AttemptKey& attempt, const PoolLaneKey& lane,
                              uint64_t expected_length);
 
     // Post path: the provider call returned exactly once. acceptance must be
@@ -140,7 +140,7 @@ class AttemptGate final {
    private:
     struct GateRecord {
         AttemptKey attempt{};
-        LaneKey lane{};
+        PoolLaneKey lane{};
         uint64_t expected_length = 0;
         bool post_returned = false;
         PostAcceptance acceptance = PostAcceptance::kUnknown;

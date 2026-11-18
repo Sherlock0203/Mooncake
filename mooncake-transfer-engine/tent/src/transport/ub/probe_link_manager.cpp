@@ -2018,6 +2018,25 @@ uint64_t ProbeLinkManager::graphEpoch() const {
     return graph_epoch_;
 }
 
+size_t ProbeLinkManager::pathCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return paths_.size();
+}
+
+size_t ProbeLinkManager::campaignCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return campaigns_.size();
+}
+
+bool ProbeLinkManager::postingStopped() const {
+    return !accepting_.load(std::memory_order_acquire);
+}
+
+uint64_t ProbeLinkManager::probeGeneration() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return graph_epoch_;
+}
+
 }  // namespace ub
 }  // namespace tent
 }  // namespace mooncake

@@ -22,8 +22,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <string>
 #include <tuple>
+#include <vector>
 
 #include "tent/common/types.h"
 #include "tent/runtime/topology.h"
@@ -290,6 +292,16 @@ struct ProbeParams {
     bool test_periodic_all{false};
     uint64_t test_interval_ms{5000};
     bool test_apply_health{true};
+
+    // Declared probe topology (design §9.1). These are the operator's
+    // declaration of local ports and legal adjacency edges. They are validated
+    // fail-closed (non-empty, no duplicate edge) and are the configuration
+    // source a configured probe directory uses; the standalone provider still
+    // derives its live graph from trusted discovery, so a mismatch is visible
+    // instead of silently inventing a topology.
+    std::vector<std::string> local_ports;
+    std::map<std::string, std::vector<std::string>> adjacency;
+    std::map<std::string, std::vector<std::string>> target_map;
 
     [[nodiscard]] uint64_t intervalNs() const { return interval_ms * kNsPerMs; }
     [[nodiscard]] uint64_t timeoutNs() const { return timeout_ms * kNsPerMs; }

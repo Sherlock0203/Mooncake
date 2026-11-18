@@ -463,19 +463,19 @@ TEST(TransferEngineConfigOverrideTest, UrmaTransModeRmKeepsRmLegacyProfile) {
 }
 
 // MC_URMA_TRANS_MODE=rm must not clobber an rm_pool profile selected by the
-// JSON config: the profile and its custom send_pool/native_budget tuning
-// survive the env override, physical_only is aligned, and the full gate
+// JSON config: the profile and its custom jetty_pool/send_pool/native_budget
+// tuning survive the env override, physical_only is aligned, and the full gate
 // resolves to pooled RM with the JSON values still effective.
 TEST(TransferEngineConfigOverrideTest,
      UrmaTransModeRmKeepsRmPoolProfileAndTuning) {
     EnvVarGuard conf_guard(
         "MC_TENT_CONF", R"({"transports":{"ub":{)"
                         R"("runtime_profile":"rm_pool",)"
-                        R"("jetty_pool":{"enable":true},)"
+                        R"("jetty_pool":{"enable":true,)"
+                        R"("business_desired_serving":7},)"
                         R"("probe":{"enabled":true,"stop_on_recovery":true},)"
-                        R"("send_pool":{"desired_per_context":7,)"
                         R"("task_max_inflight_attempts":13,)"
-                        R"("max_creating_per_key":3,)"
+                        R"("send_pool":{"max_creating_per_key":3,)"
                         R"("jfc_credit_reserve":5},)"
                         R"("native_budget":{"max_jetty_per_device":41,)"
                         R"("replacement_reserve":6},)"
@@ -493,7 +493,8 @@ TEST(TransferEngineConfigOverrideTest,
     EXPECT_EQ(config.get("transports/ub/runtime_profile", ""), "rm_pool");
     EXPECT_TRUE(config.get("transports/ub/physical_only", false));
     // Custom pool tuning from the JSON survives the env override.
-    EXPECT_EQ(config.get("transports/ub/send_pool/desired_per_context", 0), 7);
+    EXPECT_EQ(
+        config.get("transports/ub/jetty_pool/business_desired_serving", 0), 7);
     EXPECT_EQ(config.get("transports/ub/native_budget/max_jetty_per_device", 0),
               41);
 
@@ -503,8 +504,8 @@ TEST(TransferEngineConfigOverrideTest,
     ASSERT_TRUE(ub::resolveUbRuntimeMode(params, resolved).ok());
     EXPECT_EQ(resolved, ub::UbRuntimeMode::kPooledRm);
     // Effective params carry the JSON-defined custom values, not defaults.
-    EXPECT_EQ(params.send_pool.desired_per_context, 7U);
-    EXPECT_EQ(params.send_pool.task_max_inflight_attempts, 13U);
+    EXPECT_EQ(params.jetty_pool.business_desired_serving, 7U);
+    EXPECT_EQ(params.task_max_inflight_attempts, 13U);
     EXPECT_EQ(params.send_pool.max_creating_per_key, 3U);
     EXPECT_EQ(params.send_pool.jfc_credit_reserve, 5U);
     EXPECT_EQ(params.native_budget.max_jetty_per_device, 41U);
@@ -551,9 +552,9 @@ TEST(TransferEngineConfigOverrideTest,
     EnvVarGuard conf_guard(
         "MC_TENT_CONF", R"({"transports":{"ub":{)"
                         R"("runtime_profile":"rm_pool",)"
-                        R"("jetty_pool":{"enable":true,"force_disable":true},)"
+                        R"("jetty_pool":{"enable":true,"force_disable":true,)"
+                        R"("business_desired_serving":7},)"
                         R"("probe":{"enabled":true,"stop_on_recovery":true},)"
-                        R"("send_pool":{"desired_per_context":7},)"
                         R"("device_identities":[{)"
                         R"("native_device_name":"ubma_0",)"
                         R"("native_device_path":"/dev/uburma/0",)"

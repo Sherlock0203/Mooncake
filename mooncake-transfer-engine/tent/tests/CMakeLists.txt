@@ -561,7 +561,8 @@ if(USE_UB)
   add_executable(
     tent_ub_core_test
     ub_core_test.cpp ../src/transport/ub/bootstrap.cpp
-    ../src/transport/ub/quota.cpp ../src/transport/ub/rail_monitor.cpp)
+    ../src/transport/ub/completion_record.cpp ../src/transport/ub/quota.cpp
+    ../src/transport/ub/rail_monitor.cpp)
   target_link_libraries(tent_ub_core_test PRIVATE tent_common gtest gtest_main)
   target_include_directories(tent_ub_core_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
@@ -570,15 +571,48 @@ if(USE_UB)
   # Pooled rm_pool core components (C05/C06/C07): budget ledger, admission
   # tickets, per-attempt send pool and completion gate. Software-only: the
   # fake adapter needs no provider or NIC.
+  # Tombstone table and recovery budgets (design §7.2): unproven destruction
+  # is recorded, never TTL-evicted, and gates the native budget release.
+  add_executable(
+    tent_ub_tombstone_test
+    ub_tombstone_test.cpp ../src/transport/ub/native_budget.cpp
+    ../src/transport/ub/admission.cpp ../src/transport/ub/business_jetty_pool.cpp ../src/transport/ub/jetty_retire_worker.cpp ../src/transport/ub/jetty_refill_worker.cpp
+    ../src/transport/ub/tombstone.cpp ../src/transport/ub/jfc.cpp)
+  target_link_libraries(tent_ub_tombstone_test PRIVATE tent_common gtest
+                                                       gtest_main)
+  target_include_directories(tent_ub_tombstone_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_tombstone_test COMMAND tent_ub_tombstone_test)
+
+  # W3e/W3g claim/return unit tests: the pool's claim authority, the epoch
+  # snapshot and the mutually exclusive claim verdicts. The PLM is linked only
+  # for the fault-epoch anchor test.
+  add_executable(
+    tent_ub_post_claim_test ub_post_claim_test.cpp
+                               ../src/transport/ub/native_budget.cpp
+                               ../src/transport/ub/admission.cpp
+                               ../src/transport/ub/business_jetty_pool.cpp ../src/transport/ub/jetty_retire_worker.cpp ../src/transport/ub/jetty_refill_worker.cpp
+                               ../src/transport/ub/tombstone.cpp
+                               ../src/transport/ub/jfc.cpp
+                               ../src/transport/ub/probe_link_manager.cpp)
+  target_link_libraries(tent_ub_post_claim_test PRIVATE tent_common gtest
+                                                            gtest_main)
+  target_include_directories(tent_ub_post_claim_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_post_claim_test COMMAND tent_ub_post_claim_test)
+
   add_executable(
     tent_ub_pooled_core_test
     ub_pooled_core_test.cpp
     ../src/transport/ub/native_budget.cpp
     ../src/transport/ub/admission.cpp
-    ../src/transport/ub/send_jetty_pool.cpp
+    ../src/transport/ub/business_jetty_pool.cpp ../src/transport/ub/jetty_retire_worker.cpp ../src/transport/ub/jetty_refill_worker.cpp
+    ../src/transport/ub/tombstone.cpp
     ../src/transport/ub/attempt_gate.cpp
     ../src/transport/ub/jfc.cpp
     ../src/transport/ub/context.cpp
+    ../src/transport/ub/bootstrap.cpp
+    ../src/transport/ub/target_registry.cpp
     ../src/transport/ub/jetty_pool.cpp)
   target_link_libraries(tent_ub_pooled_core_test PRIVATE tent_common gtest
                                                          gtest_main)
@@ -599,7 +633,9 @@ if(USE_UB)
     ../src/transport/ub/jfc.cpp
     ../src/transport/ub/native_budget.cpp
     ../src/transport/ub/admission.cpp
-    ../src/transport/ub/send_jetty_pool.cpp)
+    ../src/transport/ub/business_jetty_pool.cpp ../src/transport/ub/jetty_retire_worker.cpp ../src/transport/ub/jetty_refill_worker.cpp
+    ../src/transport/ub/tombstone.cpp
+    ../src/transport/ub/target_registry.cpp)
   target_link_libraries(tent_ub_teardown_test PRIVATE tent_common gtest
                                                       gtest_main)
   target_include_directories(tent_ub_teardown_test

@@ -6,7 +6,7 @@
 namespace mooncake::tent::ub {
 
 uint64_t AttemptGate::registerAttempt(const AttemptKey& attempt,
-                                      const LaneKey& lane,
+                                      const PoolLaneKey& lane,
                                       uint64_t expected_length) {
     std::lock_guard<std::mutex> lock(mutex_);
     const uint64_t token = next_token_++;

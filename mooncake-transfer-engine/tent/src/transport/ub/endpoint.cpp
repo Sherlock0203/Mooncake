@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "tent/transport/ub/endpoint.h"
+#include "tent/transport/ub/target_registry.h"
 
 #include "tent/transport/ub/bootstrap.h"
 
@@ -130,25 +131,26 @@ Status UbEndpoint::resetAndUnbindLocked() {
     return first_error;
 }
 
-Status UbEndpoint::unimportTargetsLocked() {
+Status UbEndpoint::unimportTargetsLocked(bool retry_retained) {
     Status first_error = Status::OK();
-    if (imported_targets_.empty()) return first_error;
-    if (!adapter_) {
+    auto registry = context_ ? context_->targetRegistry() : nullptr;
+    if (!registry) {
         return Status::InternalError(
-            "UB endpoint cannot unimport RM targets without an "
-            "adapter" LOC_MARK);
+            "UB endpoint cannot unimport RM targets without a Context target "
+            "registry" LOC_MARK);
     }
-    std::vector<RemoteTargetPtr> retained;
-    for (size_t index = imported_targets_.size(); index > 0; --index) {
-        auto& target = imported_targets_[index - 1];
-        if (!target) continue;
-        auto status = adapter_->unimportRemoteTarget(target);
-        rememberFirstError(status, first_error);
-        // A failed unimport leaves the handle owned by this incarnation; it
-        // is never dereferenced blindly or retried without a budget.
-        if (!status.ok()) retained.push_back(std::move(target));
+    if (imported_targets_.empty()) {
+        // A previous retire already released this incarnation's references but
+        // a provider unimport failed. The handle lives in the registry's
+        // quarantine; a retire retry is the place that retries it.
+        return retry_retained ? registry->drainRetained() : Status::OK();
     }
-    imported_targets_ = std::move(retained);
+    // Release this incarnation's references. The registry unimports the native
+    // target on the last release and retains a failed unimport as quarantine,
+    // so this endpoint never drops a handle blindly.
+    const Status status = registry->releaseAll(imported_targets_);
+    rememberFirstError(status, first_error);
+    imported_targets_.clear();
     return first_error;
 }
 
@@ -229,7 +231,8 @@ Status UbEndpoint::failLocked(Status status) {
     rememberFirstError(resetAndUnbindLocked(), retire_status_);
     rememberFirstError(deleteJettysLocked(), retire_status_);
     if (jetties_.empty()) {
-        rememberFirstError(unimportTargetsLocked(), retire_status_);
+        rememberFirstError(unimportTargetsLocked(/*retry_retained=*/false),
+                           retire_status_);
     }
     return lifecycle_status_;
 }
@@ -413,21 +416,6 @@ Status UbEndpoint::bind(const UbBootstrapDesc& peer) {
     return Status::OK();
 }
 
-RemoteJettyInfo UbEndpoint::rmTarget(size_t jetty_index) const {
-    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
-    RemoteJettyInfo target;
-    if (!rmMode() || jetties_.empty() || peer_.local_eid.empty() ||
-        peer_.jetty_ids.empty()) {
-        return target;
-    }
-    const size_t index = jetty_index % peer_.jetty_ids.size();
-    target.eid = peer_.local_eid;
-    target.id = peer_.jetty_ids[index];
-    if (peer_.jetty_uasids.size() == peer_.jetty_ids.size()) {
-        target.uasid = peer_.jetty_uasids[index];
-    }
-    return target;
-}
 Status UbEndpoint::bindRm(const UbBootstrapDesc& peer,
                           const UbExpectedPeerIdentity& expected) {
     std::lock_guard<std::mutex> lock(lifecycle_mutex_);
@@ -523,36 +511,25 @@ Status UbEndpoint::bindRm(const UbBootstrapDesc& peer,
         }
     }
 
-    // Import every peer target owned by this endpoint incarnation. A failed
-    // import publishes the partial import set to this incarnation so the
-    // retire cleanup owns every handle: failLocked() unimports them in
-    // reverse order, retains handles whose unimport fails, and the destructor
-    // quarantine takes over persistent failures. A provider may also return a
-    // partially allocated handle alongside the error (same contract as
-    // createJetty in prepare()); such handles are adopted, never dropped.
-    std::vector<RemoteTargetPtr> imported;
-    imported.reserve(rm.targets.size());
-    Status first_error = Status::OK();
-    for (const auto& target : rm.targets) {
-        RemoteTargetPtr handle;
-        auto status = adapter_->importRemoteTarget(
-            context_->handle(), target.eid, target.uasid, target.id,
-            target.profile.trans_mode, target.profile.target_type,
-            target.profile.tp_type, handle);
-        if (!status.ok()) {
-            if (handle) {
-                imported.push_back(std::move(handle));
-            }
-            if (first_error.ok()) {
-                first_error = std::move(status);
-            }
-            continue;
-        }
-        imported.push_back(std::move(handle));
+    // Import every peer target through the Context registry. A target is a
+    // node-wide resource shared by every endpoint/probe on this Context, so the
+    // registry deduplicates it and reference-counts this incarnation; the
+    // native import is released only when the last reference goes away. A
+    // failed import rolls the registry back to its previous state, and any
+    // partially allocated native handle is adopted and quarantined there (same
+    // provider contract as createJetty in prepare()).
+    auto registry = context_ ? context_->targetRegistry() : nullptr;
+    if (!registry) {
+        return failLocked(Status::InternalError(
+            "UB endpoint has no Context target registry" LOC_MARK));
     }
-    if (!first_error.ok()) {
-        imported_targets_ = std::move(imported);
-        return failLocked(std::move(first_error));
+    const std::string peer_scope =
+        peer.segment_name + "|" + rm.physical_device_identity;
+    std::vector<RemoteTargetPtr> imported;
+    const Status import_status =
+        registry->importAll(peer_scope, rm.targets, imported);
+    if (!import_status.ok()) {
+        return failLocked(import_status);
     }
 
     // Compare-and-commit: the incumbent state is only replaced after every
@@ -743,7 +720,7 @@ Status UbEndpoint::finishRetireLocked() {
     // Imported RM targets are unimported only after every Jetty that could
     // reference them has been deleted; a failed unimport keeps the handle
     // owned and leaves the incarnation short of kDestroyed.
-    auto unimport_status = unimportTargetsLocked();
+    auto unimport_status = unimportTargetsLocked(/*retry_retained=*/true);
     if (!unimport_status.ok()) {
         retire_status_ = unimport_status;
         return unimport_status;

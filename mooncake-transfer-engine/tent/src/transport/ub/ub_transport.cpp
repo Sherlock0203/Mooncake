@@ -34,14 +34,15 @@
 #include "tent/transport/ub/context.h"
 
 #include "jetty_pool.h"
-#include "tent/transport/ub/attempt_gate.h"
 #include "tent/transport/ub/device_selection.h"
 #include "tent/transport/ub/endpoint.h"
 #include "tent/transport/ub/endpoint_store.h"
 #include "tent/transport/ub/identity_import.h"
 #include "tent/transport/ub/native_budget.h"
 #include "tent/transport/ub/params.h"
-#include "tent/transport/ub/send_jetty_pool.h"
+#include "tent/transport/ub/business_jetty_pool.h"
+#include "tent/transport/ub/target_registry.h"
+#include "tent/transport/ub/tombstone.h"
 #include "tent/transport/ub/quota.h"
 #include "tent/transport/ub/rail_monitor.h"
 #include "tent/transport/ub/slice.h"
@@ -214,16 +215,11 @@ struct UbTransport::Impl {
                 "UB notifications are not supported by protocol version "
                 "1" LOC_MARK));
         }
-        if (parsed.runtime_profile == ub::UbRuntimeProfile::kRmLegacy) {
-            // W3 wires exactly two profiles: the untouched RC legacy baseline
-            // and the pooled rm_pool path (D-2). RM legacy depends on the
-            // pooling side's bootstrap-v2 target import, which this baseline
-            // does not carry yet (M-4), so it fails closed instead of silently
-            // running RC under an RM label.
-            return Status::NotImplemented(
-                "runtime_profile=rm_legacy is not wired in W3; use rc_legacy "
-                "or rm_pool" LOC_MARK);
-        }
+        // RM legacy is a first-class runtime profile: the merged baseline
+        // carries bootstrap-v2 target import (bindRm/importRemoteTarget) and
+        // the RM endpoint data path, so it no longer fails closed here. Its
+        // provider/capability gates still run during install and reject an
+        // inconsistent device before any native resource is created.
         ub::UbRuntimeMode selected_mode = ub::UbRuntimeMode::kRcLegacy;
         auto mode_status = ub::resolveUbRuntimeMode(parsed, selected_mode);
         if (!mode_status.ok()) return abort_after_auto_import(mode_status);
@@ -527,11 +523,14 @@ struct UbTransport::Impl {
                 }
             }
             native_budget = std::make_shared<ub::NativeBudget>();
+            // One bounded tombstone table per install: it records unproven
+            // destructions and is what authorizes a final budget release.
+            tombstones =
+                std::make_shared<ub::TombstoneTable>(params.tombstone_budget);
             std::unordered_set<std::string> configured_devices;
             for (const auto& context : contexts) {
                 const auto& device = context->deviceInfo();
-                const std::string device_key = ub::makePhysicalDeviceIdentity(
-                    device.native_device_path, device.eid);
+                const std::string device_key = ub::physicalDeviceKey(device);
                 if (!configured_devices.insert(device_key).second) continue;
                 const uint64_t verified = device.capabilities.max_jetty;
                 uint64_t configured = params.native_budget.max_jetty_per_device;
@@ -555,9 +554,6 @@ struct UbTransport::Impl {
                                                   configured, reserve);
                 if (!status.ok()) return failInstall(status);
             }
-            task_permits = std::make_shared<ub::TaskPermitLedger>(
-                params.send_pool.task_max_inflight_attempts);
-            attempt_gate = std::make_shared<ub::AttemptGate>();
             for (auto& context : contexts) {
                 const auto& device = context->deviceInfo();
                 const uint32_t depth =
@@ -581,7 +577,7 @@ struct UbTransport::Impl {
                 }
                 ub::SendJettyPoolOptions pool_options;
                 pool_options.desired_serving =
-                    params.send_pool.desired_per_context;
+                    params.jetty_pool.business_desired_serving;
                 pool_options.max_creating =
                     params.send_pool.max_creating_per_key;
                 pool_options.background_refill =
@@ -589,15 +585,18 @@ struct UbTransport::Impl {
                 pool_options.background_delete =
                     params.send_pool.background_delete;
                 pool_options.refill_interval_ms =
-                    params.send_pool.refill_interval_ms;
+                    params.jetty_pool.refill_interval_ms;
+                pool_options.retire_timeout_ms =
+                    params.jetty_pool.retire_timeout_ms;
+                pool_options.cooldown_ms = params.jetty_pool.cooldown_ms;
+                pool_options.quarantine_budget = params.quarantine_budget;
+                pool_options.tombstones = tombstones;
                 pool_options.jetty_options = jetty_options;
                 context->attachPooledSendPool(
                     std::make_shared<ub::SendJettyPool>(
                         adapter, context->handle(), context->jfcs(),
-                        native_budget,
-                        ub::makePhysicalDeviceIdentity(
-                            device.native_device_path, device.eid),
-                        credits, pool_options));
+                        native_budget, ub::physicalDeviceKey(device), credits,
+                        pool_options));
             }
         }
         ub::RailMonitorConfig rail_config;
@@ -731,8 +730,7 @@ struct UbTransport::Impl {
                 }
                 return endpoints->retireLocalDevice(local_topology_id);
             },
-            probe_manager.get(), std::move(probe_jfcs), task_permits,
-            attempt_gate);
+            probe_manager.get(), std::move(probe_jfcs), tombstones);
         status = workers->start();
         if (!status.ok()) return failInstall(status);
 
@@ -751,6 +749,14 @@ struct UbTransport::Impl {
         }
 
         installed.store(true, std::memory_order_release);
+        LOG(INFO) << "UB installed: probe_links="
+                  << (probe_manager ? probe_manager->pathCount() : 0)
+                  << " probe_generation="
+                  << (probe_manager ? probe_manager->probeGeneration() : 0)
+                  << " pool_generation="
+                  << (contexts.empty() || !contexts.front()
+                          ? 0
+                          : contexts.front()->incarnation());
         return Status::OK();
     }
 
@@ -861,8 +867,7 @@ struct UbTransport::Impl {
         // contexts just drained their pools; the admission components can be
         // released now.
         native_budget.reset();
-        task_permits.reset();
-        attempt_gate.reset();
+        tombstones.reset();
         rails.reset();
         quota.reset();
         if (adapter_initialized && adapter) {
@@ -1030,7 +1035,16 @@ struct UbTransport::Impl {
                                 runtime_mode == ub::UbRuntimeMode::kPooledRm;
         auto gate_status = ub::gateUbBootstrapForMode(
             rm_runtime ? ub::UbBootstrapMode::RM : ub::UbBootstrapMode::RC,
-            request);
+            params.bootstrap_protocol, request);
+        if (request.ignored_v2_payload) {
+            // A v1 peer sent a v2 block. It was sanitized away during
+            // deserialization and never reached an endpoint; count it so a
+            // protocol mismatch is observable instead of silent.
+            bootstrap_v2_ignored.fetch_add(1, std::memory_order_relaxed);
+            LOG_EVERY_N(WARNING, 100)
+                << "UB bootstrap v1 peer carried a v2 payload; the block was "
+                   "ignored";
+        }
         if (!gate_status.ok()) {
             response = request;
             response.reply_msg = gate_status.ToString();
@@ -1197,12 +1211,15 @@ struct UbTransport::Impl {
     std::unique_ptr<ub::ProbeLinkManager> probe_manager;
     std::unique_ptr<ub::ProbeScheduler> probe_scheduler;
     std::unique_ptr<ub::UbWorkers> workers;
-    // rm_pool admission and completion-gate components, owned by the install
-    // generation and shared with the workers. Reset during shutdown after the
-    // workers stop and the contexts (pool owners) are released.
+    // rm_pool admission components, owned by the install generation and
+    // shared with the workers. Reset during shutdown after the workers stop
+    // and the contexts (pool owners) are released.
     std::shared_ptr<ub::NativeBudget> native_budget;
-    std::shared_ptr<ub::TaskPermitLedger> task_permits;
-    std::shared_ptr<ub::AttemptGate> attempt_gate;
+    // Bounded tombstones for unproven native destruction (design §7.2). One
+    // table per install generation, shared by the pools and the workers.
+    std::shared_ptr<ub::TombstoneTable> tombstones;
+    // v1 peers that carried a v2 block (sanitized ignore, design §6.4).
+    std::atomic<uint64_t> bootstrap_v2_ignored{0};
 };
 
 UbTransport::UbTransport(
@@ -1435,6 +1452,36 @@ bool UbTransport::warmupMemory(void* addr, size_t length) {
         length, options, segment);
     if (!status.ok()) return false;
     return impl_->adapter->unregisterLocalSegment(segment).ok();
+}
+
+size_t UbTransport::probeLinkCount() const {
+    std::lock_guard<std::mutex> lock(impl_->lifecycle_mutex);
+    return impl_->probe_manager ? impl_->probe_manager->pathCount() : 0;
+}
+
+size_t UbTransport::probeCampaignCount() const {
+    std::lock_guard<std::mutex> lock(impl_->lifecycle_mutex);
+    return impl_->probe_manager ? impl_->probe_manager->campaignCount() : 0;
+}
+
+bool UbTransport::probeStopped() const {
+    std::lock_guard<std::mutex> lock(impl_->lifecycle_mutex);
+    return impl_->probe_manager != nullptr &&
+           impl_->probe_manager->postingStopped();
+}
+
+uint64_t UbTransport::probeGeneration() const {
+    std::lock_guard<std::mutex> lock(impl_->lifecycle_mutex);
+    return impl_->probe_manager ? impl_->probe_manager->probeGeneration() : 0;
+}
+
+uint64_t UbTransport::poolGeneration() const {
+    std::lock_guard<std::mutex> lock(impl_->lifecycle_mutex);
+    uint64_t generation = 0;
+    for (const auto& context : impl_->contexts) {
+        if (context) generation = std::max(generation, context->incarnation());
+    }
+    return generation;
 }
 
 double UbTransport::getEstimatedBandwidth() const {
