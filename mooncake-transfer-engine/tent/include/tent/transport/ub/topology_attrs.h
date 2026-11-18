@@ -18,6 +18,9 @@ inline constexpr std::string_view kTopologyEidIndexAttr = "ub.eid_index";
 inline constexpr std::string_view kTopologyEidAttr = "ub.eid";
 inline constexpr std::string_view kTopologyDiscoveryActiveAttr =
     "ub.discovery_active";
+inline constexpr std::string_view kTopologyDeviceKindAttr = "ub.device_kind";
+inline constexpr std::string_view kTopologyDeviceKindSourceAttr =
+    "ub.device_kind_source";
 
 inline void encodeTopologyDeviceAttributes(
     const DeviceInfo& device, int device_index,
@@ -31,6 +34,10 @@ inline void encodeTopologyDeviceAttributes(
     attributes[std::string(kTopologyEidAttr)] = device.eid;
     attributes[std::string(kTopologyDiscoveryActiveAttr)] =
         device.active ? "true" : "false";
+    attributes[std::string(kTopologyDeviceKindAttr)] =
+        std::string(deviceKindName(device.kind));
+    attributes[std::string(kTopologyDeviceKindSourceAttr)] =
+        std::string(deviceKindSourceName(device.kind_source));
 }
 
 }  // namespace mooncake::tent::ub

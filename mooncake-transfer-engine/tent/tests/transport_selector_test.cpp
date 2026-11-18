@@ -397,6 +397,47 @@ TEST(TopologyTest, UbDeviceAttributesRoundTripThroughJson) {
     EXPECT_EQ(round_tripped->device_attrs, ub.device_attrs);
 }
 
+UbBootstrapDesc makeRmBootstrapV2() {
+    UbBootstrapDesc desc;
+    desc.protocol_version = 2;
+    desc.segment_name = "peer-segment";
+    desc.local_nic_path = "peer/ub:udma0:eid0";
+    desc.peer_nic_path = "local/ub:udma1:eid0";
+    desc.local_device_name = "udma0";
+    desc.local_device_id = 7;
+    desc.local_eid_index = 0;
+    desc.local_eid = "0001:0000:0000:0000:0000:0000:0000:0000";
+    desc.endpoint_generation = 11;
+    desc.segment_generation = 12;
+
+    UbRemoteTargetProfile profile;
+    profile.trans_mode = ub::kUrmaTransportModeRm;
+    profile.target_type = ub::kUrmaTargetTypeJetty;
+    profile.tp_type = ub::kUrmaTpTypeRtp;
+
+    UbRmTargetDescriptor target;
+    target.target_identity = "node-a/P0/epoch9";
+    target.eid = desc.local_eid;
+    target.uasid = 0;
+    target.id = 41;
+    target.target_epoch = 9;
+    target.profile = profile;
+
+    UbRmBootstrapDesc rm;
+    rm.transport_mode = "RM";
+    rm.device_kind = "PHYSICAL";
+    rm.physical_device_identity = "/dev/uburma/udma0#0001";
+    rm.node_incarnation = 13;
+    rm.context_incarnation = 14;
+    rm.topology_epoch = 15;
+    rm.transport_modes = 3;
+    rm.provider_capabilities = {"read", "write", "rm"};
+    rm.targets = {target};
+    rm.probe_target_map = {{"P0", {target.target_identity}}};
+    desc.rm = std::move(rm);
+    return desc;
+}
+
 TEST(ControlPlaneTest, UbBootstrapJsonRoundTripsNativeIdentity) {
     UbBootstrapDesc source;
     source.protocol_version = 1;
@@ -452,9 +493,157 @@ TEST(ControlPlaneTest, UbBootstrapJsonDefaultsOptionalFields) {
 TEST(ControlPlaneTest, UbBootstrapJsonRejectsMissingOrUnknownVersion) {
     EXPECT_THROW((void)json::object().get<UbBootstrapDesc>(),
                  std::invalid_argument);
-    const json unknown_version{{"protocol_version", 2}};
+    const json unknown_version{{"protocol_version", 3}};
     EXPECT_THROW((void)unknown_version.get<UbBootstrapDesc>(),
                  std::invalid_argument);
+}
+
+TEST(ControlPlaneTest, UbBootstrapV1JsonDoesNotLeakV2Fields) {
+    UbBootstrapDesc source;
+    source.protocol_version = 1;
+    source.segment_name = "legacy";
+    const json wire = json(source);
+    EXPECT_FALSE(wire.contains("rm"));
+    EXPECT_TRUE(wire.contains("jetty_ids"));
+    EXPECT_TRUE(wire.contains("jetty_uasids"));
+    EXPECT_EQ(wire.get<UbBootstrapDesc>().rm, std::nullopt);
+}
+
+TEST(ControlPlaneTest, UbBootstrapV2JsonRoundTripsStructuredRmIdentity) {
+    const auto source = makeRmBootstrapV2();
+    const json wire = json(source);
+    EXPECT_EQ(wire["protocol_version"], 2);
+    EXPECT_FALSE(wire.contains("jetty_ids"));
+    EXPECT_FALSE(wire.contains("jetty_uasids"));
+    EXPECT_EQ(wire["rm"]["targets"][0]["uasid"], 0);
+    EXPECT_EQ(wire["rm"]["targets"][0]["profile"]["trans_mode"], 1);
+    EXPECT_EQ(wire["rm"]["targets"][0]["profile"]["target_type"], 1);
+    EXPECT_EQ(wire["rm"]["targets"][0]["profile"]["tp_type"], 0);
+
+    const auto parsed = wire.get<UbBootstrapDesc>();
+    ASSERT_TRUE(parsed.rm.has_value());
+    EXPECT_EQ(parsed.protocol_version, 2);
+    EXPECT_EQ(parsed.rm->transport_mode, "RM");
+    EXPECT_EQ(parsed.rm->targets[0].target_identity,
+              source.rm->targets[0].target_identity);
+    EXPECT_EQ(parsed.rm->targets[0].uasid, 0U);
+    EXPECT_EQ(parsed.rm->probe_target_map, source.rm->probe_target_map);
+    EXPECT_EQ(json(parsed), wire);
+}
+
+TEST(ControlPlaneTest, UbBootstrapV2JsonRequiresEveryMandatoryField) {
+    const auto source = makeRmBootstrapV2();
+    const std::vector<std::string> common_fields = {
+        "segment_name",       "local_nic_path", "peer_nic_path",
+        "local_device_name",  "local_device_id", "local_eid_index",
+        "local_eid",          "endpoint_generation",
+        "segment_generation"};
+    for (const auto& field : common_fields) {
+        json wire = json(source);
+        wire.erase(field);
+        EXPECT_THROW((void)wire.get<UbBootstrapDesc>(), json::out_of_range)
+            << field;
+    }
+
+    const std::vector<std::string> rm_fields = {
+        "transport_mode",          "device_kind",
+        "physical_device_identity", "node_incarnation",
+        "context_incarnation",     "topology_epoch",
+        "transport_modes",         "provider_capabilities",
+        "targets",
+        "probe_target_map"};
+    for (const auto& field : rm_fields) {
+        json wire = json(source);
+        wire["rm"].erase(field);
+        EXPECT_THROW((void)wire.get<UbBootstrapDesc>(), json::out_of_range)
+            << field;
+    }
+
+    const std::vector<std::string> target_fields = {
+        "target_identity", "eid", "uasid", "id", "target_epoch", "profile"};
+    for (const auto& field : target_fields) {
+        json wire = json(source);
+        wire["rm"]["targets"][0].erase(field);
+        EXPECT_THROW((void)wire.get<UbBootstrapDesc>(), json::out_of_range)
+            << field;
+    }
+
+    const std::vector<std::string> profile_fields = {
+        "trans_mode", "target_type", "tp_type"};
+    for (const auto& field : profile_fields) {
+        json wire = json(source);
+        wire["rm"]["targets"][0]["profile"].erase(field);
+        EXPECT_THROW((void)wire.get<UbBootstrapDesc>(), json::out_of_range)
+            << field;
+    }
+}
+
+TEST(ControlPlaneTest, UbBootstrapV2JsonRejectsInvalidNumericValues) {
+    const auto source = makeRmBootstrapV2();
+    json missing_rm = json(source);
+    missing_rm.erase("rm");
+    EXPECT_THROW((void)missing_rm.get<UbBootstrapDesc>(),
+                 std::invalid_argument);
+
+    json wire = json(source);
+    wire["protocol_version"] = 2.0;
+    EXPECT_THROW((void)wire.get<UbBootstrapDesc>(), std::invalid_argument);
+    wire = json(source);
+    wire["endpoint_generation"] = -1;
+    EXPECT_THROW((void)wire.get<UbBootstrapDesc>(), std::invalid_argument);
+    wire = json(source);
+    wire["rm"]["node_incarnation"] = -1;
+    EXPECT_THROW((void)wire.get<UbBootstrapDesc>(), std::invalid_argument);
+    wire = json(source);
+    wire["rm"]["targets"][0]["target_epoch"] = 1.5;
+    EXPECT_THROW((void)wire.get<UbBootstrapDesc>(), std::invalid_argument);
+    wire = json(source);
+    wire["rm"]["targets"][0]["uasid"] = -1;
+    EXPECT_THROW((void)wire.get<UbBootstrapDesc>(), std::invalid_argument);
+    wire = json(source);
+    wire["rm"]["targets"][0]["id"] = 4294967296ULL;
+    EXPECT_THROW((void)wire.get<UbBootstrapDesc>(), std::invalid_argument);
+    wire = json(source);
+    wire["rm"]["targets"][0]["profile"]["tp_type"] = 1.5;
+    EXPECT_THROW((void)wire.get<UbBootstrapDesc>(), std::invalid_argument);
+    wire = json(source);
+    wire["rm"]["transport_modes"] = 65536;
+    EXPECT_THROW((void)wire.get<UbBootstrapDesc>(), std::invalid_argument);
+    wire = json(source);
+    wire["rm"]["targets"][0]["profile"]["trans_mode"] = "RM";
+    EXPECT_THROW((void)wire.get<UbBootstrapDesc>(), std::invalid_argument);
+    wire = json(source);
+    wire["rm"]["targets"][0]["profile"]["target_type"] = "URMA_JETTY";
+    EXPECT_THROW((void)wire.get<UbBootstrapDesc>(), std::invalid_argument);
+    wire = json(source);
+    wire["rm"]["targets"][0]["profile"]["tp_type"] = "RTP";
+    EXPECT_THROW((void)wire.get<UbBootstrapDesc>(), std::invalid_argument);
+}
+
+TEST(ControlPlaneTest, UbBootstrapV2RejectsLocalOnlyAndLegacyProfileFields) {
+    const auto source = makeRmBootstrapV2();
+    for (const char* key : {"jetty_type", "remote_jetty_type", "priority",
+                            "capabilities", "capability_set", "local_capabilities",
+                            "bind_tp_type_mask", "policy", "flag",
+                            "unknown_extension"}) {
+        json wire = json(source);
+        wire["rm"]["targets"][0]["profile"][key] = 1;
+        EXPECT_THROW((void)wire.get<UbBootstrapDesc>(), std::invalid_argument)
+            << key;
+    }
+}
+
+TEST(ControlPlaneTest, UbBootstrapV2ErrorEnvelopeRoundTripsWithoutRmPayload) {
+    UbBootstrapDesc source;
+    source.protocol_version = 2;
+    source.reply_msg = "malformed v2 request";
+    const json wire = json(source);
+    EXPECT_EQ(wire["protocol_version"], 2);
+    EXPECT_FALSE(wire.contains("rm"));
+    const auto parsed = wire.get<UbBootstrapDesc>();
+    EXPECT_EQ(parsed.protocol_version, 2U);
+    EXPECT_EQ(parsed.reply_msg, source.reply_msg);
+    EXPECT_FALSE(parsed.rm.has_value());
 }
 
 TEST(ControlPlaneTest, UbBootstrapRpcIdIsAppendedWithoutRenumbering) {

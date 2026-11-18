@@ -115,7 +115,6 @@ class Topology {
 
     const std::vector<std::string> &getHcaList() const { return hca_list_; }
 
-   private:
     int resolve();
 
    private:

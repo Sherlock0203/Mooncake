@@ -73,6 +73,21 @@ if [ "$USE_HTTP" = "ON" ]; then
     EXT_LDFLAGS+=" -lcurl"
 fi
 
+# TENT static link closure: transfer_engine references tent symbols when
+# USE_TENT=ON and the example links statically outside CMake.
+TENT_SRC="$BUILD_DIR/mooncake-transfer-engine/tent/src"
+if [ -e "$TENT_SRC/libtent.a" ]; then
+    EXT_LDFLAGS+=" -Wl,--start-group"
+    for _lib in $(find "$TENT_SRC" -name "*.a" 2>/dev/null); do
+        EXT_LDFLAGS+=" $_lib"
+    done
+    _mc=$(find "$BUILD_DIR/mooncake-common" -name 'libmooncake_common.a' 2>/dev/null | head -n 1)
+    [ -n "$_mc" ] && EXT_LDFLAGS+=" $_mc"
+    EXT_LDFLAGS+=" -Wl,--end-group -L $TENT_SRC/metrics -ltent_metrics -lcufile"
+    EXT_LDFLAGS+=" -luring -lhiredis -lxxhash -lssl -lcrypto -lnuma -lglog -lgflags 
+    -lcurl"
+fi
+
 go get
 go build -o "$TARGET/p2p-store-example" -ldflags="-extldflags '$EXT_LDFLAGS'" "../example/p2p-store-example.go"
 if [ $? -ne 0 ]; then

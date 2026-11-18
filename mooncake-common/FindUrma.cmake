@@ -1,7 +1,9 @@
 include(FetchContent)
 
 # Prefer a system UMDK installation so configure works without downloading a
-# second copy and the headers match the liburma ABI used at runtime.
+# second copy and the headers match the liburma ABI used at runtime. Production
+# builds must install the latest UMDK on the host; the FetchContent fallback
+# below tracks UMDK master for test/header-only builds.
 find_path(
   URMA_SYSTEM_INCLUDE_DIR
   NAMES urma_api.h
@@ -21,7 +23,7 @@ else()
   FetchContent_Declare(
     urma
     GIT_REPOSITORY https://atomgit.com/openeuler/umdk.git
-    GIT_TAG v25.12.0.B081)
+    GIT_TAG master)
   FetchContent_MakeAvailable(urma)
   set(urma_INCLUDE_DIR "${urma_SOURCE_DIR}/src/urma/lib/urma/core/include")
 endif()

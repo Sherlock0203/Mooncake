@@ -147,7 +147,28 @@ std::vector<std::string> getAvailableRdmaDevices() {
     }
     devices.reserve(num_devices);
     for (int i = 0; i < num_devices; ++i) {
-        devices.emplace_back(ibv_get_device_name(device_list[i]));
+        // A link-down port still enumerates as a device (for example
+        // rocep166s0f1 without a cable); handing it to construct() aborts
+        // deep in the port query path. Keep only devices that report at
+        // least one ACTIVE port.
+        ibv_context* ctx = ibv_open_device(device_list[i]);
+        if (!ctx) continue;
+        ibv_device_attr attr{};
+        bool port_active = false;
+        if (ibv_query_device(ctx, &attr) == 0) {
+            for (uint8_t port = 1; port <= attr.phys_port_cnt && !port_active;
+                 ++port) {
+                ibv_port_attr port_attr{};
+                if (ibv_query_port(ctx, port, &port_attr) == 0 &&
+                    port_attr.state == IBV_PORT_ACTIVE) {
+                    port_active = true;
+                }
+            }
+        }
+        if (port_active) {
+            devices.emplace_back(ibv_get_device_name(device_list[i]));
+        }
+        ibv_close_device(ctx);
     }
     ibv_free_device_list(device_list);
     return devices;
@@ -193,12 +214,50 @@ void resetRtrFaultInjectionState() {
     g_rtr_fault_injection_state.rtr_gid_history.clear();
 }
 
+// Returns the first two valid (non-empty) gid indexes on port 1 of the named
+// device, or {0, 1} when the probe fails. Hardcoding 0/1 breaks on devices
+// whose gid table has fewer usable RoCE entries, silently turning the swap
+// injection into a no-op.
+std::pair<int, int> probeSyntheticGidSwapPair(const std::string& device_name) {
+    int num_devices = 0;
+    ibv_device** device_list = ibv_get_device_list(&num_devices);
+    if (!device_list) return {0, 1};
+    std::pair<int, int> pair{0, 1};
+    for (int i = 0; i < num_devices; ++i) {
+        if (device_name != ibv_get_device_name(device_list[i])) continue;
+        ibv_context* ctx = ibv_open_device(device_list[i]);
+        if (ctx) {
+            std::vector<int> valid;
+            for (int gid_index = 0; valid.size() < 2 && gid_index < 32;
+                 ++gid_index) {
+                ibv_gid gid{};
+                bool nonzero = false;
+                if (ibv_query_gid(ctx, 1, gid_index, &gid) == 0) {
+                    for (int b = 0; b < 16; ++b) {
+                        if (gid.raw[b]) {
+                            nonzero = true;
+                            break;
+                        }
+                    }
+                }
+                if (nonzero) valid.push_back(gid_index);
+            }
+            if (valid.size() == 2) pair = {valid[0], valid[1]};
+            ibv_close_device(ctx);
+        }
+        break;
+    }
+    ibv_free_device_list(device_list);
+    return pair;
+}
+
 void configureRtrFaultInjection(const std::string& device_name) {
     std::lock_guard<std::mutex> guard(g_rtr_fault_injection_state.mu);
+    const auto gid_pair = probeSyntheticGidSwapPair(device_name);
     g_rtr_fault_injection_state.synthetic_gid_swap_enabled = true;
     g_rtr_fault_injection_state.synthetic_gid_device = device_name;
-    g_rtr_fault_injection_state.synthetic_gid_a = 0;
-    g_rtr_fault_injection_state.synthetic_gid_b = 1;
+    g_rtr_fault_injection_state.synthetic_gid_a = gid_pair.first;
+    g_rtr_fault_injection_state.synthetic_gid_b = gid_pair.second;
     g_rtr_fault_injection_state.fail_first_rtr_einval = true;
     g_rtr_fault_injection_state.fail_rtr_device = device_name;
     g_rtr_fault_injection_state.first_rtr_attempted = false;

@@ -16,6 +16,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <algorithm>
 #include <iostream>
 #include <map>
 #include <set>
@@ -107,7 +108,7 @@ void Topology::print() const {
     }
 }
 
-Status Topology::discover(const std::vector<Platform*>& platforms) {
+Status Topology::discover(const std::vector<Platform*>& platforms, const Config* conf) {
     clear();
     for (auto& entry : platforms) {
         CHECK_STATUS(entry->probe(nic_list_, mem_list_));
@@ -116,6 +117,27 @@ Status Topology::discover(const std::vector<Platform*>& platforms) {
     // UB discovery is intentionally adapter-backed instead of inferring UB
     // devices from verbs/sysfs names. One topology NIC is emitted per EID and
     // carries both the globally serialized identity and the native URMA name.
+    if (!platforms.empty()) {
+        std::vector<std::string> ub_whitelist;
+        std::vector<std::string> ub_blacklist;
+        if(conf) {
+            ub_whitelist = conf->getArray<std::string>("topology/rdma_whitelist");
+            ub_blacklist = conf->getArray<std::string>("topology/rdma_blacklist");
+        }
+        const auto ub_device_allowed = [&](const std::string& name) {
+            if (ub_whitelist.empty() && ub_blacklist.empty()) return true;
+            if (!ub_whitelist.empty() &&
+                std::find(ub_whitelist.begin(), ub_whitelist.end(), name) ==
+                    ub_whitelist.end()) {
+                return false;
+            }
+            if (!ub_blacklist.empty() &&
+                std::find(ub_blacklist.begin(), ub_blacklist.end(), name) !=
+                    ub_blacklist.end()) {
+                return false;
+            }
+            return true;
+        };
     auto adapter = ub::createDefaultUrmaAdapter();
     if (adapter && adapter->available()) {
         auto status = adapter->initialize();
@@ -125,6 +147,9 @@ Status Topology::discover(const std::vector<Platform*>& platforms) {
             if (status.ok()) {
                 std::unordered_map<std::string, int> native_device_indices;
                 for (const auto& device : devices) {
+                    if (!ub_device_allowed(device.native_device_name)) {
+                        continue;
+                    }
                     auto [native_it, inserted] = native_device_indices.emplace(
                         device.native_device_name,
                         static_cast<int>(native_device_indices.size()));
@@ -176,6 +201,7 @@ Status Topology::discover(const std::vector<Platform*>& platforms) {
                          << status.ToString();
         }
     }
+}
 #endif
     return Status::OK();
 }
@@ -359,7 +385,7 @@ Status Topology::loadFromConfig(const Config& conf,
             LOG(WARNING) << "Failed to parse topology/priority_matrix: "
                          << status.ToString()
                          << ", falling back to auto-discover";
-            return discover(platforms);
+            return discover(platforms, &conf);
         }
     }
 
@@ -378,16 +404,15 @@ Status Topology::loadFromConfig(const Config& conf,
         if (content.empty()) {
             LOG(WARNING) << "Failed to load custom topology from " << path
                          << ", falling back to auto-detect.";
-            return discover(platforms);
+            return discover(platforms, &conf);
         }
         auto status = parseCustomTopology(content);
         if (status.ok()) return Status::OK();
         LOG(WARNING) << "Failed to parse custom topology from " << path << ": "
                      << status.ToString() << ", falling back to auto-detect.";
-        return discover(platforms);
+        return discover(platforms, &conf);
     }
-
-    return discover(platforms);
+    return discover(platforms, &conf);
 }
 
 size_t Topology::getNicCount(NicType type) const {
