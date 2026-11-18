@@ -444,7 +444,7 @@ processPending(pending, worker_index):
 
 注 2：⑤ 的快照在 ⑥ lease **之前**、⑦ 的比对在 lease **之后**，覆盖"选路 → lease"这段最长的窗口（§8.2）。
 
-### 8.2 认领复核（D-4 的过渡形态；R-1 待池化侧确认）
+### 8.2 认领复核（D-4 的过渡形态；R-1 已于 W3g 落地）
 
 ```cpp
 // 紧贴 native post 之前的复核；无锁长临界区，只读两个标量。
@@ -462,7 +462,9 @@ bool UbWorkers::claimPost(BusinessRecord& r) {
 - **成员级"已被判故障"这一维不需要认领**：成员被 lease 期间是独占的，930 的 `PoolMemberState` 只有在归还/退役/关闭 drain/泄漏路径才会离开 `kInUse`（[send_jetty_pool.cpp](../../930/Mooncake/mooncake-transfer-engine/tent/src/transport/ub/send_jetty_pool.cpp) 的状态赋值只在 `returnOnce`/`retireFaulted`/`drainIdle`/`onLeaseLeaked` 里），也就是说**没有第三方能在持有者 post 之前把成员标坏**。池化详设 §5.2 规则 3 的成员级那一半，已被"独占 lease＋退役只发生在结算路径"覆盖。
 - **真正非原子的只有路径健康一维**：它由 PLM 在另一把锁里变更，本侧无法与其线性化。这一维正是 R-1 要解决的**唯一**问题。
 
-#### R-1：请池化侧补 `tryClaimPost`（待确认）
+#### R-1：池化侧 `tryClaimPost`（W3g 已落地）
+
+> 2026-11-18：**本侧池化实现已补 `SendJettyPool::tryClaimPost()`**（池同步域内复核 stopping / 成员状态 / lane generation / member `error_epoch`，纯读），`workers.cpp::claimPost()` 改为调用它并保留 PLM fault epoch 标量比对；`transports/ub/claim/enabled=false` 可退回本节描述的过渡形态。设计见《tent-ub-w3g-pool-claim-and-v2-design》§6。
 
 池化详设 §5.2 规则 3 原文要求"发布 token 和全部 owner；**PostGate ticket 与 close 线性化，复核 stopping、PathVersion、fault_epoch、target/注册代次后认领唯一 post**"，总设计 §5.5 把这条落成接口 `tryClaimPost(lease, fault_epoch_snapshot)`。930 的工作区**两样都没实现**（`PostGate`/`active_post` 零引用，只有池级 `stopping_`）。请求的形状：
 
@@ -702,6 +704,12 @@ rm_pool ⇒ desired_per_context >= 1
 | `pool_lease_attempts` / `pool_lease_misses` / `pool_stop_rejections` | lease 结果分布 | miss 高 → `desired_per_context` 或 credit 偏小 |
 | `credit_starved` | `tryReserve` 失败次数（R-2 有 miss reason 后可用） | 高 → `jfc_credit_reserve` 偏大或 depth 偏小 |
 | `claim_after_isolation` | 认领复核失败次数（拦下的多发） | 常态极小；与 `post_on_isolated_path` 成对看 |
+| `claim_rejected_{stopping,member,generation,error_epoch}` | W3g 池侧 claim 分因拒绝 | 只有 stopping 在当前单租约模型下可达，其余为防御性；均应为 0 或极小 |
+| `claim_disabled` | `claim/enabled=false` 走回退复核的次数 | 关闭时 ≈ lease 次数；开启时恒 0 |
+| `bootstrap_v2_peers` / `bootstrap_v1_peers` / `bootstrap_v2_ignored` | W3g 对端协商结果 / 接收侧因 `protocol=v1` 丢弃的 v2 块 | v2_ignored 仅在强制 v1 且对端发 v2 时非 0 |
+| `identity_import_ok` / `identity_import_fail` | W3g 物理口身份导入 | fail 恒 0（空 path/eid 即装配失败） |
+| `probe_path_count`（`UbTransport::probePathCount()`） | PLM 路径行数（任何健康状态，不是仅健康数） | 探测未启用/无对端 area 时为 0；首个 bootstrap 后 ≥1 |
+| `probe_scheduled` / `probe_posted`（`UbTransport::probeStats()`） | 调度器实际取走/投出的探测量 | 懒激活后 ≥1；长期只增不成功说明投递或完成路径有问题 |
 | `post_on_isolated_path` | post 返回后发现路径已隔离（残漏上界） | 与上一项成对看；触发 §8.2 的 R-1 紧迫度判据 |
 | `path_inflight_peak{path}` | `PathLoadLedger` 峰值 | 评分是否真的把负载摊开 |
 | `completion_length_mismatch` | 完成字节 ≠ 提交字节 | 恒 0；非 0 即缺陷（D-15 只记账） |
@@ -919,6 +927,9 @@ transports/ub/native_budget/replacement_reserve   非负整数(默认 2)
 transports/ub/business_queue_budget      正整数，且 >= max_slices_per_task     (默认 65536)
 transports/ub/task_max_inflight_attempts 正整数  (默认 4；仅 rm_pool 生效)
 transports/ub/defer_reflow_batch         正整数  (默认 256)
+transports/ub/claim/enabled              bool    (默认 true；W3g)
+transports/ub/bootstrap/protocol         auto|v1|v2 (默认 auto；W3g)
+transports/ub/identity/import            bool    (默认 on；W3g)
 ```
 
 交叉校验（install 时 fail-closed，全部在 `UbParams::FromConfig` 内）：
@@ -965,7 +976,7 @@ transports/ub/defer_reflow_batch         正整数  (默认 256)
 
 ### 22.4 仍未闭合
 
-- **认领复核失败的回滚仍无端到端用例**：`claimPost()` 的失败窗口（选路后、post 前）由 PLM 隔离或池停止触发，没有确定性测试钩子；目前只覆盖其两个输入（epoch 变化、stopping）与回滚代码路径的静态审查。若要可测，需要池侧 R-1 的 `tryClaimPost` 或一个仅测试可见的注入点。
+- **认领复核失败的回滚仍无端到端用例**：W3g 已落地池侧 `tryClaimPost`，并用池单测覆盖四类拒绝（stopping/member/generation/error_epoch）与只读性；但"选路后成员被退役 → claim 拒绝 → 回滚不变量"仍没有确定性集成注入点（需要测试可见的 lease→claim 窗口钩子）。回滚代码路径本身沿用既有 W3 用例覆盖。
 - **M10**：endpoint Jetty 与探测 Jetty 尚未登记进 `NativeBudget`（RK5/W6）。
 - **实机门槛**（RK11）未做：`TENT_HAS_REAL_URMA=OFF`，RM 的 JFR/JFS 同模式、credit 与三态仍只有 fake 证据。
 - **上游探测提交引入的两个用例失败与本轮无关**：在 03772891（含 774d1ac2/35fea91d）上，不应用本轮任何改动也能复现 `tent_ub_probe_campaign_test::PostRejectionRollsEntryBackToQueued` 与 `tent_ub_probe_scheduler_test` 的两个用例失败（探测侧“拒绝的 campaign 不再空转”等语义变更未同步用例）。已核实与本轮 W3 改动无因果关系，归属探测侧。

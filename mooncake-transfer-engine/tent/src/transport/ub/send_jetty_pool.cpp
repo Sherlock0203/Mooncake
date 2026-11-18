@@ -89,6 +89,7 @@ Status SendJettyPool::tryLease(const PoolKey& pool_key,
         std::shared_ptr<PoolMember> chosen;
         size_t chosen_jfc = 0;
         uint64_t credit_token = 0;
+        uint64_t chosen_error_epoch = 0;
         bool can_create = false;
 
         {
@@ -107,6 +108,7 @@ Status SendJettyPool::tryLease(const PoolKey& pool_key,
                 chosen = std::move(*it);
                 chosen_jfc = chosen->jfc_index;
                 credit_token = *token;
+                chosen_error_epoch = chosen->error_epoch;
                 bucket.idle.erase(it);
                 break;
             }
@@ -127,6 +129,9 @@ Status SendJettyPool::tryLease(const PoolKey& pool_key,
             out.lease = SliceJettyLease(this, std::move(chosen), attempt);
             out.jfc_index = chosen_jfc;
             out.jfc_credit_token = credit_token;
+            // W3g: the retirement epoch was snapshotted under the same lock
+            // that handed out the member, so the claim cannot see a torn value.
+            out.error_epoch = chosen_error_epoch;
             return Status::OK();
         }
 
@@ -318,6 +323,10 @@ void SendJettyPool::retireMemberLocked(std::shared_ptr<PoolMember> member,
                                        const std::string& reason) {
     member->state = PoolMemberState::kDraining;
     member->retire_reason = reason;
+    // W3g: every retirement raises the epoch. A lease taken before this point
+    // can never claim again, even if the member object is briefly reused for
+    // delete/drain bookkeeping.
+    ++member->error_epoch;
     // First real error retires permanently (INV07): the member never
     // re-enters the idle stack even if the path recovers.
     if (options_.background_delete && !delete_stop_) {
@@ -379,8 +388,47 @@ void SendJettyPool::onLeaseLeaked(const std::shared_ptr<PoolMember>& member) {
         }
     }
     member->state = PoolMemberState::kQuarantined;
+    // A leaked lease removes the member from circulation just like a
+    // retirement; the epoch must move so a stale claim cannot succeed.
+    ++member->error_epoch;
     budget_->transition(member->budget, BudgetObjectState::kQuarantined);
     quarantined_.push_back(member);
+}
+
+ClaimVerdict SendJettyPool::tryClaimPost(const PoolKey& pool_key,
+                                         const AttemptKey& attempt,
+                                         const ClaimRequest& request) const {
+    // Read-only verdict (IN-1): no member state changes, no counters, no
+    // provider call. The fixed check order mirrors the pooling-side design
+    // (W3g §6.1): stopping -> bucket -> member state -> generation -> epoch.
+    //
+    // A null member (or a member that never belonged to this pool key) is
+    // reported as retired: the lease is the only proof of identity the caller
+    // has, and without it there is nothing this pool can vouch for.
+    //
+    // Only kPoolStopping is reachable under today's single-lease model; the
+    // other verdicts are defensive and covered by unit tests (see the header).
+    if (!attempt.valid() || request.member == nullptr) {
+        return ClaimVerdict{ClaimClosed::kMemberRetired};
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (stopping_) return ClaimVerdict{ClaimClosed::kPoolStopping};
+    auto bucket = buckets_.find(pool_key);
+    if (bucket == buckets_.end()) {
+        return ClaimVerdict{ClaimClosed::kMemberRetired};
+    }
+    const PoolMember& member = *request.member;
+    if (member.pool_key != pool_key ||
+        member.state != PoolMemberState::kInUse) {
+        return ClaimVerdict{ClaimClosed::kMemberRetired};
+    }
+    if (member.lane.lane_generation != request.lane_generation) {
+        return ClaimVerdict{ClaimClosed::kGenerationMoved};
+    }
+    if (member.error_epoch != request.error_epoch_snapshot) {
+        return ClaimVerdict{ClaimClosed::kErrorEpochMoved};
+    }
+    return ClaimVerdict{ClaimClosed::kNone};
 }
 
 void SendJettyPool::beginStop() {
@@ -467,8 +515,7 @@ void SendJettyPool::refillLoop() {
                 continue;
             }
             if (bucket.creating >= options_.max_creating) continue;
-            size_t slots =
-                options_.desired_serving - serving - bucket.creating;
+            size_t slots = options_.desired_serving - serving - bucket.creating;
             slots = std::min(slots, options_.max_creating - bucket.creating);
             bucket.creating += slots;
             for (size_t slot = 0; slot < slots; ++slot) {
@@ -486,9 +533,8 @@ void SendJettyPool::refillLoop() {
 void SendJettyPool::deleteLoop() {
     std::unique_lock<std::mutex> lock(mutex_);
     for (;;) {
-        delete_cv_.wait(lock, [this] {
-            return delete_stop_ || !delete_ready_.empty();
-        });
+        delete_cv_.wait(
+            lock, [this] { return delete_stop_ || !delete_ready_.empty(); });
         if (delete_ready_.empty()) {
             if (delete_stop_) break;
             continue;

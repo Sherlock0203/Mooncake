@@ -30,6 +30,10 @@ uint64_t generationSeed() {
 
 std::atomic<uint64_t> g_next_endpoint_generation{generationSeed()};
 
+// Native identity of a bound peer. The W3g-b v2 block (schema version, target
+// profile, probe pages and epochs) is negotiated metadata, not identity: a
+// re-bootstrap may legitimately upgrade a v1 peer descriptor to v2 without
+// being "another peer generation".
 bool samePeer(const UbBootstrapDesc& lhs, const UbBootstrapDesc& rhs) {
     return lhs.protocol_version == rhs.protocol_version &&
            lhs.local_eid == rhs.local_eid && lhs.jetty_ids == rhs.jetty_ids &&
@@ -242,13 +246,43 @@ Status UbEndpoint::prepare() {
     return Status::OK();
 }
 
-Status UbEndpoint::bind(const UbBootstrapDesc& peer) {
+Status UbEndpoint::bind(const UbBootstrapDesc& peer_desc) {
     std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    // W3g-b/Major-1: `bootstrap/protocol=v1` is a hard local lock. A peer that
+    // still sends the v2 block has it dropped before validation/storage, so the
+    // effective contract is byte-for-byte v1 and no target profile or probe
+    // page can leak through the rollback switch.
+    UbBootstrapDesc effective = peer_desc;
+    if (!bootstrapV2Allowed() &&
+        (peer_desc.schema_version >= kUbBootstrapSchemaV2 ||
+         !peer_desc.target_profiles.empty() ||
+         !peer_desc.probe_areas.empty())) {
+        bootstrap_v2_ignored_.fetch_add(1, std::memory_order_relaxed);
+        LOG_EVERY_N(INFO, 64)
+            << "UB endpoint: ignoring a received bootstrap v2 block because "
+               "bootstrap/protocol=v1";
+        effective.schema_version = kUbBootstrapSchemaV1;
+        effective.target_profiles.clear();
+        effective.probe_areas.clear();
+        effective.topology_epoch = 0;
+        effective.target_epoch = 0;
+    }
+    return bindLocked(effective);
+}
+
+Status UbEndpoint::bindLocked(const UbBootstrapDesc& peer) {
     const State current = state_.load(std::memory_order_relaxed);
     if (current == State::kReady) {
-        if (samePeer(peer_, peer)) return Status::OK();
-        return Status::InvalidArgument(
-            "UB endpoint is already bound to another peer generation" LOC_MARK);
+        if (!samePeer(peer_, peer)) {
+            return Status::InvalidArgument(
+                "UB endpoint is already bound to another peer "
+                "generation" LOC_MARK);
+        }
+        // W3g-b: refresh the advisory v2 metadata (target profile, probe pages,
+        // epochs). The native binding is unchanged, so a schema upgrade is
+        // idempotent instead of looking like a peer-generation conflict.
+        peer_ = peer;
+        return Status::OK();
     }
     if (current == State::kFailed) return lifecycle_status_;
     if (current != State::kPrepared) {
@@ -269,6 +303,20 @@ Status UbEndpoint::bind(const UbBootstrapDesc& peer) {
         return failLocked(
             Status::InvalidArgument("Peer UB bootstrap is missing EID or "
                                     "endpoint generation" LOC_MARK));
+    }
+    // W3g-b: protocol_version stays 1 (v2 is a field addition), and an unknown
+    // schema version is treated as v1 with unknown fields ignored. A v2 field
+    // block that is present must be internally consistent, otherwise the bind
+    // is rejected rather than partially interpreted (IN-5).
+    if (peer.schema_version < kUbBootstrapSchemaV1) {
+        return failLocked(Status::InvalidArgument(
+            "Peer UB bootstrap schema_version is invalid" LOC_MARK));
+    }
+    if (!peer.target_profiles.empty() &&
+        peer.target_profiles.size() != peer.jetty_ids.size()) {
+        return failLocked(Status::InvalidArgument(
+            "Peer UB bootstrap target_profiles do not align with Jetty "
+            "IDs" LOC_MARK));
     }
     if (peer.jetty_ids.size() != jetties_.size()) {
         return failLocked(
@@ -337,6 +385,13 @@ RemoteJettyInfo UbEndpoint::rmTarget(size_t jetty_index) const {
     if (peer_.jetty_uasids.size() == peer_.jetty_ids.size()) {
         target.uasid = peer_.jetty_uasids[index];
     }
+    // W3g-b: a negotiated target profile is carried verbatim. Zero means the
+    // peer did not publish one, which keeps the v1 import path byte-for-byte.
+    if (peer_.target_profiles.size() == peer_.jetty_ids.size()) {
+        target.trans_mode = peer_.target_profiles[index].trans_mode;
+        target.target_type = peer_.target_profiles[index].target_type;
+        target.tp_type = peer_.target_profiles[index].tp_type;
+    }
     return target;
 }
 
@@ -383,6 +438,31 @@ Status UbEndpoint::makeBootstrapDesc(const std::string& segment_name,
     output.capabilities = {"read", "write", "endpoint_generation"};
     output.capabilities.push_back(rmMode() ? kUbCapabilityRmTransport
                                            : kUbCapabilityRcTransport);
+    // W3g-b: advertise the v2 capability unconditionally so a peer can opt in.
+    // Sending fields still requires both sides: this switch and the peer's
+    // capability list. In the request phase peer_ is empty, so only the
+    // response (built after bind(request)) can carry the field block.
+    output.capabilities.push_back(kUbCapabilityBootstrapV2);
+    output.capabilities.push_back(kUbCapabilityProbeAreaV1);
+    output.capabilities.push_back(kUbCapabilityTargetProfileV1);
+    if (bootstrapV2Allowed() && peer_.advertisesBootstrapV2()) {
+        output.schema_version = kUbBootstrapSchemaV2;
+        output.topology_epoch = context_ ? context_->incarnation() : 0;
+        output.target_epoch = generation_;
+        if (rmMode()) {
+            // One profile per local send Jetty, aligned with jetty_ids. The
+            // provider unions behind these constants are checked at compile
+            // time in the real adapter.
+            output.target_profiles.reserve(jetties_.size());
+            for (size_t index = 0; index < jetties_.size(); ++index) {
+                UbRemoteTargetProfile profile;
+                profile.trans_mode = kUrmaTransportModeRm;
+                profile.target_type = kUrmaTargetTypeJetty;
+                profile.tp_type = kUrmaTpTypeCtp;
+                output.target_profiles.push_back(profile);
+            }
+        }
+    }
     return Status::OK();
 }
 

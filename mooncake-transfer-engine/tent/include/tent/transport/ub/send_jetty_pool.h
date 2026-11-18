@@ -132,6 +132,12 @@ struct PoolMember {
     BudgetReservation budget{};
     PoolMemberState state = PoolMemberState::kCreating;
     std::string retire_reason;
+    // W3g collectible retirement counter. It is bumped whenever the member
+    // leaves circulation (retirement, leak/quarantine), so a lease can carry
+    // the value it was handed out with and a claim can prove the member was
+    // not retired in between. Guarded by the pool mutex; the value is copied
+    // out under that mutex, so a plain uint64_t is enough.
+    uint64_t error_epoch = 0;
 };
 
 class SendJettyPool;
@@ -189,6 +195,63 @@ struct LeaseWithCredit {
     SliceJettyLease lease;
     size_t jfc_index = 0;
     uint64_t jfc_credit_token = 0;
+    // W3g: the member retirement epoch observed under the pool mutex while the
+    // lease was taken. Claim compares it without re-locking for the member.
+    uint64_t error_epoch = 0;
+};
+
+// W3g (R-1): why the pool refused the post right. The order of the checks is
+// fixed in tryClaimPost(): stopping -> bucket -> member state -> generation ->
+// error epoch.
+//
+// Reachability today: with the single-lease ownership model only kPoolStopping
+// occurs in practice (a leased member cannot be retired by anyone except its
+// lease holder, which is the caller itself). kMemberRetired /
+// kGenerationMoved / kErrorEpochMoved are defensive assertions: they make the
+// check total for a future multi-owner/background-retirement model and pin the
+// intended verdicts in tests. They must not be read as evidence of a current
+// race, and no extra lock is needed on their account.
+enum class ClaimClosed : uint8_t {
+    kNone = 0,
+    kPoolStopping,     // beginStop() happened after the lease
+    kMemberRetired,    // member is not in use any more (retired/quarantined)
+    kGenerationMoved,  // the leased lane generation no longer matches
+    kErrorEpochMoved,  // the member was retired at least once after the lease
+};
+
+inline const char* claimClosedName(ClaimClosed closed) noexcept {
+    switch (closed) {
+        case ClaimClosed::kNone:
+            return "claimed";
+        case ClaimClosed::kPoolStopping:
+            return "pool_stopping";
+        case ClaimClosed::kMemberRetired:
+            return "member_retired";
+        case ClaimClosed::kGenerationMoved:
+            return "generation_moved";
+        case ClaimClosed::kErrorEpochMoved:
+            return "error_epoch_moved";
+    }
+    return "unknown";
+}
+
+// W3g input for tryClaimPost(). `member` is the leased member itself: the pool
+// does not keep an in-use index, the lease is the only owner of that identity,
+// so passing it avoids a second index and keeps the check O(1). The pointer
+// stays valid because the caller holds the lease for the whole call.
+struct ClaimRequest {
+    AttemptKey attempt;
+    uint64_t lane_generation = 0;
+    uint64_t error_epoch_snapshot = 0;
+    const PoolMember* member = nullptr;
+};
+
+struct ClaimVerdict {
+    ClaimClosed closed = ClaimClosed::kNone;
+
+    [[nodiscard]] bool claimed() const noexcept {
+        return closed == ClaimClosed::kNone;
+    }
 };
 
 struct SendJettyPoolOptions {
@@ -253,6 +316,14 @@ class SendJettyPool final {
     //   InvalidArgument  bad key/attempt or pool not attached
     Status tryLease(const PoolKey& pool_key, const AttemptKey& attempt,
                     LeaseWithCredit& out);
+
+    // W3g R-1: the pool's authority on "may this attempt be posted now".
+    // Pure read: it changes no member state, takes no lease, releases nothing
+    // (IN-1). It runs entirely under the pool mutex and performs no provider
+    // call, so it is safe between the last rollback point and the native post.
+    [[nodiscard]] ClaimVerdict tryClaimPost(const PoolKey& pool_key,
+                                            const AttemptKey& attempt,
+                                            const ClaimRequest& request) const;
 
     // Returns a lease exactly once. completion_gate_passed=true (the C07
     // normal gate) pushes the member back to the idle front; false or a

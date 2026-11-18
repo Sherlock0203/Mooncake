@@ -120,7 +120,8 @@ bool ProbeLinkManager::initialized() const {
     return initialized_;
 }
 
-Status ProbeLinkManager::initialize(const ProbeGraph& graph) {
+Status ProbeLinkManager::initialize(const ProbeGraph& graph,
+                                    bool allow_empty_edges) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (initialized_) {
         return Status::InvalidArgument(
@@ -144,7 +145,7 @@ Status ProbeLinkManager::initialize(const ProbeGraph& graph) {
     if (graph.ports.empty()) {
         return Status::InvalidArgument("probe graph supplies no local port");
     }
-    if (graph.edges.empty()) {
+    if (graph.edges.empty() && !allow_empty_edges) {
         // Fail fast instead of silently degrading to "no probing" (design
         // §12.3): enabled probing with an empty adjacency is a supply bug.
         return Status::InvalidArgument(
@@ -1157,7 +1158,11 @@ std::optional<PathVersion> ProbeLinkManager::resolveVersionLocked(
         auto edge = edges_.find(version);
         if (edge == edges_.end()) return std::nullopt;
         const uint64_t anchor = edge->second.endpoint_generation;
-        if (anchor == 0 || anchor == evidence.endpoint_generation) {
+        if (evidence.endpoint_generation == 0 || anchor == 0 ||
+            anchor == evidence.endpoint_generation) {
+            // Zero evidence means a path-level query (pre-resolution health
+            // screening) with no generation claim; zero anchor means the
+            // provider did not publish one. Neither is a mismatch.
             return version;
         }
         // L-7: an unmappable fault is attributed to the rail's current
@@ -2001,6 +2006,11 @@ ProbeStats ProbeLinkManager::stats() const {
         if (waiting) ++snapshot.campaign_waiting_for_event;
     }
     return snapshot;
+}
+
+size_t ProbeLinkManager::pathRowCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return paths_.size();
 }
 
 size_t ProbeLinkManager::inflightCount() const {

@@ -1080,6 +1080,12 @@ Status validateSegmentOptions(const SegmentOptions& options) {
     return Status::OK();
 }
 
+// W3g-b: the negotiated target profile crosses the adapter boundary as plain
+// numbers, so the mirrors must match the provider enums.
+static_assert(kUrmaTargetTypeJetty == URMA_JETTY,
+              "URMA target type mirror drifted");
+static_assert(kUrmaTpTypeCtp == URMA_CTP, "URMA TP type mirror drifted");
+
 CompletionCategory classifyCompletion(int status) {
     switch (status) {
         case URMA_CR_SUCCESS:

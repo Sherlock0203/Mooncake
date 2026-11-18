@@ -190,7 +190,13 @@ class ProbeLinkManager final : public ProbeAvailabilitySink {
 
     // Interface 4. Builds the health table from a full snapshot; every edge
     // starts ELIGIBLE_UNVERIFIED and no periodic task exists (design §5.4).
-    Status initialize(const ProbeGraph& graph);
+    //
+    // W3g-c: `allow_empty_edges` exists only for the bootstrap-driven peer
+    // source. At install time no peer has completed a business bootstrap yet,
+    // so the graph legitimately has local ports and zero adjacency edges; the
+    // PLM is armed with its ports and waits for the first interface-7
+    // kEdgeAdded event. An injected supply still fails fast on an empty graph.
+    Status initialize(const ProbeGraph& graph, bool allow_empty_edges = false);
     [[nodiscard]] bool initialized() const;
 
     // ---- scheduler seam (design §8.1) -------------------------------------
@@ -282,6 +288,10 @@ class ProbeLinkManager final : public ProbeAvailabilitySink {
     [[nodiscard]] std::vector<CampaignView> campaignView() const;
     [[nodiscard]] ProbeStats stats() const;
     [[nodiscard]] size_t inflightCount() const;
+    // W3g: installed probe path rows (any health state). Unlike healthView()
+    // this never hides a row and is the honest "how many edges are wired"
+    // observation.
+    [[nodiscard]] size_t pathRowCount() const;
     [[nodiscard]] size_t orphanCount() const;
     [[nodiscard]] uint64_t graphEpoch() const;
     [[nodiscard]] const ProbeParams& params() const { return params_; }

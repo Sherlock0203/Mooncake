@@ -38,6 +38,7 @@
 #include "tent/rpc/rpc.h"
 #include "tent/runtime/topology.h"
 #include "tent/thirdparty/nlohmann/json.h"
+#include "tent/transport/ub/bootstrap_v2.h"
 
 namespace mooncake {
 namespace tent {
@@ -79,6 +80,24 @@ struct UbBootstrapDesc {
     uint64_t segment_generation = 0;
     std::vector<std::string> capabilities;
     std::string reply_msg;
+
+    // ---- W3g-b additive v2 block (design §5.2) ----------------------------
+    // `protocol_version` stays 1: v2 is an optional field set, not a new wire
+    // version. A peer that does not advertise `bootstrap_v2` never sees these
+    // keys, and this side ignores them from a peer that does not declare v2.
+    uint32_t schema_version = ub::kUbBootstrapSchemaV1;
+    // Optional per-Jetty target profile; empty means "all v1 behaviour", and a
+    // non-empty list must be aligned with jetty_ids (IN-5).
+    std::vector<ub::UbRemoteTargetProfile> target_profiles;
+    // Peer probe pages, one per published local port. Empty or mismatched means
+    // probing stays off for that peer; an address is never guessed.
+    std::vector<ub::UbProbeAreaDescriptor> probe_areas;
+    uint64_t topology_epoch = 0;
+    uint64_t target_epoch = 0;
+
+    [[nodiscard]] bool advertisesBootstrapV2() const {
+        return ub::ubBootstrapV2Capable(capabilities);
+    }
 };
 
 inline void to_json(nlohmann::json& j, const UbBootstrapDesc& desc) {
@@ -96,9 +115,21 @@ inline void to_json(nlohmann::json& j, const UbBootstrapDesc& desc) {
                        {"segment_generation", desc.segment_generation},
                        {"capabilities", desc.capabilities},
                        {"reply_msg", desc.reply_msg}};
+    // Pure addition: a v1 envelope keeps exactly the keys above, so an old peer
+    // never has to tolerate an unknown object it did not ask for.
+    if (desc.schema_version >= ub::kUbBootstrapSchemaV2) {
+        j["schema_version"] = desc.schema_version;
+        j["target_profiles"] = desc.target_profiles;
+        j["probe_areas"] = desc.probe_areas;
+        j["topology_epoch"] = desc.topology_epoch;
+        j["target_epoch"] = desc.target_epoch;
+    }
 }
 
 inline void from_json(const nlohmann::json& j, UbBootstrapDesc& desc) {
+    // Reset first: a v2 reply must not inherit stale arrays from a previous
+    // envelope reused by the caller.
+    desc = UbBootstrapDesc{};
     desc.protocol_version = j.value("protocol_version", 0u);
     if (desc.protocol_version != 1) {
         throw std::invalid_argument("unsupported UB bootstrap version");
@@ -116,6 +147,63 @@ inline void from_json(const nlohmann::json& j, UbBootstrapDesc& desc) {
     desc.segment_generation = j.value("segment_generation", uint64_t{0});
     desc.capabilities = j.value("capabilities", std::vector<std::string>{});
     desc.reply_msg = j.value("reply_msg", "");
+
+    // W3g-b: v2 is additive, and unknown schema versions are ignored rather
+    // than rejected (forward compatibility). A malformed v2 field is rejected:
+    // its type is part of the contract.
+    if (j.contains("schema_version")) {
+        const auto& version = j.at("schema_version");
+        if (!version.is_number_unsigned() && !version.is_number_integer()) {
+            throw std::invalid_argument(
+                "UB bootstrap schema_version must be an integer");
+        }
+        const int64_t parsed = version.get<int64_t>();
+        if (parsed < 0) {
+            throw std::invalid_argument(
+                "UB bootstrap schema_version must not be negative");
+        }
+        desc.schema_version = static_cast<uint32_t>(parsed);
+    }
+    if (desc.schema_version == ub::kUbBootstrapSchemaV2) {
+        // Uniform contract: every malformed v2 field surfaces as
+        // invalid_argument, including nlohmann's own type_error, so the caller
+        // has one rejection path (D-7: unknown fields ignored, bad types
+        // rejected).
+        try {
+            if (j.contains("target_profiles")) {
+                desc.target_profiles =
+                    j.at("target_profiles")
+                        .get<std::vector<ub::UbRemoteTargetProfile>>();
+            }
+            if (j.contains("probe_areas")) {
+                desc.probe_areas =
+                    j.at("probe_areas")
+                        .get<std::vector<ub::UbProbeAreaDescriptor>>();
+            }
+            if (j.contains("topology_epoch")) {
+                desc.topology_epoch =
+                    ub::ubBootstrapJsonUnsigned<uint64_t>(j, "topology_epoch");
+            }
+            if (j.contains("target_epoch")) {
+                desc.target_epoch =
+                    ub::ubBootstrapJsonUnsigned<uint64_t>(j, "target_epoch");
+            }
+        } catch (const std::invalid_argument&) {
+            throw;
+        } catch (const std::exception& error) {
+            throw std::invalid_argument(std::string("invalid UB bootstrap v2 "
+                                                    "field: ") +
+                                        error.what());
+        }
+        // IN-5: an aligned-but-nonempty profile list is the only accepted
+        // shape. Rejecting here keeps a partially interpreted target set from
+        // ever reaching the endpoint.
+        if (!desc.target_profiles.empty() &&
+            desc.target_profiles.size() != desc.jetty_ids.size()) {
+            throw std::invalid_argument(
+                "UB bootstrap target_profiles must align with jetty_ids");
+        }
+    }
 }
 
 struct XferDataDesc {

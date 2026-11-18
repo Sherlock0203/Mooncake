@@ -39,6 +39,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <set>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -120,6 +121,13 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
     // graph. A second call after success is rejected; a failed call rolls back
     // every resource it created.
     Status snapshot(ProbeGraph& graph) override;
+
+    // W3g-c lazy activation: re-read the peer directory and publish newly
+    // learned or refreshed edges as interface-7 events (kEdgeAdded /
+    // kAreaReplaced / kTargetEpochChanged). The transport calls this after a
+    // business bootstrap taught the source a new peer probe page. Idempotent:
+    // unchanged published paths produce no event.
+    Status refreshRemoteEdges(size_t* published = nullptr);
 
     // Interface 2. Quiesces the old probe Jetty, dispatches its completions
     // through the completion sink, replaces the Jetty/source page/area page on
@@ -246,6 +254,10 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
     const std::shared_ptr<UrmaAdapter> adapter_;
     const ProbeParams params_;
     std::vector<PortState> ports_;
+    // Last published edge per adjacency path (W3g-c refresh dedupe). The
+    // supply owns the imported area segment, so a refresh can compare the page
+    // epoch/address and publish kAreaReplaced without re-deriving it.
+    std::map<ProbePathKey, ProbeEdgeSupply> published_edges_;
     ProbePeerDirectory* directory_;
     const TopologyIdResolver topology_resolver_;
     bool owns_contexts_{false};

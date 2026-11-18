@@ -37,6 +37,11 @@ namespace ub {
 // modes can never share a member (design §5.2).
 inline constexpr uint16_t kUrmaTransportModeRm = 0x1;
 inline constexpr uint16_t kUrmaTransportModeRc = 0x1 << 1;
+// W3g-b: adapter-neutral mirror of urma_target_type_t / urma_tp_type_t, used by
+// the negotiated bootstrap v2 target profile. The real adapter validates them
+// against the provider enums at compile time.
+inline constexpr uint8_t kUrmaTargetTypeJetty = 1;  // URMA_JETTY
+inline constexpr uint8_t kUrmaTpTypeCtp = 1;        // URMA_CTP
 
 // Adapter-neutral subset of the capabilities needed by the TENT UB data
 // plane. Values of zero mean that the provider did not report a limit.
@@ -186,6 +191,12 @@ struct RemoteJettyInfo {
     uint32_t id = 0;
     uint32_t uasid = 0;
     uint32_t token = 0xACFE;
+    // W3g-b: negotiated remote target profile mirroring the provider enums.
+    // Zero means "v1 / provider default"; the existing adapters keep their
+    // exact v1 import path until they consume these fields.
+    uint16_t trans_mode = 0;
+    uint8_t target_type = 0;
+    uint8_t tp_type = 0;
 };
 
 enum class Operation : uint8_t {

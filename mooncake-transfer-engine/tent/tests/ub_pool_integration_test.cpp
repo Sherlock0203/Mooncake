@@ -57,7 +57,8 @@ class PooledDataPath {
                             size_t jfc_count = 1, size_t jetty_per_endpoint = 1,
                             bool background_refill = false,
                             bool background_delete = false,
-                            uint32_t refill_interval_ms = 5)
+                            uint32_t refill_interval_ms = 5,
+                            bool claim_enabled = true)
         : adapter_(std::make_shared<FakeUrmaAdapter>(fakeDevice())),
           context_(std::make_shared<UbContext>(0, fakeDevice(), adapter_)),
           slice_timeout_ms_(slice_timeout_ms),
@@ -70,7 +71,8 @@ class PooledDataPath {
           jetty_per_endpoint_(jetty_per_endpoint),
           background_refill_(background_refill),
           background_delete_(background_delete),
-          refill_interval_ms_(refill_interval_ms) {
+          refill_interval_ms_(refill_interval_ms),
+          claim_enabled_(claim_enabled) {
         (void)adapter_->initialize();
         adapter_->setAutoBindCreatedJetties(true);
 
@@ -173,6 +175,7 @@ class PooledDataPath {
         params.business_queue_budget = queue_budget_;
         params.send_pool.desired_per_context =
             static_cast<uint32_t>(desired_serving_);
+        params.claim.enabled = claim_enabled_;
 
         EndpointResolver resolver = [this](
                                         const EndpointResolveRequest& request,
@@ -291,6 +294,7 @@ class PooledDataPath {
     bool background_refill_{false};
     bool background_delete_{false};
     uint32_t refill_interval_ms_{5};
+    bool claim_enabled_{true};
     std::array<char, 64> source_{};
     std::array<char, 64> target_{};
     BufferDesc source_desc_{};
@@ -348,6 +352,49 @@ TEST(UbPoolIntegrationTest, SuccessfulPostReturnsTheMemberAndTheCredit) {
 
 // First real error: the member is retired (INV07), never reused, and the
 // endpoint is not blamed for a pooled failure.
+// W3g-a: the claim is the pool's synchronized verdict, not a side path. A
+// successful pooled attempt must claim exactly once and see no rejection.
+TEST(UbPoolIntegrationTest, ClaimAllowsTheHealthyPooledAttempt) {
+    PooledDataPath path;
+    ASSERT_TRUE(path.start());
+    auto task = path.makeTask(/*slice_count=*/1);
+    ASSERT_TRUE(path.workers().submit(task).ok());
+    ASSERT_TRUE(PooledDataPath::waitFor(
+        [&] { return task->transferStatus().s == COMPLETED; }));
+    const auto business = path.workers().businessStats();
+    EXPECT_EQ(business.claim_rejected_stopping, 0U);
+    EXPECT_EQ(business.claim_rejected_member, 0U);
+    EXPECT_EQ(business.claim_rejected_generation, 0U);
+    EXPECT_EQ(business.claim_rejected_error_epoch, 0U);
+    EXPECT_EQ(business.claim_after_isolation, 0U);
+    EXPECT_EQ(business.claim_disabled, 0U);
+    EXPECT_TRUE(path.stop());
+}
+
+// W3g-a D-9 rollback lever: with claim/enabled=false the pre-W3g recheck runs,
+// the attempt still succeeds, and the fallback is observable
+// (`claim_disabled`).
+TEST(UbPoolIntegrationTest, ClaimDisabledFallsBackToTheLegacyRecheck) {
+    PooledDataPath path(/*slice_timeout_ms=*/5000, /*desired_serving=*/2,
+                        /*credit_capacity=*/8, /*rm_mode=*/false,
+                        /*task_k=*/2, /*queue_budget=*/65536,
+                        /*jfc_count=*/1, /*jetty_per_endpoint=*/1,
+                        /*background_refill=*/false,
+                        /*background_delete=*/false,
+                        /*refill_interval_ms=*/5,
+                        /*claim_enabled=*/false);
+    ASSERT_TRUE(path.start());
+    auto task = path.makeTask(/*slice_count=*/1);
+    ASSERT_TRUE(path.workers().submit(task).ok());
+    ASSERT_TRUE(PooledDataPath::waitFor(
+        [&] { return task->transferStatus().s == COMPLETED; }));
+    const auto business = path.workers().businessStats();
+    EXPECT_GE(business.claim_disabled, 1U);
+    EXPECT_EQ(business.claim_rejected_stopping, 0U);
+    EXPECT_EQ(business.claim_rejected_member, 0U);
+    EXPECT_TRUE(path.stop());
+}
+
 TEST(UbPoolIntegrationTest, FirstErrorRetiresTheMember) {
     PooledDataPath path;
     ASSERT_TRUE(path.start());
@@ -884,11 +931,11 @@ TEST(NativeBudgetDerivationTest, ZeroReserveStillFitsTheDeviceLimit) {
     EXPECT_TRUE(budget.configure("dev", kVerified, derived, 0).ok());
 }
 
-
 // W3f (ported from the pooling side ef9ba164): background refill tops the pool
 // up to the static Serving target without any business traffic, and it must
 // stop there instead of storming the provider.
-TEST(UbPoolIntegrationTest, BackgroundRefillKeepsTheDesiredServingWithoutTraffic) {
+TEST(UbPoolIntegrationTest,
+     BackgroundRefillKeepsTheDesiredServingWithoutTraffic) {
     PooledDataPath path(/*slice_timeout_ms=*/5000, /*desired_serving=*/2,
                         /*credit_capacity=*/8, /*rm_mode=*/false,
                         /*task_k=*/2, /*queue_budget=*/65536,
@@ -938,9 +985,8 @@ TEST(UbPoolIntegrationTest, BackgroundDeleteReclaimsTheRetiredMemberBudget) {
     EXPECT_NE(task->transferStatus().s, COMPLETED);
     // The delete executor owns reset+delete, so the budget must return to zero
     // without the return path doing native work.
-    ASSERT_TRUE(PooledDataPath::waitFor([&] {
-        return path.budget().snapshot(kDeviceKey).total_jetties == 0;
-    }));
+    ASSERT_TRUE(PooledDataPath::waitFor(
+        [&] { return path.budget().snapshot(kDeviceKey).total_jetties == 0; }));
     const auto stats = path.pool().stats();
     EXPECT_EQ(stats.in_use_members, 0U);
     EXPECT_EQ(stats.quarantined_members, 0U);

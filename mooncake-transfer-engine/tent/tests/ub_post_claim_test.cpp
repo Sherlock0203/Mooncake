@@ -184,6 +184,122 @@ TEST(UbPostClaimTest, DroppedLeaseIsQuarantinedNotReused) {
 
 // §8.2 claim anchor: the fault epoch is the only thing the claim review can
 // compare, and it moves on isolation (and only then).
+// W3g-a: the pool's claim is the authority on "may this attempt be posted".
+// A healthy in-use lease claims; a stopping pool, a retired member, a moved
+// lane generation and a raised error epoch each get their own verdict.
+TEST(UbPostClaimTest, TryClaimPostReportsEachClosedReason) {
+    PoolFixture fixture(/*jfc_count=*/1, /*desired_serving=*/2);
+    LeaseWithCredit leased;
+    ASSERT_TRUE(
+        fixture.pool()
+            .tryLease(PoolFixture::key(), PoolFixture::attempt(1), leased)
+            .ok());
+    ASSERT_TRUE(leased.lease.valid());
+    const auto lane = leased.lease.lane();
+
+    ClaimRequest request;
+    request.attempt = leased.lease.attempt();
+    request.lane_generation = lane.lane_generation;
+    request.error_epoch_snapshot = leased.error_epoch;
+    request.member = leased.lease.member().get();
+
+    // Healthy lease: claimed.
+    ClaimVerdict verdict = fixture.pool().tryClaimPost(
+        PoolFixture::key(), request.attempt, request);
+    EXPECT_TRUE(verdict.claimed());
+    EXPECT_EQ(verdict.closed, ClaimClosed::kNone);
+
+    // Wrong generation / wrong epoch are distinguishable and do not mutate the
+    // member (IN-1: the claim is read-only).
+    ClaimRequest wrong_generation = request;
+    wrong_generation.lane_generation = lane.lane_generation + 1;
+    EXPECT_EQ(
+        fixture.pool()
+            .tryClaimPost(PoolFixture::key(), request.attempt, wrong_generation)
+            .closed,
+        ClaimClosed::kGenerationMoved);
+    ClaimRequest wrong_epoch = request;
+    wrong_epoch.error_epoch_snapshot = leased.error_epoch + 1;
+    EXPECT_EQ(
+        fixture.pool()
+            .tryClaimPost(PoolFixture::key(), request.attempt, wrong_epoch)
+            .closed,
+        ClaimClosed::kErrorEpochMoved);
+    // Unknown member identity is treated as retired.
+    ClaimRequest no_member = request;
+    no_member.member = nullptr;
+    EXPECT_EQ(fixture.pool()
+                  .tryClaimPost(PoolFixture::key(), request.attempt, no_member)
+                  .closed,
+              ClaimClosed::kMemberRetired);
+    // The read-only claim did not change any pool accounting.
+    const auto after_claims = fixture.pool().stats();
+    EXPECT_EQ(after_claims.in_use_members, 1U);
+    EXPECT_EQ(after_claims.total_returns, 0U);
+
+    // Retiring the member (normal return with a failed gate) raises its epoch
+    // and makes the old snapshot claim fail as retired.
+    ASSERT_TRUE(fixture.pool()
+                    .returnOnce(std::move(leased.lease), /*gate_passed=*/false)
+                    .ok());
+    EXPECT_EQ(fixture.pool()
+                  .tryClaimPost(PoolFixture::key(), request.attempt, request)
+                  .closed,
+              ClaimClosed::kMemberRetired);
+}
+
+TEST(UbPostClaimTest, TryClaimPostReportsPoolStoppingFirst) {
+    PoolFixture fixture(/*jfc_count=*/1, /*desired_serving=*/1);
+    LeaseWithCredit leased;
+    ASSERT_TRUE(
+        fixture.pool()
+            .tryLease(PoolFixture::key(), PoolFixture::attempt(1), leased)
+            .ok());
+    ClaimRequest request;
+    request.attempt = leased.lease.attempt();
+    request.lane_generation = leased.lease.lane().lane_generation;
+    request.error_epoch_snapshot = leased.error_epoch;
+    request.member = leased.lease.member().get();
+
+    fixture.pool().beginStop();
+    EXPECT_EQ(fixture.pool()
+                  .tryClaimPost(PoolFixture::key(), request.attempt, request)
+                  .closed,
+              ClaimClosed::kPoolStopping);
+    // Even a perfect request is refused once the pool is stopping.
+    ASSERT_TRUE(fixture.pool().returnOnce(std::move(leased.lease), true).ok());
+}
+
+// The epoch is snapshotted into the lease under the pool lock, so a lease taken
+// after a member was retired and replaced can never claim with a stale value.
+TEST(UbPostClaimTest, LeaseCarriesTheMemberRetirementEpoch) {
+    PoolFixture fixture(/*jfc_count=*/1, /*desired_serving=*/2);
+    LeaseWithCredit first;
+    ASSERT_TRUE(
+        fixture.pool()
+            .tryLease(PoolFixture::key(), PoolFixture::attempt(1), first)
+            .ok());
+    const uint64_t first_epoch = first.error_epoch;
+    ASSERT_TRUE(
+        fixture.pool().retireFaulted(std::move(first.lease), "test").ok());
+
+    LeaseWithCredit second;
+    ASSERT_TRUE(
+        fixture.pool()
+            .tryLease(PoolFixture::key(), PoolFixture::attempt(2), second)
+            .ok());
+    EXPECT_GE(second.error_epoch, first_epoch);
+    ClaimRequest request;
+    request.attempt = second.lease.attempt();
+    request.lane_generation = second.lease.lane().lane_generation;
+    request.error_epoch_snapshot = second.error_epoch;
+    request.member = second.lease.member().get();
+    EXPECT_TRUE(fixture.pool()
+                    .tryClaimPost(PoolFixture::key(), request.attempt, request)
+                    .claimed());
+    ASSERT_TRUE(fixture.pool().returnOnce(std::move(second.lease), true).ok());
+}
+
 TEST(UbPostClaimTest, ClaimAnchorMovesOnlyOnIsolation) {
     using namespace probe_test;
     TestClock clock;

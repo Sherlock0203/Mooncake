@@ -74,6 +74,12 @@ class UbTransport final : public Transport {
     bool warmupMemory(void* addr, size_t length) override;
 
     const char* getName() const override { return "ub"; }
+    // W3g-c observation: installed probe path rows (0 while probing is
+    // disabled or no peer has published a probe page yet). Named "path" because
+    // it counts rows in the PLM path table, not only currently healthy ones.
+    [[nodiscard]] size_t probePathCount() const;
+    // W3g-c: PLM counters (scheduled/posted/health). Empty when probing is off.
+    [[nodiscard]] ub::ProbeStats probeStats() const;
     double getEstimatedBandwidth() const override;
     Status getNicLoadStats(std::vector<NicLoadStats>& stats) const override;
     bool supportNotification() const override { return false; }

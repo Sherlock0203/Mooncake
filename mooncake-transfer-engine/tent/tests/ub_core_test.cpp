@@ -46,6 +46,42 @@ TEST(UbParamsTest, ParsesStrictValuesAndAllowsRetryDisable) {
     EXPECT_TRUE(UbParams::FromConfig(config, params).IsInvalidArgument());
 }
 
+// W3g-e: the three incremental switches default to today's behaviour and are
+// parsed fail-closed.
+TEST(UbParamsTest, ParsesW3gSwitchesAndRejectsIllegalValues) {
+    Config defaults;
+    UbParams params;
+    ASSERT_TRUE(UbParams::FromConfig(defaults, params).ok());
+    EXPECT_TRUE(params.claim.enabled);
+    EXPECT_EQ(params.bootstrap_protocol, UbBootstrapProtocol::kAuto);
+    EXPECT_TRUE(params.identity.import);
+
+    Config configured;
+    configured.set("transports/ub/claim/enabled", false);
+    configured.set("transports/ub/bootstrap/protocol", "v1");
+    configured.set("transports/ub/identity/import", false);
+    ASSERT_TRUE(UbParams::FromConfig(configured, params).ok());
+    EXPECT_FALSE(params.claim.enabled);
+    EXPECT_EQ(params.bootstrap_protocol, UbBootstrapProtocol::kV1);
+    EXPECT_FALSE(params.identity.import);
+
+    configured.set("transports/ub/bootstrap/protocol", "v2");
+    ASSERT_TRUE(UbParams::FromConfig(configured, params).ok());
+    EXPECT_EQ(params.bootstrap_protocol, UbBootstrapProtocol::kV2);
+
+    auto expect_invalid = [](const std::string& key, const json& value) {
+        Config bad;
+        bad.set(key, value);
+        UbParams parsed;
+        EXPECT_TRUE(UbParams::FromConfig(bad, parsed).IsInvalidArgument())
+            << key << ": " << value;
+    };
+    expect_invalid("transports/ub/bootstrap/protocol", "v3");
+    expect_invalid("transports/ub/bootstrap/protocol", 1);
+    expect_invalid("transports/ub/claim/enabled", "on");
+    expect_invalid("transports/ub/identity/import", 1);
+}
+
 TEST(UbParamsTest, ParsesProbeConfigAndRejectsIllegalValues) {
     Config empty;
     UbParams params;

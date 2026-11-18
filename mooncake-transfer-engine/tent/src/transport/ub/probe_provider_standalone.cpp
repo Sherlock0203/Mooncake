@@ -543,6 +543,78 @@ Status StandaloneProbeResourceProvider::buildGraphLocked(ProbeGraph& graph) {
     return Status::OK();
 }
 
+Status StandaloneProbeResourceProvider::refreshRemoteEdges(size_t* published) {
+    if (published != nullptr) *published = 0;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (shut_down_ || !initialized_) {
+        return Status::InvalidArgument(
+            "standalone probe provider is not initialized");
+    }
+    if (directory_ == nullptr || availability_sink_ == nullptr) {
+        return Status::InvalidArgument(
+            "standalone probe provider is not attached to the graph");
+    }
+    std::vector<ProbeEdgeSupply> edges;
+    Status status = directory_->snapshotEdges(edges);
+    if (!status.ok()) return status;
+
+    size_t count = 0;
+    for (auto& edge : edges) {
+        const ProbePathKey& path = edge.version.path;
+        auto published = published_edges_.find(path);
+        ProbeEventKind kind = ProbeEventKind::kEdgeAdded;
+        if (published != published_edges_.end()) {
+            const ProbeEdgeSupply& previous = published->second;
+            if (previous.version == edge.version) {
+                const bool page_changed =
+                    previous.area_epoch != edge.area_epoch ||
+                    previous.area_address != edge.area_address;
+                if (!page_changed) continue;
+                kind = ProbeEventKind::kAreaReplaced;
+            } else if (previous.version.topology_epoch ==
+                       edge.version.topology_epoch) {
+                // target_epoch is part of the key; the PLM retires the old
+                // row by its (path, topology_epoch) prefix then upserts.
+                kind = ProbeEventKind::kTargetEpochChanged;
+            } else {
+                // A new topology epoch is not expressible by
+                // kTargetEpochChanged (it only retires the same topology
+                // epoch): remove the old row first, then add the new one.
+                ProbeEvent removal;
+                removal.kind = ProbeEventKind::kEdgeRemoved;
+                removal.local_nic = path.local_nic;
+                removal.graph_epoch = graph_epoch_;
+                removal.event_seq = event_seq_ + 1;
+                removal.version = previous.version;
+                const Status removed =
+                    availability_sink_->onPoolAvailabilityChange(removal);
+                if (!removed.ok()) return removed;
+                ++event_seq_;
+                published_edges_.erase(published);
+                kind = ProbeEventKind::kEdgeAdded;
+            }
+        }
+
+        ProbeEvent event;
+        event.kind = kind;
+        event.local_nic = path.local_nic;
+        event.graph_epoch = graph_epoch_;
+        event.event_seq = event_seq_ + 1;
+        event.edge = edge;
+        status = availability_sink_->onPoolAvailabilityChange(event);
+        if (!status.ok()) return status;
+        ++event_seq_;
+        published_edges_[path] = edge;
+        ++count;
+    }
+    if (published != nullptr) *published = count;
+    if (count != 0) {
+        LOG(INFO) << "UB probe: activated " << count
+                  << " peer edge(s) from the bootstrap descriptor source";
+    }
+    return Status::OK();
+}
+
 Status StandaloneProbeResourceProvider::prepareLocal() {
     if (auto_discover_) {
         auto status = discover();
@@ -635,6 +707,12 @@ Status StandaloneProbeResourceProvider::snapshot(ProbeGraph& graph) {
     graph_epoch_ = built.graph_epoch;
     event_seq_ = 0;
     initialized_ = true;
+    // W3g-c: these edges are already part of the initial graph, so a later
+    // refresh must not republish them as kEdgeAdded.
+    published_edges_.clear();
+    for (const auto& edge : built.edges) {
+        published_edges_[edge.version.path] = edge;
+    }
     graph = std::move(built);
     LOG(INFO) << "UB standalone probe provider created " << available
               << " probe port(s)";

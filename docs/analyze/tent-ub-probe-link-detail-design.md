@@ -1153,7 +1153,7 @@ ProbeResources：发现物理口（过滤 bond），自建 Context/JFC/Jetty/源
 
 ## 16. 尚待确认的契约点
 
-1. **远端描述符**：bootstrap v2 的字段（对端 probe jetty 的 id/uasid/eid/token、探测页 address/length/token/epoch）与 v1 兼容/回退策略。
+1. **远端描述符**：~~bootstrap v2 的字段与 v1 兼容/回退策略~~ —— **W3g 已落地**：v1 信封原样保留、v2 仅在双方能力串 `bootstrap_v2` 下追加（`schema_version`/`target_profiles`/`probe_areas`/epochs）；无 `probe_area` 的对端不产生 edge，探测对其保持关闭（《tent-ub-w3g-pool-claim-and-v2-design》§7）。安装时无对端则按本地端口武装 PLM/scheduler，首个 area 到达后经接口 7 `kEdgeAdded` 懒激活；无 area 的对端仍不产生 edge。
 2. **per-WR target**：adapter 落地时间（P0-B）；W1 期间由 fake 承接。
 3. **send-only JFC**：adapter 是否支持只建发送 JFC（省 JFR/降低 `max_jfc` 压力）；本侧创建。
 4. **非 bonding 环境**：bond 设备识别规则（名字启发式是否足够）、探测启用时发现 bonded 环境的失败语义（install 失败 + 提示）。

@@ -155,6 +155,13 @@ struct UbBusinessStatsSnapshot {
     uint64_t pool_lease_misses{0};
     uint64_t pool_stop_rejections{0};
     uint64_t pool_hard_errors{0};
+    // W3g claim (R-1): rejections by pool-authority reason, the pre-W3g
+    // rollback path (claim/enabled=false) and the surviving PLM epoch check.
+    uint64_t claim_rejected_stopping{0};
+    uint64_t claim_rejected_member{0};
+    uint64_t claim_rejected_generation{0};
+    uint64_t claim_rejected_error_epoch{0};
+    uint64_t claim_disabled{0};
     uint64_t claim_after_isolation{0};
     uint64_t post_on_isolated_path{0};
     uint64_t pooled_return{0};
@@ -309,12 +316,25 @@ class UbWorkers final : public gate::Sink {
         const std::shared_ptr<UbEndpoint>& endpoint, const UbPostPath& path,
         const QuotaReservation& reservation, const LocalSegmentRef& local,
         const ImportedSegmentRef& remote, const UbAttemptToken& attempt);
-    // The W3 claim review (design §8.2, R-1 transition shape): pool stop plus
-    // the fault-epoch snapshot comparison. Deliberately lock-free and
-    // allocation-free: it runs immediately before the native post (W3-IN-8).
-    [[nodiscard]] bool claimPost(const std::shared_ptr<SendJettyPool>& pool,
-                                 const UbPostPath& path,
-                                 uint64_t fault_epoch_snapshot);
+    // W3g-a claim decision. `closed` is the pool authority's verdict (R-1);
+    // `path_epoch_changed` is the pre-W3g PLM scalar check, which stays a
+    // separate input (design D-2: sampling is kept, authority moves).
+    struct ClaimDecision {
+        ClaimClosed closed{ClaimClosed::kNone};
+        bool path_epoch_changed{false};
+
+        [[nodiscard]] bool claimed() const noexcept {
+            return closed == ClaimClosed::kNone && !path_epoch_changed;
+        }
+    };
+
+    // The W3g claim (design §8.2/R-1): the pool's synchronized verdict plus the
+    // surviving fault-epoch comparison. Runs immediately before the native
+    // post, never blocks and never calls a provider (W3-IN-8, W3g IN-1).
+    [[nodiscard]] ClaimDecision claimPost(
+        const std::shared_ptr<SendJettyPool>& pool, const PoolKey& pool_key,
+        const AttemptKey& attempt, const LeaseWithCredit& leased,
+        const UbPostPath& path, uint64_t fault_epoch_snapshot);
     [[nodiscard]] static PoolKey poolKeyFor(
         const std::shared_ptr<UbEndpoint>& endpoint);
     [[nodiscard]] DeferEpochs readDeferEpochs() const;
@@ -443,6 +463,11 @@ class UbWorkers final : public gate::Sink {
     std::atomic<uint64_t> pool_lease_misses_{0};
     std::atomic<uint64_t> pool_stop_rejections_{0};
     std::atomic<uint64_t> pool_hard_errors_{0};
+    std::atomic<uint64_t> claim_rejected_stopping_{0};
+    std::atomic<uint64_t> claim_rejected_member_{0};
+    std::atomic<uint64_t> claim_rejected_generation_{0};
+    std::atomic<uint64_t> claim_rejected_error_epoch_{0};
+    std::atomic<uint64_t> claim_disabled_{0};
     std::atomic<uint64_t> claim_after_isolation_{0};
     std::atomic<uint64_t> post_on_isolated_path_{0};
     std::atomic<uint64_t> pooled_return_{0};

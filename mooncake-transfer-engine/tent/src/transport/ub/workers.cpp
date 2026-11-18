@@ -41,7 +41,12 @@ RecordPath makeBusinessRecordPath(const UbPostPath& path) {
 // excludes the endpoint generation (see UbRailKey). These read-only probes
 // therefore only need a generation that satisfies UbPostPath::valid(); real
 // endpoint generations are monotonic and never below this value.
-constexpr uint64_t kRailProbeEndpointGeneration = 1;
+// W3g-c: pre-resolution health queries are path-level, not generation-level.
+// Zero means "no generation claim" to the PLM, so a bootstrap-published edge
+// with a real endpoint-generation anchor does not report every candidate as
+// `probe_evidence_unmapped`. The claim-time check still uses the real
+// generation and remains strict.
+constexpr uint64_t kRailProbeEndpointGeneration = 0;
 
 // Number of candidates always taken in pre-score order, regardless of which
 // local device they belong to. Two is the floor that keeps tryAcquireFirst from
@@ -536,6 +541,15 @@ UbBusinessStatsSnapshot UbWorkers::businessStats() const {
     out.pool_stop_rejections =
         pool_stop_rejections_.load(std::memory_order_relaxed);
     out.pool_hard_errors = pool_hard_errors_.load(std::memory_order_relaxed);
+    out.claim_rejected_stopping =
+        claim_rejected_stopping_.load(std::memory_order_relaxed);
+    out.claim_rejected_member =
+        claim_rejected_member_.load(std::memory_order_relaxed);
+    out.claim_rejected_generation =
+        claim_rejected_generation_.load(std::memory_order_relaxed);
+    out.claim_rejected_error_epoch =
+        claim_rejected_error_epoch_.load(std::memory_order_relaxed);
+    out.claim_disabled = claim_disabled_.load(std::memory_order_relaxed);
     out.claim_after_isolation =
         claim_after_isolation_.load(std::memory_order_relaxed);
     out.post_on_isolated_path =
@@ -716,7 +730,12 @@ void UbWorkers::logBusinessSummary(uint64_t now_ns) {
               << ",miss=" << stats.pool_lease_misses
               << ",stopped=" << stats.pool_stop_rejections
               << ",hard=" << stats.pool_hard_errors
-              << "} claim_isolated=" << stats.claim_after_isolation
+              << "} claim{stopping=" << stats.claim_rejected_stopping
+              << ",member=" << stats.claim_rejected_member
+              << ",gen=" << stats.claim_rejected_generation
+              << ",epoch=" << stats.claim_rejected_error_epoch
+              << ",disabled=" << stats.claim_disabled
+              << ",isolated=" << stats.claim_after_isolation << "}"
               << " post_isolated=" << stats.post_on_isolated_path
               << " retire=" << stats.pooled_retire
               << " path_peak=" << stats.path_inflight_peak
@@ -1352,24 +1371,40 @@ PoolKey UbWorkers::poolKeyFor(const std::shared_ptr<UbEndpoint>& endpoint) {
     return key;
 }
 
-bool UbWorkers::claimPost(const std::shared_ptr<SendJettyPool>& pool,
-                          const UbPostPath& path,
-                          uint64_t fault_epoch_snapshot) {
-    // W3 claim review (design §8.2, the R-1 transition shape). Two scalar reads
-    // and no lock held across them: this runs between the last rollback point
-    // and the native post, so it must stay non-blocking (W3-IN-8).
-    //
-    // The window that remains is "review -> tryCommitPost -> publish -> post",
-    // which is a handful of non-blocking instructions. A path isolated inside
-    // that window can leak at most one post per posting thread, and PLM is
-    // idempotent for repeated errors on an already isolated path, so the leak
-    // cannot amplify into a storm (design §8.2, RK1).
-    if (pool && pool->stopping()) return false;
+UbWorkers::ClaimDecision UbWorkers::claimPost(
+    const std::shared_ptr<SendJettyPool>& pool, const PoolKey& pool_key,
+    const AttemptKey& attempt, const LeaseWithCredit& leased,
+    const UbPostPath& path, uint64_t fault_epoch_snapshot) {
+    // W3g R-1. Two independent inputs decide whether the WR may be posted:
+    //   1. the pool's synchronized verdict (stopping / member / generation /
+    //      error epoch), authoritative for the leased resource;
+    //   2. the PLM fault-epoch scalar compared against the pre-lease sample,
+    //      which stays a separate read because the pool must not call the PLM
+    //      while holding its lock (W3g D-4).
+    // Both are lock-free from this thread's perspective and allocation-free;
+    // this runs between the last rollback point and the native post.
+    ClaimDecision decision;
     if (probe_manager_ != nullptr &&
         probe_manager_->businessFaultEpoch(path) != fault_epoch_snapshot) {
-        return false;
+        decision.path_epoch_changed = true;
     }
-    return true;
+    if (!params_.claim.enabled) {
+        // D-9 rollback lever: the pre-W3g recheck only. Counted so a config
+        // accidentally left off is visible in the periodic summary.
+        claim_disabled_.fetch_add(1, std::memory_order_relaxed);
+        if (pool && pool->stopping()) {
+            decision.closed = ClaimClosed::kPoolStopping;
+        }
+        return decision;
+    }
+    if (!pool) return decision;
+    ClaimRequest request;
+    request.attempt = attempt;
+    request.lane_generation = leased.lease.lane().lane_generation;
+    request.error_epoch_snapshot = leased.error_epoch;
+    request.member = leased.lease.member().get();
+    decision.closed = pool->tryClaimPost(pool_key, attempt, request).closed;
+    return decision;
 }
 
 WorkRequest UbWorkers::makeWorkRequest(const PendingSlice& pending,
@@ -1680,10 +1715,33 @@ void UbWorkers::processPendingPooled(
         return;
     }
 
-    // ⑦ Claim review. The member is exclusively leased, so only the pool's stop
-    // flag and the path health can have changed since selection.
-    if (!claimPost(pool, path, fault_epoch_snapshot)) {
-        claim_after_isolation_.fetch_add(1, std::memory_order_relaxed);
+    // ⑦ W3g claim (R-1). The pool synchronizes the verdict with retirement and
+    // stop; the PLM fault epoch remains a separate scalar input.
+    const ClaimDecision claim = claimPost(pool, pool_key, attempt_key, leased,
+                                          path, fault_epoch_snapshot);
+    if (!claim.claimed()) {
+        switch (claim.closed) {
+            case ClaimClosed::kPoolStopping:
+                claim_rejected_stopping_.fetch_add(1,
+                                                   std::memory_order_relaxed);
+                break;
+            case ClaimClosed::kMemberRetired:
+                claim_rejected_member_.fetch_add(1, std::memory_order_relaxed);
+                break;
+            case ClaimClosed::kGenerationMoved:
+                claim_rejected_generation_.fetch_add(1,
+                                                     std::memory_order_relaxed);
+                break;
+            case ClaimClosed::kErrorEpochMoved:
+                claim_rejected_error_epoch_.fetch_add(
+                    1, std::memory_order_relaxed);
+                break;
+            case ClaimClosed::kNone:
+                break;
+        }
+        if (claim.path_epoch_changed) {
+            claim_after_isolation_.fetch_add(1, std::memory_order_relaxed);
+        }
         // Reverse order again: credit (bound to the member's JFC) after the
         // member, then quota, outstanding counter and the K slot. No WR was
         // posted, so the member is clean and goes straight back to the LIFO

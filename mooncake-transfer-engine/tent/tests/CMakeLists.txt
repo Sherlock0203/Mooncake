@@ -579,6 +579,37 @@ if(USE_UB)
   add_test(NAME tent_ub_completion_record_test
            COMMAND tent_ub_completion_record_test)
 
+  # W3g-c: bootstrap-driven probe peer source (no area -> no edge).
+  add_executable(tent_ub_bootstrap_peer_source_test
+                 ub_bootstrap_peer_source_test.cpp
+                 ../src/transport/ub/bootstrap_peer_source.cpp)
+  target_link_libraries(tent_ub_bootstrap_peer_source_test
+                        PRIVATE tent_common gtest gtest_main)
+  target_include_directories(tent_ub_bootstrap_peer_source_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_bootstrap_peer_source_test
+           COMMAND tent_ub_bootstrap_peer_source_test)
+
+  # W3g-b: bootstrap v2 additive fields, capability negotiation, v1 fallback and
+  # the endpoint target-profile/switch wiring.
+  add_executable(tent_ub_bootstrap_v2_test ub_bootstrap_v2_test.cpp)
+  target_link_libraries(tent_ub_bootstrap_v2_test
+                        PRIVATE gtest gtest_main tent_link_group)
+  target_include_directories(tent_ub_bootstrap_v2_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_bootstrap_v2_test COMMAND tent_ub_bootstrap_v2_test)
+
+  # W3g-d: physical port identity normalization (budget-key stability).
+  add_executable(tent_ub_identity_import_test
+                 ub_identity_import_test.cpp
+                 ../src/transport/ub/identity_import.cpp)
+  target_link_libraries(tent_ub_identity_import_test
+                        PRIVATE tent_common gtest gtest_main)
+  target_include_directories(tent_ub_identity_import_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_identity_import_test
+           COMMAND tent_ub_identity_import_test)
+
   # W3a/W3b/W3c: bounded queue arithmetic, the five-bucket defer registry and
   # the task-level K gate. Header-only pieces plus slice.h, so the target needs
   # no adapter, workers or segment manager.

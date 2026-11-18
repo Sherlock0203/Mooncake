@@ -74,6 +74,27 @@ struct UbSendPoolParams {
     uint32_t refill_interval_ms = 50;
 };
 
+// W3g-a: the pooling-side claim (R-1). When disabled the pre-W3g local epoch
+// recheck runs unchanged, which is the documented rollback lever.
+struct UbClaimParams {
+    bool enabled = true;
+};
+
+// W3g-b: bootstrap protocol selection. `auto` sends v2 fields only to a peer
+// that advertised `bootstrap_v2`; `v1` never sends them; `v2` still requires
+// the peer capability (an all-v1 peer only logs a warning).
+enum class UbBootstrapProtocol : uint8_t {
+    kAuto,
+    kV1,
+    kV2,
+};
+
+// W3g-d: physical port identity import. Off keeps the historical
+// `name:path:eid` budget key.
+struct UbIdentityParams {
+    bool import = true;
+};
+
 // Device-level native budget (C05). 0 derives the per-device budget from the
 // verified device limit.
 struct UbNativeBudgetParams {
@@ -148,6 +169,10 @@ struct UbParams {
     UbJettyPoolParams jetty_pool;
     UbSendPoolParams send_pool;
     UbNativeBudgetParams native_budget;
+    // ---- W3g increments (independent switches, D-9) ----
+    UbClaimParams claim;
+    UbBootstrapProtocol bootstrap_protocol = UbBootstrapProtocol::kAuto;
+    UbIdentityParams identity;
 
     // ---- W3 business queue / defer / K (design §12) ----
     // Capacity of the bounded business queue in slices: queued + parked.
@@ -255,16 +280,18 @@ struct UbParams {
             config, "transports/ub/send_pool/jfc_credit_reserve",
             parsed.send_pool.jfc_credit_reserve,
             parsed.send_pool.jfc_credit_reserve));
-        CHECK_STATUS(readBool(config, "transports/ub/send_pool/background_refill",
+        CHECK_STATUS(readBool(config,
+                              "transports/ub/send_pool/background_refill",
                               parsed.send_pool.background_refill,
                               parsed.send_pool.background_refill));
-        CHECK_STATUS(readBool(config, "transports/ub/send_pool/background_delete",
+        CHECK_STATUS(readBool(config,
+                              "transports/ub/send_pool/background_delete",
                               parsed.send_pool.background_delete,
                               parsed.send_pool.background_delete));
-        CHECK_STATUS(readPositive(
-            config, "transports/ub/send_pool/refill_interval_ms",
-            parsed.send_pool.refill_interval_ms,
-            parsed.send_pool.refill_interval_ms));
+        CHECK_STATUS(readPositive(config,
+                                  "transports/ub/send_pool/refill_interval_ms",
+                                  parsed.send_pool.refill_interval_ms,
+                                  parsed.send_pool.refill_interval_ms));
         CHECK_STATUS(readNonNegative(
             config, "transports/ub/native_budget/max_jetty_per_device",
             parsed.native_budget.max_jetty_per_device,
@@ -273,6 +300,21 @@ struct UbParams {
             config, "transports/ub/native_budget/replacement_reserve",
             parsed.native_budget.replacement_reserve,
             parsed.native_budget.replacement_reserve));
+        // W3g switches (design §9.1). All default to today's behaviour.
+        CHECK_STATUS(readBool(config, "transports/ub/claim/enabled",
+                              parsed.claim.enabled, parsed.claim.enabled));
+        CHECK_STATUS(readBool(config, "transports/ub/identity/import",
+                              parsed.identity.import, parsed.identity.import));
+        std::string bootstrap_protocol;
+        CHECK_STATUS(readStringEnum(config, "transports/ub/bootstrap/protocol",
+                                    "auto", {"auto", "v1", "v2"},
+                                    bootstrap_protocol));
+        parsed.bootstrap_protocol =
+            bootstrap_protocol == "v1"
+                ? UbBootstrapProtocol::kV1
+                : (bootstrap_protocol == "v2" ? UbBootstrapProtocol::kV2
+                                              : UbBootstrapProtocol::kAuto);
+
         // K belongs to UbTask (D-6). The pooling side's process-wide
         // send_pool/task_max_inflight_attempts is accepted for compatibility
         // but never wired, so it is not read here.

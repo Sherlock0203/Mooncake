@@ -28,11 +28,13 @@
 #include "tent/runtime/segment.h"
 #include "tent/thirdparty/nlohmann/json.h"
 #include "tent/transport/ub/admission.h"
+#include "tent/transport/ub/bootstrap_peer_source.h"
 #include "tent/transport/ub/buffers.h"
 #include "tent/transport/ub/context.h"
 #include "tent/transport/ub/device_selection.h"
 #include "tent/transport/ub/endpoint.h"
 #include "tent/transport/ub/endpoint_store.h"
+#include "tent/transport/ub/identity_import.h"
 #include "tent/transport/ub/native_budget.h"
 #include "tent/transport/ub/params.h"
 #include "tent/transport/ub/send_jetty_pool.h"
@@ -104,6 +106,10 @@ struct UbTransport::Impl {
         : adapter(injected ? std::move(injected)
                            : ub::createDefaultUrmaAdapter()),
           probe_peer_source(injected_peer_source),
+          // W3g-c: the production source. Bootstraps populate it; an injected
+          // source (tests / the pooling side) still wins at install time.
+          owned_probe_source(
+              std::make_unique<ub::BootstrapProbePeerDescriptorSource>()),
           probe_provider(std::move(injected_probe_provider)),
           probe_poster(std::move(injected_probe_poster)) {}
 
@@ -396,6 +402,13 @@ struct UbTransport::Impl {
         // otherwise installation fails fast instead of degrading silently.
         std::vector<ub::ProbeJfcSlot> probe_jfcs;
         if (params.probe.enabled) {
+            // W3g-c: an injected source wins; otherwise the bootstrap-driven
+            // source is used. `bootstrap_fallback` also changes the empty-graph
+            // policy below: with the fallback, "no peer has advertised a probe
+            // area yet" is a normal startup state, not a supply bug.
+            ub::ProbePeerDescriptorSource* peer_source = probe_peer_source;
+            const bool bootstrap_fallback = peer_source == nullptr;
+            if (bootstrap_fallback) peer_source = owned_probe_source.get();
             if (!probe_provider || !probe_poster) {
                 if (params.probe.provider !=
                     ub::ProbeProviderKind::kStandalone) {
@@ -404,7 +417,7 @@ struct UbTransport::Impl {
                         "installed; inject one or set "
                         "transports/ub/probe/provider=standalone" LOC_MARK));
                 }
-                if (probe_peer_source == nullptr) {
+                if (peer_source == nullptr) {
                     return failInstall(Status::InvalidArgument(
                         "UB probe provider=standalone requires a peer "
                         "descriptor source" LOC_MARK));
@@ -421,18 +434,32 @@ struct UbTransport::Impl {
                 if (!discover.ok()) return failInstall(discover);
                 probe_directory =
                     std::make_shared<ub::HandshakeProbePeerDirectory>(
-                        adapter, standalone->contexts(), probe_peer_source);
+                        adapter, standalone->contexts(), peer_source);
                 standalone->setRemoteDirectory(probe_directory.get());
                 probe_provider = standalone;
+                // W3g-c: the bootstrap handler publishes this provider's local
+                // probe pages. The pointer is visible once install completes
+                // (release-store of `installed` below).
+                probe_area_source = standalone.get();
                 probe_poster = std::make_shared<ub::UrmaProbePoster>(adapter);
             }
             ub::ProbeGraph graph;
             status = probe_provider->snapshot(graph);
             if (!status.ok()) return failInstall(status);
+            if (bootstrap_fallback && graph.edges.empty()) {
+                // W3g-c: no peer has completed a business bootstrap yet, so the
+                // graph has ports but no adjacency edges. Arm the PLM and the
+                // scheduler around the local ports now; the first incoming
+                // probe_area becomes a kEdgeAdded event and wakes the
+                // scheduler. Business is unaffected while no edge exists.
+                LOG(INFO) << "UB probe: armed with " << graph.ports.size()
+                          << " local port(s); waiting for the first peer "
+                             "probe_area";
+            }
             probe_manager =
                 std::make_unique<ub::ProbeLinkManager>(params.probe);
             probe_manager->setReportSink(probe_provider.get());
-            status = probe_manager->initialize(graph);
+            status = probe_manager->initialize(graph, bootstrap_fallback);
             if (!status.ok()) return failInstall(status);
             probe_provider->setAvailabilitySink(
                 probe_manager->availabilitySink());
@@ -520,24 +547,47 @@ struct UbTransport::Impl {
         const uint64_t credit_reserve = parsed.send_pool.jfc_credit_reserve;
         // M5: a static Serving target that the device budget cannot hold makes
         // tryLease miss forever (permanent defer instead of fail-fast).
+        // W3g-d: one normalized identity per physical port. The same key is
+        // used for the per-device Context count, the NativeBudget ledger and
+        // the SendJettyPool, so the three can never disagree.
+        ub::PhysicalDeviceIdentityCache identities;
+        const auto budget_key_for = [&parsed, &identities](
+                                        const ub::DeviceInfo& device,
+                                        std::string& key) -> Status {
+            if (!parsed.identity.import) {
+                key = device.native_device_name + ":" +
+                      device.native_device_path + ":" + device.eid;
+                return Status::OK();
+            }
+            ub::PhysicalDeviceIdentity identity;
+            CHECK_STATUS(identities.import(device, identity));
+            key = std::move(identity.device_key);
+            return Status::OK();
+        };
         std::unordered_map<std::string, uint64_t> contexts_per_device;
         for (const auto& context : contexts) {
             if (!context) continue;
-            const auto& device = context->deviceInfo();
-            ++contexts_per_device[device.native_device_name + ":" +
-                                  device.native_device_path + ":" + device.eid];
+            std::string device_key;
+            const Status key_status =
+                budget_key_for(context->deviceInfo(), device_key);
+            if (!key_status.ok()) {
+                return Status::InvalidArgument(
+                    "UB physical device identity import failed for " +
+                    context->deviceInfo().topology_name + ": " +
+                    std::string(key_status.message()));
+            }
+            ++contexts_per_device[device_key];
         }
         std::unordered_map<std::string, std::shared_ptr<ub::NativeBudget>>
             budgets;
         for (const auto& context : contexts) {
             if (!context || !context->handle()) continue;
             const auto& device = context->deviceInfo();
-            // A physical device is identified by name + path + EID, so every
-            // Context sitting on the same device shares one ledger and can
-            // never overcommit the device's Jetty limit (C05).
-            const std::string device_key = device.native_device_name + ":" +
-                                           device.native_device_path + ":" +
-                                           device.eid;
+            // A physical device is identified by its normalized path + EID
+            // (W3g-d), so every Context sitting on the same device shares one
+            // ledger and can never overcommit the device's Jetty limit (C05).
+            std::string device_key;
+            CHECK_STATUS(budget_key_for(device, device_key));
             auto& budget = budgets[device_key];
             if (!budget) {
                 budget = std::make_shared<ub::NativeBudget>();
@@ -620,6 +670,13 @@ struct UbTransport::Impl {
             // (D-2). Nothing else in the transport changes behavior.
             context->attachPooledSendPool(std::move(pool));
         }
+        // W3g-e summary: one line tells an operator whether the budget keys are
+        // normalized identities or the legacy name:path:eid form.
+        LOG(INFO) << "UB identity: import="
+                  << (parsed.identity.import ? "on" : "off")
+                  << " devices=" << identities.size()
+                  << " ok=" << identities.importOk()
+                  << " fail=" << identities.importFailed();
         return Status::OK();
     }
 
@@ -676,8 +733,22 @@ struct UbTransport::Impl {
         probe_scheduler.reset();
         probe_manager.reset();
         probe_poster.reset();
+        if (bootstrap_v2_peers.load(std::memory_order_relaxed) != 0 ||
+            bootstrap_v1_peers.load(std::memory_order_relaxed) != 0 ||
+            probe_area_missing.load(std::memory_order_relaxed) != 0 ||
+            bootstrap_v2_ignored.load(std::memory_order_relaxed) != 0) {
+            LOG(INFO) << "UB bootstrap summary: v2_peers="
+                      << bootstrap_v2_peers.load(std::memory_order_relaxed)
+                      << " v1_peers="
+                      << bootstrap_v1_peers.load(std::memory_order_relaxed)
+                      << " probe_area_missing="
+                      << probe_area_missing.load(std::memory_order_relaxed)
+                      << " v2_ignored="
+                      << bootstrap_v2_ignored.load(std::memory_order_relaxed);
+        }
         // Unimport remote probe areas while the probe Contexts are still
         // alive; the self-owned provider closes them in its shutdown.
+        probe_area_source = nullptr;
         if (probe_directory) (void)probe_directory->shutdown();
         probe_provider.reset();
         probe_directory.reset();
@@ -812,6 +883,7 @@ struct UbTransport::Impl {
                               request.remote_topology_id, peer_path};
         CHECK_STATUS(
             endpoints->getOrCreate(key, request.local_context, endpoint));
+        configureEndpoint(endpoint);
         if (endpoint->ready()) {
             recordReadyEndpoint(endpoint);
             return Status::OK();
@@ -824,6 +896,10 @@ struct UbTransport::Impl {
         auto status = endpoint->makeBootstrapDesc(
             local_segment_name, local_path, peer_path,
             request.segment_generation, bootstrap);
+        if (status.ok()) {
+            appendLocalProbeAreas(bootstrap,
+                                  request.local_context->topologyId());
+        }
         if (!status.ok()) {
             (void)endpoints->retire(endpoint);
             endpoint.reset();
@@ -832,7 +908,20 @@ struct UbTransport::Impl {
         UbBootstrapDesc response;
         status = ControlClient::bootstrapUb(
             request.remote_segment->rpc_server_addr, bootstrap, response);
-        if (status.ok()) status = endpoint->bind(response);
+        const UbBootstrapDesc effective = effectivePeerDesc(response);
+        if (status.ok()) status = endpoint->bind(effective);
+        if (status.ok()) {
+            // W3g-b: the response carries the peer's v2 block (including its
+            // probe pages) only when both sides advertised the capability.
+            // Our own pages are appended to request/response when the envelope
+            // is already a v2 one.
+            notePeerNegotiation(effective);
+            // W3g-c: learn the peer's probe page for this directed edge, then
+            // arm the scheduler with it (lazy activation).
+            ingestBootstrapProbePeer(request, peer_path, effective,
+                                     endpoint->generation());
+            refreshProbeEdges();
+        }
         if (!status.ok()) {
             (void)endpoints->retire(endpoint);
             endpoint.reset();
@@ -866,11 +955,18 @@ struct UbTransport::Impl {
                               request.local_nic_path};
         std::shared_ptr<ub::UbEndpoint> endpoint;
         auto status = endpoints->getOrCreate(key, context_it->second, endpoint);
-        if (status.ok()) status = endpoint->bind(request);
+        if (status.ok()) {
+            configureEndpoint(endpoint);
+            status = endpoint->bind(effectivePeerDesc(request));
+        }
         if (status.ok()) {
             status = endpoint->makeBootstrapDesc(
                 local_segment_name, request.peer_nic_path,
                 request.local_nic_path, currentSegmentGeneration(), response);
+        }
+        if (status.ok()) {
+            notePeerNegotiation(request);
+            appendLocalProbeAreas(response, context_it->second->topologyId());
         }
         if (status.ok()) {
             recordReadyEndpoint(endpoint);
@@ -882,6 +978,158 @@ struct UbTransport::Impl {
             return -1;
         }
         return 0;
+    }
+
+    // W3g-b/c: append this port's published probe page to a v2 envelope. The
+    // page is owned by the standalone provider and already registered with the
+    // provider; nothing here invents an address. A peer that does not receive
+    // an area simply does not get a probe edge (IN-4).
+    void appendLocalProbeAreas(UbBootstrapDesc& desc,
+                               Topology::NicID local_nic) {
+        if (desc.schema_version < ub::kUbBootstrapSchemaV2) return;
+        auto* provider = probe_area_source;
+        // Probing disabled (or not assembled) is not a "missing peer area":
+        // counting it would make the metric fire on every normal install.
+        if (provider == nullptr) return;
+        const auto areas = provider->localAreaViews();
+        const auto ports = provider->portViews();
+        uint32_t uasid = 0;
+        uint32_t jetty_id = 0;
+        for (const auto& port : ports) {
+            if (port.local_nic != local_nic) continue;
+            uasid = port.native_jetty_uasid;
+            jetty_id = port.native_jetty_id;
+            break;
+        }
+        bool appended = false;
+        for (const auto& area : areas) {
+            if (area.local_nic != local_nic) continue;
+            if (area.length == 0 || jetty_id == 0) break;
+            ub::UbProbeAreaDescriptor descriptor;
+            descriptor.descriptor = area.descriptor;
+            descriptor.address = area.address;
+            descriptor.length = area.length;
+            descriptor.token = area.token;
+            descriptor.area_epoch = area.epoch;
+            descriptor.uasid = uasid;
+            descriptor.jetty_id = jetty_id;
+            desc.probe_areas.push_back(std::move(descriptor));
+            appended = true;
+            break;
+        }
+        if (!appended) ++probe_area_missing;
+    }
+
+    // W3g-c: project a bound peer's envelope into the probe descriptor source.
+    // Only outbound resolves carry the remote segment id needed for a directed
+    // edge; an inbound request has no segment identity yet, so it is not
+    // ingested here.
+    void ingestBootstrapProbePeer(const ub::EndpointResolveRequest& request,
+                                  const std::string& peer_path,
+                                  const UbBootstrapDesc& peer,
+                                  uint64_t local_endpoint_generation) {
+        if (!owned_probe_source) return;
+        ub::BootstrapProbePeerInfo info;
+        info.local_nic = request.local_context->topologyId();
+        info.peer_segment_id = request.remote_segment_id;
+        info.remote_nic = request.remote_topology_id;
+        info.peer_nic_path = peer_path;
+        info.peer_eid = peer.local_eid;
+        info.capabilities = peer.capabilities;
+        info.probe_areas = peer.probe_areas;
+        // The probe path key must be the *local* generation identity, because
+        // business evidence (UbPostPath.generation) is the local endpoint
+        // generation. The peer's v2 epochs describe the peer's own resources;
+        // copying them here would make every business success look unmapped
+        // (probe_evidence_unmapped). The peer's values are still validated by
+        // bind() and remain part of the negotiated contract.
+        info.topology_epoch = request.local_context->incarnation();
+        info.target_epoch = local_endpoint_generation;
+        info.endpoint_generation = local_endpoint_generation;
+        info.schema_version = peer.schema_version;
+        (void)owned_probe_source->ingest(info);
+    }
+
+    // W3g-b: one endpoint must apply the configured protocol before its first
+    // bootstrap. `v1` never emits the v2 block even to a capable peer.
+    void configureEndpoint(const std::shared_ptr<ub::UbEndpoint>& endpoint) {
+        if (!endpoint) return;
+        endpoint->setBootstrapV2Allowed(params.bootstrap_protocol !=
+                                        ub::UbBootstrapProtocol::kV1);
+    }
+
+    // W3g-b/Major-1: protocol=v1 also ignores a received v2 block. The switch
+    // is a local hard lock, not just a send-side preference: the peer's
+    // profiles/pages are dropped before bind() so the effective contract is
+    // byte-for-byte v1.
+    UbBootstrapDesc effectivePeerDesc(const UbBootstrapDesc& peer) {
+        if (params.bootstrap_protocol != ub::UbBootstrapProtocol::kV1) {
+            return peer;
+        }
+        const bool has_v2 = peer.schema_version >= ub::kUbBootstrapSchemaV2 ||
+                            !peer.target_profiles.empty() ||
+                            !peer.probe_areas.empty();
+        if (!has_v2) return peer;
+        ++bootstrap_v2_ignored;
+        LOG_EVERY_N(INFO, 64)
+            << "UB bootstrap: ignored a v2 block because "
+               "transports/ub/bootstrap/protocol=v1 (peer schema="
+            << peer.schema_version << ")";
+        UbBootstrapDesc sanitized = peer;
+        sanitized.schema_version = ub::kUbBootstrapSchemaV1;
+        sanitized.target_profiles.clear();
+        sanitized.probe_areas.clear();
+        sanitized.topology_epoch = 0;
+        sanitized.target_epoch = 0;
+        return sanitized;
+    }
+
+    // W3g-c lazy activation: after a business bootstrap taught the source a
+    // peer probe page, re-read the directory and publish the new edge. Runs on
+    // the posting thread during endpoint resolution (once per endpoint
+    // generation), never on the poller.
+    void refreshProbeEdges() {
+        if (probe_area_source == nullptr) return;
+        size_t activated = 0;
+        const Status status = probe_area_source->refreshRemoteEdges(&activated);
+        if (!status.ok()) {
+            LOG_EVERY_N(WARNING, 100)
+                << "UB probe: cannot activate the newly learned peer edge: "
+                << status.ToString();
+        }
+    }
+
+    // W3g-c observation used by tests and operators.
+    size_t probePathCount() const {
+        if (!probe_manager) return 0;
+        return probe_manager->pathRowCount();
+    }
+
+    ub::ProbeStats probeStats() const {
+        if (!probe_manager) return ub::ProbeStats{};
+        return probe_manager->stats();
+    }
+
+    // W3g-b negotiation counters. There is no transport-wide stats consumer in
+    // this baseline, so the periodic log line is the observation outlet.
+    void notePeerNegotiation(const UbBootstrapDesc& peer) {
+        const bool v2 = peer.schema_version >= ub::kUbBootstrapSchemaV2 &&
+                        peer.advertisesBootstrapV2();
+        if (v2) {
+            bootstrap_v2_peers.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            bootstrap_v1_peers.fetch_add(1, std::memory_order_relaxed);
+        }
+        LOG_EVERY_N(INFO, 64)
+            << "UB bootstrap peer: schema=" << peer.schema_version
+            << " v2=" << (v2 ? 1 : 0) << " v2_peers="
+            << bootstrap_v2_peers.load(std::memory_order_relaxed)
+            << " v1_peers="
+            << bootstrap_v1_peers.load(std::memory_order_relaxed)
+            << " probe_area_missing="
+            << probe_area_missing.load(std::memory_order_relaxed)
+            << " v2_ignored="
+            << bootstrap_v2_ignored.load(std::memory_order_relaxed);
     }
 
     uint64_t currentSegmentGeneration() const {
@@ -916,6 +1164,15 @@ struct UbTransport::Impl {
     // probe_directory is declared before probe_provider so it is destroyed
     // after the provider that borrows it.
     ub::ProbePeerDescriptorSource* probe_peer_source{nullptr};
+    std::unique_ptr<ub::BootstrapProbePeerDescriptorSource> owned_probe_source;
+    // W3g-c: raw, non-owning view of the standalone provider for publishing the
+    // local probe page. Only read after `installed` is observed (release), so
+    // the assignment in install() happens-before the bootstrap handler.
+    ub::StandaloneProbeResourceProvider* probe_area_source{nullptr};
+    std::atomic<uint64_t> bootstrap_v2_peers{0};
+    std::atomic<uint64_t> bootstrap_v1_peers{0};
+    std::atomic<uint64_t> probe_area_missing{0};
+    std::atomic<uint64_t> bootstrap_v2_ignored{0};
     std::shared_ptr<ub::HandshakeProbePeerDirectory> probe_directory;
     std::shared_ptr<ub::ProbeResourceProvider> probe_provider;
     std::shared_ptr<ub::ProbePoster> probe_poster;
@@ -1154,6 +1411,16 @@ bool UbTransport::warmupMemory(void* addr, size_t length) {
         length, options, segment);
     if (!status.ok()) return false;
     return impl_->adapter->unregisterLocalSegment(segment).ok();
+}
+
+size_t UbTransport::probePathCount() const {
+    std::lock_guard<std::mutex> lock(impl_->lifecycle_mutex);
+    return impl_->probePathCount();
+}
+
+ub::ProbeStats UbTransport::probeStats() const {
+    std::lock_guard<std::mutex> lock(impl_->lifecycle_mutex);
+    return impl_->probeStats();
 }
 
 double UbTransport::getEstimatedBandwidth() const {

@@ -88,6 +88,22 @@ class UbEndpoint final : public std::enable_shared_from_this<UbEndpoint> {
                              uint64_t segment_generation,
                              UbBootstrapDesc& output) const;
 
+    // W3g-b: local switch for the additive v2 field block. When false the
+    // endpoint still advertises the capability strings (peers can negotiate)
+    // but never emits schema_version >= 2 fields. Set from
+    // transports/ub/bootstrap/protocol and applied before the first bootstrap.
+    void setBootstrapV2Allowed(bool allowed) noexcept {
+        bootstrap_v2_allowed_.store(allowed, std::memory_order_release);
+    }
+    [[nodiscard]] bool bootstrapV2Allowed() const noexcept {
+        return bootstrap_v2_allowed_.load(std::memory_order_acquire);
+    }
+    // W3g-b/Major-1: received v2 blocks dropped because protocol=v1. The
+    // transport also maintains an aggregate counter for its summary line.
+    [[nodiscard]] uint64_t bootstrapV2Ignored() const noexcept {
+        return bootstrap_v2_ignored_.load(std::memory_order_relaxed);
+    }
+
     // Admission to the posting path is synchronized with retirement: once
     // kDestroying is visible no new work can acquire the endpoint. Every
     // successful acquire must have one matching release.
@@ -164,6 +180,9 @@ class UbEndpoint final : public std::enable_shared_from_this<UbEndpoint> {
 
     Status failLocked(Status status);
     Status resetAndUnbindLocked();
+    // W3g-b: bind body; lifecycle_mutex_ must be held. `bind()` sanitizes the
+    // incoming descriptor (protocol=v1 drops a received v2 block) first.
+    Status bindLocked(const UbBootstrapDesc& peer);
     Status deleteJettysLocked();
     Status finishRetireLocked();
     static void rememberFirstError(const Status& candidate, Status& first);
@@ -184,6 +203,11 @@ class UbEndpoint final : public std::enable_shared_from_this<UbEndpoint> {
     bool native_quiesced_{false};
     std::atomic<State> state_{State::kUninitialized};
     std::atomic<uint64_t> peer_generation_{0};
+    // W3g-b: does this endpoint emit the v2 field block when the peer supports
+    // it? Atomic because the transport configures it from another thread than
+    // the bootstrap handler that reads it.
+    std::atomic<bool> bootstrap_v2_allowed_{true};
+    std::atomic<uint64_t> bootstrap_v2_ignored_{0};
     std::atomic<uint64_t> outstanding_wrs_{0};
     std::atomic<uint64_t> outstanding_bytes_{0};
 };

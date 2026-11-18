@@ -36,6 +36,7 @@
 
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/segment_manager.h"
+#include "tent/transport/ub/bootstrap_peer_source.h"
 #include "tent/transport/ub/buffers.h"
 #include "tent/transport/ub/context.h"
 #include "tent/transport/ub/endpoint_store.h"
@@ -548,7 +549,157 @@ TEST(UbProbeIntegrationTest, TransportBuildsStandaloneProbeProvider) {
     EXPECT_TRUE(adapter->shutdown().ok());
 }
 
-TEST(UbProbeIntegrationTest, StandaloneProbeWithoutPeerSourceFailsInstall) {
+// W3g-c: the production source built from a real bootstrap envelope must feed
+// the same standalone probe assembly as the W1 test source (one imported peer
+// page and the probe graph edge).
+TEST(UbProbeIntegrationTest, BootstrapPeerSourceFeedsTheProbeGraph) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    auto topology = fakeTopology();
+    std::string segment_name;
+    auto control = startFakeControl(topology, segment_name);
+    ASSERT_NE(control, nullptr);
+    auto config = makeTransportConfig(/*probe_enabled=*/true);
+    config->set("transports/ub/probe/provider", "standalone");
+
+    BootstrapProbePeerDescriptorSource source;
+    BootstrapProbePeerInfo info;
+    info.local_nic = 0;
+    info.peer_segment_id = 42;
+    info.remote_nic = 0;
+    info.peer_nic_path = "peer@ub:fake0:eid0";
+    info.peer_eid = fakeDevice().eid;
+    info.capabilities = {"read", "write", kUbCapabilityBootstrapV2};
+    info.topology_epoch = 3;
+    info.target_epoch = 4;
+    info.endpoint_generation = 100;
+    info.schema_version = kUbBootstrapSchemaV2;
+    UbProbeAreaDescriptor area;
+    area.descriptor = makeDescriptor(0xA00000, 4096);
+    area.address = 0xA00000;
+    area.length = 4096;
+    area.token = 0xACFE;
+    area.area_epoch = 1;
+    area.uasid = 501;
+    area.jetty_id = 401;
+    info.probe_areas = {area};
+    ASSERT_TRUE(source.ingest(info).ok());
+    EXPECT_EQ(source.descriptorCount(), 1U);
+
+    UbTransport transport(adapter, nullptr, nullptr, &source);
+    std::string mutable_segment_name = segment_name;
+    ASSERT_TRUE(
+        transport.install(mutable_segment_name, control, topology, config)
+            .ok());
+    EXPECT_EQ(adapter->liveRemoteSegmentCount(), 1U);
+    EXPECT_GE(adapter->liveJfcCount(), 2U);
+    EXPECT_EQ(transport.probePathCount(), 1U);
+    ASSERT_TRUE(transport.uninstall().ok());
+    EXPECT_EQ(adapter->liveRemoteSegmentCount(), 0U);
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
+// W3g-c lazy activation (review 2026-11-18): install arms the probe assembly
+// with no edge, and the first business bootstrap (which carries the peer's v2
+// probe_area) must add the edge and wake the scheduler. This is the real
+// deployment order that the pre-ingested source tests cannot express.
+TEST(UbProbeIntegrationTest, BusinessBootstrapActivatesProbingAfterInstall) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    auto topology = fakeTopology();
+    std::string segment_name;
+    auto control = startFakeControl(topology, segment_name);
+    ASSERT_NE(control, nullptr);
+    auto config = makeTransportConfig(/*probe_enabled=*/true);
+    config->set("transports/ub/probe/provider", "standalone");
+    // Short probe cadence keeps the shutdown drain bounded; the test only
+    // asserts that the edge appears and the scheduler starts.
+    config->set("transports/ub/probe/interval_ms", 100);
+    config->set("transports/ub/probe/timeout_ms", 100);
+    config->set("transports/ub/probe/backoff_max_ms", 1000);
+    // Default policy probes only campaigns (ELIGIBLE_UNVERIFIED / HEALTHY never
+    // run periodic probes), so proving "the armed scheduler really posts over
+    // the new edge" needs the validation-only periodic sweep.
+    config->set("transports/ub/probe/test/periodic_all", true);
+    config->set("transports/ub/probe/test/interval_ms", 50);
+
+    UbTransport transport(adapter);
+    std::string mutable_segment_name = segment_name;
+    ASSERT_TRUE(
+        transport.install(mutable_segment_name, control, topology, config)
+            .ok());
+    // Real deployment order: no business bootstrap has happened yet.
+    EXPECT_EQ(transport.probePathCount(), 0U);
+
+    std::array<char, 64> source{};
+    std::array<char, 64> target{};
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>(100 - i);
+    }
+    BufferDesc source_desc{};
+    source_desc.addr = reinterpret_cast<uint64_t>(source.data());
+    source_desc.length = source.size();
+    source_desc.location = kWildcardLocation;
+    BufferDesc target_desc{};
+    target_desc.addr = reinterpret_cast<uint64_t>(target.data());
+    target_desc.length = target.size();
+    target_desc.location = kWildcardLocation;
+    MemoryOptions options;
+    options.perm = kGlobalReadWrite;
+    std::vector<BufferDesc> descriptors{source_desc, target_desc};
+    ASSERT_TRUE(transport.addMemoryBuffer(descriptors, options).ok());
+    ASSERT_TRUE(control->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        std::get<MemorySegmentDesc>(segment.detail).buffers =
+                            descriptors;
+                        return Status::OK();
+                    })
+                    .ok());
+    // A real peer is a distinct segment id; loopback self-traffic uses
+    // LOCAL_SEGMENT_ID, which deliberately cannot form a probe path key (you do
+    // not probe yourself).
+    SegmentID remote_id = LOCAL_SEGMENT_ID;
+    ASSERT_TRUE(
+        control->segmentManager().openRemote(remote_id, segment_name).ok());
+    ASSERT_NE(remote_id, LOCAL_SEGMENT_ID);
+
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = source.data();
+    request.target_id = remote_id;
+    request.target_offset = reinterpret_cast<uint64_t>(target.data());
+    request.length = source.size();
+    ASSERT_TRUE(transport.submitTransferTasks(batch, {request}).ok());
+    TransferStatus transfer{PENDING, 0};
+    ASSERT_TRUE(pt::waitUntil([&] {
+        (void)transport.getTransferStatus(batch, 0, transfer);
+        return transfer.s == COMPLETED;
+    }));
+    EXPECT_EQ(transfer.transferred_bytes, source.size());
+
+    // The bootstrap response carried this side's v2 probe_area; the lazy
+    // activation must have published it as an interface-7 edge.
+    EXPECT_TRUE(pt::waitUntil([&] { return transport.probePathCount() >= 1; }));
+    EXPECT_GE(transport.probePathCount(), 1U);
+    EXPECT_GE(adapter->liveRemoteSegmentCount(), 1U);
+    // An edge reaching the PLM is only half of the contract (design §17.3):
+    // the armed scheduler must actually post a probe over it. Without this the
+    // test would still pass with a PLM that never schedules anything.
+    EXPECT_TRUE(pt::waitUntil(
+        [&] { return transport.probeStats().probe_scheduled >= 1; },
+        std::chrono::milliseconds(4000)));
+    EXPECT_GE(transport.probeStats().probe_posted, 1U);
+
+    ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+    ASSERT_TRUE(transport.uninstall().ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
+// W3g-c: with the bootstrap-driven peer source and no peer yet, "no probe
+// area" is a normal startup state, not a supply bug. The probe assembly is
+// armed (ports, PLM, scheduler) and waits for the first probe_area; business
+// installs normally (design §2.2/§7.2).
+TEST(UbProbeIntegrationTest, StandaloneProbeWithoutPeerAreaArmsAndWaits) {
     auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
     auto topology = fakeTopology();
     std::string segment_name;
@@ -558,6 +709,41 @@ TEST(UbProbeIntegrationTest, StandaloneProbeWithoutPeerSourceFailsInstall) {
     config->set("transports/ub/probe/provider", "standalone");
 
     UbTransport transport(adapter);
+    std::string mutable_segment_name = segment_name;
+    const auto status =
+        transport.install(mutable_segment_name, control, topology, config);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    // Armed with the local probe ports but no peer edge yet.
+    EXPECT_EQ(transport.probePathCount(), 0U);
+    EXPECT_TRUE(transport.uninstall().ok());
+    // The probe assembly must not leak: after uninstall, no JFC or Jetty of
+    // either half is still alive.
+    EXPECT_EQ(adapter->liveJfcCount(), 0U);
+    EXPECT_EQ(adapter->liveJettyCount(), 0U);
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
+// The distinction matters: an *injected* peer source that yields no descriptor
+// is still a supply bug and must fail fast, exactly like W1.
+class EmptyPeerSource final : public ProbePeerDescriptorSource {
+   public:
+    Status snapshot(std::vector<ProbePeerDescriptor>& descriptors) override {
+        descriptors.clear();
+        return Status::OK();
+    }
+};
+
+TEST(UbProbeIntegrationTest, InjectedEmptyPeerSourceStillFailsInstall) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    auto topology = fakeTopology();
+    std::string segment_name;
+    auto control = startFakeControl(topology, segment_name);
+    ASSERT_NE(control, nullptr);
+    auto config = makeTransportConfig(/*probe_enabled=*/true);
+    config->set("transports/ub/probe/provider", "standalone");
+
+    EmptyPeerSource source;
+    UbTransport transport(adapter, nullptr, nullptr, &source);
     std::string mutable_segment_name = segment_name;
     const auto status =
         transport.install(mutable_segment_name, control, topology, config);
