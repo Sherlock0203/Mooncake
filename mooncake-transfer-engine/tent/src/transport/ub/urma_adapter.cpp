@@ -737,7 +737,13 @@ class RealJetty final : public Jetty {
             }
         }
         urma_jetty_cfg_t config{};
-        reliable_message_ = options.transport_mode == JettyTransportMode::kRm;
+        // RM is selected natively by trans_mode, which both RM runtime
+        // profiles set; transport_mode is the adapter-level spelling and is
+        // only set by rm_pool. Treat either as RM so an RM Legacy JFS gets the
+        // RM JFS profile (max_rsge/err_timeout), releases its cached targets on
+        // unbind/close, and never requires a bind.
+        reliable_message_ = options.transport_mode == JettyTransportMode::kRm ||
+                            options.trans_mode == kUrmaTransportModeRm;
         // UMDK requires JFS.trans_mode == shared JFR.trans_mode; the probe JFC
         // is created with an RM JFR so RM Jetties share it like RC ones do.
         config.flag.bs.share_jfr = 1;
@@ -807,21 +813,15 @@ class RealJetty final : public Jetty {
     std::mutex& mutex() noexcept { return mutex_; }
     urma_jetty_t* native() const noexcept { return native_; }
     urma_target_jetty_t* remote() const noexcept { return remote_; }
-    bool postable() const noexcept {
-        // RC Jetties must be bound; RM Jetties are usable immediately after
-        // creation and carry their target per WR.
-        return
-    }
     bool reliableMessage() const noexcept { return reliable_message_; }
     // RM Legacy never binds a remote Jetty: each WR carries its own imported
     // target, so an unbound RM JFS is still postable. RC keeps requiring a
-    // completed bind.
+    // completed bind. Gating on the native trans_mode covers both RM runtime
+    // profiles, including RM Legacy where the adapter-level transport_mode is
+    // still RC.
     bool postable() const noexcept {
-        auto reliable_message_ ? state_ == State::CREATED
-                               : state_ == State::BOUND;
-        auto rm_mode_ ? (state_ == State::CREATED || state_ == State::BOUND)
-                      : state_ == State::BOUND;
-        return reliable_message_ && rm_mode_;
+        return rm_mode_ ? (state_ == State::CREATED || state_ == State::BOUND)
+                        : state_ == State::BOUND;
     }
 
     bool rmMode() const noexcept { return rm_mode_; }
@@ -867,12 +867,12 @@ class RealJetty final : public Jetty {
         if (reliable_message_) {
             return Status::InvalidArgument(
                 "RM Jetty imports a target per WR and cannot be bound");
-            if (rm_mode_) {
-                return Status::InvalidArgument(
-                    "RM Legacy Jetties never bind a remote Jetty; every RM "
-                    "work "
-                    "request carries an explicit imported target");
-            }
+        }
+        if (rm_mode_) {
+            return Status::InvalidArgument(
+                "RM Legacy Jetties never bind a remote Jetty; every RM work "
+                "request carries an explicit imported target");
+        }
         if (state_ == State::RESET) {
             return Status::InvalidArgument("cannot bind a reset Jetty");
         }
@@ -1868,10 +1868,11 @@ class RealUrmaAdapter final : public UrmaAdapter {
         CHECK_STATUS(getRuntime(runtime));
         auto real_jetty = std::dynamic_pointer_cast<RealJetty>(jetty);
         if (!real_jetty || !real_jetty->valid()) return invalidHandle("Jetty");
-        if (real_jetty->reliableMessage()) {
-            return Status::InvalidArgument(
-                "RM Jetty requires a per-WR remote target");
-        }
+        // RM requests are accepted here with their explicit per-WR target
+        // (WorkRequest::target); the loop below rejects an RM request without
+        // one and an RC request with one. The provider overload that takes a
+        // RemoteJettyInfo stays available for callers that only have the
+        // descriptor, but the merged data path uses the target-carrying form.
         if (requests.empty()) return Status::OK();
 
         struct NativeWorkRequest {
