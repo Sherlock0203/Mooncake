@@ -736,7 +736,7 @@ TEST(UbSendJettyPoolTest, DoubleReturnRejected) {
     SliceJettyLease lease = std::move(grant.lease);
     // Fabricate a second lease on the same member to force a double return.
     SliceJettyLease duplicate;
-    duplicate.pool_ = harness.pool.get();
+    duplicate.pool_ = harness.pool;
     duplicate.member_ = lease.member();
     duplicate.attempt_ = lease.attempt();
 

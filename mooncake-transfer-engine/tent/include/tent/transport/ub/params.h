@@ -98,6 +98,13 @@ struct UbSendPoolParams {
     // Per-JFC WR credits reserved for control records (flush-done markers,
     // AE); business WRs only use the remaining capacity.
     uint32_t jfc_credit_reserve = 16;
+    // Background executors (P2/P3). Refill keeps every known PoolKey at the
+    // desired Serving size while idle and replaces retired members without
+    // waiting for the next attempt; delete performs reset+delete and budget
+    // release off the completion path.
+    bool background_refill = true;
+    bool background_delete = true;
+    uint32_t refill_interval_ms = 50;
 };
 
 // Device-level native budget parameters (C01/C05).
@@ -325,6 +332,18 @@ struct UbParams {
             config, "transports/ub/send_pool/jfc_credit_reserve",
             parsed.send_pool.jfc_credit_reserve,
             parsed.send_pool.jfc_credit_reserve));
+        CHECK_STATUS(readBool(
+            config, "transports/ub/send_pool/background_refill",
+            parsed.send_pool.background_refill,
+            parsed.send_pool.background_refill));
+        CHECK_STATUS(readBool(
+            config, "transports/ub/send_pool/background_delete",
+            parsed.send_pool.background_delete,
+            parsed.send_pool.background_delete));
+        CHECK_STATUS(readPositive(
+            config, "transports/ub/send_pool/refill_interval_ms",
+            parsed.send_pool.refill_interval_ms,
+            parsed.send_pool.refill_interval_ms));
         CHECK_STATUS(readNonNegative(
             config, "transports/ub/native_budget/max_jetty_per_device",
             parsed.native_budget.max_jetty_per_device,

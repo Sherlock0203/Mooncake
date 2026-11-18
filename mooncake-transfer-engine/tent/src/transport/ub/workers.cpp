@@ -1400,6 +1400,32 @@ void UbWorkers::settlePooledAttempt(const std::shared_ptr<Inflight>& inflight,
             expected, true, std::memory_order_acq_rel)) {
         return;
     }
+    // Hardware retirement fence (C08): a real error completion, including the
+    // pinned provider's native status 9 class, takes the member out of
+    // hardware service before it is retired. quiesceJetty moves the Jetty to
+    // URMA_JETTY_STATE_ERROR (urma_modify_jetty), waits for that ERROR
+    // epoch's flush-done marker and drains the remaining WRs with
+    // urma_flush_jetty. Only then does the pool reset and delete the member.
+    // A failed fence leaves the member in ERROR without a trusted barrier, so
+    // the pool's reset is rejected and the handle stays quarantined instead
+    // of re-entering circulation.
+    if (kind == PooledSettleKind::kRealError) {
+        const auto& member = inflight->pooled_lease.member();
+        if (member && member->jetty) {
+            std::vector<Completion> drained;
+            const Status fence = adapter_->quiesceJetty(
+                member->jetty, params_.slice_timeout_ms, drained);
+            for (const auto& completion : drained) {
+                if (completion.token != 0) handleCompletion(completion);
+            }
+            if (!fence.ok()) {
+                LOG_EVERY_N(WARNING, 100)
+                    << "UB pooled member could not be fenced before retirement; "
+                       "it stays quarantined: "
+                    << fence.ToString();
+            }
+        }
+    }
     const auto& pool = inflight->pooled_pool;
     AttemptGate::Settlement settlement;
     bool settled = false;

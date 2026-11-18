@@ -396,6 +396,15 @@ struct Completion {
 
 // Pure, injectable URMA boundary. It deliberately does not know about TENT
 // Request, SubBatch, UbTask, UbSlice, scheduling, retry, or rail health.
+//
+// Thread-safety contract (RC-07): implementations must make the object
+// lifecycle operations safe for concurrent callers operating on DISTINCT
+// handles. The pooled send path calls createJetty/resetJetty/deleteJetty
+// from posting threads, completion/polling threads, the background
+// refill/delete executors, and the shutdown thread without external
+// serialization; per-handle internal locking (as RealUrmaAdapter provides)
+// is sufficient, but a replacement adapter must not assume single-threaded
+// use.
 class UrmaAdapter {
    public:
     virtual ~UrmaAdapter() = default;
