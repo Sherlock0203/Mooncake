@@ -6,10 +6,6 @@
 #include <algorithm>
 #include <chrono>
 #include <limits>
-#include <utility>
-
-#include "jetty_pool.h"
-#include "tent/transport/ub/send_jetty_pool.h"
 
 namespace mooncake::tent::ub {
 namespace {
@@ -21,41 +17,13 @@ uint64_t steadyNowNs() noexcept {
             .count());
 }
 
-uint64_t incarnationSeed() {
-    const auto wall = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::system_clock::now().time_since_epoch())
-            .count());
-    const auto steady = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch())
-            .count());
-    const uint64_t seed =
-        (wall ^ (steady << 17) ^ (steady >> 3)) & 0x7fffffffffffffffULL;
-    return seed == 0 ? 1 : seed;
-}
-
-std::atomic<uint64_t> g_next_context_incarnation{incarnationSeed()};
-
 }  // namespace
-
-uint64_t UbContext::allocateIncarnation() noexcept {
-    const uint64_t incarnation =
-        g_next_context_incarnation.fetch_add(1, std::memory_order_relaxed);
-    // Zero is reserved for "no incarnation"; exhausting the 64-bit sequence
-    // would reuse incarnations and is not recoverable.
-    if (incarnation == 0 || incarnation == std::numeric_limits<uint64_t>::max()) {
-        std::terminate();
-    }
-    return incarnation;
-}
 
 UbContext::UbContext(Topology::NicID topology_id, DeviceInfo device,
                      std::shared_ptr<UrmaAdapter> adapter)
     : topology_id_(topology_id),
       device_(std::move(device)),
-      adapter_(std::move(adapter)),
-      incarnation_(allocateIncarnation()) {}
+      adapter_(std::move(adapter)) {}
 
 UbContext::~UbContext() { (void)shutdown(); }
 
@@ -115,21 +83,8 @@ Status UbContext::initialize(uint32_t jfc_count, const JfcOptions& options) {
 }
 
 Status UbContext::shutdown() {
-    // Precondition (RC-03): the transport must have stopped every
-    // posting/polling consumer (workers->stop()) first; the pooled send pool
-    // verifies that no lease is still outstanding during drainIdle().
     std::lock_guard<std::mutex> lock(lifecycle_mutex_);
     return shutdownLocked();
-}
-
-void UbContext::attachJettyPool(std::shared_ptr<UbSendJettyPool> pool) {
-    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
-    jetty_pool_ = std::move(pool);
-}
-
-void UbContext::attachPooledSendPool(std::shared_ptr<SendJettyPool> pool) {
-    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
-    pooled_send_pool_ = std::move(pool);
 }
 
 Status UbContext::shutdownLocked() {
@@ -141,24 +96,7 @@ Status UbContext::shutdownLocked() {
     }
     state_.store(State::kDraining, std::memory_order_release);
 
-    // Drain the send-Jetty reuse pool (when attached) before the JFCs are
-    // closed so no idle Jetty outlives its parent JFC. A failed delete keeps
-    // the handle inside the pool for the next shutdown retry.
     Status first_error = Status::OK();
-    if (jetty_pool_) {
-        auto status = jetty_pool_->drain();
-        if (!status.ok()) first_error = std::move(status);
-    }
-    // Drain the pooled rm_pool send pool (when attached) before the JFCs
-    // are closed. Idle members are deleted; quarantined members get one
-    // deletion attempt and otherwise keep their budget and owner.
-    if (pooled_send_pool_) {
-        pooled_send_pool_->beginStop();
-        auto status = pooled_send_pool_->drainIdle();
-        if (!status.ok() && first_error.ok()) first_error = std::move(status);
-        status = pooled_send_pool_->drainQuarantined();
-        if (!status.ok() && first_error.ok()) first_error = std::move(status);
-    }
     for (size_t index = jfcs_.size(); index > 0;) {
         --index;
         auto& jfc = jfcs_[index];

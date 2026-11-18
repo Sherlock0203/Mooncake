@@ -164,10 +164,6 @@ class Config {
 
     Status loadFile(const std::string& file_path);
 
-    // Atomically writes the current configuration to file_path (temp file
-    // plus replace), so a concurrent reader never observes a partial file.
-    Status saveFile(const std::string& file_path) const;
-
     std::string dump(int indent = 2) const;
 
     // If key_path resolves to a JSON value, dump it into *out and return true.

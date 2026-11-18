@@ -18,9 +18,6 @@
 
 namespace mooncake::tent::ub {
 
-class UbSendJettyPool;
-class SendJettyPool;
-
 class UbContext final : public std::enable_shared_from_this<UbContext> {
    public:
     enum class State : uint8_t {
@@ -58,11 +55,6 @@ class UbContext final : public std::enable_shared_from_this<UbContext> {
     [[nodiscard]] Topology::NicID topologyId() const noexcept {
         return topology_id_;
     }
-    // Process-unique identity for bootstrap v2 context_incarnation. It is
-    // allocated once per constructed context and never reused.
-    [[nodiscard]] uint64_t incarnation() const noexcept {
-        return incarnation_;
-    }
     [[nodiscard]] const DeviceInfo& deviceInfo() const noexcept {
         return device_;
     }
@@ -75,25 +67,6 @@ class UbContext final : public std::enable_shared_from_this<UbContext> {
     }
     [[nodiscard]] const std::vector<std::shared_ptr<UbJfc>>& jfcs() const {
         return jfcs_;
-    }
-
-    // Simple send-Jetty reuse (RM Legacy only). Null unless the transport
-    // installed a pool for this context; endpoints fall back to per-incarnation
-    // createJetty when absent, so RC behavior is unchanged.
-    void attachJettyPool(std::shared_ptr<UbSendJettyPool> pool);
-    [[nodiscard]] std::shared_ptr<UbSendJettyPool> jettyPool() const {
-        std::lock_guard<std::mutex> lock(lifecycle_mutex_);
-        return jetty_pool_;
-    }
-
-    // Pooled rm_pool data path (C06). Null unless the transport installed a
-    // per-attempt pool for this context; the legacy send path never touches
-    // it, so RC/RM-legacy behavior is unchanged while the rm_pool gate
-    // matrix remains fail-closed.
-    void attachPooledSendPool(std::shared_ptr<SendJettyPool> pool);
-    [[nodiscard]] std::shared_ptr<SendJettyPool> pooledSendPool() const {
-        std::lock_guard<std::mutex> lock(lifecycle_mutex_);
-        return pooled_send_pool_;
     }
     [[nodiscard]] std::shared_ptr<UbJfc> jfc(size_t index) const;
 
@@ -114,16 +87,12 @@ class UbContext final : public std::enable_shared_from_this<UbContext> {
 
    private:
     Status shutdownLocked();
-    static uint64_t allocateIncarnation() noexcept;
 
     const Topology::NicID topology_id_;
     const DeviceInfo device_;
     std::shared_ptr<UrmaAdapter> adapter_;
-    const uint64_t incarnation_;
     ContextPtr handle_;
     std::vector<std::shared_ptr<UbJfc>> jfcs_;
-    std::shared_ptr<UbSendJettyPool> jetty_pool_;
-    std::shared_ptr<SendJettyPool> pooled_send_pool_;
     mutable std::mutex lifecycle_mutex_;
     std::atomic<State> state_{State::kUninitialized};
     std::atomic<uint64_t> inflight_bytes_{0};

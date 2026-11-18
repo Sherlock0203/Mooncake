@@ -54,7 +54,7 @@ class TransferMetadataTest : public ::testing::Test {
         if (env)
             metadata_server = env;
         else
-            metadata_server = P2PHANDSHAKE;
+            metadata_server = metadata_server;
         LOG(INFO) << "metadata_server: " << metadata_server;
 
         env = std::getenv("MC_LOCAL_SERVER_NAME");

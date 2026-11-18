@@ -15,7 +15,6 @@
 #include <glog/logging.h>
 #include <cassert>
 #include <cstddef>
-#include <unistd.h>
 #include "config.h"
 #include "transport/kunpeng_transport/urma/urma_endpoint.h"
 
@@ -237,10 +236,10 @@ int UrmaContext::deconstruct() {
         urma_context_ = nullptr;
     }
 
-    // urma_uninit() is process-lifetime: calling it from one context's
-    // teardown unregisters the provider while sibling contexts (one per
-    // RNIC in context_list_) are still using it, which surfaces as SIGSEGV
-    // in their threads. Each context only deletes its own handle here.
+    // urma_init()/urma_uninit() are process-global and owned by
+    // UbTransport, which pairs them once per transport. Releasing the
+    // module per context tears it down while sibling contexts still hold
+    // jetties, so the next urma_unbind_jetty() faults.
     return 0;
 }
 
@@ -276,17 +275,6 @@ int UrmaContext::registerMemoryRegion(uint64_t va, size_t length) {
         length = (size_t)globalConfig().max_seg_size;
     }
     LOG(INFO) << "Register memory region " << va << " length " << length;
-    // ummu_grant() silently rejects a non-page-aligned VA: the provider
-    // swallows -EINVAL with errno left at 0, which later surfaces as an
-    // unrelated ERR_CONTEXT with no actionable diagnostics. Expand
-    // [va, va + length) outward to page boundaries; seg() and
-    // unregisterMemoryRegion() match on the registered span, which is a
-    // superset of the caller's range, so the original VA stays valid.
-    const uint64_t page_size = (uint64_t)sysconf(_SC_PAGESIZE);
-    const uint64_t page_mask = page_size - 1;
-    const uint64_t reg_va = va & ~page_mask;
-    const uint64_t reg_end = (va + length + page_mask) & ~page_mask;
-    const size_t reg_length = (size_t)(reg_end - reg_va);
     urma_reg_seg_flag_t flag = {};
     flag.bs.token_policy = URMA_TOKEN_NONE;
     flag.bs.cacheable = URMA_NON_CACHEABLE;
@@ -295,8 +283,8 @@ int UrmaContext::registerMemoryRegion(uint64_t va, size_t length) {
     flag.bs.reserved = 0;
 
     urma_seg_cfg_t seg_cfg = {
-        .va = reg_va,
-        .len = reg_length,
+        .va = va,
+        .len = length,
         .token_id = NULL,
         .token_value = urma_token,
         .flag = flag,
@@ -312,7 +300,7 @@ int UrmaContext::registerMemoryRegion(uint64_t va, size_t length) {
     local_tseg_list_.push_back(seg);
 
     RWSpinlock::WriteGuard guard(seg_region_lock_);
-    seg_region_list_.emplace_back(seg, reg_length);
+    seg_region_list_.emplace_back(seg, length);
     return 0;
 }
 

@@ -459,27 +459,22 @@ static std::vector<UBDevice> listUBDevices(
     const std::vector<std::string> &filter) {
     int num_devices = 0;
     std::vector<UBDevice> devices;
+
     urma_init_attr_t init_attr = {};
-    auto init_ret = urma_init(&init_attr);
-    const bool urma_initialized_here = init_ret == URMA_SUCCESS;
-    if (!urma_initialized_here && init_ret != URMA_SUCCESS) {
-        LOG(WARNING) << "Failed to urma init, ret = " << init_ret;
+    if (urma_init(&init_attr) != URMA_SUCCESS) {
+        LOG(WARNING) << "Failed to urma init";
         return {};
     }
+    LOG(INFO) << "URMA module init success";
     urma_device_t **device_list = urma_get_device_list(&num_devices);
     if (!device_list) {
         LOG(WARNING) << "No UB devices found, check your device installation";
-        if (urma_initialized_here) {
-            urma_uninit();
-        }
+        urma_uninit();
         return {};
     }
     if (device_list && num_devices <= 0) {
         LOG(WARNING) << "No UB devices found, check your device installation";
         urma_free_device_list(device_list);
-        if (urma_initialized_here) {
-            urma_uninit();
-        }
         return {};
     }
 
@@ -515,7 +510,7 @@ static std::vector<UBDevice> listUBDevices(
                                    .numa_node = numa_node});
     }
     urma_free_device_list(device_list);
-    // No urma_uninit() here: see ensureUrmaInitialized() above.
+    urma_uninit();
     return devices;
 }
 
@@ -852,36 +847,9 @@ int Topology::discover(const std::vector<std::string> &filter,
     }
 #endif
 #ifdef USE_UB
-    auto ub_all_hca = listUBDevices({});
-    if (!ub_all_hca.empty()) {
-        // Merge UB-discovered NICs into the existing matrix entries instead
-        // of overwriting them: discoverCpuTopology() rebuilds the "cpu:N"
-        // keys from a UB-only HCA list, so a plain assignment drops every
-        // verbs-discovered NIC of the same entry (and wipes the entry to an
-        // empty one on machines with no UB devices), which surfaces as
-        // "Found 0 HCAs" after resolve().
-        for (auto &ent : discoverCpuTopology(ub_all_hca)) {
-            auto iter = matrix_.find(ent.name);
-            if (iter == matrix_.end()) {
-                matrix_[ent.name] = ent;
-                continue;
-            }
-            auto &existing = iter->second;
-            for (const auto &hca : ent.preferred_hca) {
-                if (std::find(existing.preferred_hca.begin(),
-                              existing.preferred_hca.end(),
-                              hca) == existing.preferred_hca.end()) {
-                    existing.preferred_hca.push_back(hca);
-                }
-            }
-            for (const auto &hca : ent.avail_hca) {
-                if (std::find(existing.avail_hca.begin(),
-                              existing.avail_hca.end(),
-                              hca) == existing.avail_hca.end()) {
-                    existing.avail_hca.push_back(hca);
-                }
-            }
-        }
+    auto ub_all_hca = listUBDevices(filter);
+    for (auto &ent : discoverCpuTopology(ub_all_hca)) {
+        matrix_[ent.name] = ent;
     }
 #endif
     return resolve();

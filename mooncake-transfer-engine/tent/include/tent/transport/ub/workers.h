@@ -13,7 +13,6 @@
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -21,14 +20,11 @@
 #include "tent/common/status.h"
 #include "tent/runtime/segment_manager.h"
 #include "tent/runtime/topology.h"
-#include "tent/transport/ub/admission.h"
-#include "tent/transport/ub/attempt_gate.h"
 #include "tent/transport/ub/buffers.h"
 #include "tent/transport/ub/context.h"
 #include "tent/transport/ub/params.h"
 #include "tent/transport/ub/quota.h"
 #include "tent/transport/ub/rail_monitor.h"
-#include "tent/transport/ub/send_jetty_pool.h"
 #include "tent/transport/ub/slice.h"
 #include "tent/transport/ub/urma_adapter.h"
 
@@ -143,9 +139,7 @@ class UbWorkers final {
               RailMonitor* rail_monitor, QuotaManager* quota, UbParams params,
               EndpointResolver endpoint_resolver,
               EndpointRetirer endpoint_retirer = {},
-              LocalDeviceFailureHandler local_device_failure_handler = {},
-              std::shared_ptr<TaskPermitLedger> task_permits = nullptr,
-              std::shared_ptr<AttemptGate> attempt_gate = nullptr);
+              LocalDeviceFailureHandler local_device_failure_handler = {});
     ~UbWorkers();
 
     UbWorkers(const UbWorkers&) = delete;
@@ -207,19 +201,6 @@ class UbWorkers final {
     void resolveInflight(const std::shared_ptr<Inflight>& inflight,
                          TransferStatusEnum outcome, size_t bytes,
                          bool retryable);
-    // rm_pool data path: how a pooled attempt reached its terminal point.
-    enum class PooledSettleKind : uint8_t {
-        kRealSuccess,  // exactly one real SUCCESS completion
-        kRealError,    // a real error completion attributed to the member
-        kZeroAccept,   // definitive zero acceptance rollback (INV07)
-        kFence,        // timeout/shutdown fence proved no more DMA
-    };
-    // Settles the pooled attempt exactly once through the attempt gate,
-    // returns or retires the leased member, and releases the JFC credit.
-    // Idempotent across completion/timeout/shutdown racers.
-    void settlePooledAttempt(const std::shared_ptr<Inflight>& inflight,
-                             PooledSettleKind kind, uint64_t completed_length,
-                             const std::string& reason);
     void recordTimeoutOnce(const std::shared_ptr<Inflight>& inflight,
                            uint64_t now_ns);
     void rememberEndpointDrain(const std::shared_ptr<UbEndpoint>& endpoint);
@@ -244,11 +225,6 @@ class UbWorkers final {
     EndpointResolver endpoint_resolver_;
     EndpointRetirer endpoint_retirer_;
     LocalDeviceFailureHandler local_device_failure_handler_;
-    // rm_pool admission and completion-gate components. Null on legacy
-    // installs; the pooled data path is only entered through a context with
-    // an attached SendJettyPool, which legacy installs never create.
-    std::shared_ptr<TaskPermitLedger> task_permits_;
-    std::shared_ptr<AttemptGate> attempt_gate_;
     // Serializes endpoint-store retirement progress across JFC pollers. The
     // handler temporarily moves quarantined endpoints out of the store while
     // retrying cleanup, so a second poller must not observe a false empty

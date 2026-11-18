@@ -1181,7 +1181,7 @@ class FakeAcceleratorDevice final : public device::AcceleratorDevice {
         : device_ptr_(device_ptr) {}
 
     device::AcceleratorVendor Vendor() const override {
-        return device::AcceleratorVendor::kSunrise;
+        return device::AcceleratorVendor::kNvidia;
     }
 
     bool Available(bool ensure) const override {

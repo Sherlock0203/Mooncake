@@ -492,13 +492,8 @@ void ControlService::onBootstrapUb(const std::string_view& request,
                                    std::string& response) {
     UbBootstrapDesc response_desc;
     try {
-        const auto request_json = json::parse(std::string(request));
-        // Preserve the major version even when strict v2 decoding fails, so
-        // the client can decode a minimal versioned error envelope.
-        if (request_json.value("protocol_version", 0u) == 2) {
-            response_desc.protocol_version = 2;
-        }
-        auto request_desc = request_json.get<UbBootstrapDesc>();
+        auto request_desc =
+            json::parse(std::string(request)).get<UbBootstrapDesc>();
         int ret = -1;
         {
             // Callback replacement during uninstall is serialized with

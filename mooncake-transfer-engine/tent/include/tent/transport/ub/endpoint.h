@@ -16,7 +16,6 @@
 #include "tent/common/types.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/topology.h"
-#include "tent/transport/ub/bootstrap.h"
 #include "tent/transport/ub/context.h"
 #include "tent/transport/ub/urma_adapter.h"
 
@@ -73,17 +72,7 @@ class UbEndpoint final : public std::enable_shared_from_this<UbEndpoint> {
 
     // Binds each local Jetty to the peer EID and the corresponding peer Jetty
     // ID. The bootstrap must describe exactly one peer Jetty per local Jetty.
-    // RC-only: RM Legacy endpoints use bindRm() instead.
     Status bind(const UbBootstrapDesc& peer);
-
-    // RM Legacy handshake (consumer side). Validates the peer's v2 descriptor
-    // against trusted metadata, applies generation compare-and-commit
-    // semantics, and imports the peer targets owned by this endpoint
-    // incarnation. Never calls bindJetty/unbindJetty. A failed import rolls
-    // back every target imported by this attempt in reverse order and leaves
-    // the incumbent state untouched.
-    Status bindRm(const UbBootstrapDesc& peer,
-                  const UbExpectedPeerIdentity& expected);
 
     // Builds the local half of the native UB bootstrap after prepare().
     Status makeBootstrapDesc(const std::string& segment_name,
@@ -91,18 +80,6 @@ class UbEndpoint final : public std::enable_shared_from_this<UbEndpoint> {
                              const std::string& peer_nic_path,
                              uint64_t segment_generation,
                              UbBootstrapDesc& output) const;
-
-    // RM Legacy producer side: builds the local v2 descriptor with one RM
-    // target per local Jetty. node_incarnation and topology_epoch come from
-    // the transport's trusted local state; context_incarnation is taken from
-    // this endpoint's context.
-    Status makeBootstrapDescV2(const std::string& segment_name,
-                               const std::string& local_nic_path,
-                               const std::string& peer_nic_path,
-                               uint64_t segment_generation,
-                               uint64_t node_incarnation,
-                               uint64_t topology_epoch,
-                               UbBootstrapDesc& output) const;
 
     // Admission to the posting path is synchronized with retirement: once
     // kDestroying is visible no new work can acquire the endpoint. Every
@@ -151,21 +128,6 @@ class UbEndpoint final : public std::enable_shared_from_this<UbEndpoint> {
     [[nodiscard]] std::vector<JettyPtr> jetties() const;
     [[nodiscard]] Status lifecycleStatus() const;
 
-    // RM Legacy: true when this incarnation runs the RM transport profile.
-    [[nodiscard]] bool rmMode() const noexcept {
-        return jetty_options_.trans_mode == kUrmaTransportModeRm;
-    }
-    // The Jetty profile this endpoint incarnation was created with. The
-    // pooled data path derives its PoolKey (trans_mode/priority/bind mask)
-    // from it so pooled members never mix profiles.
-    [[nodiscard]] JettyOptions jettyOptions() const noexcept {
-        return jetty_options_;
-    }
-    // RM Legacy: the explicit imported target a WR on jetty(index) must use.
-    // Returns nullptr before a successful bindRm() or after retirement.
-    [[nodiscard]] RemoteTargetPtr rmTarget(size_t jetty_index) const;
-    [[nodiscard]] size_t importedTargetCount() const;
-
    private:
     static uint64_t allocateGeneration() noexcept;
 
@@ -173,10 +135,6 @@ class UbEndpoint final : public std::enable_shared_from_this<UbEndpoint> {
     Status resetAndUnbindLocked();
     Status deleteJettysLocked();
     Status finishRetireLocked();
-    // Unimports every imported RM target in reverse import order. Only called
-    // after the Jetty set is fenced and deleted, so no WR can still reference
-    // a target. Failed handles stay owned for a later retry.
-    Status unimportTargetsLocked();
     static void rememberFirstError(const Status& candidate, Status& first);
 
     const UbEndpointKey key_;
@@ -189,14 +147,6 @@ class UbEndpoint final : public std::enable_shared_from_this<UbEndpoint> {
     mutable std::mutex lifecycle_mutex_;
     std::vector<JettyPtr> jetties_;
     std::vector<size_t> jfc_indices_;
-    // Recomputed by resetAndUnbindLocked(): which Jettys proved drained
-    // (RESET succeeded). Only Jettys with a fresh true entry may return to
-    // the context send-Jetty pool in deleteJettysLocked().
-    std::vector<bool> jetty_reset_ok_;
-    // RM Legacy imported peer targets, positional with jetties_. Owned by
-    // this endpoint incarnation from a successful bindRm() until retirement
-    // has fenced and deleted every Jetty.
-    std::vector<RemoteTargetPtr> imported_targets_;
     UbBootstrapDesc peer_;
     Status lifecycle_status_;
     Status retire_status_;
