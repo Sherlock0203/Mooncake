@@ -609,6 +609,10 @@ struct UbTransport::Impl {
             options.desired_serving = parsed.send_pool.desired_per_context;
             options.max_creating = parsed.send_pool.max_creating_per_key;
             options.jetty_options = jetty_options;
+            // W3f: background refill/delete executors (pooling-side ef9ba164).
+            options.background_refill = parsed.send_pool.background_refill;
+            options.background_delete = parsed.send_pool.background_delete;
+            options.refill_interval_ms = parsed.send_pool.refill_interval_ms;
             auto pool = std::make_shared<ub::SendJettyPool>(
                 adapter, context->handle(), context->jfcs(), budget, device_key,
                 credits, options);

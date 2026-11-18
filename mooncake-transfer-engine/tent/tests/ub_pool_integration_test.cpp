@@ -54,7 +54,10 @@ class PooledDataPath {
                             size_t desired_serving = 2,
                             uint64_t credit_capacity = 8, bool rm_mode = false,
                             uint32_t task_k = 2, uint64_t queue_budget = 65536,
-                            size_t jfc_count = 1, size_t jetty_per_endpoint = 1)
+                            size_t jfc_count = 1, size_t jetty_per_endpoint = 1,
+                            bool background_refill = false,
+                            bool background_delete = false,
+                            uint32_t refill_interval_ms = 5)
         : adapter_(std::make_shared<FakeUrmaAdapter>(fakeDevice())),
           context_(std::make_shared<UbContext>(0, fakeDevice(), adapter_)),
           slice_timeout_ms_(slice_timeout_ms),
@@ -64,7 +67,10 @@ class PooledDataPath {
           task_k_(task_k),
           queue_budget_(queue_budget),
           jfc_count_(jfc_count),
-          jetty_per_endpoint_(jetty_per_endpoint) {
+          jetty_per_endpoint_(jetty_per_endpoint),
+          background_refill_(background_refill),
+          background_delete_(background_delete),
+          refill_interval_ms_(refill_interval_ms) {
         (void)adapter_->initialize();
         adapter_->setAutoBindCreatedJetties(true);
 
@@ -133,6 +139,9 @@ class PooledDataPath {
         SendJettyPoolOptions pool_options;
         pool_options.desired_serving = desired_serving_;
         pool_options.max_creating = 2;
+        pool_options.background_refill = background_refill_;
+        pool_options.background_delete = background_delete_;
+        pool_options.refill_interval_ms = refill_interval_ms_;
         if (rm_mode_) {
             pool_options.jetty_options.transport_mode = JettyTransportMode::kRm;
         }
@@ -279,6 +288,9 @@ class PooledDataPath {
     uint64_t queue_budget_{65536};
     size_t jfc_count_{1};
     size_t jetty_per_endpoint_{1};
+    bool background_refill_{false};
+    bool background_delete_{false};
+    uint32_t refill_interval_ms_{5};
     std::array<char, 64> source_{};
     std::array<char, 64> target_{};
     BufferDesc source_desc_{};
@@ -870,6 +882,94 @@ TEST(NativeBudgetDerivationTest, ZeroReserveStillFitsTheDeviceLimit) {
     EXPECT_EQ(derived, kVerified);
     NativeBudget budget;
     EXPECT_TRUE(budget.configure("dev", kVerified, derived, 0).ok());
+}
+
+
+// W3f (ported from the pooling side ef9ba164): background refill tops the pool
+// up to the static Serving target without any business traffic, and it must
+// stop there instead of storming the provider.
+TEST(UbPoolIntegrationTest, BackgroundRefillKeepsTheDesiredServingWithoutTraffic) {
+    PooledDataPath path(/*slice_timeout_ms=*/5000, /*desired_serving=*/2,
+                        /*credit_capacity=*/8, /*rm_mode=*/false,
+                        /*task_k=*/2, /*queue_budget=*/65536,
+                        /*jfc_count=*/1, /*jetty_per_endpoint=*/1,
+                        /*background_refill=*/true,
+                        /*background_delete=*/false,
+                        // Slow tick so the seeding attempt finishes before the
+                        // first refill: the test then pins one deterministic
+                        // top-up instead of racing a concurrent return.
+                        /*refill_interval_ms=*/100);
+    ASSERT_TRUE(path.start());
+    // Refill maintains *known* pool keys: one attempt introduces the key and
+    // leaves one idle member behind.
+    auto seed = path.makeTask(/*slice_count=*/1);
+    ASSERT_TRUE(path.workers().submit(seed).ok());
+    ASSERT_TRUE(PooledDataPath::waitFor(
+        [&] { return seed->transferStatus().s == COMPLETED; }));
+    ASSERT_TRUE(PooledDataPath::waitFor(
+        [&] { return path.pool().stats().idle_members == 2; }));
+    // A few refill intervals later the pool is still exactly at the target.
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    const auto stats = path.pool().stats();
+    EXPECT_EQ(stats.idle_members, 2U);
+    EXPECT_EQ(stats.creating_members, 0U);
+    EXPECT_EQ(stats.created_members, 2U);
+    // Only the seeding attempt leased; refill created the second member.
+    EXPECT_EQ(stats.total_leases, 1U);
+    EXPECT_EQ(path.budget().snapshot(kDeviceKey).total_jetties, 2U);
+    EXPECT_TRUE(path.stop());
+}
+
+// W3f: a retired member is deleted (and its budget released) by the background
+// delete executor, not on the completion path.
+TEST(UbPoolIntegrationTest, BackgroundDeleteReclaimsTheRetiredMemberBudget) {
+    PooledDataPath path(/*slice_timeout_ms=*/5000, /*desired_serving=*/1,
+                        /*credit_capacity=*/8, /*rm_mode=*/false,
+                        /*task_k=*/2, /*queue_budget=*/65536,
+                        /*jfc_count=*/1, /*jetty_per_endpoint=*/1,
+                        /*background_refill=*/false,
+                        /*background_delete=*/true);
+    ASSERT_TRUE(path.start());
+    path.adapter()->failNextCompletion(CompletionCategory::ENDPOINT_ERROR);
+    auto task = path.makeTask(/*slice_count=*/1);
+    ASSERT_TRUE(path.workers().submit(task).ok());
+    ASSERT_TRUE(PooledDataPath::waitFor(
+        [&] { return task->transferStatus().s != PENDING; }));
+    EXPECT_NE(task->transferStatus().s, COMPLETED);
+    // The delete executor owns reset+delete, so the budget must return to zero
+    // without the return path doing native work.
+    ASSERT_TRUE(PooledDataPath::waitFor([&] {
+        return path.budget().snapshot(kDeviceKey).total_jetties == 0;
+    }));
+    const auto stats = path.pool().stats();
+    EXPECT_EQ(stats.in_use_members, 0U);
+    EXPECT_EQ(stats.quarantined_members, 0U);
+    EXPECT_EQ(stats.leaked_leases, 0U);
+    EXPECT_EQ(stats.double_returns, 0U);
+    EXPECT_TRUE(path.stop());
+}
+
+// W3f: stop() joins both executors and leaves no lease, member or budget
+// behind (context shutdown calls beginStop/drainIdle/drainQuarantined).
+TEST(UbPoolIntegrationTest, StopJoinsBackgroundExecutorsWithoutLeaks) {
+    PooledDataPath path(/*slice_timeout_ms=*/5000, /*desired_serving=*/2,
+                        /*credit_capacity=*/8, /*rm_mode=*/false,
+                        /*task_k=*/2, /*queue_budget=*/65536,
+                        /*jfc_count=*/1, /*jetty_per_endpoint=*/1,
+                        /*background_refill=*/true,
+                        /*background_delete=*/true);
+    ASSERT_TRUE(path.start());
+    auto seed = path.makeTask(/*slice_count=*/1);
+    ASSERT_TRUE(path.workers().submit(seed).ok());
+    ASSERT_TRUE(PooledDataPath::waitFor(
+        [&] { return seed->transferStatus().s == COMPLETED; }));
+    ASSERT_TRUE(PooledDataPath::waitFor(
+        [&] { return path.pool().stats().idle_members == 2; }));
+    const auto before = path.pool().stats();
+    EXPECT_EQ(before.leaked_leases, 0U);
+    EXPECT_EQ(before.in_use_members, 0U);
+    EXPECT_TRUE(path.stop());
+    EXPECT_EQ(path.budget().snapshot(kDeviceKey).total_jetties, 0U);
 }
 
 }  // namespace

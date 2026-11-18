@@ -64,6 +64,14 @@ struct UbSendPoolParams {
     uint32_t max_creating_per_key = 2;
     // Per-JFC WR credits reserved for control records (markers, AE).
     uint32_t jfc_credit_reserve = 16;
+    // W3f background executors (ported from the pooling side `ef9ba164`).
+    // Refill keeps every known PoolKey at desired_per_context while idle and
+    // replaces retired members without waiting for the next attempt; delete
+    // moves reset+delete of retired members off the completion path. Both are
+    // off by default so deterministic paths keep synchronous accounting.
+    bool background_refill = false;
+    bool background_delete = false;
+    uint32_t refill_interval_ms = 50;
 };
 
 // Device-level native budget (C05). 0 derives the per-device budget from the
@@ -247,6 +255,16 @@ struct UbParams {
             config, "transports/ub/send_pool/jfc_credit_reserve",
             parsed.send_pool.jfc_credit_reserve,
             parsed.send_pool.jfc_credit_reserve));
+        CHECK_STATUS(readBool(config, "transports/ub/send_pool/background_refill",
+                              parsed.send_pool.background_refill,
+                              parsed.send_pool.background_refill));
+        CHECK_STATUS(readBool(config, "transports/ub/send_pool/background_delete",
+                              parsed.send_pool.background_delete,
+                              parsed.send_pool.background_delete));
+        CHECK_STATUS(readPositive(
+            config, "transports/ub/send_pool/refill_interval_ms",
+            parsed.send_pool.refill_interval_ms,
+            parsed.send_pool.refill_interval_ms));
         CHECK_STATUS(readNonNegative(
             config, "transports/ub/native_budget/max_jetty_per_device",
             parsed.native_budget.max_jetty_per_device,

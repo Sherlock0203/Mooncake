@@ -11,6 +11,7 @@
 #ifndef TENT_TRANSPORT_UB_SEND_JETTY_POOL_H_
 #define TENT_TRANSPORT_UB_SEND_JETTY_POOL_H_
 
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -18,6 +19,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -197,6 +199,16 @@ struct SendJettyPoolOptions {
     // provider.
     size_t max_creating = 2;
     JettyOptions jetty_options;
+    // W3f (ported from the pooling side `ef9ba164`): background refill keeps
+    // every known PoolKey at the desired Serving size while idle and replaces
+    // retired members without waiting for the next business attempt.
+    // Disabled by default so deterministic direct-pool users keep synchronous
+    // accounting.
+    bool background_refill = false;
+    // W3f: reset+delete of retired members runs off the completion/return
+    // path. Disabled by default for the same reason.
+    bool background_delete = false;
+    uint32_t refill_interval_ms = 50;
 };
 
 struct SendJettyPoolStats {
@@ -252,8 +264,15 @@ class SendJettyPool final {
     // member never returns to the pool, even if the path recovers).
     Status retireFaulted(SliceJettyLease lease, const std::string& reason);
 
-    // Stops new leases/creations. Outstanding leases still settle through
-    // returnOnce()/retireFaulted(); their members are retired, never reused.
+    // W3f: stops both executors (when enabled), joins them and drains pending
+    // asynchronous deletes. The context normally calls beginStop()/drainIdle()/
+    // drainQuarantined() first; the destructor is the final safety net.
+    ~SendJettyPool();
+
+    // Stops new leases/creations and joins both background executors (when
+    // enabled), draining pending asynchronous deletes synchronously.
+    // Outstanding leases still settle through returnOnce()/retireFaulted();
+    // their members are retired synchronously, never reused.
     void beginStop();
     [[nodiscard]] bool stopping() const;
 
@@ -281,6 +300,15 @@ class SendJettyPool final {
     // credit and pool-idle misses share the kPoolIdle defer bucket (§18-2).
     [[nodiscard]] size_t idleCount(const PoolKey& pool_key) const;
     [[nodiscard]] size_t creatingCount(const PoolKey& pool_key) const;
+
+    // ---- W3f background executors (ported from ef9ba164) ------------------
+    // Both loops run outside the pool lock for every provider call and exit
+    // on their stop flag. stop*() join the thread and leave no delete-ready
+    // member behind.
+    void refillLoop();
+    void deleteLoop();
+    void stopRefillExecutor();
+    void stopDeleteExecutor();
 
     // The JFC credit ledger shared by every lease of this pool. Credits are
     // released by the caller (completion or rollback path), never by the pool.
@@ -318,6 +346,18 @@ class SendJettyPool final {
     uint64_t next_lane_generation_ = 1;
     size_t next_jfc_rotation_ = 0;
     bool stopping_ = false;
+
+    // ---- W3f background executors (ported from ef9ba164) ------------------
+    // delete_ready_ is the hand-off queue between the return/completion path
+    // and the delete executor; the executor owns native destruction from the
+    // moment a member enters it (state kDeleteReady).
+    std::thread refill_thread_;
+    std::thread delete_thread_;
+    std::condition_variable refill_cv_;
+    std::condition_variable delete_cv_;
+    std::vector<std::shared_ptr<PoolMember>> delete_ready_;
+    bool refill_stop_ = false;
+    bool delete_stop_ = false;
 
     // Diagnostics counters (protected by mutex_).
     uint64_t total_leases_ = 0;
