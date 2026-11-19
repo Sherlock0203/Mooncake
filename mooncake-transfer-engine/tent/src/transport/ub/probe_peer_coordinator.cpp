@@ -182,6 +182,40 @@ void ProbePeerCoordinator::tickChain() {
                   << publication_epoch << "; refreshing every peer";
     }
     processDue();
+    if (now - last_summary_ns_ >= 30'000'000'000ULL) {
+        last_summary_ns_ = now;
+        const auto stats = this->stats();
+        uint64_t max_age_ns = 0;
+        uint64_t stale_peers = 0;
+        for (const auto& binding : deps_.registry->snapshot()) {
+            if (!binding.published) continue;
+            if (binding.stale) ++stale_peers;
+            if (binding.last_success_ns != 0 && now > binding.last_success_ns) {
+                max_age_ns =
+                    std::max(max_age_ns, now - binding.last_success_ns);
+            }
+        }
+        LOG(INFO) << "UB probe handshake summary:"
+                  << " attempt=" << stats.attempts
+                  << " success=" << stats.success
+                  << " failure=" << stats.failure
+                  << " timeout=" << stats.timeout
+                  << " skipped_inflight=" << stats.skipped_inflight
+                  << " peer_unresolved=" << stats.peer_unresolved
+                  << " unsupported=" << stats.unsupported
+                  << " not_ready=" << stats.not_ready
+                  << " publication_apply=" << stats.publication_apply
+                  << " unchanged=" << stats.publication_unchanged
+                  << " stale=" << stats.publication_stale
+                  << " unknown_port=" << stats.publication_unknown_port
+                  << " identity_mismatch="
+                  << stats.publication_identity_mismatch
+                  << " graph_event_failed=" << stats.graph_event_failed
+                  << " refresh_hint=" << stats.refresh_hint
+                  << " publication_bump=" << stats.publication_bump
+                  << " peer_publication_stale=" << stale_peers
+                  << " publication_age_ns_max=" << max_age_ns;
+    }
     scheduleTick(params_.handshakeRefreshNs());
 }
 
@@ -454,6 +488,11 @@ Status ProbePeerCoordinator::applyResponse(
         }
     }
     if (!applied) return Status::OK();
+    LOG(INFO) << "UB probe publication applied: peer=" << peer
+              << " node_incarnation=" << binding.node_incarnation
+              << " topology_epoch=" << binding.topology_epoch
+              << " publication_epoch=" << binding.publication_epoch
+              << " ports=" << matched;
     status = deps_.provider->refreshPeerEdges();
     if (!status.ok()) {
         std::lock_guard<std::mutex> lock(mutex_);

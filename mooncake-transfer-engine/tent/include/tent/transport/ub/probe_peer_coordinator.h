@@ -127,6 +127,7 @@ class ProbePeerCoordinator {
     std::atomic<bool> stopping_{false};
     size_t round_robin_{0};
     uint64_t last_local_publication_epoch_{0};
+    uint64_t last_summary_ns_{0};
     ProbeCoordinatorStats stats_;
 };
 

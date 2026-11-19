@@ -608,8 +608,12 @@ TEST(UbProbeIntegrationTest, DeclaredProbeTopologyInstallsWithAnEmptyGraph) {
     // port and zero edges, and the coordinator retries in the background.
     EXPECT_EQ(transport.probeLinkCount(), 0U);
     EXPECT_GE(transport.probeGeneration(), 1U);
+    const auto topology_stats = transport.probeTopologyStats();
+    EXPECT_EQ(topology_stats.ports, 1U);
+    EXPECT_EQ(topology_stats.edges, 1U);
 
     ASSERT_TRUE(transport.uninstall().ok());
+    EXPECT_EQ(transport.probeTopologyStats().ports, 0U);
 }
 
 TEST(UbProbeIntegrationTest, StandaloneProbeWithoutPeerSourceFailsInstall) {

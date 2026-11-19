@@ -131,8 +131,8 @@ TEST(UbProbeHandshakeTest, OneBadDescriptorDoesNotDropTheSnapshot) {
     auto malformed = makePeer(0, 43, 1);
     malformed.area_length = 0;
     auto unknown_local = makePeer(9, 44, 0);
-    StubPeerSource source({makePeer(0, 42, 0), malformed, unknown_local,
-                           makePeer(0, 42, 0)});
+    StubPeerSource source(
+        {makePeer(0, 42, 0), malformed, unknown_local, makePeer(0, 42, 0)});
     HandshakeProbePeerDirectory directory(adapter, {{0, context}}, &source);
 
     std::vector<ProbeEdgeSupply> edges;

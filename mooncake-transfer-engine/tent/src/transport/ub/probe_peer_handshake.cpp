@@ -85,10 +85,9 @@ Status HandshakeProbePeerDirectory::snapshotEdges(
         }
         EdgeKey key{};
         const bool has_key = key_of(descriptor, key);
-        const bool valid =
-            has_key && descriptor.area_length != 0 &&
-            descriptor.area_epoch != 0 &&
-            !descriptor.area_descriptor.hex.empty();
+        const bool valid = has_key && descriptor.area_length != 0 &&
+                           descriptor.area_epoch != 0 &&
+                           !descriptor.area_descriptor.hex.empty();
         if (!valid) {
             ++malformed_descriptor_count_;
             LOG_EVERY_N(WARNING, 100)

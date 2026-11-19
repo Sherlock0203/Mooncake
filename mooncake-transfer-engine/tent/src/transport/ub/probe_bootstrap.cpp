@@ -65,10 +65,10 @@ void decodeArea(const json& area, ProbeBootstrapPort& port) {
     }
     port.area_descriptor.schema_version =
         static_cast<uint32_t>(readUnsigned(*descriptor, "schema_version", 0));
-    port.area_descriptor.urma_api_version = static_cast<uint32_t>(
-        readUnsigned(*descriptor, "urma_api_version", 0));
-    port.area_descriptor.urma_abi_size = static_cast<uint32_t>(
-        readUnsigned(*descriptor, "urma_abi_size", 0));
+    port.area_descriptor.urma_api_version =
+        static_cast<uint32_t>(readUnsigned(*descriptor, "urma_api_version", 0));
+    port.area_descriptor.urma_abi_size =
+        static_cast<uint32_t>(readUnsigned(*descriptor, "urma_abi_size", 0));
     port.area_descriptor.hex = readString(*descriptor, "hex");
     port.area_length = readUnsigned(area, "length", 0);
     port.area_epoch = readUnsigned(area, "epoch", 0);
@@ -76,21 +76,18 @@ void decodeArea(const json& area, ProbeBootstrapPort& port) {
 }
 
 json encodePort(const ProbeBootstrapPort& port) {
-    return json{
-        {"port_id", port.port_id},
-        {"topology_name", port.topology_name},
-        {"eid", port.eid},
-        {"target_epoch", port.target_epoch},
-        {"jetty",
-         json{{"eid", port.jetty.eid},
-              {"uasid", port.jetty.uasid},
-              {"id", port.jetty.id},
-              {"token", port.jetty.token}}},
-        {"area", encodeArea(port)},
-        {"gates",
-         json{{"node", port.node_gate_ok},
-              {"port", port.port_gate_ok},
-              {"profile", port.profile_gate_ok}}}};
+    return json{{"port_id", port.port_id},
+                {"topology_name", port.topology_name},
+                {"eid", port.eid},
+                {"target_epoch", port.target_epoch},
+                {"jetty", json{{"eid", port.jetty.eid},
+                               {"uasid", port.jetty.uasid},
+                               {"id", port.jetty.id},
+                               {"token", port.jetty.token}}},
+                {"area", encodeArea(port)},
+                {"gates", json{{"node", port.node_gate_ok},
+                               {"port", port.port_gate_ok},
+                               {"profile", port.profile_gate_ok}}}};
 }
 
 void decodePort(const json& value, ProbeBootstrapPort& port) {
@@ -106,8 +103,7 @@ void decodePort(const json& value, ProbeBootstrapPort& port) {
     port.jetty.eid = readString(*jetty, "eid");
     port.jetty.uasid = static_cast<uint32_t>(readUnsigned(*jetty, "uasid", 0));
     port.jetty.id = static_cast<uint32_t>(readUnsigned(*jetty, "id", 0));
-    port.jetty.token =
-        static_cast<uint32_t>(readUnsigned(*jetty, "token", 0));
+    port.jetty.token = static_cast<uint32_t>(readUnsigned(*jetty, "token", 0));
     const auto area = value.find("area");
     if (area == value.end()) throw std::runtime_error("port.area is missing");
     decodeArea(*area, port);
@@ -130,16 +126,15 @@ json encodeRequest(const ProbeBootstrapRequest& request) {
         }
         peers[peer] = std::move(list);
     }
-    return json{{"schema_version", request.schema_version},
-                {"requester_segment", request.requester_segment},
-                {"requester_node_incarnation",
-                 request.requester_node_incarnation},
-                {"requester_topology_epoch", request.requester_topology_epoch},
-                {"requester_publication_epoch",
-                 request.requester_publication_epoch},
-                {"declared_local_ports", request.declared_local_ports},
-                {"ports", std::move(ports)},
-                {"declared_peers", std::move(peers)}};
+    return json{
+        {"schema_version", request.schema_version},
+        {"requester_segment", request.requester_segment},
+        {"requester_node_incarnation", request.requester_node_incarnation},
+        {"requester_topology_epoch", request.requester_topology_epoch},
+        {"requester_publication_epoch", request.requester_publication_epoch},
+        {"declared_local_ports", request.declared_local_ports},
+        {"ports", std::move(ports)},
+        {"declared_peers", std::move(peers)}};
 }
 
 json encodeResponse(const ProbeBootstrapResponse& response) {
@@ -157,7 +152,8 @@ json encodeResponse(const ProbeBootstrapResponse& response) {
 }
 
 Status validatePort(const ProbeBootstrapPort& port, const char* side) {
-    if (port.port_id.empty()) return invalid(std::string(side) + " has an empty port_id");
+    if (port.port_id.empty())
+        return invalid(std::string(side) + " has an empty port_id");
     if (port.topology_name.empty()) {
         return invalid(std::string(side) + " has an empty topology_name");
     }
@@ -179,8 +175,7 @@ Status validatePort(const ProbeBootstrapPort& port, const char* side) {
 
 }  // namespace
 
-ProbeBootstrapPort toProbeBootstrapPort(
-    const ProbeLocalPortPublication& port) {
+ProbeBootstrapPort toProbeBootstrapPort(const ProbeLocalPortPublication& port) {
     ProbeBootstrapPort wire;
     wire.port_id = port.port_id;
     wire.topology_name = port.topology_name;
@@ -300,8 +295,8 @@ Status decodeProbeBootstrapRequest(std::string_view input,
         const auto value = json::parse(input.begin(), input.end());
         if (!value.is_object()) return invalid("request must be an object");
         ProbeBootstrapRequest request;
-        request.schema_version = static_cast<uint32_t>(
-            readUnsigned(value, "schema_version", 0));
+        request.schema_version =
+            static_cast<uint32_t>(readUnsigned(value, "schema_version", 0));
         request.requester_segment = readString(value, "requester_segment");
         request.requester_node_incarnation =
             readUnsigned(value, "requester_node_incarnation", 0);
@@ -340,8 +335,7 @@ Status decodeProbeBootstrapRequest(std::string_view input,
                         return invalid("declared_peers ports must be objects");
                     }
                     ports.push_back(ProbeBootstrapPeerPort{
-                        readString(entry, "id"),
-                        readString(entry, "eid")});
+                        readString(entry, "id"), readString(entry, "eid")});
                 }
                 request.declared_peers.emplace(peer.key(), std::move(ports));
             }
@@ -349,8 +343,7 @@ Status decodeProbeBootstrapRequest(std::string_view input,
         output = std::move(request);
     } catch (const std::exception& error) {
         return Status::MalformedJson(
-            std::string("Malformed ProbeBootstrapUb request: ") +
-            error.what());
+            std::string("Malformed ProbeBootstrapUb request: ") + error.what());
     }
     return Status::OK();
 }
@@ -373,8 +366,8 @@ Status decodeProbeBootstrapResponse(std::string_view input,
         const auto value = json::parse(input.begin(), input.end());
         if (!value.is_object()) return invalid("response must be an object");
         ProbeBootstrapResponse response;
-        response.schema_version = static_cast<uint32_t>(
-            readUnsigned(value, "schema_version", 0));
+        response.schema_version =
+            static_cast<uint32_t>(readUnsigned(value, "schema_version", 0));
         response.reply_msg = readString(value, "reply_msg");
         response.responder_segment = readString(value, "responder_segment");
         response.node_incarnation = readUnsigned(value, "node_incarnation", 0);

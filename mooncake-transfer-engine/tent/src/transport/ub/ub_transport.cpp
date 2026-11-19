@@ -1806,6 +1806,18 @@ uint64_t UbTransport::probeGeneration() const {
     return impl_->probe_manager ? impl_->probe_manager->probeGeneration() : 0;
 }
 
+ub::ProbeTopologyStats UbTransport::probeTopologyStats() const {
+    std::lock_guard<std::mutex> lock(impl_->lifecycle_mutex);
+    if (!impl_->probe_topology) return ub::ProbeTopologyStats{};
+    return impl_->probe_topology->stats();
+}
+
+ub::ProbeCoordinatorStats UbTransport::probeCoordinatorStats() const {
+    std::lock_guard<std::mutex> lock(impl_->lifecycle_mutex);
+    if (!impl_->probe_coordinator) return ub::ProbeCoordinatorStats{};
+    return impl_->probe_coordinator->stats();
+}
+
 uint64_t UbTransport::poolGeneration() const {
     std::lock_guard<std::mutex> lock(impl_->lifecycle_mutex);
     uint64_t generation = 0;

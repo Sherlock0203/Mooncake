@@ -97,6 +97,11 @@ Status ProbePeerRegistry::apply(const ProbePeerBinding& publication,
         } else {
             ++port.missing_publications;
             if (port.missing_publications >= withdraw_grace_) {
+                if (!port.withdrawn) {
+                    LOG(WARNING) << "UB probe port withdrawn: peer="
+                                 << publication.segment << " port=" << port.id
+                                 << " missing=" << port.missing_publications;
+                }
                 port.withdrawn = true;
             }
         }

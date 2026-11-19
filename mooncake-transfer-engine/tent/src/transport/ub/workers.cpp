@@ -813,6 +813,25 @@ void UbWorkers::logBusinessSummary(uint64_t now_ns) {
               << ",settled_late=" << drain.drained_after_settle
               << ",supported=" << (drain.async_drain_supported ? 1 : 0)
               << ",disabled=" << drain.async_drain_disabled << "}";
+    if (probe_topology_ != nullptr) {
+        const auto probe = probe_topology_->stats();
+        LOG(INFO) << "UB probe topology: ports=" << probe.ports
+                  << " edges=" << probe.edges
+                  << " adjacency_allowed=" << probe.adjacency_allowed
+                  << " adjacency_undeclared_peer="
+                  << probe.adjacency_undeclared_peer
+                  << " adjacency_undeclared_local="
+                  << probe.adjacency_undeclared_local
+                  << " adjacency_undeclared_remote="
+                  << probe.adjacency_undeclared_remote
+                  << " adjacency_peer_eid_unmatched="
+                  << probe.adjacency_peer_eid_unmatched
+                  << " adjacency_port_missing=" << probe.adjacency_port_missing
+                  << " adjacency_peer_gate_blocked="
+                  << probe.adjacency_peer_gate_blocked
+                  << " adjacency_unverified_peer="
+                  << probe.adjacency_unverified_peer;
+    }
 }
 
 bool UbWorkers::pollBusinessSlot(size_t slot_index) {
@@ -1303,6 +1322,11 @@ Status UbWorkers::chooseAndResolveEndpoint(
             bool local_declared = false;
             const auto decision =
                 route.adjacency.check(local.id, remote_id, &local_declared);
+            if (probe_topology_ != nullptr) {
+                probe_topology_->recordAdjacency(
+                    decision, decision == AdjacencyDecision::kAllowed &&
+                                  !route.adjacency.publication_seen);
+            }
             if (decision != AdjacencyDecision::kAllowed) {
                 if (!adjacency_screened_out) {
                     first_adjacency_denial = decision;

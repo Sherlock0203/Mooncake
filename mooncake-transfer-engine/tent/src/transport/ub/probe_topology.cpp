@@ -68,6 +68,72 @@ std::optional<Topology::NicID> remoteNicForEid(const Topology& topology,
 
 }  // namespace
 
+void ProbeTopology::recordAdjacency(AdjacencyDecision decision,
+                                    bool unverified) const {
+    size_t index = kAllowedIndex;
+    switch (decision) {
+        case AdjacencyDecision::kAllowed:
+            index = kAllowedIndex;
+            break;
+        case AdjacencyDecision::kUndeclaredPeer:
+            index = kUndeclaredPeerIndex;
+            break;
+        case AdjacencyDecision::kUndeclaredLocal:
+            index = kUndeclaredLocalIndex;
+            break;
+        case AdjacencyDecision::kUndeclaredRemote:
+            index = kUndeclaredRemoteIndex;
+            break;
+        case AdjacencyDecision::kPeerEidUnmatched:
+            index = kPeerEidUnmatchedIndex;
+            break;
+        case AdjacencyDecision::kPortMissing:
+            index = kPortMissingIndex;
+            break;
+        case AdjacencyDecision::kPeerGateBlocked:
+            index = kPeerGateBlockedIndex;
+            break;
+    }
+    counters_->decision[index].fetch_add(1, std::memory_order_relaxed);
+    if (unverified) {
+        counters_->unverified.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+ProbeTopologyStats ProbeTopology::stats() const {
+    ProbeTopologyStats result;
+    result.ports = ports_.size();
+    for (const auto& [peer, edges] : adjacency_) {
+        (void)peer;
+        for (const auto& [local_id, remote_ids] : edges) {
+            (void)local_id;
+            result.edges += remote_ids.size();
+        }
+    }
+    result.adjacency_allowed =
+        counters_->decision[kAllowedIndex].load(std::memory_order_relaxed);
+    result.adjacency_undeclared_peer =
+        counters_->decision[kUndeclaredPeerIndex].load(
+            std::memory_order_relaxed);
+    result.adjacency_undeclared_local =
+        counters_->decision[kUndeclaredLocalIndex].load(
+            std::memory_order_relaxed);
+    result.adjacency_undeclared_remote =
+        counters_->decision[kUndeclaredRemoteIndex].load(
+            std::memory_order_relaxed);
+    result.adjacency_peer_eid_unmatched =
+        counters_->decision[kPeerEidUnmatchedIndex].load(
+            std::memory_order_relaxed);
+    result.adjacency_port_missing =
+        counters_->decision[kPortMissingIndex].load(std::memory_order_relaxed);
+    result.adjacency_peer_gate_blocked =
+        counters_->decision[kPeerGateBlockedIndex].load(
+            std::memory_order_relaxed);
+    result.adjacency_unverified_peer =
+        counters_->unverified.load(std::memory_order_relaxed);
+    return result;
+}
+
 AdjacencyDecision AdjacencyView::check(Topology::NicID local_nic,
                                        Topology::NicID remote_nic,
                                        bool* local_declared) const {

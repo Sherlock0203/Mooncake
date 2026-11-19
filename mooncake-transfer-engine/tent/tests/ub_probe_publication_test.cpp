@@ -49,8 +49,7 @@ ProbeBootstrapRequest makeRequest() {
     request.requester_publication_epoch = 7;
     request.declared_local_ports = {"P0"};
     request.ports = {makePort("P0", kEidA)};
-    request.declared_peers = {
-        {"node-b", {{"R0", kEidB}}}};
+    request.declared_peers = {{"node-b", {{"R0", kEidB}}}};
     return request;
 }
 
@@ -88,8 +87,7 @@ TEST(UbProbeBootstrapTest, RequestRoundTripsAndValidates) {
     EXPECT_EQ(decoded.ports[0].target_epoch, 3U);
     EXPECT_EQ(decoded.ports[0].jetty.id, 4097U);
     EXPECT_EQ(decoded.ports[0].area_length, 4096U);
-    EXPECT_EQ(decoded.ports[0].area_descriptor.hex,
-              descriptor().hex);
+    EXPECT_EQ(decoded.ports[0].area_descriptor.hex, descriptor().hex);
     ASSERT_EQ(decoded.declared_peers.count("node-b"), 1U);
     EXPECT_EQ(decoded.declared_peers.at("node-b")[0].eid, kEidB);
     EXPECT_TRUE(validateProbeBootstrapRequest(decoded).ok());
@@ -197,8 +195,7 @@ TEST(UbProbeBootstrapTest, DecodesMalformedJsonWithoutThrowing) {
     EXPECT_FALSE(decodeProbeBootstrapResponse("[]", response).ok());
     EXPECT_TRUE(
         decodeProbeBootstrapResponse("{bad", response).IsMalformedJson());
-    EXPECT_TRUE(
-        decodeProbeBootstrapResponse("{}", response).ok());
+    EXPECT_TRUE(decodeProbeBootstrapResponse("{}", response).ok());
     // A decoded empty response fails the semantic validator, not the codec.
     EXPECT_FALSE(validateProbeBootstrapResponse(response).ok());
 }

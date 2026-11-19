@@ -820,7 +820,18 @@ Status StandaloneProbeResourceProvider::applyEdgeDiffLocked(
         event.version = version;
         event.edge = edge;
         auto status = availability_sink_->onPoolAvailabilityChange(event);
-        if (status.ok()) ++event_seq_;
+        if (status.ok()) {
+            ++event_seq_;
+            LOG(INFO) << "UB probe graph event: kind="
+                      << probeEventKindName(kind)
+                      << " peer=" << edge.peer.segment_id
+                      << " local_nic=" << edge.version.path.local_nic
+                      << " remote_nic=" << edge.version.path.remote_nic
+                      << " topology_epoch=" << edge.version.topology_epoch
+                      << " target_epoch=" << edge.version.target_epoch
+                      << " area_epoch=" << edge.area_epoch
+                      << " event_seq=" << event_seq_;
+        }
         return status;
     };
     const auto same_volatile = [](const ProbeEdgeSupply& lhs,

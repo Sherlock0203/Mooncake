@@ -11,7 +11,9 @@
 
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/transport.h"
+#include "tent/transport/ub/probe_peer_coordinator.h"
 #include "tent/transport/ub/probe_resources.h"
+#include "tent/transport/ub/probe_topology.h"
 
 namespace mooncake::tent {
 
@@ -89,6 +91,11 @@ class UbTransport final : public Transport {
     [[nodiscard]] bool probeStopped() const;
     // Current probe graph generation, for log correlation.
     [[nodiscard]] uint64_t probeGeneration() const;
+    // Declared adjacency counters (design §11). Zeroed when no declaration
+    // was installed or after uninstall.
+    [[nodiscard]] ub::ProbeTopologyStats probeTopologyStats() const;
+    // Probe handshake/publication counters.
+    [[nodiscard]] ub::ProbeCoordinatorStats probeCoordinatorStats() const;
     // Largest installed Context incarnation. Pool members are keyed by it, so
     // a summary that prints it can be correlated with a pool generation.
     [[nodiscard]] uint64_t poolGeneration() const;

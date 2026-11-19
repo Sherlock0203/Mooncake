@@ -17,6 +17,8 @@
 #ifndef TENT_TRANSPORT_UB_PROBE_TOPOLOGY_H_
 #define TENT_TRANSPORT_UB_PROBE_TOPOLOGY_H_
 
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -110,6 +112,19 @@ struct AdjacencyView {
                                           bool* local_declared = nullptr) const;
 };
 
+struct ProbeTopologyStats {
+    uint64_t ports{0};
+    uint64_t edges{0};
+    uint64_t adjacency_allowed{0};
+    uint64_t adjacency_undeclared_peer{0};
+    uint64_t adjacency_undeclared_local{0};
+    uint64_t adjacency_undeclared_remote{0};
+    uint64_t adjacency_peer_eid_unmatched{0};
+    uint64_t adjacency_port_missing{0};
+    uint64_t adjacency_peer_gate_blocked{0};
+    uint64_t adjacency_unverified_peer{0};
+};
+
 // Immutable after resolve(); shared by the workers' read-only routing gate.
 class ProbeTopology {
    public:
@@ -170,6 +185,11 @@ class ProbeTopology {
     void setPeerRegistry(const ProbePeerRegistry* registry) {
         peer_registry_ = registry;
     }
+
+    // Observability only (design §11). Safe on the business hot path: one
+    // relaxed atomic increment per candidate decision.
+    void recordAdjacency(AdjacencyDecision decision, bool unverified) const;
+    [[nodiscard]] ProbeTopologyStats stats() const;
     [[nodiscard]] std::optional<Topology::NicID> localNic(
         const std::string& local_id) const {
         auto found = bindings_.find(local_id);
@@ -200,6 +220,23 @@ class ProbeTopology {
     std::map<std::string, std::map<std::string, std::vector<std::string>>>
         adjacency_;
     const ProbePeerRegistry* peer_registry_{nullptr};
+    enum DecisionIndex : size_t {
+        kAllowedIndex = 0,
+        kUndeclaredPeerIndex,
+        kUndeclaredLocalIndex,
+        kUndeclaredRemoteIndex,
+        kPeerEidUnmatchedIndex,
+        kPortMissingIndex,
+        kPeerGateBlockedIndex,
+        kDecisionIndexCount,
+    };
+    // Atomics live behind a shared pointer so ProbeTopology itself stays
+    // movable (resolve() builds a temporary and returns it).
+    struct Counters {
+        std::array<std::atomic<uint64_t>, kDecisionIndexCount> decision{};
+        std::atomic<uint64_t> unverified{0};
+    };
+    std::shared_ptr<Counters> counters_{std::make_shared<Counters>()};
 };
 
 }  // namespace ub
