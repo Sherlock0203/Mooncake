@@ -43,6 +43,7 @@
 #include "tent/transport/ub/probe_peer_handshake.h"
 #include "tent/transport/ub/quota.h"
 #include "tent/transport/ub/rail_monitor.h"
+#include "tent/transport/ub/topology_attrs.h"
 #include "tent/transport/ub/ub_transport.h"
 #include "tent/transport/ub/workers.h"
 #include "ub_fake_topology.h"
@@ -593,7 +594,7 @@ TEST(UbProbeIntegrationTest, DeclaredProbeTopologyInstallsWithAnEmptyGraph) {
                   nlohmann::json::array({nlohmann::json{
                       {"id", "R0"},
                       {"eid",
-                       "0000:0000:0000:0000:0000:0000:0000:0020"}}})}}}});
+                       "0001:0000:0000:0000:0000:0000:0000:0020"}}})}}}});
     config->set(
         "transports/ub/probe/adjacency",
         nlohmann::json{
@@ -612,8 +613,106 @@ TEST(UbProbeIntegrationTest, DeclaredProbeTopologyInstallsWithAnEmptyGraph) {
     EXPECT_EQ(topology_stats.ports, 1U);
     EXPECT_EQ(topology_stats.edges, 1U);
 
+    // G-1: the published local segment must carry the trusted kind, not the
+    // raw discovery "unknown".
+    const auto local_segment = control->segmentManager().getLocal();
+    ASSERT_NE(local_segment, nullptr);
+    bool found_kind = false;
+    for (const auto& nic : local_segment->getMemory().topology.nic_list_) {
+        if (nic.type != Topology::NIC_UB || nic.name != device.topology_name) {
+            continue;
+        }
+        auto kind = nic.device_attrs.find(std::string(kTopologyDeviceKindAttr));
+        ASSERT_NE(kind, nic.device_attrs.end());
+        EXPECT_EQ(kind->second, "physical");
+        found_kind = true;
+    }
+    EXPECT_TRUE(found_kind);
+
     ASSERT_TRUE(transport.uninstall().ok());
     EXPECT_EQ(transport.probeTopologyStats().ports, 0U);
+}
+
+TEST(UbProbeIntegrationTest, DeclaredModeOnlyOpensDeclaredBusinessContexts) {
+    auto declared = fakeDevice();
+    declared.kind = DeviceKind::PHYSICAL;
+    declared.capabilities.transport_modes = 3;
+    declared.capabilities.max_jfc = 4;
+    declared.capabilities.max_jetty = 64;
+    declared.capabilities.rm_tp_cap = kUrmaTpTypeCtpMask;
+    declared.capabilities.priority_tp_type_masks[kUrmaMaxPriority] =
+        kUrmaTpTypeCtpMask;
+    auto extra = fakeDevice();
+    extra.topology_name = "ub:fake1:eid0";
+    extra.native_device_name = "fake1";
+    extra.native_device_path = "/fake/fake1";
+    extra.eid = "0002:0000:0000:0000:0000:0000:0000:0000";
+    extra.kind = DeviceKind::PHYSICAL;
+    extra.capabilities.transport_modes = 3;
+    extra.capabilities.max_jfc = 4;
+    extra.capabilities.max_jetty = 64;
+    extra.capabilities.rm_tp_cap = kUrmaTpTypeCtpMask;
+    extra.capabilities.priority_tp_type_masks[kUrmaMaxPriority] =
+        kUrmaTpTypeCtpMask;
+
+    auto adapter = std::make_shared<FakeUrmaAdapter>(declared);
+    adapter->setDiscoveredDevices({declared, extra});
+    auto topology = std::make_shared<Topology>();
+    for (const auto& device : std::vector<DeviceInfo>{declared, extra}) {
+        Topology::NicEntry nic;
+        nic.name = device.topology_name;
+        nic.type = Topology::NIC_UB;
+        nic.numa_node = 0;
+        encodeTopologyDeviceAttributes(device, 0, nic.device_attrs);
+        topology->nic_list_.push_back(std::move(nic));
+    }
+    Topology::MemEntry memory;
+    memory.name = kWildcardLocation;
+    memory.type = Topology::MEM_HOST;
+    memory.numa_node = -1;
+    memory.device_list[0].push_back(0);
+    memory.device_list[0].push_back(1);
+    topology->mem_list_.push_back(std::move(memory));
+
+    std::string segment_name;
+    auto control = startFakeControl(topology, segment_name);
+    ASSERT_NE(control, nullptr);
+    auto config = makeTransportConfig(/*probe_enabled=*/true);
+    config->set("transports/ub/runtime_profile", "rm_legacy");
+    config->set("transports/ub/trans_mode", "rm");
+    config->set("transports/ub/physical_only", true);
+    config->set("transports/ub/probe/provider", "standalone");
+    config->set("transports/ub/probe/local_ports",
+                nlohmann::json::array({nlohmann::json{
+                    {"id", "P0"}, {"bind", declared.topology_name}}}));
+    config->set(
+        "transports/ub/probe/peers",
+        nlohmann::json{
+            {"node-b",
+             nlohmann::json{
+                 {"ports",
+                  nlohmann::json::array({nlohmann::json{
+                      {"id", "R0"},
+                      {"eid",
+                       "0001:0000:0000:0000:0000:0000:0000:0020"}}})}}}});
+    config->set(
+        "transports/ub/probe/adjacency",
+        nlohmann::json{
+            {"node-b", nlohmann::json{{"P0", nlohmann::json::array({"R0"})}}}});
+
+    UbTransport transport(adapter);
+    std::string mutable_segment_name = segment_name;
+    ASSERT_TRUE(
+        transport.install(mutable_segment_name, control, topology, config)
+            .ok());
+    EXPECT_EQ(transport.probeTopologyStats().ports, 1U);
+    // One business JFC for P0 + one probe JFC; the undeclared device never
+    // gets a context or JFC.
+    EXPECT_EQ(adapter->liveJfcCount(), 2U);
+    EXPECT_EQ(adapter->liveJettyCount(), 1U);
+    ASSERT_TRUE(transport.uninstall().ok());
+    EXPECT_EQ(adapter->liveJfcCount(), 0U);
+    EXPECT_EQ(adapter->liveLocalSegmentCount(), 0U);
 }
 
 TEST(UbProbeIntegrationTest, StandaloneProbeWithoutPeerSourceFailsInstall) {

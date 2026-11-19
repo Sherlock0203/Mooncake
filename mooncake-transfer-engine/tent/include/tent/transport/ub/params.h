@@ -1320,6 +1320,17 @@ struct UbParams {
                               "require_peer_ports",
                               probe.handshake.require_peer_ports,
                               probe.handshake.require_peer_ports));
+        CHECK_STATUS(readBool(
+            config,
+            "transports/ub/probe/adjacency_policy/require_same_eid_scope",
+            probe.adjacency_policy.require_same_eid_scope,
+            probe.adjacency_policy.require_same_eid_scope));
+        CHECK_STATUS(readNonNegative(
+            config,
+            "transports/ub/probe/adjacency_policy/"
+            "param_error_invalidate_threshold",
+            probe.adjacency_policy.param_error_invalidate_threshold,
+            probe.adjacency_policy.param_error_invalidate_threshold));
         CHECK_STATUS(readPositive(config,
                                   "transports/ub/probe/handshake/"
                                   "withdraw_grace",

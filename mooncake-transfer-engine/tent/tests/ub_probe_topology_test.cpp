@@ -207,6 +207,99 @@ TEST(UbProbeTopologyTest, EidsAreMatchedCaseInsensitively) {
               AdjacencyDecision::kAllowed);
 }
 
+TEST(UbProbeTopologyTest, ApplyUbNicKindsPublishesTrustedKind) {
+    Topology topology;
+    auto device = makeDevice("udma0", kEid0, 0);
+    device.kind = DeviceKind::UNKNOWN;
+    device.kind_source = DeviceKindSource::NONE;
+    addUbNic(topology, device);
+    ASSERT_EQ(topology.nic_list_[0]
+                  .device_attrs[std::string(kTopologyDeviceKindAttr)],
+              "unknown");
+
+    const std::vector<Topology::UbNicKindOverride> overrides{
+        {device.topology_name, "physical", "explicit_config"}};
+    ASSERT_TRUE(topology.applyUbDeviceKinds(overrides).ok());
+    EXPECT_EQ(topology.nic_list_[0]
+                  .device_attrs[std::string(kTopologyDeviceKindAttr)],
+              "physical");
+    EXPECT_EQ(topology.nic_list_[0]
+                  .device_attrs[std::string(kTopologyDeviceKindSourceAttr)],
+              "explicit_config");
+
+    // An unknown name and a non-UB NIC are never touched.
+    Topology other;
+    auto rdma = makeDevice("udma1", kEid1, 0);
+    other.nic_list_.push_back(Topology::NicEntry{
+        .name = rdma.topology_name,
+        .pci_bus_id = "",
+        .type = Topology::NIC_RDMA,
+        .numa_node = 0,
+        .device_attrs = {{std::string(kTopologyDeviceKindAttr), "unknown"}}});
+    ASSERT_TRUE(topology.applyUbDeviceKinds(overrides).ok());
+    EXPECT_EQ(
+        other.nic_list_[0].device_attrs[std::string(kTopologyDeviceKindAttr)],
+        "unknown");
+}
+
+TEST(UbProbeTopologyTest, EidScopeUsesTheEidPrefix) {
+    const auto same = eidScopeForEid("0000:0000:0004:0200:0010:0000:df00:4500");
+    const auto same_peer =
+        eidScopeForEid("0000:0000:0004:0200:0010:0000:df00:c500");
+    const auto other =
+        eidScopeForEid("0000:0000:0004:0200:0010:0000:df04:c500");
+    ASSERT_TRUE(same.trusted);
+    ASSERT_TRUE(same_peer.trusted);
+    ASSERT_TRUE(other.trusted);
+    EXPECT_EQ(same.key, same_peer.key);
+    EXPECT_NE(same.key, other.key);
+    EXPECT_FALSE(eidScopeForEid("bad-eid").trusted);
+}
+
+TEST(UbProbeTopologyTest, CrossScopeEdgeFailsInstallUnlessDisabled) {
+    Topology local;
+    const auto device =
+        makeDevice("local0", "0000:0000:0004:0200:0010:0000:df00:4500", 0);
+    addUbNic(local, device);
+
+    auto load = [&](bool require_same_scope, ProbeParams& params) {
+        Config config;
+        const std::string policy = require_same_scope ? "true" : "false";
+        EXPECT_TRUE(config
+                        .load(R"({
+            "transports": {"ub": {
+                "runtime_profile": "rm_legacy", "trans_mode": "rm",
+                "probe": {
+                    "enabled": true, "provider": "standalone",
+                    "local_ports": [{"id": "P0", "bind": "ub:local0:eid0"}],
+                    "peers": {"node-b": {"ports": [
+                        {"id": "R0", "eid": "0000:0000:0004:0200:0010:0000:df04:c500"}
+                    ]}},
+                    "adjacency": {"node-b": {"P0": ["R0"]}},
+                    "adjacency_policy": {"require_same_eid_scope": )" +
+                              policy + R"(}
+                }
+            }}
+        })")
+                        .ok());
+        UbParams ub_params;
+        EXPECT_TRUE(UbParams::FromConfig(config, ub_params).ok());
+        params = ub_params.probe;
+    };
+
+    ProbeParams strict;
+    load(true, strict);
+    ProbeTopology topology;
+    auto status = ProbeTopology::resolve(strict, {device}, local, topology);
+    EXPECT_TRUE(status.IsInvalidArgument());
+    EXPECT_NE(status.ToString().find("crosses EID scope"), std::string::npos);
+
+    ProbeParams relaxed;
+    load(false, relaxed);
+    EXPECT_TRUE(
+        ProbeTopology::resolve(relaxed, {device}, local, topology).ok());
+}
+
 TEST(UbProbeTopologyTest, EmptyDeclarationDoesNotEnforce) {
     Topology local;
     ProbeParams params;  // probe off, no declaration

@@ -40,6 +40,17 @@ namespace ub {
 
 class ProbePeerRegistry;
 
+// Provider-neutral reachability scope of one EID. The default derives it from
+// the canonical EID prefix (the first seven groups, i.e. everything except the
+// interface/port group); config declarations can disable the check when a
+// deployment really routes across scopes.
+struct EidScope {
+    std::string key;
+    bool trusted{false};
+};
+
+[[nodiscard]] EidScope eidScopeForEid(std::string_view eid);
+
 // One declared local port resolved against the discovered devices.
 struct ProbeLocalPortBinding {
     std::string id;

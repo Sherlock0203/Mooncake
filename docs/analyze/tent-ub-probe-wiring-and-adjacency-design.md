@@ -1098,3 +1098,17 @@ probe_refresh_hint
 - 代次比较按 `(node_incarnation, topology_epoch, publication_epoch)` 语义：前两者不同即视为新代次（`generationSeed()` 非单调，不能比较大小），只有同一代次内才比较 `publication_epoch`；`topology_epoch` 每次安装重新生成，因此同进程卸载重装也能被接受。
 - `ProbePathKey` 只对“配置中声明了对端”的业务路径启用；未声明对端（注入 seam/未启用探测）继续走 `UbPostPath` 兼容入口，保持既有行为。
 - 基线中的 `probe_peer_source` 注入 seam 完全保留；声明模式在生产装配时自建 Registry/Source/Coordinator。
+
+## 附录 E：声明拓扑闭环 Phase 1 实施记录
+
+对应后续设计《TENT UB 声明拓扑闭环与业务/探测选路统一详细设计》的 Phase 1：
+
+| 项 | 实现 | 验证 |
+| --- | --- | --- |
+| G-1 | `Topology::applyUbDeviceKinds` 在 install 时用可信 `DeviceInfo.kind/source` 回写 `ub.device_kind` / `ub.device_kind_source`；发布路径不再输出 `unknown` | `tent_ub_probe_topology_test`、`tent_ub_probe_integration_test` |
+| G-2 | 声明模式下业务 Context 只按 `local_ports` 绑定创建；业务候选收敛为 `AdjacencyView` 的 local×adjacency 允许对，不再枚举未声明设备 | 声明模式集成用例 |
+| G-3 | 安装期新增 EID scope 校验；默认 scope 取 canonical EID 的前 7 组（去掉最后一组接口/端口位），跨 scope 边 fail-closed；`probe/adjacency_policy/require_same_eid_scope=false` 可关闭并 WARNING | `tent_ub_probe_topology_test` |
+| P1-6 | `probe/adjacency_policy/param_error_invalidate_threshold`（默认 3）连续 `kParamError` 后边失效，选路拒绝；成功/其它错误清零连续计数 | `tent_ub_edge_invalid_tracker_test` |
+| 观测 | `declared_candidates_total/denied`、`business_param_error_invalid_edge`、`probe_publication_identity_fail` | 业务摘要/transport getter |
+
+与后续设计草稿的差异：草稿建议默认 scope key 用 `native_device_name`，但该值在跨节点时必然不同，会把所有合法声明边判为跨 scope；实现改为 provider-neutral 的 EID 前缀 scope，并保留配置关闭开关。若后续 provider 提供显式 reachability scope，应优先使用 provider 值。

@@ -294,6 +294,17 @@ struct ProbePeerDecl {
     std::vector<ProbePeerPortDecl> ports;
 };
 
+// Declared adjacency policy (closed-loop design §5.6).
+struct ProbeAdjacencyPolicyParams {
+    // Reject declared edges whose local/remote EIDs are in different
+    // reachability scopes. Disable only for a deployment that really routes
+    // across scopes; a warning is logged when disabled.
+    bool require_same_eid_scope{true};
+    // Consecutive kParamError observations on one declared edge after which
+    // the edge is considered invalid for this install. 0 disables.
+    uint32_t param_error_invalidate_threshold{3};
+};
+
 // Bootstrap handshake scheduling (design §4.1). Distinct from the probe
 // scheduler's interval/timeout: this is the control-plane refresh loop.
 struct ProbeHandshakeParams {
@@ -371,6 +382,7 @@ struct ProbeParams {
     // incrementally. Derived from the declaration, never configured directly.
     bool dynamic_edges{false};
     ProbeHandshakeParams handshake;
+    ProbeAdjacencyPolicyParams adjacency_policy;
 
     [[nodiscard]] bool hasDeclaredTopology() const {
         return !local_ports.empty() || !peers.empty() || !adjacency.empty();

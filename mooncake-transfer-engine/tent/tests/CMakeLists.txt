@@ -599,6 +599,16 @@ if(USE_UB)
   add_test(NAME tent_ub_probe_peer_registry_test
            COMMAND tent_ub_probe_peer_registry_test)
 
+  # Declared-edge kParamError invalidation (closed-loop design §5.6.3).
+  add_executable(tent_ub_edge_invalid_tracker_test
+                 ub_edge_invalid_tracker_test.cpp)
+  target_link_libraries(tent_ub_edge_invalid_tracker_test
+                        PRIVATE tent_common gtest gtest_main)
+  target_include_directories(tent_ub_edge_invalid_tracker_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_edge_invalid_tracker_test
+           COMMAND tent_ub_edge_invalid_tracker_test)
+
   # Handshake scheduling/apply and the publication -> registry -> source ->
   # provider diff path (design §7).
   add_executable(tent_ub_probe_peer_coordinator_test

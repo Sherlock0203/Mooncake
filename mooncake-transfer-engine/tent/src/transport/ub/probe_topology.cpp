@@ -68,6 +68,16 @@ std::optional<Topology::NicID> remoteNicForEid(const Topology& topology,
 
 }  // namespace
 
+EidScope eidScopeForEid(std::string_view eid) {
+    EidScope scope;
+    if (!isCanonicalEid(eid)) return scope;
+    // Eight groups of four hex digits. The last group is the interface/port
+    // identity; the prefix is the reachability scope (df00 vs df04).
+    scope.key = lowerAscii(eid.substr(0, 34));
+    scope.trusted = true;
+    return scope;
+}
+
 void ProbeTopology::recordAdjacency(AdjacencyDecision decision,
                                     bool unverified) const {
     size_t index = kAllowedIndex;
@@ -247,6 +257,55 @@ Status ProbeTopology::resolve(const ProbeParams& params,
         resolved.bindings_.emplace(binding.id, local_nic);
         resolved.local_by_nic_.emplace(local_nic, binding.id);
         resolved.ports_.push_back(std::move(binding));
+    }
+
+    // INV-4: declared edges must be reachable at install time. The default
+    // EID-prefix scope rejects a cross-subnet edge (e.g. df00 <-> df04)
+    // instead of letting it fail later as a business MEMORY_ERROR.
+    bool scope_mismatch = false;
+    std::string first_scope_error;
+    for (const auto& [peer_name, edges] : resolved.adjacency_) {
+        auto peer = resolved.peers_.find(peer_name);
+        if (peer == resolved.peers_.end()) continue;
+        for (const auto& [local_id, remote_ids] : edges) {
+            const ProbeLocalPortBinding* binding = nullptr;
+            for (const auto& candidate : resolved.ports_) {
+                if (candidate.id == local_id) {
+                    binding = &candidate;
+                    break;
+                }
+            }
+            if (binding == nullptr) continue;
+            const EidScope local_scope = eidScopeForEid(binding->eid);
+            for (const auto& remote_id : remote_ids) {
+                const ProbePeerPortDecl* remote = nullptr;
+                for (const auto& port : peer->second.ports) {
+                    if (port.id == remote_id) {
+                        remote = &port;
+                        break;
+                    }
+                }
+                if (remote == nullptr) continue;
+                const EidScope remote_scope = eidScopeForEid(remote->eid);
+                if (!local_scope.trusted || !remote_scope.trusted) continue;
+                if (local_scope.key == remote_scope.key) continue;
+                scope_mismatch = true;
+                if (first_scope_error.empty()) {
+                    first_scope_error =
+                        "declared edge " + peer_name + "/" + local_id + "->" +
+                        remote_id + " crosses EID scope '" + local_scope.key +
+                        "' -> '" + remote_scope.key + "'";
+                }
+            }
+        }
+    }
+    if (scope_mismatch) {
+        if (params.adjacency_policy.require_same_eid_scope) {
+            return Status::InvalidArgument(first_scope_error);
+        }
+        LOG(WARNING) << "UB probe: " << first_scope_error
+                     << "; adjacency_policy.require_same_eid_scope=false, "
+                        "allowing it";
     }
 
     // Re-validate every adjacency reference against the resolved bindings and

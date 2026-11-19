@@ -23,6 +23,7 @@
 #include "tent/transport/ub/buffers.h"
 #include "tent/transport/ub/completion_record.h"
 #include "tent/transport/ub/context.h"
+#include "tent/transport/ub/edge_invalid_tracker.h"
 #include "tent/transport/ub/entity_event.h"
 #include "tent/transport/ub/jetty_drain_controller.h"
 #include "tent/transport/ub/params.h"
@@ -158,6 +159,9 @@ struct UbBusinessStatsSnapshot {
     uint64_t pool_lease_misses{0};
     uint64_t pool_stop_rejections{0};
     uint64_t pool_hard_errors{0};
+    uint64_t business_param_error_invalid_edge{0};
+    uint64_t declared_candidates_total{0};
+    uint64_t declared_candidates_denied{0};
     // W3g claim (R-1): rejections by pool-authority reason, the pre-W3g
     // rollback path (claim/enabled=false) and the surviving PLM epoch check.
     uint64_t claim_rejected_stopping{0};
@@ -493,6 +497,10 @@ class UbWorkers final : public gate::Sink {
     std::function<void(uint64_t)> probe_refresh_hint_;
     // Read-only adjacency policy; nullptr when no topology was declared.
     const ProbeTopology* probe_topology_{nullptr};
+    // Declared-edge kParamError invalidation (closed-loop design §5.6.3).
+    ParamErrorEdgeTracker param_error_edges_;
+    std::atomic<uint64_t> declared_candidates_total_{0};
+    std::atomic<uint64_t> declared_candidates_denied_{0};
     // Bounded record of unproven destructions, used to attribute a completion
     // whose token no longer maps to a live record (design §7.1/§7.2).
     std::shared_ptr<TombstoneTable> tombstones_;

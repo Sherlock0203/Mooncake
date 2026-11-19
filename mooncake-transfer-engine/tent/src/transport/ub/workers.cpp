@@ -139,6 +139,8 @@ UbWorkers::UbWorkers(std::shared_ptr<UrmaAdapter> adapter,
       local_device_failure_handler_(std::move(local_device_failure_handler)),
       probe_manager_(probe_manager),
       probe_topology_(probe_topology),
+      param_error_edges_(
+          params_.probe.adjacency_policy.param_error_invalidate_threshold),
       tombstones_(std::move(tombstones)) {
     for (const auto& context : contexts_) {
         if (!context) continue;
@@ -557,6 +559,11 @@ UbBusinessStatsSnapshot UbWorkers::businessStats() const {
     out.pool_stop_rejections =
         pool_stop_rejections_.load(std::memory_order_relaxed);
     out.pool_hard_errors = pool_hard_errors_.load(std::memory_order_relaxed);
+    out.business_param_error_invalid_edge = param_error_edges_.invalidations();
+    out.declared_candidates_total =
+        declared_candidates_total_.load(std::memory_order_relaxed);
+    out.declared_candidates_denied =
+        declared_candidates_denied_.load(std::memory_order_relaxed);
     out.claim_rejected_stopping =
         claim_rejected_stopping_.load(std::memory_order_relaxed);
     out.claim_rejected_member =
@@ -788,6 +795,10 @@ void UbWorkers::logBusinessSummary(uint64_t now_ns) {
               << ",disabled=" << stats.claim_disabled
               << ",isolated=" << stats.claim_after_isolation << "}"
               << " post_isolated=" << stats.post_on_isolated_path
+              << " param_invalid_edge="
+              << stats.business_param_error_invalid_edge
+              << " declared_candidates=" << stats.declared_candidates_total
+              << "/" << stats.declared_candidates_denied
               << " retire=" << stats.pooled_retire
               << " path_peak=" << stats.path_inflight_peak
               << " imbalance=" << stats.path_load_imbalance
@@ -1103,7 +1114,9 @@ Status UbWorkers::buildRoute(const PendingSlice& pending, Route& route) {
                     probe_topology_->probePeerId(segment->name)
                         .value_or(LOCAL_SEGMENT_ID);
             }
-            if (route.remote_devices.empty()) {
+            if (route.remote_devices.empty() &&
+                !(route.adjacency.enforced &&
+                  route.adjacency.peer_eid_unmatched)) {
                 return Status::DeviceNotFound(
                     "UB target has no active advertised device" LOC_MARK);
             }
@@ -1236,8 +1249,41 @@ Status UbWorkers::chooseAndResolveEndpoint(
         QuotaAvailability capacity;
     };
 
-    const auto local_devices = orderedLocalDevices(pending);
-    if (route.remote_devices.empty()) {
+    auto local_devices = orderedLocalDevices(pending);
+    auto remote_devices = route.remote_devices;
+    // INV-1/INV-2: in declared mode the candidate set is exactly the resolved
+    // bindings x declared adjacency, not the full local x remote discovery
+    // product. Unpublished/withdrawn/gated remote ports stay in the view so
+    // the gate can classify them as transient.
+    if (route.adjacency.enforced) {
+        if (route.adjacency.peer_eid_unmatched || remote_devices.empty()) {
+            if (plan != nullptr) {
+                plan->reason = DeferReason::kPathUnavailable;
+                plan->expire_ns = deadlineAfter(steadyNowNs(), kTimedDeferNs);
+            }
+            return Status::TooManyRequests(
+                "Declared peer has no reachable probe port yet" LOC_MARK);
+        }
+        std::unordered_set<Topology::NicID> declared_locals(
+            route.adjacency.local_nics.begin(),
+            route.adjacency.local_nics.end());
+        local_devices.erase(
+            std::remove_if(local_devices.begin(), local_devices.end(),
+                           [&](const LocalDeviceCandidate& candidate) {
+                               return declared_locals.count(candidate.id) == 0;
+                           }),
+            local_devices.end());
+        remote_devices = route.adjacency.remote_nics;
+        if (remote_devices.empty()) {
+            if (plan != nullptr) {
+                plan->reason = DeferReason::kPathUnavailable;
+                plan->expire_ns = deadlineAfter(steadyNowNs(), kTimedDeferNs);
+            }
+            return Status::TooManyRequests(
+                "Declared peer has no mapped remote port" LOC_MARK);
+        }
+    }
+    if (remote_devices.empty()) {
         return Status::DeviceNotFound("No usable UB posting path" LOC_MARK);
     }
     const auto snapshot = pending.slice->snapshot();
@@ -1279,8 +1325,41 @@ Status UbWorkers::chooseAndResolveEndpoint(
         return Status::DeviceNotFound(
             "All local UB devices remained unavailable" LOC_MARK);
     }
+    struct DeclaredPair {
+        LocalDeviceCandidate local;
+        Topology::NicID remote_id;
+    };
+    std::vector<DeclaredPair> declared_pairs;
+    if (route.adjacency.enforced) {
+        for (const auto& local : local_devices) {
+            const auto local_it =
+                std::find(route.adjacency.local_nics.begin(),
+                          route.adjacency.local_nics.end(), local.id);
+            if (local_it == route.adjacency.local_nics.end()) continue;
+            const size_t local_slot = static_cast<size_t>(
+                std::distance(route.adjacency.local_nics.begin(), local_it));
+            for (size_t remote_slot = 0;
+                 remote_slot < route.adjacency.remote_nics.size();
+                 ++remote_slot) {
+                const size_t index =
+                    local_slot * route.adjacency.remote_nics.size() +
+                    remote_slot;
+                if (index >= route.adjacency.allowed.size() ||
+                    route.adjacency.allowed[index] == 0) {
+                    continue;
+                }
+                declared_pairs.push_back(DeclaredPair{
+                    local, route.adjacency.remote_nics[remote_slot]});
+            }
+        }
+        if (declared_pairs.empty()) {
+            return Status::InvalidArgument(
+                "declared adjacency has no usable local/remote pair" LOC_MARK);
+        }
+    }
     const size_t combinations =
-        local_devices.size() * route.remote_devices.size();
+        route.adjacency.enforced ? declared_pairs.size()
+                                 : local_devices.size() * remote_devices.size();
     const size_t start =
         combinations == 0 ? 0 : snapshot.retry_count % combinations;
     Status first_error = Status::DeviceNotFound(
@@ -1314,13 +1393,31 @@ Status UbWorkers::chooseAndResolveEndpoint(
     size_t adjacency_denied = 0;
     size_t adjacency_hard_denied = 0;
     size_t adjacency_transient_denied = 0;
+    size_t invalid_edge_denied = 0;
     AdjacencyDecision first_adjacency_denial = AdjacencyDecision::kAllowed;
     Topology::NicID first_denied_local = -1;
     Topology::NicID first_denied_remote = -1;
+    if (route.adjacency.enforced) {
+        declared_candidates_total_.fetch_add(combinations,
+                                             std::memory_order_relaxed);
+    }
     for (size_t flat = 0; flat < combinations; ++flat) {
-        const auto& local = local_devices[flat / route.remote_devices.size()];
-        const auto remote_id =
-            route.remote_devices[flat % route.remote_devices.size()];
+        LocalDeviceCandidate local;
+        Topology::NicID remote_id = -1;
+        if (route.adjacency.enforced) {
+            local = declared_pairs[flat].local;
+            remote_id = declared_pairs[flat].remote_id;
+            const ProbePathKey candidate_key{
+                local.id, static_cast<SegmentID>(route.probe_peer_id),
+                remote_id};
+            if (param_error_edges_.invalid(candidate_key)) {
+                ++invalid_edge_denied;
+                continue;
+            }
+        } else {
+            local = local_devices[flat / remote_devices.size()];
+            remote_id = remote_devices[flat % remote_devices.size()];
+        }
         if (route.adjacency.enforced) {
             bool local_declared = false;
             const auto decision =
@@ -1383,6 +1480,15 @@ Status UbWorkers::chooseAndResolveEndpoint(
             (flat + combinations - start) % combinations, probe_path,
             std::move(rail_stats),
             quota_->availability(probe_path, pending.slice->spec().length)});
+    }
+    if (route.adjacency.enforced) {
+        declared_candidates_denied_.fetch_add(
+            adjacency_denied + invalid_edge_denied, std::memory_order_relaxed);
+    }
+    if (rails.empty() && invalid_edge_denied == combinations) {
+        return Status::InvalidArgument(
+            "Every declared edge was invalidated after repeated "
+            "parameter/memory errors" LOC_MARK);
     }
     if (rails.empty() && adjacency_screened_out &&
         adjacency_denied == combinations) {
@@ -2239,6 +2345,20 @@ void UbWorkers::onFault(CompletionRecord& record, FaultKind kind) {
     if (business == nullptr) return;
     const uint64_t now = steadyNowNs();
     const auto report_error = [&](BusinessErrorKind kind) {
+        if (business->probe_key.valid()) {
+            if (kind == BusinessErrorKind::kParamError) {
+                if (param_error_edges_.noteError(business->probe_key)) {
+                    LOG(WARNING)
+                        << "UB declared edge invalidated after repeated "
+                           "parameter/memory errors: peer="
+                        << business->probe_key.segment_id
+                        << " local_nic=" << business->probe_key.local_nic
+                        << " remote_nic=" << business->probe_key.remote_nic;
+                }
+            } else {
+                param_error_edges_.noteSuccess(business->probe_key);
+            }
+        }
         if (probe_manager_ == nullptr) return;
         if (business->probe_key.valid()) {
             probe_manager_->onBusinessPathError(business->probe_key, kind, now);
@@ -2633,6 +2753,9 @@ void UbWorkers::recordSuccessEvidence(BusinessRecord& record) {
     const uint64_t now = steadyNowNs();
     const uint64_t latency =
         now >= record.posted_ns ? now - record.posted_ns : 0;
+    if (record.probe_key.valid()) {
+        param_error_edges_.noteSuccess(record.probe_key);
+    }
     if (probe_manager_ != nullptr) {
         if (record.probe_key.valid()) {
             probe_manager_->onBusinessPathSuccess(record.probe_key, now);

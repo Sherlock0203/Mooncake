@@ -161,6 +161,40 @@ struct UbTransport::Impl {
         }
     }
 
+    Status createBusinessContext(
+        Topology::NicID local_nic, const ub::DeviceInfo& device,
+        std::unordered_map<Topology::NicID, uint32_t>& jfc_depth_by_device,
+        ub::UbContextPtr& created) {
+        ub::JfcOptions jfc_options;
+        const bool rm_runtime = runtime_mode == ub::UbRuntimeMode::kRmLegacy ||
+                                runtime_mode == ub::UbRuntimeMode::kPooledRm;
+        if (params.runtime_profile == ub::UbRuntimeProfile::kRmPool) {
+            jfc_options.transport_mode = ub::JettyTransportMode::kRm;
+        }
+        if (rm_runtime) jfc_options.trans_mode = ub::kUrmaTransportModeRm;
+        const auto& device_caps = device.capabilities;
+        if (device_caps.max_jfc_depth != 0) {
+            jfc_options.depth =
+                std::min(jfc_options.depth, device_caps.max_jfc_depth);
+            jfc_options.receiver_depth =
+                std::min(jfc_options.receiver_depth, device_caps.max_jfc_depth);
+        }
+        if (device_caps.max_jfr_depth != 0) {
+            jfc_options.receiver_depth =
+                std::min(jfc_options.receiver_depth, device_caps.max_jfr_depth);
+        }
+        auto context =
+            std::make_shared<ub::UbContext>(local_nic, device, adapter);
+        auto status = context->initialize(params.jfc_per_context, jfc_options);
+        created = context;
+        if (!status.ok()) return status;
+        context_by_topology_id.emplace(local_nic, context);
+        context_by_topology_name.emplace(device.topology_name, context);
+        jfc_depth_by_device.emplace(local_nic, jfc_options.depth);
+        contexts.push_back(std::move(context));
+        return Status::OK();
+    }
+
     Status install(const std::string& segment_name,
                    std::shared_ptr<ControlService> control,
                    std::shared_ptr<Topology> topology,
@@ -276,6 +310,19 @@ struct UbTransport::Impl {
                                                  discovered);
         if (!status.ok()) return failInstall(status);
 
+        // Publish the trusted kind, not the raw discovery kind: the peer's
+        // ProbeBootstrapUb identity check requires physical UB NICs.
+        std::vector<Topology::UbNicKindOverride> kind_overrides;
+        kind_overrides.reserve(discovered.size());
+        for (const auto& device : discovered) {
+            kind_overrides.push_back(Topology::UbNicKindOverride{
+                device.topology_name,
+                std::string(ub::deviceKindName(device.kind)),
+                std::string(ub::deviceKindSourceName(device.kind_source))});
+        }
+        status = local_topology->applyUbDeviceKinds(kind_overrides);
+        if (!status.ok()) return failInstall(status);
+
         // Declared topology is resolved once, against the same discovery
         // snapshot that selects the business devices. A declared binding that
         // matches zero or multiple physical EIDs fails the install (design
@@ -306,6 +353,15 @@ struct UbTransport::Impl {
         std::unordered_map<Topology::NicID, uint32_t> jfc_depth_by_device;
         for (auto& device : discovered) {
             by_topology_name.emplace(device.topology_name, std::move(device));
+        }
+        // INV-1: in declared mode the bindings are the only business device
+        // source. Restricting the RM-capability gate here also prevents an
+        // undeclared device from blocking or joining the install.
+        if (probe_topology->declared()) {
+            preferred_topology_names.clear();
+            for (const auto& binding : probe_topology->ports()) {
+                preferred_topology_names.insert(binding.topology_name);
+            }
         }
 
         // RM capability gate (legacy and pooled): every selectable device
@@ -350,71 +406,66 @@ struct UbTransport::Impl {
         std::vector<std::string> preferred_names;
         std::vector<std::string> skipped_names;
 
-        for (size_t id = 0; id < local_topology->getNicCount(); ++id) {
-            const auto* nic = local_topology->getNicEntry(static_cast<int>(id));
-            if (!nic || nic->type != Topology::NIC_UB) continue;
-            auto found = by_topology_name.find(nic->name);
-            if (found == by_topology_name.end() || !found->second.active) {
-                continue;
-            }
-            if (!filterAllows(params.device_filter, found->second)) continue;
-            if (preferred_topology_names.find(found->second.topology_name) ==
-                preferred_topology_names.end()) {
-                skipped_names.push_back(found->second.native_device_name);
-                continue;
-            }
-
-            ub::JfcOptions jfc_options;
-            // W3 B2: UMDK requires JFS.trans_mode == shared JFR.trans_mode
-            // (urma_adapter.cpp RealJetty::initialize). The business JFC of an
-            // rm_pool context therefore has to create an RM JFR, otherwise
-            // every createJetty for a pooled member is rejected by the provider
-            // and tryLease can never succeed.
-            if (params.runtime_profile == ub::UbRuntimeProfile::kRmPool) {
-                jfc_options.transport_mode = ub::JettyTransportMode::kRm;
-            }
-            const auto& device_caps = found->second.capabilities;
-            if (rm_runtime) {
-                // RM creates an RM receive-side JFR; it never falls
-                // back to RC.
-                jfc_options.trans_mode = ub::kUrmaTransportModeRm;
-            }
-            if (device_caps.max_jfc_depth != 0) {
-                jfc_options.depth =
-                    std::min(jfc_options.depth, device_caps.max_jfc_depth);
-                jfc_options.receiver_depth = std::min(
-                    jfc_options.receiver_depth, device_caps.max_jfc_depth);
-            }
-            if (device_caps.max_jfr_depth != 0) {
-                jfc_options.receiver_depth = std::min(
-                    jfc_options.receiver_depth, device_caps.max_jfr_depth);
-            }
-            auto context = std::make_shared<ub::UbContext>(
-                static_cast<Topology::NicID>(id), found->second, adapter);
-            status = context->initialize(params.jfc_per_context, jfc_options);
-            if (!status.ok()) {
-                if (context->state() == ub::UbContext::State::kDraining) {
-                    // Initialization produced a native handle whose cleanup
-                    // also failed. Adopt it into the transport graph and abort
-                    // installation so uninstall can retry without a leak.
-                    contexts.push_back(std::move(context));
+        if (probe_topology->declared()) {
+            for (const auto& binding : probe_topology->ports()) {
+                auto found = by_topology_name.find(binding.topology_name);
+                if (found == by_topology_name.end() || !found->second.active) {
+                    return failInstall(Status::DeviceNotFound(
+                        "declared probe port '" + binding.id +
+                        "' resolved device is not active" LOC_MARK));
+                }
+                ub::UbContextPtr context;
+                status = createBusinessContext(binding.local_nic, found->second,
+                                               jfc_depth_by_device, context);
+                if (!status.ok()) {
+                    if (context &&
+                        context->state() == ub::UbContext::State::kDraining) {
+                        contexts.push_back(std::move(context));
+                    }
                     return failInstall(status);
                 }
-                LOG(WARNING) << "Disable UB device " << nic->name << ": "
-                             << status.ToString();
-                continue;
+                preferred_names.push_back(found->second.native_device_name);
             }
-            preferred_names.push_back(found->second.native_device_name);
-            context_by_topology_id.emplace(static_cast<int>(id), context);
-            context_by_topology_name.emplace(nic->name, context);
-            jfc_depth_by_device.emplace(static_cast<Topology::NicID>(id),
-                                        jfc_options.depth);
-            contexts.push_back(std::move(context));
+        } else {
+            for (size_t id = 0; id < local_topology->getNicCount(); ++id) {
+                const auto* nic =
+                    local_topology->getNicEntry(static_cast<int>(id));
+                if (!nic || nic->type != Topology::NIC_UB) continue;
+                auto found = by_topology_name.find(nic->name);
+                if (found == by_topology_name.end() || !found->second.active) {
+                    continue;
+                }
+                if (!filterAllows(params.device_filter, found->second))
+                    continue;
+                if (preferred_topology_names.find(
+                        found->second.topology_name) ==
+                    preferred_topology_names.end()) {
+                    skipped_names.push_back(found->second.native_device_name);
+                    continue;
+                }
+                ub::UbContextPtr context;
+                status = createBusinessContext(static_cast<Topology::NicID>(id),
+                                               found->second,
+                                               jfc_depth_by_device, context);
+                if (!status.ok()) {
+                    if (context &&
+                        context->state() == ub::UbContext::State::kDraining) {
+                        contexts.push_back(std::move(context));
+                        return failInstall(status);
+                    }
+                    LOG(WARNING) << "Disable UB device " << nic->name << ": "
+                                 << status.ToString();
+                    continue;
+                }
+                preferred_names.push_back(found->second.native_device_name);
+            }
         }
 
         {
             std::ostringstream selection_log;
-            if (params.physical_only) {
+            if (probe_topology->declared()) {
+                selection_log << "UB device selection: mode=declared-topology";
+            } else if (params.physical_only) {
                 selection_log << "UB device selection: mode=physical-only";
                 if (explicit_filter) selection_log << "+explicit-filter";
             } else if (explicit_filter) {
@@ -1336,6 +1387,13 @@ struct UbTransport::Impl {
                 ++matches;
             }
             if (matches != 1 || !physical) {
+                probe_publication_identity_fail.fetch_add(
+                    1, std::memory_order_relaxed);
+                LOG_EVERY_N(WARNING, 100)
+                    << "UB probe publication identity mismatch: port="
+                    << port.port_id << " topology=" << port.topology_name
+                    << " eid=" << port.eid << " matches=" << matches
+                    << " physical=" << (physical ? 1 : 0);
                 response.reply_msg =
                     "probe publication identity mismatch for port '" +
                     port.port_id + "'";
@@ -1598,6 +1656,7 @@ struct UbTransport::Impl {
     std::shared_ptr<ub::TombstoneTable> tombstones;
     // v1 peers that carried a v2 block (sanitized ignore, design §6.4).
     std::atomic<uint64_t> bootstrap_v2_ignored{0};
+    std::atomic<uint64_t> probe_publication_identity_fail{0};
     bool probe_bootstrap_callback_installed{false};
 };
 
@@ -1864,6 +1923,12 @@ ub::ProbeCoordinatorStats UbTransport::probeCoordinatorStats() const {
     std::lock_guard<std::mutex> lock(impl_->lifecycle_mutex);
     if (!impl_->probe_coordinator) return ub::ProbeCoordinatorStats{};
     return impl_->probe_coordinator->stats();
+}
+
+uint64_t UbTransport::probePublicationIdentityFailures() const {
+    std::lock_guard<std::mutex> lock(impl_->lifecycle_mutex);
+    return impl_->probe_publication_identity_fail.load(
+        std::memory_order_relaxed);
 }
 
 uint64_t UbTransport::poolGeneration() const {
