@@ -1,6 +1,7 @@
 // Copyright 2026 KVCache.AI
 // SPDX-License-Identifier: Apache-2.0
 
+#include "tent/transport/ub/probe_bootstrap.h"
 #include "tent/transport/ub/probe_link_manager.h"
 #include "tent/transport/ub/probe_peer_handshake.h"
 #include "tent/transport/ub/probe_poster_urma.h"
@@ -11,6 +12,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <limits>
@@ -33,6 +35,7 @@
 #include "tent/transport/ub/bootstrap.h"
 #include "tent/transport/ub/buffers.h"
 #include "tent/transport/ub/context.h"
+#include "tent/transport/ub/topology_attrs.h"
 
 #include "jetty_pool.h"
 #include "tent/transport/ub/device_selection.h"
@@ -737,14 +740,41 @@ struct UbTransport::Impl {
                 }
                 auto standalone =
                     std::make_shared<ub::StandaloneProbeResourceProvider>(
-                        adapter, params.probe,
-                        [topology =
-                             local_topology](const std::string& topology_name) {
-                            return topology ? topology->getNicId(topology_name)
-                                            : static_cast<Topology::NicID>(-1);
-                        });
-                auto discover = standalone->discover();
-                if (!discover.ok()) return failInstall(discover);
+                        adapter, params.probe);
+                standalone->setNodeIdentity(local_segment_name,
+                                            node_incarnation, topology_epoch);
+                if (probe_topology->declared()) {
+                    // Declared mode: the configured bindings decide which
+                    // ports exist. A missing business context is an install
+                    // error, never a silent skip (design §6.2).
+                    std::vector<ub::ProbePortSpec> specs;
+                    specs.reserve(probe_topology->ports().size());
+                    for (const auto& binding : probe_topology->ports()) {
+                        auto device =
+                            by_topology_name.find(binding.topology_name);
+                        if (device == by_topology_name.end()) {
+                            return failInstall(Status::InvalidArgument(
+                                "declared probe port '" + binding.id +
+                                "' has no discovered device" LOC_MARK));
+                        }
+                        ub::ProbePortSpec spec;
+                        spec.port_id = binding.id;
+                        spec.local_nic = binding.local_nic;
+                        spec.device = device->second;
+                        spec.topology_name = binding.topology_name;
+                        spec.native_device_name = binding.native_device_name;
+                        spec.eid = binding.eid;
+                        spec.generation = 1;
+                        specs.push_back(std::move(spec));
+                    }
+                    auto bind = standalone->bindPorts(specs);
+                    if (!bind.ok()) return failInstall(bind);
+                    auto prepared = standalone->prepareLocal();
+                    if (!prepared.ok()) return failInstall(prepared);
+                } else {
+                    auto discover = standalone->discover();
+                    if (!discover.ok()) return failInstall(discover);
+                }
                 probe_directory =
                     std::make_shared<ub::HandshakeProbePeerDirectory>(
                         adapter, standalone->contexts(), probe_peer_source);
@@ -781,6 +811,15 @@ struct UbTransport::Impl {
                     }
                     return Status::OK();
                 });
+            // Responder side of ProbeBootstrapUb. The callback is installed
+            // only while the probe resources exist and is cleared before they
+            // are released.
+            metadata->setProbeBootstrapCallback(
+                [this](const ub::ProbeBootstrapRequest& request,
+                       ub::ProbeBootstrapResponse& response) {
+                    return onProbeBootstrap(request, response);
+                });
+            probe_bootstrap_callback_installed = true;
             for (const auto& supply : graph.ports) {
                 if (context_by_topology_id.find(supply.local_nic) ==
                     context_by_topology_id.end()) {
@@ -874,6 +913,10 @@ struct UbTransport::Impl {
         if (callback_installed && metadata) {
             metadata->setBootstrapUbCallback({});
             callback_installed = false;
+        }
+        if (probe_bootstrap_callback_installed && metadata) {
+            metadata->setProbeBootstrapCallback({});
+            probe_bootstrap_callback_installed = false;
         }
         // Stop interface-7 rebuilds before draining workers: a retire during
         // teardown must stay a record, not create resources that are about to
@@ -1123,6 +1166,115 @@ struct UbTransport::Impl {
         return Status::OK();
     }
 
+    int onProbeBootstrap(const ub::ProbeBootstrapRequest& request,
+                         ub::ProbeBootstrapResponse& response) {
+        response.responder_segment = local_segment_name;
+        response.node_incarnation = node_incarnation;
+        response.topology_epoch = topology_epoch;
+        response.transport_mode = ub::kProbeBootstrapTransportMode;
+        response.device_kind = ub::kProbeBootstrapDeviceKind;
+        if (shutting_down.load(std::memory_order_acquire) ||
+            !probe_provider) {
+            response.reply_msg = "probe not ready";
+            return -1;
+        }
+        auto standalone =
+            std::dynamic_pointer_cast<ub::StandaloneProbeResourceProvider>(
+                probe_provider);
+        if (!standalone) {
+            response.reply_msg = "probe provider does not publish resources";
+            return -1;
+        }
+        auto status = ub::validateProbeBootstrapRequest(request);
+        if (!status.ok()) {
+            response.reply_msg = status.ToString();
+            return -1;
+        }
+
+        // The registered segment metadata is the only trusted anchor for the
+        // requester's ports. Never accept a self-asserted EID (design §7.7).
+        SegmentDescRef requester_segment;
+        if (request.requester_segment == local_segment_name) {
+            requester_segment = metadata->segmentManager().getLocal();
+        } else {
+            auto fetch = std::async(
+                std::launch::async, [this, name = request.requester_segment]() {
+                    SegmentDescRef segment;
+                    auto fetch_status =
+                        metadata->segmentManager().getRemote(segment, name);
+                    return std::make_pair(fetch_status, std::move(segment));
+                });
+            auto fetched = fetch.get();
+            if (!fetched.first.ok() || !fetched.second) {
+                response.reply_msg = "requester segment is not registered";
+                return -1;
+            }
+            requester_segment = std::move(fetched.second);
+        }
+        if (!requester_segment) {
+            response.reply_msg = "requester segment is not registered";
+            return -1;
+        }
+
+        auto lower = [](std::string value) {
+            std::transform(value.begin(), value.end(), value.begin(),
+                           [](unsigned char c) {
+                               return static_cast<char>(std::tolower(c));
+                           });
+            return value;
+        };
+        const auto& topology = requester_segment->getMemory().topology;
+        for (const auto& port : request.ports) {
+            size_t matches = 0;
+            bool physical = true;
+            for (size_t id = 0; id < topology.getNicCount(); ++id) {
+                const auto* nic =
+                    topology.getNicEntry(static_cast<Topology::NicID>(id));
+                if (!nic || nic->type != Topology::NIC_UB) continue;
+                auto eid = nic->device_attrs.find(
+                    std::string(ub::kTopologyEidAttr));
+                if (eid == nic->device_attrs.end()) continue;
+                if (nic->name != port.topology_name) continue;
+                if (lower(eid->second) != lower(port.eid)) continue;
+                auto kind = nic->device_attrs.find(
+                    std::string(ub::kTopologyDeviceKindAttr));
+                if (kind != nic->device_attrs.end() &&
+                    kind->second != ub::deviceKindName(
+                                        ub::DeviceKind::PHYSICAL)) {
+                    physical = false;
+                }
+                ++matches;
+            }
+            if (matches != 1 || !physical) {
+                response.reply_msg =
+                    "probe publication identity mismatch for port '" +
+                    port.port_id + "'";
+                return -1;
+            }
+        }
+
+        // declared_peers is diagnostic only: a mismatch between both sides'
+        // declarations is logged, never used to create resources.
+        if (request.declared_peers.size() != params.probe.peers.size()) {
+            LOG_EVERY_N(INFO, 100)
+                << "UB probe handshake: requester " << request.requester_segment
+                << " declares " << request.declared_peers.size()
+                << " peer(s), local declares " << params.probe.peers.size();
+        }
+
+        auto publication = standalone->publication();
+        if (publication.ports.empty()) {
+            response.reply_msg = "probe not ready";
+            return -1;
+        }
+        response.publication_epoch = publication.publication_epoch;
+        response.ports.reserve(publication.ports.size());
+        for (const auto& port : publication.ports) {
+            response.ports.push_back(ub::toProbeBootstrapPort(port));
+        }
+        return 0;
+    }
+
     int onBootstrap(const UbBootstrapDesc& request, UbBootstrapDesc& response) {
         if (shutting_down.load(std::memory_order_acquire) || !endpoints) {
             response.reply_msg = "UB transport is shutting down";
@@ -1328,6 +1480,7 @@ struct UbTransport::Impl {
     std::shared_ptr<ub::TombstoneTable> tombstones;
     // v1 peers that carried a v2 block (sanitized ignore, design §6.4).
     std::atomic<uint64_t> bootstrap_v2_ignored{0};
+    bool probe_bootstrap_callback_installed{false};
 };
 
 UbTransport::UbTransport(

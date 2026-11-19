@@ -77,6 +77,35 @@ TEST(UbProbeLinkManagerTest, InitializesEligibleAndBusinessSuccessPromotes) {
     EXPECT_EQ(plm.stats().probe_unknown_token, 1U);
 }
 
+TEST(UbProbeLinkManagerTest, DynamicEdgesAllowAnEmptyStartupGraph) {
+    TestClock clock;
+    auto params = defaultParams();
+    params.dynamic_edges = true;
+    ProbeLinkManager plm(params, clock.clock());
+
+    // Declared topology: ports exist, the peer handshake has not completed.
+    auto graph = makeGraph({makePortSupply(0, 1)}, {});
+    ASSERT_TRUE(plm.initialize(graph).ok());
+    EXPECT_EQ(plm.pathCount(), 0U);
+    EXPECT_EQ(plm.graphEpoch(), 1U);
+
+    ProbeEvent added;
+    added.kind = ProbeEventKind::kEdgeAdded;
+    added.graph_epoch = 1;
+    added.event_seq = 1;
+    added.edge = makeEdgeSupply(0, 10, 0);
+    ASSERT_TRUE(plm.onPoolAvailabilityChange(added).ok());
+    EXPECT_EQ(plm.pathCount(), 1U);
+    EXPECT_EQ(plm.stats().path_state_eligible, 1U);
+}
+
+TEST(UbProbeLinkManagerTest, EmptyGraphStillFailsClosedWithoutDynamicEdges) {
+    TestClock clock;
+    ProbeLinkManager plm(defaultParams(), clock.clock());
+    auto graph = makeGraph({makePortSupply(0, 1)}, {});
+    EXPECT_TRUE(plm.initialize(graph).IsInvalidArgument());
+}
+
 TEST(UbProbeLinkManagerTest, BusinessGateRequiresExternalPeerGates) {
     TestClock clock;
     ProbeLinkManager plm(defaultParams(), clock.clock());

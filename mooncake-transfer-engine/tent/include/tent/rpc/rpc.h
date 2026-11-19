@@ -49,6 +49,7 @@ enum RpcFuncID {
     NotifySegmentUpdated,
     // Appended to preserve the numeric values of the existing RPCs.
     BootstrapUb,
+    ProbeBootstrapUb,
 };
 
 class ClientPool;
@@ -59,12 +60,12 @@ class CoroRpcAgent {
 
     virtual ~CoroRpcAgent();
 
-    CoroRpcAgent(const CoroRpcAgent &) = delete;
-    CoroRpcAgent &operator=(const CoroRpcAgent &) = delete;
+    CoroRpcAgent(const CoroRpcAgent&) = delete;
+    CoroRpcAgent& operator=(const CoroRpcAgent&) = delete;
 
    public:
-    using Function = std::function<void(const std::string_view & /* request */,
-                                        std::string & /* response */)>;
+    using Function = std::function<void(const std::string_view& /* request */,
+                                        std::string& /* response */)>;
 
     // Handlers run on the server io_context thread pool (the threads
     // argument of start(), 1 by default), so a blocking one stalls every
@@ -76,7 +77,7 @@ class CoroRpcAgent {
     // coroutine suspends, keeping the io_context free. Callers see the same
     // request/response, but ordering within a connection is no longer
     // guaranteed.
-    Status registerFunction(int func_id, const Function &func,
+    Status registerFunction(int func_id, const Function& func,
                             bool offload = false);
 
     // threads: number of io_context worker threads (default 1, the
@@ -84,26 +85,26 @@ class CoroRpcAgent {
     // offloaded off this pool, but attachments are still read here; when
     // TCP is enabled the engine defaults rpc_server_threads higher so
     // concurrent bulk transfers are not serialized on one io_context.
-    Status start(uint16_t &port, bool ipv6 = false, size_t threads = 1);
+    Status start(uint16_t& port, bool ipv6 = false, size_t threads = 1);
 
     Status stop();
 
-    Status call(const std::string &server_addr, int func_id,
-                const std::string_view &request, std::string &response);
+    Status call(const std::string& server_addr, int func_id,
+                const std::string_view& request, std::string& response);
 
     // Same as call(), but moves the request into the coroutine instead of
     // copying it, for large payloads.
-    Status callOwned(const std::string &server_addr, int func_id,
-                     std::string request, std::string &response);
+    Status callOwned(const std::string& server_addr, int func_id,
+                     std::string request, std::string& response);
 
     using AsyncCallback = std::function<void(Status, std::string)>;
-    void callAsync(const std::string &server_addr, int func_id,
-                   const std::string &request, AsyncCallback callback);
+    void callAsync(const std::string& server_addr, int func_id,
+                   const std::string& request, AsyncCallback callback);
     // Same as callAsync(), but retries once on a transport-level RPC failure.
     // Only for idempotent RPCs: a failure may arrive after the peer already ran
     // the handler, so a retry can run it twice.
-    void callAsyncRetryOnce(const std::string &server_addr, int func_id,
-                            const std::string &request, AsyncCallback callback);
+    void callAsyncRetryOnce(const std::string& server_addr, int func_id,
+                            const std::string& request, AsyncCallback callback);
 
     async_simple::coro::Lazy<std::pair<Status, std::string>> callCoroutine(
         std::string server_addr, int func_id, std::string request,
@@ -112,7 +113,7 @@ class CoroRpcAgent {
    private:
     async_simple::coro::Lazy<void> process(int func_id);
 
-    std::shared_ptr<ClientPool> getOrCreatePool(const std::string &server_addr);
+    std::shared_ptr<ClientPool> getOrCreatePool(const std::string& server_addr);
 
    private:
     struct Handler {
@@ -120,7 +121,7 @@ class CoroRpcAgent {
         bool offload = false;
     };
 
-    coro_rpc::coro_rpc_server *server_ = nullptr;
+    coro_rpc::coro_rpc_server* server_ = nullptr;
 
     std::mutex pools_mutex_;
     std::unordered_map<std::string, std::shared_ptr<ClientPool>> pools_;

@@ -39,6 +39,9 @@
 #include "tent/runtime/topology.h"
 #include "tent/thirdparty/nlohmann/json.h"
 #include "tent/transport/ub/bootstrap_types.h"
+#ifdef USE_UB
+#include "tent/transport/ub/probe_bootstrap.h"
+#endif
 
 namespace mooncake {
 namespace tent {
@@ -80,6 +83,11 @@ using OnReceiveBootstrap =
 
 using OnReceiveUbBootstrap = std::function<int(const UbBootstrapDesc& request,
                                                UbBootstrapDesc& response)>;
+#ifdef USE_UB
+using OnProbeBootstrap =
+    std::function<int(const ub::ProbeBootstrapRequest& request,
+                      ub::ProbeBootstrapResponse& response)>;
+#endif
 
 using OnNotify = std::function<int(const Notification&)>;
 
@@ -105,6 +113,12 @@ class ControlClient {
     static Status bootstrapUb(const std::string& server_addr,
                               const UbBootstrapDesc& request,
                               UbBootstrapDesc& response);
+
+#ifdef USE_UB
+    static Status probeBootstrapUb(const std::string& server_addr,
+                                   const ub::ProbeBootstrapRequest& request,
+                                   ub::ProbeBootstrapResponse& response);
+#endif
 
     static Status sendData(const std::string& server_addr,
                            uint64_t peer_mem_addr, void* local_mem_addr,
@@ -166,6 +180,13 @@ class ControlService {
         ub_bootstrap_callback_ = callback;
     }
 
+#ifdef USE_UB
+    void setProbeBootstrapCallback(const OnProbeBootstrap& callback) {
+        std::lock_guard<std::mutex> lock(probe_bootstrap_callback_mutex_);
+        probe_bootstrap_callback_ = callback;
+    }
+#endif
+
     void setNotifyCallback(const OnNotify& callback);
 
     Status start(uint16_t& port, bool ipv6_ = false, size_t threads = 1);
@@ -178,6 +199,11 @@ class ControlService {
                          std::string& response);
 
     void onBootstrapUb(const std::string_view& request, std::string& response);
+
+#ifdef USE_UB
+    void onProbeBootstrap(const std::string_view& request,
+                          std::string& response);
+#endif
 
     void onSendData(const std::string_view& request, std::string& response);
 
@@ -218,6 +244,11 @@ class ControlService {
 
     std::mutex ub_bootstrap_callback_mutex_;
     OnReceiveUbBootstrap ub_bootstrap_callback_;
+
+#ifdef USE_UB
+    std::mutex probe_bootstrap_callback_mutex_;
+    OnProbeBootstrap probe_bootstrap_callback_;
+#endif
 
     std::mutex notify_cb_mutex_;
     std::condition_variable notify_cb_cv_;

@@ -144,9 +144,12 @@ Status ProbeLinkManager::initialize(const ProbeGraph& graph) {
     if (graph.ports.empty()) {
         return Status::InvalidArgument("probe graph supplies no local port");
     }
-    if (graph.edges.empty()) {
+    if (graph.edges.empty() && !params_.dynamic_edges) {
         // Fail fast instead of silently degrading to "no probing" (design
         // §12.3): enabled probing with an empty adjacency is a supply bug.
+        // Declared topology is the one exception: the peer may not have
+        // answered yet, so the graph starts empty and grows through
+        // kEdgeAdded events (design §6.4).
         return Status::InvalidArgument(
             "probe graph supplies no adjacency edge");
     }

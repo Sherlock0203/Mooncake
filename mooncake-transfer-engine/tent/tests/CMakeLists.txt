@@ -578,6 +578,16 @@ if(USE_UB)
   add_test(NAME tent_ub_probe_topology_test
            COMMAND tent_ub_probe_topology_test)
 
+  # ProbeBootstrapUb wire codec/validation (design §7.2/§7.3).
+  add_executable(tent_ub_probe_publication_test
+                 ub_probe_publication_test.cpp)
+  target_link_libraries(tent_ub_probe_publication_test
+                        PRIVATE tent_link_group gtest gtest_main)
+  target_include_directories(tent_ub_probe_publication_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_probe_publication_test
+           COMMAND tent_ub_probe_publication_test)
+
   # Pooled rm_pool core components (C05/C06/C07): budget ledger, admission
   # tickets, per-attempt send pool and completion gate. Software-only: the
   # fake adapter needs no provider or NIC.

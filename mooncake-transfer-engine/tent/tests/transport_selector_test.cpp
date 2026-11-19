@@ -656,6 +656,7 @@ TEST(ControlPlaneTest, UbBootstrapRpcIdIsAppendedWithoutRenumbering) {
     EXPECT_EQ(static_cast<int>(SubscribeSegmentUpdate), 10);
     EXPECT_EQ(static_cast<int>(NotifySegmentUpdated), 11);
     EXPECT_EQ(static_cast<int>(BootstrapUb), 12);
+    EXPECT_EQ(static_cast<int>(ProbeBootstrapUb), 13);
 }
 
 // ---------------------------------------------------------------------------

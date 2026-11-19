@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <set>
+#include <unordered_set>
 #include <utility>
 
 #include <glog/logging.h>
@@ -50,7 +51,8 @@ StandaloneProbeResourceProvider::StandaloneProbeResourceProvider(
       directory_(nullptr),
       topology_resolver_(std::move(topology_resolver)),
       owns_contexts_(true),
-      auto_discover_(true) {
+      auto_discover_(true),
+      declared_mode_(!params_.local_ports.empty()) {
     maintenance_ = std::thread([this] { maintenanceLoop(); });
 }
 
@@ -79,6 +81,143 @@ Status StandaloneProbeResourceProvider::discover() {
     return discoverLocked();
 }
 
+Status StandaloneProbeResourceProvider::bindPorts(
+    const std::vector<ProbePortSpec>& specs) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (shut_down_) {
+        return Status::InvalidArgument(
+            "standalone probe provider is shut down");
+    }
+    if (initialized_ || resources_ready_) {
+        return Status::InvalidArgument(
+            "probe ports must be bound before local resources are created");
+    }
+    if (ports_bound_ || !ports_.empty()) {
+        return Status::InvalidArgument("probe ports are already bound");
+    }
+    if (specs.empty()) {
+        return Status::InvalidArgument("no declared probe port was supplied");
+    }
+    std::unordered_set<std::string> port_ids;
+    std::unordered_set<Topology::NicID> local_nics;
+    for (const auto& spec : specs) {
+        if (spec.port_id.empty()) {
+            return Status::InvalidArgument("declared probe port has no id");
+        }
+        if (spec.local_nic < 0 || spec.device.topology_name.empty()) {
+            return Status::InvalidArgument(
+                "declared probe port '" + spec.port_id +
+                "' has no resolved device identity");
+        }
+        if (!port_ids.insert(spec.port_id).second) {
+            return Status::InvalidArgument(
+                "declared probe port '" + spec.port_id + "' is duplicated");
+        }
+        if (!local_nics.insert(spec.local_nic).second) {
+            return Status::InvalidArgument(
+                "two declared probe ports bind the same local NIC " +
+                std::to_string(spec.local_nic));
+        }
+        PortState port;
+        port.config.local_nic = spec.local_nic;
+        port.config.generation = spec.generation == 0 ? 1 : spec.generation;
+        port.port_id = spec.port_id;
+        port.eid = spec.eid;
+        port.topology_name = spec.topology_name;
+        port.native_device_name = spec.native_device_name;
+        port.pending_device = spec.device;
+        port.has_pending_device = true;
+        port.source_generation = port.config.generation;
+        ports_.push_back(std::move(port));
+    }
+    declared_mode_ = true;
+    ports_bound_ = true;
+    owns_contexts_ = true;
+    LOG(INFO) << "UB probe: bound " << ports_.size()
+              << " declared probe port(s)";
+    return Status::OK();
+}
+
+Status StandaloneProbeResourceProvider::ensureBoundContextsLocked() {
+    for (auto& port : ports_) {
+        if (port.config.context && port.config.context->valid()) continue;
+        if (!port.has_pending_device) continue;
+        ContextPtr context;
+        auto status = adapter_->openContext(port.pending_device, context);
+        if (!status.ok() || !context || !context->valid()) {
+            return Status::DeviceNotFound(
+                "declared probe port '" + port.port_id +
+                "' cannot open a probe context: " + status.ToString());
+        }
+        port.config.context = std::move(context);
+        LOG(INFO) << "UB probe: opened declared probe context for port "
+                  << port.port_id << " device "
+                  << port.pending_device.native_device_name;
+    }
+    return Status::OK();
+}
+
+void StandaloneProbeResourceProvider::setNodeIdentity(std::string segment,
+                                                      uint64_t node_incarnation,
+                                                      uint64_t topology_epoch) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    publication_segment_ = std::move(segment);
+    if (node_incarnation != 0) {
+        publication_node_incarnation_ = node_incarnation;
+    }
+    if (topology_epoch != 0) publication_topology_epoch_ = topology_epoch;
+}
+
+ProbeLocalPublication StandaloneProbeResourceProvider::publication() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ProbeLocalPublication result;
+    result.segment = publication_segment_;
+    result.node_incarnation = publication_node_incarnation_;
+    result.topology_epoch = publication_topology_epoch_;
+    result.publication_epoch = publication_epoch_;
+    for (const auto& port : ports_) {
+        if (!port.available || !port.probe_jetty || !port.area_segment) {
+            continue;
+        }
+        ProbeLocalPortPublication published;
+        published.port_id = port.port_id;
+        published.topology_name = port.topology_name;
+        published.eid = port.eid;
+        if (published.eid.empty() && port.config.context) {
+            published.eid = port.config.context->deviceInfo().eid;
+        }
+        published.target_epoch = port.config.generation;
+        published.jetty.eid = published.eid;
+        published.jetty.uasid = port.probe_jetty->uasid();
+        published.jetty.id = port.probe_jetty->id();
+        published.jetty.token = kProbeAreaToken;
+        published.area_descriptor = port.area_segment->descriptor();
+        published.area_length = port.area_size;
+        published.area_epoch = port.area_epoch;
+        published.area_token = kProbeAreaToken;
+        published.node_gate_ok = !shut_down_;
+        published.port_gate_ok = true;
+        const auto& device = port.config.context->deviceInfo();
+        const uint16_t modes = device.capabilities.transport_modes;
+        published.profile_gate_ok =
+            device.kind == DeviceKind::PHYSICAL &&
+            (modes == 0 || (modes & kUrmaTransportModeRm) != 0);
+        result.ports.push_back(std::move(published));
+    }
+    return result;
+}
+
+uint64_t StandaloneProbeResourceProvider::publicationEpoch() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return publication_epoch_;
+}
+
+void StandaloneProbeResourceProvider::bumpPublicationEpochLocked() {
+    ++publication_epoch_;
+    LOG(INFO) << "UB probe publication bumped to epoch "
+              << publication_epoch_;
+}
+
 namespace {
 
 std::string shortEidName(const DeviceInfo& device) {
@@ -105,6 +244,10 @@ Status StandaloneProbeResourceProvider::discoverLocked() {
             "standalone probe provider is shut down");
     }
     if (!ports_.empty()) return Status::OK();
+    if (declared_mode_) {
+        return Status::InvalidArgument(
+            "declared probe topology requires bindPorts() before discovery");
+    }
     if (!params_.valid()) {
         return Status::InvalidArgument("invalid probe parameters");
     }
@@ -561,6 +704,7 @@ Status StandaloneProbeResourceProvider::prepareLocal() {
 }
 
 Status StandaloneProbeResourceProvider::createLocalResourcesLocked() {
+    CHECK_STATUS(ensureBoundContextsLocked());
     auto page_status = validatePageSizeLocked();
     if (!page_status.ok()) return page_status;
 
@@ -907,6 +1051,9 @@ Status StandaloneProbeResourceProvider::rebuildPortLocked(
     port.source_size = page;
     port.config.generation = next_generation;
     port.source_generation = next_generation;
+    // A probe Jetty rebuild changes target_epoch: peers must refresh quickly
+    // instead of waiting for the periodic handshake (design §6.6).
+    bumpPublicationEpochLocked();
     auto delete_status = adapter_->deleteJetty(old_jetty);
     if (!delete_status.ok()) {
         LOG(WARNING) << "UB probe: old Jetty deletion deferred: "

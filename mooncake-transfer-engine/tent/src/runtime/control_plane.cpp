@@ -119,6 +119,19 @@ Status ControlClient::bootstrapUb(const std::string& server_addr,
     return Status::OK();
 }
 
+#ifdef USE_UB
+Status ControlClient::probeBootstrapUb(const std::string& server_addr,
+                                       const ub::ProbeBootstrapRequest& request,
+                                       ub::ProbeBootstrapResponse& response) {
+    std::string request_raw;
+    CHECK_STATUS(ub::encodeProbeBootstrapRequest(request, request_raw));
+    std::string response_raw;
+    CHECK_STATUS(tl_rpc_agent.call(server_addr, ProbeBootstrapUb, request_raw,
+                                   response_raw));
+    return ub::decodeProbeBootstrapResponse(response_raw, response);
+}
+#endif  // USE_UB
+
 Status ControlClient::sendData(const std::string& server_addr,
                                uint64_t peer_mem_addr, void* local_mem_addr,
                                size_t length) {
@@ -321,6 +334,13 @@ ControlService::ControlService(const std::string& type,
         [this](const std::string_view& request, std::string& response) {
             onBootstrapUb(request, response);
         });
+#ifdef USE_UB
+    rpc_server_->registerFunction(
+        ProbeBootstrapUb,
+        [this](const std::string_view& request, std::string& response) {
+            onProbeBootstrap(request, response);
+        });
+#endif
     rpc_server_->registerFunction(
         SendData,
         [this](const std::string_view& request, std::string& response) {
@@ -523,6 +543,54 @@ void ControlService::onBootstrapUb(const std::string_view& request,
     json j = response_desc;
     response = j.dump();
 }
+
+#ifdef USE_UB
+void ControlService::onProbeBootstrap(const std::string_view& request,
+                                      std::string& response) {
+    ub::ProbeBootstrapResponse response_desc;
+    try {
+        ub::ProbeBootstrapRequest request_desc;
+        auto decoded = ub::decodeProbeBootstrapRequest(request, request_desc);
+        if (!decoded.ok()) {
+            response_desc.reply_msg = decoded.ToString();
+            std::string encoded_error;
+            auto encode_status =
+                ub::encodeProbeBootstrapResponse(response_desc, encoded_error);
+            response = encode_status.ok()
+                           ? std::move(encoded_error)
+                           : "ProbeBootstrapUb response encoding failed";
+            return;
+        }
+        int ret = -1;
+        {
+            // Callback replacement during uninstall is serialized with
+            // invocation, so an in-flight handshake cannot outlive the UB
+            // transport object it targets.
+            std::lock_guard<std::mutex> lock(probe_bootstrap_callback_mutex_);
+            if (probe_bootstrap_callback_) {
+                ret = probe_bootstrap_callback_(request_desc, response_desc);
+            } else {
+                response_desc.reply_msg =
+                    "Probe bootstrap callback is not registered";
+            }
+        }
+        if (ret != 0 && response_desc.reply_msg.empty()) {
+            response_desc.reply_msg =
+                "Probe bootstrap callback failed, ret=" + std::to_string(ret);
+        }
+    } catch (const std::exception& e) {
+        response_desc.reply_msg =
+            std::string("Malformed ProbeBootstrapUb request: ") + e.what();
+    }
+    std::string encoded;
+    auto status = ub::encodeProbeBootstrapResponse(response_desc, encoded);
+    if (!status.ok()) {
+        response = "ProbeBootstrapUb response encoding failed";
+        return;
+    }
+    response = std::move(encoded);
+}
+#endif  // USE_UB
 
 void ControlService::onSendData(const std::string_view& request,
                                 std::string& response) {

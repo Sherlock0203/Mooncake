@@ -279,6 +279,70 @@ TEST(UbProbeStandaloneProviderTest, RecordsRetireAndHandoffUntilShutdown) {
     EXPECT_TRUE(adapter->shutdown().ok());
 }
 
+TEST(UbProbeStandaloneProviderTest, DeclaredPortsPublishNodeIdentityAndArea) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+
+    ProbeParams params = makeProbeParams();
+    StandaloneProbeResourceProvider provider(adapter, params);
+    provider.setNodeIdentity("node-a", 11, 22);
+
+    auto device = fakeDevice();
+    device.kind = DeviceKind::PHYSICAL;
+    device.capabilities.transport_modes = 3;
+    ProbePortSpec spec;
+    spec.port_id = "P0";
+    spec.local_nic = 0;
+    spec.device = device;
+    spec.topology_name = device.topology_name;
+    spec.native_device_name = device.native_device_name;
+    spec.eid = device.eid;
+    spec.generation = 1;
+    ASSERT_TRUE(provider.bindPorts({spec}).ok());
+    // Ports may only be bound once, before resources exist.
+    EXPECT_TRUE(provider.bindPorts({spec}).IsInvalidArgument());
+    ASSERT_TRUE(provider.prepareLocal().ok());
+
+    const auto publication = provider.publication();
+    EXPECT_EQ(publication.segment, "node-a");
+    EXPECT_EQ(publication.node_incarnation, 11U);
+    EXPECT_EQ(publication.topology_epoch, 22U);
+    EXPECT_EQ(publication.publication_epoch, 1U);
+    ASSERT_EQ(publication.ports.size(), 1U);
+    const auto& port = publication.ports[0];
+    EXPECT_EQ(port.port_id, "P0");
+    EXPECT_EQ(port.topology_name, device.topology_name);
+    EXPECT_EQ(port.eid, device.eid);
+    EXPECT_EQ(port.target_epoch, 1U);
+    EXPECT_NE(port.jetty.id, 0U);
+    EXPECT_EQ(port.jetty.eid, device.eid);
+    EXPECT_EQ(port.jetty.token, 0xACFEU);
+    EXPECT_EQ(port.area_length % static_cast<uint64_t>(::getpagesize()), 0U);
+    EXPECT_EQ(port.area_epoch, 1U);
+    EXPECT_EQ(port.area_token, 0xACFEU);
+    EXPECT_FALSE(port.area_descriptor.hex.empty());
+    EXPECT_TRUE(port.node_gate_ok);
+    EXPECT_TRUE(port.port_gate_ok);
+    EXPECT_TRUE(port.profile_gate_ok);
+    EXPECT_EQ(provider.publicationEpoch(), 1U);
+
+    EXPECT_TRUE(provider.shutdown().ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
+TEST(UbProbeStandaloneProviderTest, DeclaredModeRequiresBindPorts) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+
+    ProbeParams params = makeProbeParams();
+    params.local_ports.push_back(ProbeLocalPortDecl{"P0", "ub:fake0:eid0", ""});
+    StandaloneProbeResourceProvider provider(adapter, params);
+    EXPECT_TRUE(provider.discover().IsInvalidArgument());
+
+    EXPECT_TRUE(provider.shutdown().ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
 }  // namespace
 }  // namespace ub
 }  // namespace tent
