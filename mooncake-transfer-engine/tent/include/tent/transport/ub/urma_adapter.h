@@ -401,6 +401,53 @@ struct Completion {
     uint32_t local_jetty_id = 0;
 };
 
+// Classification of a provider entity marker (design §4.1/§6.1). A marker is a
+// completion record that carries no work-request identity (the adapter forces
+// token 0); only these shapes may reach the asynchronous drain chain, and only
+// a flush-done marker for the current ERROR epoch may advance a drain.
+enum class EntityMarkerKind : uint8_t {
+    kNone = 0,
+    kFlushDone = 1,    // URMA_CR_WR_FLUSH_ERR_DONE
+    kSuspendDone = 2,  // URMA_CR_WR_SUSPEND_DONE
+};
+
+inline const char* entityMarkerKindName(EntityMarkerKind kind) noexcept {
+    switch (kind) {
+        case EntityMarkerKind::kNone:
+            return "none";
+        case EntityMarkerKind::kFlushDone:
+            return "flush_done";
+        case EntityMarkerKind::kSuspendDone:
+            return "suspend_done";
+    }
+    return "none";
+}
+
+// Three-way native delete result (design §8.1). Only kConsumed proves that the
+// provider reclaimed the handle, so only kConsumed may release budget and erase
+// the tombstone.
+struct DeleteOutcome {
+    enum class Kind : uint8_t {
+        kConsumed = 0,  // handle reclaimed (or provably already gone)
+        kRetained = 1,  // provider says the handle is still valid: retry
+        kUnknown = 2,   // undecidable: keep every owner, never re-dereference
+    };
+    Kind kind = Kind::kUnknown;
+    Status status;
+};
+
+inline const char* deleteOutcomeKindName(DeleteOutcome::Kind kind) noexcept {
+    switch (kind) {
+        case DeleteOutcome::Kind::kConsumed:
+            return "consumed";
+        case DeleteOutcome::Kind::kRetained:
+            return "retained";
+        case DeleteOutcome::Kind::kUnknown:
+            return "unknown";
+    }
+    return "unknown";
+}
+
 // Pure, injectable URMA boundary. It deliberately does not know about TENT
 // Request, SubBatch, UbTask, UbSlice, scheduling, retry, or rail health.
 //
@@ -498,8 +545,76 @@ class UrmaAdapter {
     // through their normal completion path before resetting or deleting the
     // Jetty. On failure no drain guarantee is made and native resources must
     // remain alive.
+    //
+    // This blocking form is the *legacy* fallback. The pooled error hot path
+    // must not use it (source design §1.4): it holds the JFC poll lock across a
+    // provider wait and freezes every other completion on the same JFC. It
+    // stays for shutdown, Context-fatal recovery and probe-Jetty teardown,
+    // which are the only branches the design permits.
     virtual Status quiesceJetty(const JettyPtr& jetty, uint32_t timeout_ms,
                                 std::vector<Completion>& completions) = 0;
+
+    // --- Asynchronous drain primitives (design §4.1) -----------------------
+    // These are the fine-grained steps of quiesceJetty(), exposed so the pooled
+    // retirement chain can drive them from its control executor instead of one
+    // blocking call on the fault path. Every default implementation is
+    // fail-closed: an adapter that does not override them makes the controller
+    // quarantine the member rather than delete on unproven evidence.
+
+    // Moves the Jetty into ERROR. Idempotent: an already-ERROR Jetty returns
+    // OK. Entering a new epoch discards the stale flush-done record for this
+    // native id. The implementation takes the Jetty's own mutex, which is also
+    // held by post(), so a successful return proves that no post is in flight.
+    virtual Status modifyJettyError(const JettyPtr& jetty,
+                                    uint64_t error_epoch) {
+        (void)jetty;
+        (void)error_epoch;
+        return Status::NotImplemented(
+            "asynchronous Jetty drain is not supported by this adapter");
+    }
+
+    // Classifies a token==0 completion as a provider entity marker. kNone means
+    // "not a marker" (an async event or an unknown record); the poller must
+    // keep routing it through its legacy unknown-token path.
+    virtual EntityMarkerKind classifyEntityMarker(
+        const Completion& completion) const {
+        (void)completion;
+        return EntityMarkerKind::kNone;
+    }
+
+    // Runs one bounded round of urma_flush_jetty(): returns the WR completions
+    // that were accepted by the provider but never completed. OK with an empty
+    // `out` means the software SQ is empty (the only proof of that condition).
+    // A token==0 entity marker in the returned batch is an internal error, the
+    // same judgment quiesceJetty makes.
+    virtual Status flushJettyOnce(const JettyPtr& jetty,
+                                  std::vector<Completion>& out) {
+        (void)jetty;
+        out.clear();
+        return Status::NotImplemented(
+            "asynchronous Jetty drain is not supported by this adapter");
+    }
+
+    // Drain teardown: clears the flush-done record, releases every segment
+    // retained for this Jetty and marks the Jetty flush-fenced. Called once,
+    // after the software SQ is proven empty.
+    virtual Status finishDrain(const JettyPtr& jetty) {
+        (void)jetty;
+        return Status::NotImplemented(
+            "asynchronous Jetty drain is not supported by this adapter");
+    }
+
+    // Classified native delete (design §8.1). The default derives the
+    // classification from the legacy delete contract: any error leaves the
+    // owner in place and is reported as Unknown (fail-closed). Adapters that
+    // can prove "handle already gone" or "provider says busy" override this.
+    virtual DeleteOutcome deleteJettyWithOutcome(JettyPtr& jetty) {
+        DeleteOutcome outcome;
+        outcome.status = deleteJetty(jetty);
+        outcome.kind = outcome.status.ok() ? DeleteOutcome::Kind::kConsumed
+                                           : DeleteOutcome::Kind::kUnknown;
+        return outcome;
+    }
 
     // On a native post error, posted_count is the number of leading requests
     // accepted before the provider's bad WR. Requests counted as posted must

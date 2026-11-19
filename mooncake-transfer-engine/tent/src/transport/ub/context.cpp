@@ -3,6 +3,8 @@
 
 #include "tent/transport/ub/context.h"
 
+#include "tent/transport/ub/jetty_drain_controller.h"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -137,6 +139,12 @@ void UbContext::attachJettyPool(std::shared_ptr<UbSendJettyPool> pool) {
 void UbContext::attachPooledSendPool(std::shared_ptr<SendJettyPool> pool) {
     std::lock_guard<std::mutex> lock(lifecycle_mutex_);
     pooled_send_pool_ = std::move(pool);
+}
+
+void UbContext::attachDrainController(
+    std::shared_ptr<JettyDrainController> controller) {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    drain_controller_ = std::move(controller);
 }
 
 Status UbContext::shutdownLocked() {

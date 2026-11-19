@@ -385,6 +385,61 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         quiesce_calls_.fetch_add(1, std::memory_order_relaxed);
         return Status::OK();
     }
+    // Asynchronous drain primitives (design tent-ub-async-drain-design §4.1).
+    // The pooled error path runs the chain on the control executor, so the fake
+    // provider emits the flush-done marker the way a real one does: because the
+    // Jetty entered ERROR. The marker travels through the JFC poller, which is
+    // exactly the path this integration test covers.
+    static constexpr int kFlushDoneStatus = 0x21;
+
+    Status modifyJettyError(const JettyPtr& jetty, uint64_t) override {
+        auto fake = std::dynamic_pointer_cast<FakeJetty>(jetty);
+        if (!fake || !fake->valid()) {
+            return Status::InvalidArgument("bad Jetty modify");
+        }
+        modify_error_calls_.fetch_add(1, std::memory_order_relaxed);
+        if (auto jfc = fake->jfc()) {
+            jfc->push(Completion{CompletionCategory::ENDPOINT_ERROR,
+                                 kFlushDoneStatus, 0, 0, fake->id()});
+        }
+        return Status::OK();
+    }
+
+    EntityMarkerKind classifyEntityMarker(
+        const Completion& completion) const override {
+        return completion.native_status == kFlushDoneStatus
+                   ? EntityMarkerKind::kFlushDone
+                   : EntityMarkerKind::kNone;
+    }
+
+    Status flushJettyOnce(const JettyPtr& jetty,
+                          std::vector<Completion>& out) override {
+        out.clear();
+        auto fake = std::dynamic_pointer_cast<FakeJetty>(jetty);
+        if (!fake || !fake->valid()) {
+            return Status::InvalidArgument("bad Jetty flush");
+        }
+        flush_jetty_calls_.fetch_add(1, std::memory_order_relaxed);
+        return Status::OK();
+    }
+
+    Status finishDrain(const JettyPtr& jetty) override {
+        auto fake = std::dynamic_pointer_cast<FakeJetty>(jetty);
+        if (!fake || !fake->valid()) {
+            return Status::InvalidArgument("bad Jetty finish");
+        }
+        finish_drain_calls_.fetch_add(1, std::memory_order_relaxed);
+        return Status::OK();
+    }
+
+    DeleteOutcome deleteJettyWithOutcome(JettyPtr& jetty) override {
+        DeleteOutcome outcome;
+        outcome.status = deleteJetty(jetty);
+        outcome.kind = outcome.status.ok() ? DeleteOutcome::Kind::kConsumed
+                                           : DeleteOutcome::Kind::kUnknown;
+        return outcome;
+    }
+
     Status post(const JettyPtr& jetty, const std::vector<WorkRequest>& requests,
                 size_t& posted_count) override {
         posted_count = 0;
@@ -511,6 +566,15 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     uint64_t quiesceCalls() const {
         return quiesce_calls_.load(std::memory_order_relaxed);
     }
+    uint64_t modifyErrorCalls() const {
+        return modify_error_calls_.load(std::memory_order_relaxed);
+    }
+    uint64_t flushJettyCalls() const {
+        return flush_jetty_calls_.load(std::memory_order_relaxed);
+    }
+    uint64_t finishDrainCalls() const {
+        return finish_drain_calls_.load(std::memory_order_relaxed);
+    }
     uint64_t openContextCalls() const {
         return open_context_calls_.load(std::memory_order_relaxed);
     }
@@ -566,6 +630,9 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     std::vector<Pending> pending_;
     std::vector<uint32_t> imported_ids_;
     std::atomic<uint64_t> quiesce_calls_{0};
+    std::atomic<uint64_t> modify_error_calls_{0};
+    std::atomic<uint64_t> flush_jetty_calls_{0};
+    std::atomic<uint64_t> finish_drain_calls_{0};
     std::atomic<uint64_t> open_context_calls_{0};
     std::atomic<uint64_t> create_jetty_calls_{0};
     std::atomic<uint64_t> delete_jetty_calls_{0};
@@ -3010,9 +3077,19 @@ TEST(UbRmPoolTest, PooledMemberRetiresAfterCqeError) {
     EXPECT_EQ(transfer.s, COMPLETED);
     EXPECT_EQ(source, target);
 
-    EXPECT_GE(adapter->quiesceCalls(), 1U)
-        << "an errored pooled member must be moved to ERROR and flush-fenced "
-           "before it is retired";
+    // Asynchronous drain chain (design §4.4/§5.2): the error completion closes
+    // the post gate and hands the member to the control executor, which runs
+    // modify ERROR and the software flush. The blocking quiesce must not run on
+    // this path any more.
+    EXPECT_GE(adapter->modifyErrorCalls(), 1U)
+        << "an errored pooled member must be moved to ERROR before it is "
+           "retired";
+    EXPECT_GE(adapter->flushJettyCalls(), 1U)
+        << "the drain chain must flush the software SQ before DELETE_READY";
+    EXPECT_GE(adapter->finishDrainCalls(), 1U)
+        << "the drain chain must finish (clear marker / release segments)";
+    EXPECT_EQ(adapter->quiesceCalls(), 0U)
+        << "the pooled error hot path must never block on quiesceJetty";
     // Retirement hands the native reset+delete to the background delete
     // executor, so wait (bounded) instead of sampling synchronously.
     const auto delete_deadline =

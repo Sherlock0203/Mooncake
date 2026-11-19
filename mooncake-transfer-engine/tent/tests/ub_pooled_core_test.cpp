@@ -1203,6 +1203,13 @@ TEST(UbSendJettyPoolConcurrencyTest, HammerWithStopDrainsSafely) {
     for (int thread = 0; thread < kThreads; ++thread) {
         threads.emplace_back([&, thread] {
             for (int round = 0; round < kRounds; ++round) {
+                // Trigger the stop from the top of the iteration: doing it
+                // after a successful lease made the signal racy, because a
+                // deferred (TooManyRequests) round skipped the trigger and the
+                // stopper thread then waited forever.
+                if (round == kRounds / 2 && thread == 0) {
+                    stop_requested.store(true);
+                }
                 LeaseWithCredit grant;
                 const auto attempt =
                     makeAttemptKey(static_cast<uint64_t>(thread + 1),
@@ -1220,9 +1227,6 @@ TEST(UbSendJettyPoolConcurrencyTest, HammerWithStopDrainsSafely) {
                 ASSERT_TRUE(
                     harness.pool->returnOnce(std::move(grant.lease), true)
                         .ok());
-                if (round == kRounds / 2 && thread == 0) {
-                    stop_requested.store(true);
-                }
             }
         });
     }

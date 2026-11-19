@@ -15,7 +15,9 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -356,6 +358,137 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         quiesce_calls_.fetch_add(1, std::memory_order_relaxed);
         return Status::OK();
     }
+    // --- Asynchronous drain primitives (design §4.1) ----------------------
+    // Deterministic fakes: every call is counted, every failure and every
+    // provider answer is injected by the test, so the drain chain's state
+    // machine can be asserted step by step without a real provider.
+
+    Status modifyJettyError(const JettyPtr& jetty,
+                            uint64_t error_epoch) override {
+        auto fake = std::dynamic_pointer_cast<FakeJetty>(jetty);
+        if (!fake || !fake->valid()) {
+            return Status::InvalidArgument("bad Jetty modify");
+        }
+        if (fail_next_modify_error_.exchange(false,
+                                             std::memory_order_acq_rel)) {
+            modify_error_failures_.fetch_add(1, std::memory_order_relaxed);
+            return Status::RdmaError("injected modifyJettyError failure");
+        }
+        {
+            std::lock_guard<std::mutex> lock(drain_mutex_);
+            // A new ERROR epoch discards the marker of the previous epoch for
+            // the same (possibly reused) native id.
+            flush_done_ids_.erase(fake->id());
+            last_modify_epoch_.store(error_epoch, std::memory_order_release);
+            modify_error_calls_.fetch_add(1, std::memory_order_relaxed);
+        }
+        // Provider semantics: ERROR takes effect (and the flush-done marker is
+        // produced) before modifyJettyError() returns. The gate lets a test run
+        // the poller exactly in that window.
+        std::function<void(uint32_t, uint64_t)> gate;
+        {
+            std::lock_guard<std::mutex> lock(hook_mutex_);
+            gate = modify_gate_;
+        }
+        if (gate) gate(fake->id(), error_epoch);
+        return Status::OK();
+    }
+
+    EntityMarkerKind classifyEntityMarker(
+        const Completion& completion) const override {
+        switch (completion.native_status) {
+            case kFakeFlushDoneStatus:
+                return EntityMarkerKind::kFlushDone;
+            case kFakeSuspendDoneStatus:
+                return EntityMarkerKind::kSuspendDone;
+            default:
+                return EntityMarkerKind::kNone;
+        }
+    }
+
+    Status flushJettyOnce(const JettyPtr& jetty,
+                          std::vector<Completion>& out) override {
+        out.clear();
+        auto fake = std::dynamic_pointer_cast<FakeJetty>(jetty);
+        if (!fake || !fake->valid()) {
+            return Status::InvalidArgument("bad Jetty flush");
+        }
+        if (fail_next_flush_jetty_.exchange(false, std::memory_order_acq_rel)) {
+            flush_jetty_failures_.fetch_add(1, std::memory_order_relaxed);
+            return Status::RdmaError("injected flushJettyOnce failure");
+        }
+        {
+            std::lock_guard<std::mutex> lock(drain_mutex_);
+            flush_jetty_calls_.fetch_add(1, std::memory_order_relaxed);
+            auto it = injected_flush_.find(fake->id());
+            if (it != injected_flush_.end()) {
+                out = std::move(it->second);
+                injected_flush_.erase(it);
+            }
+        }
+        for (const auto& completion : out) {
+            if (completion.token == 0) {
+                flush_marker_errors_.fetch_add(1, std::memory_order_relaxed);
+                return Status::InternalError(
+                    "fake Jetty flush returned an entity marker");
+            }
+        }
+        return Status::OK();
+    }
+
+    Status finishDrain(const JettyPtr& jetty) override {
+        auto fake = std::dynamic_pointer_cast<FakeJetty>(jetty);
+        if (!fake || !fake->valid()) {
+            return Status::InvalidArgument("bad Jetty finish");
+        }
+        {
+            std::lock_guard<std::mutex> lock(drain_mutex_);
+            flush_done_ids_.erase(fake->id());
+            last_finished_jetty_id_.store(fake->id(),
+                                          std::memory_order_release);
+            finish_drain_calls_.fetch_add(1, std::memory_order_relaxed);
+        }
+        return Status::OK();
+    }
+
+    DeleteOutcome deleteJettyWithOutcome(JettyPtr& jetty) override {
+        DeleteOutcome outcome;
+        if (jetty && jetty.use_count() != 1) {
+            // Mirror the real adapter's ownership contract: the native delete
+            // may only run while the pool is the sole owner of the handle.
+            outcome.kind = DeleteOutcome::Kind::kRetained;
+            outcome.status =
+                Status::TooManyRequests("fake Jetty handle is still retained");
+            return outcome;
+        }
+        {
+            std::lock_guard<std::mutex> lock(drain_mutex_);
+            if (!next_delete_outcomes_.empty()) {
+                outcome.kind = next_delete_outcomes_.front();
+                next_delete_outcomes_.pop_front();
+            } else {
+                outcome.kind = DeleteOutcome::Kind::kConsumed;
+            }
+        }
+        switch (outcome.kind) {
+            case DeleteOutcome::Kind::kConsumed:
+                outcome.status = deleteJetty(jetty);
+                if (!outcome.status.ok()) {
+                    outcome.kind = DeleteOutcome::Kind::kUnknown;
+                }
+                break;
+            case DeleteOutcome::Kind::kRetained:
+                outcome.status =
+                    Status::TooManyRequests("injected retained Jetty delete");
+                break;
+            case DeleteOutcome::Kind::kUnknown:
+                outcome.status =
+                    Status::InternalError("injected unknown Jetty delete");
+                break;
+        }
+        return outcome;
+    }
+
     Status post(const JettyPtr& jetty, const std::vector<WorkRequest>& requests,
                 size_t& posted_count) override {
         posted_count = 0;
@@ -560,6 +693,96 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     void failNextQuiesce() {
         fail_next_quiesce_.store(true, std::memory_order_release);
     }
+    // --- asynchronous drain hooks ----------------------------------------
+    // Runs inside modifyJettyError(), after ERROR took effect and before the
+    // call returns, so a test can deliver a marker on the exact in-flight race
+    // window.
+    void setModifyGate(std::function<void(uint32_t, uint64_t)> gate) {
+        std::lock_guard<std::mutex> lock(hook_mutex_);
+        modify_gate_ = std::move(gate);
+    }
+    void clearModifyGate() { setModifyGate({}); }
+    void failNextModifyError() {
+        fail_next_modify_error_.store(true, std::memory_order_release);
+    }
+    void failNextFlushJetty() {
+        fail_next_flush_jetty_.store(true, std::memory_order_release);
+    }
+    // Queues one provider entity marker for `jetty_id` on `jfc`. The marker
+    // carries no work-request identity, exactly like a native one.
+    void injectEntityMarker(const JfcPtr& jfc, uint32_t jetty_id,
+                            bool flush_done = true) {
+        auto fake_jfc = std::dynamic_pointer_cast<FakeJfc>(jfc);
+        if (!fake_jfc) return;
+        if (flush_done) {
+            std::lock_guard<std::mutex> lock(drain_mutex_);
+            flush_done_ids_.insert(jetty_id);
+        }
+        fake_jfc->push(Completion{
+            CompletionCategory::ENDPOINT_ERROR,
+            flush_done ? kFakeFlushDoneStatus : kFakeSuspendDoneStatus, 0, 0,
+            jetty_id});
+    }
+    // Builds the same marker without queueing it, for a direct
+    // JettyDrainController::onEntityEvent() call.
+    static Completion makeEntityMarker(uint32_t jetty_id,
+                                       bool flush_done = true) {
+        return Completion{
+            CompletionCategory::ENDPOINT_ERROR,
+            flush_done ? kFakeFlushDoneStatus : kFakeSuspendDoneStatus, 0, 0,
+            jetty_id};
+    }
+    // Queues the WR completions one flushJettyOnce() round returns.
+    void pushFlushCompletions(const JettyPtr& jetty,
+                              std::vector<Completion> completions) {
+        auto fake = std::dynamic_pointer_cast<FakeJetty>(jetty);
+        if (!fake) return;
+        std::lock_guard<std::mutex> lock(drain_mutex_);
+        auto& slot = injected_flush_[fake->id()];
+        for (auto& completion : completions) {
+            slot.push_back(std::move(completion));
+        }
+    }
+    void queueDeleteOutcome(DeleteOutcome::Kind kind) {
+        std::lock_guard<std::mutex> lock(drain_mutex_);
+        next_delete_outcomes_.push_back(kind);
+    }
+    uint64_t modifyErrorCalls() const {
+        std::lock_guard<std::mutex> lock(drain_mutex_);
+        return modify_error_calls_.load(std::memory_order_relaxed);
+    }
+    uint64_t modifyErrorFailures() const {
+        std::lock_guard<std::mutex> lock(drain_mutex_);
+        return modify_error_failures_.load(std::memory_order_relaxed);
+    }
+    uint64_t flushJettyCalls() const {
+        std::lock_guard<std::mutex> lock(drain_mutex_);
+        return flush_jetty_calls_.load(std::memory_order_relaxed);
+    }
+    uint64_t flushJettyFailures() const {
+        std::lock_guard<std::mutex> lock(drain_mutex_);
+        return flush_jetty_failures_.load(std::memory_order_relaxed);
+    }
+    uint64_t finishDrainCalls() const {
+        std::lock_guard<std::mutex> lock(drain_mutex_);
+        return finish_drain_calls_.load(std::memory_order_relaxed);
+    }
+    uint64_t flushMarkerErrors() const {
+        std::lock_guard<std::mutex> lock(drain_mutex_);
+        return flush_marker_errors_.load(std::memory_order_relaxed);
+    }
+    uint64_t lastModifyEpoch() const {
+        std::lock_guard<std::mutex> lock(drain_mutex_);
+        return last_modify_epoch_.load(std::memory_order_relaxed);
+    }
+    uint32_t lastFinishedJettyId() const {
+        std::lock_guard<std::mutex> lock(drain_mutex_);
+        return last_finished_jetty_id_.load(std::memory_order_relaxed);
+    }
+    bool hasFlushDoneRecord(uint32_t jetty_id) const {
+        std::lock_guard<std::mutex> lock(drain_mutex_);
+        return flush_done_ids_.count(jetty_id) != 0;
+    }
     void dropQuiesceCompletions() {
         quiesce_drops_completions_.store(true, std::memory_order_release);
     }
@@ -668,6 +891,10 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         if (gate) gate(request.token);
     }
 
+    // Distinct from every real URMA status; classifyEntityMarker() maps them.
+    static constexpr int kFakeFlushDoneStatus = 0x21;
+    static constexpr int kFakeSuspendDoneStatus = 0x22;
+
     DeviceInfo device_;
     std::vector<DeviceInfo> discovered_devices_;
     bool initialized_{false};
@@ -702,7 +929,26 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     std::atomic<size_t> live_remote_segments_{0};
     mutable std::mutex hook_mutex_;
     std::function<void(uint64_t)> post_gate_;
+    std::function<void(uint32_t, uint64_t)> modify_gate_;
     std::atomic<uint64_t> injected_completions_{0};
+    // Asynchronous drain state, guarded by drain_mutex_ (never taken by a
+    // provider call).
+    mutable std::mutex drain_mutex_;
+    std::atomic<bool> fail_next_modify_error_{false};
+    std::atomic<bool> fail_next_flush_jetty_{false};
+    std::atomic<uint64_t> modify_error_calls_{0};
+    std::atomic<uint64_t> modify_error_failures_{0};
+    std::atomic<uint64_t> flush_jetty_calls_{0};
+    std::atomic<uint64_t> flush_jetty_failures_{0};
+    std::atomic<uint64_t> finish_drain_calls_{0};
+    std::atomic<uint64_t> flush_marker_errors_{0};
+    std::atomic<uint64_t> last_modify_epoch_{0};
+    std::atomic<uint32_t> last_finished_jetty_id_{0};
+    std::set<uint32_t> flush_done_ids_;
+    // Per-jetty completions the next flushJettyOnce() rounds return. A
+    // token==0 entry exercises the "flush returned a marker" internal error.
+    std::unordered_map<uint32_t, std::vector<Completion>> injected_flush_;
+    std::deque<DeleteOutcome::Kind> next_delete_outcomes_;
     std::atomic<uint64_t> delivered_completions_{0};
     WorkRequest last_post_;
     RemoteJettyInfo last_post_target_;

@@ -72,8 +72,18 @@ struct UbJettyPoolParams {
     uint32_t business_min_size = 6;
     uint32_t business_max_size = 6;
     uint32_t refill_interval_ms = 50;
-    // Upper bound for the hardware retirement fence.
+    // Upper bound for the hardware retirement fence. In asynchronous mode it is
+    // the total budget from beginDrain() to DELETE_READY.
     uint32_t retire_timeout_ms = 1000;
+    // Asynchronous drain chain (design §10.1). true is the design default;
+    // false is a bisection lever that restores the synchronous quiesce on the
+    // error path, never a production fallback.
+    bool async_drain = true;
+    // Bound on flushJettyOnce() rounds per control tick.
+    uint32_t drain_flush_batch = 64;
+    // Consecutive failed drains after which the provider is declared unable to
+    // drain and new faults are quarantined (design §9).
+    uint32_t drain_quarantine_threshold = 3;
     // Creation-backoff cap (design §7.3 BACKOFF). Distinct from
     // endpoint_cooldown_ms, which throttles endpoint re-resolution.
     uint32_t cooldown_ms = 1000;
@@ -387,6 +397,17 @@ struct UbParams {
                                   "transports/ub/jetty_pool/retire_timeout_ms",
                                   parsed.jetty_pool.retire_timeout_ms,
                                   parsed.jetty_pool.retire_timeout_ms));
+        CHECK_STATUS(readBool(config, "transports/ub/jetty_pool/async_drain",
+                              parsed.jetty_pool.async_drain,
+                              parsed.jetty_pool.async_drain));
+        CHECK_STATUS(readPositive(config,
+                                  "transports/ub/jetty_pool/drain_flush_batch",
+                                  parsed.jetty_pool.drain_flush_batch,
+                                  parsed.jetty_pool.drain_flush_batch));
+        CHECK_STATUS(readPositive(
+            config, "transports/ub/jetty_pool/drain_quarantine_threshold",
+            parsed.jetty_pool.drain_quarantine_threshold,
+            parsed.jetty_pool.drain_quarantine_threshold));
         CHECK_STATUS(readPositive(
             config, "transports/ub/jetty_pool/cooldown_ms",
             parsed.jetty_pool.cooldown_ms, parsed.jetty_pool.cooldown_ms));

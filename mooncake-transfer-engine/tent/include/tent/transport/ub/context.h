@@ -21,6 +21,7 @@
 namespace mooncake::tent::ub {
 
 class UbSendJettyPool;
+class JettyDrainController;
 
 class UbContext final : public std::enable_shared_from_this<UbContext> {
    public:
@@ -94,6 +95,17 @@ class UbContext final : public std::enable_shared_from_this<UbContext> {
         std::lock_guard<std::mutex> lock(lifecycle_mutex_);
         return pooled_send_pool_;
     }
+
+    // Asynchronous drain chain owner of this context (design §3.1). Null unless
+    // the transport installed the rm_pool drain chain; the workers then deliver
+    // every token==0 entity marker to it before the legacy accounting.
+    void attachDrainController(
+        std::shared_ptr<JettyDrainController> controller);
+    [[nodiscard]] std::shared_ptr<JettyDrainController> drainController()
+        const {
+        std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+        return drain_controller_;
+    }
     [[nodiscard]] std::shared_ptr<UbJfc> jfc(size_t index) const;
 
     // Imported RM targets owned by this Context (design §5.1). Endpoints,
@@ -132,6 +144,7 @@ class UbContext final : public std::enable_shared_from_this<UbContext> {
     std::vector<std::shared_ptr<UbJfc>> jfcs_;
     std::shared_ptr<UbSendJettyPool> jetty_pool_;
     std::shared_ptr<SendJettyPool> pooled_send_pool_;
+    std::shared_ptr<JettyDrainController> drain_controller_;
     std::shared_ptr<ImportedTargetRegistry> target_registry_;
     mutable std::mutex lifecycle_mutex_;
     std::atomic<State> state_{State::kUninitialized};

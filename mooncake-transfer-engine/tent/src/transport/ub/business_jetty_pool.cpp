@@ -3,6 +3,7 @@
 
 #include "tent/transport/ub/business_jetty_pool.h"
 
+#include "tent/transport/ub/jetty_drain_controller.h"
 #include "tent/transport/ub/jetty_refill_worker.h"
 #include "tent/transport/ub/jetty_retire_worker.h"
 
@@ -193,7 +194,13 @@ Status BusinessJettyPool::tryLease(const PoolKey& pool_key,
 }
 
 bool BusinessJettyPool::admissionBlockedLocked() const {
-    return quarantine_backpressure_;
+    if (quarantine_backpressure_) return true;
+    // Design §9.2 runtime brake: once the drain controller proved that the
+    // provider cannot drain, admitting new slices would only build up members
+    // that can never be retired. Stop admission instead of relying on the
+    // quarantine budget to notice.
+    return drain_controller_ != nullptr &&
+           !drain_controller_->asyncDrainSupported();
 }
 
 void BusinessJettyPool::refreshBackpressureLocked() {
@@ -471,6 +478,7 @@ Status BusinessJettyPool::retireFaulted(SliceJettyLease lease,
     auto member = lease.member();
     lease.detach();
 
+    std::shared_ptr<JettyDrainController> controller;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (member->state != PoolMemberState::kInUse) {
@@ -483,24 +491,58 @@ Status BusinessJettyPool::retireFaulted(SliceJettyLease lease,
             --bucket->second.in_use;
         }
         ++total_returns_;
-        // Leave kInUse under the lock and raise the epoch *before* the fence:
-        // no claim may succeed on a member whose hardware is being retired,
-        // and the FLUSHING stage is visible to diagnostics while the provider
-        // call runs outside the lock.
-        member->state = fence_hardware ? PoolMemberState::kFlushing
-                                       : PoolMemberState::kDraining;
         member->retire_reason = reason.empty() ? "fault" : reason;
+        // Leave kInUse and raise the epoch *before* the fence: no claim may
+        // succeed on a member whose hardware is being retired. This is also the
+        // PostGate close the asynchronous chain requires (§4.4/§5.3 ①).
         ++member->error_epoch;
-        if (fence_hardware) ++flushing_;
         noteTombstoneLocked(member);
+        const bool async = fence_hardware && options_.async_drain &&
+                           drain_controller_ != nullptr &&
+                           member->jetty != nullptr;
+        if (async) {
+            member->state = PoolMemberState::kDraining;
+            controller = drain_controller_;
+            // The budget stays charged for the whole drain; the object merely
+            // stops counting as serving (design §4.4).
+            (void)budget_->transition(member->budget,
+                                      BudgetObjectState::kQuarantined);
+            draining_[member->lane.lane_generation] = member;
+            ++drain_begin_;
+        } else {
+            // Legacy/synchronous fence: the member rests in kFlushing while the
+            // provider call runs outside the pool lock below.
+            member->state = fence_hardware ? PoolMemberState::kFlushing
+                                           : PoolMemberState::kDraining;
+            if (fence_hardware) ++flushing_;
+        }
+    }
+
+    if (controller != nullptr) {
+        // Non-blocking hand-off: the chain continues on the control executor.
+        DrainRequest request;
+        request.lane = member->lane;
+        request.pool_key = member->pool_key;
+        request.error_epoch = member->error_epoch;
+        request.jfc_index = member->jfc_index;
+        request.post_gate_closed = true;
+        const Status begun = controller->beginDrain(request);
+        if (begun.ok()) return Status::OK();
+        // The drain could not be scheduled (controller stopping or executor
+        // full). Keep responsibility: quarantine, never guess and never block.
+        LOG_EVERY_N(WARNING, 100)
+            << "UB pooled member drain could not begin; keeping it "
+               "quarantined: "
+            << begun.ToString();
+        return quarantineDrain(member->lane,
+                               "drain begin rejected: " + begun.ToString());
     }
 
     if (fence_hardware && member->jetty != nullptr) {
-        // Hardware retirement fence (design §7.2 rule 5 / §5.2): modify ERROR,
-        // consume the flush-done marker, flush the software SQ. This runs on
-        // the retiring caller's thread, never on the delete executor, so the
-        // delete worker still never polls a JFC. A pooled member serves one
-        // WR, so a drained completion with a token is diagnostic.
+        // Legacy hardware retirement fence (design §7.2 rule 5 / §5.2): modify
+        // ERROR, consume the flush-done marker, flush the software SQ. Lives
+        // only behind async_drain=false, shutdown, or direct-pool users; it is
+        // exactly the hot-path behavior the asynchronous chain replaces.
         std::vector<Completion> drained;
         const Status fence = adapter_->quiesceJetty(
             member->jetty, options_.retire_timeout_ms, drained);
@@ -543,6 +585,88 @@ Status BusinessJettyPool::retireFaulted(SliceJettyLease lease,
     return Status::OK();
 }
 
+void BusinessJettyPool::attachDrainController(
+    std::shared_ptr<JettyDrainController> controller) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    drain_controller_ = std::move(controller);
+}
+
+std::shared_ptr<JettyDrainController> BusinessJettyPool::drainController()
+    const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return drain_controller_;
+}
+
+JettyPtr BusinessJettyPool::drainJettyFor(const PoolLaneKey& lane) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = draining_.find(lane.lane_generation);
+    if (it == draining_.end()) return nullptr;
+    if (it->second->lane != lane) return nullptr;
+    return it->second->jetty;
+}
+
+Status BusinessJettyPool::markDrainDeleteReady(const PoolLaneKey& lane,
+                                               uint64_t error_epoch) {
+    std::vector<std::shared_ptr<PoolMember>> to_destroy;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = draining_.find(lane.lane_generation);
+        if (it == draining_.end()) {
+            return Status::InvalidArgument(
+                "UB drain delete-ready names a lane that is not draining");
+        }
+        auto member = it->second;
+        if (member->lane != lane) {
+            return Status::InvalidArgument(
+                "UB drain delete-ready lane generation mismatch");
+        }
+        if (member->error_epoch != error_epoch) {
+            // The epoch moved after the drain was registered: the evidence the
+            // controller proved belongs to a different generation.
+            return Status::InvalidArgument(
+                "UB drain delete-ready error epoch mismatch");
+        }
+        if (member->state != PoolMemberState::kDraining) {
+            return Status::InvalidArgument(
+                "UB drain delete-ready member is not in the draining state");
+        }
+        draining_.erase(it);
+        ++drain_delete_ready_;
+        // Only the pool moves the member and enqueues it; the native delete
+        // still runs on the retire executor (or synchronously on this thread
+        // when no executor is running).
+        enqueueRetirementLocked(member);
+        to_destroy = std::move(retired_);
+        retired_.clear();
+    }
+    if (!to_destroy.empty()) destroyRetired(std::move(to_destroy));
+    return Status::OK();
+}
+
+Status BusinessJettyPool::quarantineDrain(const PoolLaneKey& lane,
+                                          const std::string& reason) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = draining_.find(lane.lane_generation);
+    if (it == draining_.end()) {
+        return Status::InvalidArgument(
+            "UB drain quarantine names a lane that is not draining");
+    }
+    auto member = it->second;
+    if (member->lane != lane) {
+        return Status::InvalidArgument(
+            "UB drain quarantine lane generation mismatch");
+    }
+    draining_.erase(it);
+    ++drain_quarantined_;
+    // Keep responsibility: the handle, the tombstone and the budget all stay.
+    member->state = PoolMemberState::kQuarantined;
+    member->retire_reason = reason.empty() ? "drain quarantined" : reason;
+    (void)budget_->transition(member->budget, BudgetObjectState::kQuarantined);
+    quarantined_.push_back(std::move(member));
+    refreshBackpressureLocked();
+    return Status::OK();
+}
+
 void BusinessJettyPool::enqueueRetirementLocked(
     std::shared_ptr<PoolMember> member) {
     // First real error retires permanently (INV07): the member never
@@ -577,41 +701,127 @@ void BusinessJettyPool::destroyRetired(
     // All native calls happen outside the pool lock.
     for (auto& member : members) {
         member->state = PoolMemberState::kDeleting;
-        JettyPtr jetty = std::move(member->jetty);
-        // The native delete requires a RESET Jetty. A clean member has never
-        // been reset, while an errored member is in ERROR after its flush
-        // fence. A reset that fails (for example an ERROR Jetty without a
-        // trusted barrier) keeps the handle quarantined for a later retry.
+        const DeleteOutcome outcome = resetAndDeleteMember(*member);
+        finishDelete(member, outcome);
+    }
+}
+
+DeleteOutcome BusinessJettyPool::resetAndDeleteMember(PoolMember& member) {
+    DeleteOutcome outcome;
+    JettyPtr jetty = std::move(member.jetty);
+    if (!jetty) {
+        // Nothing native is left to reclaim: the handle was already released,
+        // so destruction is proven by construction.
+        outcome.kind = DeleteOutcome::Kind::kConsumed;
+        return outcome;
+    }
+    // The native delete requires a RESET Jetty in the verified UMDK contract.
+    // A reset failure (for example an ERROR Jetty without a trusted barrier)
+    // never authorizes the delete: keep the handle for a retry.
+    if (options_.reset_before_delete && jetty->valid()) {
         const Status reset = adapter_->resetJetty(jetty);
-        const Status deleted =
-            reset.ok() ? adapter_->deleteJetty(jetty) : reset;
-        if (deleted.ok()) {
+        if (!reset.ok()) {
+            outcome.status = reset;
+            outcome.kind = reset.IsTooManyRequests()
+                               ? DeleteOutcome::Kind::kRetained
+                               : DeleteOutcome::Kind::kUnknown;
+            member.jetty = std::move(jetty);
+            return outcome;
+        }
+    }
+    outcome = adapter_->deleteJettyWithOutcome(jetty);
+    if (outcome.kind != DeleteOutcome::Kind::kConsumed) {
+        member.jetty = std::move(jetty);
+    }
+    return outcome;
+}
+
+void BusinessJettyPool::finishDelete(const std::shared_ptr<PoolMember>& member,
+                                     DeleteOutcome outcome) {
+    switch (outcome.kind) {
+        case DeleteOutcome::Kind::kConsumed: {
             member->state = PoolMemberState::kDestroyed;
+            ++delete_consumed_;
             // No release without evidence: the tombstone entry is erased only
             // now that the provider proved destruction.
             if (!eraseTombstoneForProvenDestruction(*member)) {
                 LOG_EVERY_N(WARNING, 100)
                     << "UB pooled member was deleted but its tombstone could "
                        "not be cleared; keeping its budget charged";
-            } else {
-                budget_->transition(member->budget,
-                                    BudgetObjectState::kRetiring);
-                budget_->releaseAfterProvenDestruction(member->budget, true);
+                return;
             }
-        } else {
-            // Unknown destruction: keep owner and budget (INV09/INV10).
-            // The handle goes back to the member so the next drain attempt
-            // can retry the native delete; dropping it here would lose the
-            // native ownership and leak the budget.
-            member->jetty = std::move(jetty);
-            member->state = PoolMemberState::kQuarantined;
-            budget_->transition(member->budget,
-                                BudgetObjectState::kQuarantined);
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                delete_retry_at_ns_.erase(member->lane.lane_generation);
+                retained_.erase(member->lane.lane_generation);
+            }
+            // The reservation may already be in kQuarantined (a drain always
+            // moves it there); release accepts both kRetiring and kQuarantined,
+            // so the transition is best effort and never gates the release.
+            (void)budget_->transition(member->budget,
+                                      BudgetObjectState::kRetiring);
+            budget_->releaseAfterProvenDestruction(member->budget, true);
+            return;
+        }
+        case DeleteOutcome::Kind::kRetained: {
+            // The provider explicitly says the handle is still valid. Retry
+            // after an exponential backoff; the owner, tombstone and budget
+            // stay exactly where they are.
+            ++delete_retained_;
+            const uint32_t capped =
+                std::min<uint32_t>(++member->delete_retry_attempts, 10);
+            uint64_t delay_ms =
+                std::max<uint32_t>(1, options_.refill_interval_ms);
+            delay_ms =
+                std::min<uint64_t>(delay_ms << capped,
+                                   std::max<uint32_t>(1, options_.cooldown_ms));
+            member->state = PoolMemberState::kDeleteReady;
             std::lock_guard<std::mutex> lock(mutex_);
+            delete_retry_at_ns_[member->lane.lane_generation] =
+                steadyNowNs() + delay_ms * 1'000'000ULL;
+            retained_[member->lane.lane_generation] = member;
+            return;
+        }
+        case DeleteOutcome::Kind::kUnknown: {
+            // Undecidable destruction: keep the handle owned by the member so
+            // a later drain can retry, and keep the budget charged (INV09).
+            ++delete_unknown_;
+            member->state = PoolMemberState::kQuarantined;
+            (void)budget_->transition(member->budget,
+                                      BudgetObjectState::kQuarantined);
+            std::lock_guard<std::mutex> lock(mutex_);
+            delete_retry_at_ns_.erase(member->lane.lane_generation);
+            retained_.erase(member->lane.lane_generation);
             quarantined_.push_back(member);
             refreshBackpressureLocked();
+            return;
         }
     }
+}
+
+size_t BusinessJettyPool::retryRetainedDeletes() {
+    std::vector<std::shared_ptr<PoolMember>> due;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const uint64_t now = steadyNowNs();
+        for (auto it = delete_retry_at_ns_.begin();
+             it != delete_retry_at_ns_.end();) {
+            if (it->second > now) {
+                ++it;
+                continue;
+            }
+            auto retained = retained_.find(it->first);
+            if (retained != retained_.end()) {
+                due.push_back(retained->second);
+                retained_.erase(retained);
+            }
+            it = delete_retry_at_ns_.erase(it);
+        }
+    }
+    if (due.empty()) return 0;
+    const size_t count = due.size();
+    destroyRetired(std::move(due));
+    return count;
 }
 
 void BusinessJettyPool::onLeaseLeaked(
@@ -695,9 +905,32 @@ Status BusinessJettyPool::drainIdle() {
     // call no native create/delete runs on an executor thread and the caller
     // may close the parent JFC safely.
     beginStop();
+    // Shutdown fallback (design §11.3): every in-flight asynchronous drain
+    // degrades to the synchronous quiesce fence, and only a proven fence is
+    // allowed to release the member. Leftover entries are quarantined below.
+    if (auto controller = drainController()) controller->drainSynchronously();
     std::vector<std::shared_ptr<PoolMember>> to_destroy;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        // A drain that never reached DELETE_READY by the shutdown barrier keeps
+        // its responsibility: the member goes to quarantine (handle, tombstone
+        // and budget retained) instead of being deleted on unproven evidence.
+        for (auto& entry : draining_) {
+            auto member = entry.second;
+            member->state = PoolMemberState::kQuarantined;
+            member->retire_reason = "draining at shutdown";
+            (void)budget_->transition(member->budget,
+                                      BudgetObjectState::kQuarantined);
+            quarantined_.push_back(std::move(member));
+        }
+        draining_.clear();
+        for (auto& entry : retained_) {
+            auto member = entry.second;
+            member->retire_reason = "retained delete at shutdown";
+            to_destroy.push_back(std::move(member));
+        }
+        retained_.clear();
+        delete_retry_at_ns_.clear();
         for (auto& entry : buckets_) {
             for (auto& member : entry.second.idle) {
                 member->retire_reason = "drain idle";
@@ -734,44 +967,40 @@ Status BusinessJettyPool::drainQuarantined() {
         std::lock_guard<std::mutex> lock(mutex_);
         candidates = std::move(quarantined_);
         quarantined_.clear();
+        // A shutdown drain is the last chance for a retained delete; it goes
+        // through the same classified path, so a provider that still says
+        // "valid" simply keeps the member.
+        for (auto& entry : retained_) {
+            candidates.push_back(std::move(entry.second));
+        }
+        retained_.clear();
+        delete_retry_at_ns_.clear();
     }
     for (auto& member : candidates) {
-        if (member->jetty == nullptr) {
-            member->state = PoolMemberState::kDestroyed;
-            if (eraseTombstoneForProvenDestruction(*member)) {
-                budget_->releaseAfterProvenDestruction(member->budget, true);
-            }
-            continue;
-        }
-        JettyPtr jetty = std::move(member->jetty);
-        // The native delete requires a RESET Jetty, exactly like the primary
-        // destroy path. A reset failure (for example an ERROR Jetty without
-        // a trusted flush fence) keeps the handle quarantined for a retry.
-        const Status reset = adapter_->resetJetty(jetty);
-        const Status deleted =
-            reset.ok() ? adapter_->deleteJetty(jetty) : reset;
-        if (deleted.ok()) {
-            member->state = PoolMemberState::kDestroyed;
-            if (eraseTombstoneForProvenDestruction(*member)) {
-                budget_->releaseAfterProvenDestruction(member->budget, true);
-            }
-        } else {
-            // Keep the handle owned by the pool for the next drain attempt.
-            member->jetty = std::move(jetty);
-            std::lock_guard<std::mutex> lock(mutex_);
-            quarantined_.push_back(member);
-            refreshBackpressureLocked();
-        }
+        member->state = PoolMemberState::kDeleting;
+        const DeleteOutcome outcome = resetAndDeleteMember(*member);
+        // kRetained during shutdown parks the member in retained_ again, which
+        // then still holds the handle and budget: no release without proof.
+        finishDelete(member, outcome);
     }
     return Status::OK();
 }
 
 void BusinessJettyPool::refillPass() {
+    // A retained native delete is retried on this periodic pass so a busy
+    // provider never pins a member forever without a bounded backoff.
+    (void)retryRetainedDeletes();
     std::unique_lock<std::mutex> lock(mutex_);
     if (stopping_) return;
     // A full tombstone table pauses refill: creating more members cannot free
     // an unproven owner and would only add pressure (design §7.2).
     if (options_.tombstones != nullptr && options_.tombstones->full()) {
+        refreshBackpressureLocked();
+        return;
+    }
+    // The same holds when the provider proved unable to drain (§9): new
+    // members could never be retired either.
+    if (admissionBlockedLocked()) {
         refreshBackpressureLocked();
         return;
     }
@@ -842,9 +1071,17 @@ SendJettyPoolStats BusinessJettyPool::stats() const {
     }
     result.delete_ready_members =
         retire_worker_ ? retire_worker_->pending() : 0;
-    result.retired_members = retired_.size() + result.delete_ready_members;
+    result.retired_members =
+        retired_.size() + result.delete_ready_members + retained_.size();
     result.flushing_members = flushing_;
+    result.draining_members = draining_.size();
     result.quarantined_members = quarantined_.size();
+    result.drain_begin = drain_begin_;
+    result.drain_delete_ready = drain_delete_ready_;
+    result.drain_quarantined = drain_quarantined_;
+    result.delete_consumed = delete_consumed_;
+    result.delete_retained = delete_retained_;
+    result.delete_unknown = delete_unknown_;
     for (const auto& entry : buckets_) {
         if (entry.second.backoff_attempts != 0 &&
             steadyNowNs() < entry.second.backoff_until_ns) {
@@ -866,6 +1103,8 @@ SendJettyPoolStats BusinessJettyPool::stats() const {
     result.backpressure_rejections = backpressure_rejections_;
     result.tombstone_backpressure = tombstone_backpressure_;
     result.quarantine_backpressure = quarantine_backpressure_;
+    result.drain_admission_stopped = drain_controller_ != nullptr &&
+                                     !drain_controller_->asyncDrainSupported();
     if (options_.tombstones != nullptr) {
         result.tombstone_entries = options_.tombstones->size();
         result.tombstone_capacity = options_.tombstones->capacity();
@@ -890,6 +1129,10 @@ std::vector<PoolMemberState> BusinessJettyPool::memberStates() const {
         states.insert(states.end(), retire_worker_->pending(),
                       PoolMemberState::kDeleteReady);
     }
+    // Members owned by the asynchronous drain chain are not in a container that
+    // memberStates() otherwise walks.
+    for (const auto& entry : draining_) states.push_back(entry.second->state);
+    for (const auto& entry : retained_) states.push_back(entry.second->state);
     for (const auto& member : quarantined_) states.push_back(member->state);
     return states;
 }

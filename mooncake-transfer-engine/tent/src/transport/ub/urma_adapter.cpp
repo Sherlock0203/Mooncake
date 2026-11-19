@@ -148,6 +148,32 @@ class UnavailableUrmaAdapter final : public UrmaAdapter {
         return jetty ? unavailable() : Status::OK();
     }
 
+    Status modifyJettyError(const JettyPtr& jetty, uint64_t) override {
+        return jetty ? unavailable() : Status::OK();
+    }
+
+    EntityMarkerKind classifyEntityMarker(const Completion&) const override {
+        return EntityMarkerKind::kNone;
+    }
+
+    Status flushJettyOnce(const JettyPtr& jetty,
+                          std::vector<Completion>& out) override {
+        out.clear();
+        return jetty ? unavailable() : Status::OK();
+    }
+
+    Status finishDrain(const JettyPtr& jetty) override {
+        return jetty ? unavailable() : Status::OK();
+    }
+
+    DeleteOutcome deleteJettyWithOutcome(JettyPtr& jetty) override {
+        DeleteOutcome outcome;
+        outcome.status = deleteJetty(jetty);
+        outcome.kind = outcome.status.ok() ? DeleteOutcome::Kind::kConsumed
+                                           : DeleteOutcome::Kind::kUnknown;
+        return outcome;
+    }
+
     Status post(const JettyPtr&, const std::vector<WorkRequest>&,
                 size_t& posted_count) override {
         posted_count = 0;
@@ -1686,7 +1712,27 @@ class RealUrmaAdapter final : public UrmaAdapter {
     }
 
     Status deleteJetty(JettyPtr& jetty) override {
-        return releaseTypedHandle<RealJetty>(jetty, "Jetty");
+        // Compatibility wrapper (design §4.1): the classification is the single
+        // source of truth, and the legacy contract ("error leaves the handle in
+        // place") is preserved for every existing call site.
+        const DeleteOutcome outcome = deleteJettyWithOutcome(jetty);
+        return outcome.kind == DeleteOutcome::Kind::kConsumed ? Status::OK()
+                                                              : outcome.status;
+    }
+
+    DeleteOutcome deleteJettyWithOutcome(JettyPtr& jetty) override {
+        DeleteOutcome outcome;
+        outcome.status = releaseTypedHandle<RealJetty>(jetty, "Jetty");
+        if (outcome.status.ok()) {
+            outcome.kind = DeleteOutcome::Kind::kConsumed;
+        } else if (outcome.status.IsTooManyRequests()) {
+            // The handle is still held by another owner: the provider has not
+            // been asked yet, so this is a retryable "retained", never unknown.
+            outcome.kind = DeleteOutcome::Kind::kRetained;
+        } else {
+            outcome.kind = DeleteOutcome::Kind::kUnknown;
+        }
+        return outcome;
     }
 
     Status bindJetty(const JettyPtr& jetty,
@@ -1856,6 +1902,101 @@ class RealUrmaAdapter final : public UrmaAdapter {
             }
         }
         real_jfc->clearFlushDone(real_jetty->id());
+        real_jfc->releaseSegmentsForJetty(real_jetty->id());
+        real_jetty->markFlushFenced();
+        return Status::OK();
+    }
+
+    // --- Asynchronous drain primitives (design §4.1) -----------------------
+
+    Status modifyJettyError(const JettyPtr& jetty,
+                            uint64_t error_epoch) override {
+        std::shared_ptr<RuntimeLease> runtime;
+        CHECK_STATUS(getRuntime(runtime));
+        auto real_jetty = std::dynamic_pointer_cast<RealJetty>(jetty);
+        if (!real_jetty || !real_jetty->valid()) return invalidHandle("Jetty");
+        auto real_jfc = real_jetty->jfc();
+        if (!real_jfc || !real_jfc->valid()) return invalidHandle("Jfc");
+        (void)error_epoch;
+        // Native Jetty IDs may be reused after deletion, so a flush-done record
+        // left by a previous epoch of the same id must not satisfy this one.
+        // The poll lock makes the clear atomic with respect to a concurrent
+        // poller's rememberFlushDone; it is taken for the bookkeeping only and
+        // never held across a provider wait (unlike quiesceJetty).
+        {
+            std::lock_guard<std::mutex> poll_lock(real_jfc->pollMutex());
+            if (!real_jetty->errorStarted()) {
+                real_jfc->clearFlushDone(real_jetty->id());
+            }
+        }
+        // beginError() takes the Jetty's own mutex, which post() also holds, so
+        // a successful return proves no post is in flight any more.
+        return real_jetty->beginError();
+    }
+
+    EntityMarkerKind classifyEntityMarker(
+        const Completion& completion) const override {
+        switch (completion.native_status) {
+            case URMA_CR_WR_FLUSH_ERR_DONE:
+                return EntityMarkerKind::kFlushDone;
+            case URMA_CR_WR_SUSPEND_DONE:
+                return EntityMarkerKind::kSuspendDone;
+            default:
+                return EntityMarkerKind::kNone;
+        }
+    }
+
+    Status flushJettyOnce(const JettyPtr& jetty,
+                          std::vector<Completion>& out) override {
+        out.clear();
+        std::shared_ptr<RuntimeLease> runtime;
+        CHECK_STATUS(getRuntime(runtime));
+        auto real_jetty = std::dynamic_pointer_cast<RealJetty>(jetty);
+        if (!real_jetty || !real_jetty->valid()) return invalidHandle("Jetty");
+        if (real_jetty->depth() == 0) {
+            return Status::InvalidArgument(
+                "Jetty flush requires a non-zero queue depth");
+        }
+        auto real_jfc = real_jetty->jfc();
+        if (!real_jfc || !real_jfc->valid()) return invalidHandle("Jfc");
+        // A software flush is only meaningful once the Jetty is in ERROR.
+        if (!real_jetty->errorStarted()) {
+            return Status::InvalidArgument(
+                "cannot flush a Jetty that never entered ERROR");
+        }
+        if (real_jetty->flushFenced()) return Status::OK();
+
+        std::array<urma_cr_t, 64> polled{};
+        const size_t batch =
+            std::min<size_t>(real_jetty->depth(), polled.size());
+        const int count = urma_flush_jetty(
+            real_jetty->native(), static_cast<int>(batch), polled.data());
+        if (count < 0) return nativeError("urma_flush_jetty", count);
+        for (int i = 0; i < count; ++i) {
+            auto completion = convertCompletion(polled[static_cast<size_t>(i)]);
+            if (completion.token == 0) {
+                // The software SQ cannot yield entity markers; a provider that
+                // reports one has changed behavior and the drain must stop.
+                return Status::InternalError(
+                    "URMA Jetty flush returned an entity marker");
+            }
+            real_jfc->releaseSegment(completion.token);
+            out.push_back(completion);
+        }
+        return Status::OK();
+    }
+
+    Status finishDrain(const JettyPtr& jetty) override {
+        std::shared_ptr<RuntimeLease> runtime;
+        CHECK_STATUS(getRuntime(runtime));
+        auto real_jetty = std::dynamic_pointer_cast<RealJetty>(jetty);
+        if (!real_jetty || !real_jetty->valid()) return invalidHandle("Jetty");
+        auto real_jfc = real_jetty->jfc();
+        if (!real_jfc || !real_jfc->valid()) return invalidHandle("Jfc");
+        {
+            std::lock_guard<std::mutex> poll_lock(real_jfc->pollMutex());
+            real_jfc->clearFlushDone(real_jetty->id());
+        }
         real_jfc->releaseSegmentsForJetty(real_jetty->id());
         real_jetty->markFlushFenced();
         return Status::OK();

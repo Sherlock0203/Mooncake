@@ -95,6 +95,10 @@ struct UbWorkers::BusinessRecord {
     // onOwners(). A lease still valid at destruction is a responsibility leak
     // and the pool quarantines the member (diagnostic, not a release path).
     SliceJettyLease lease;
+    // Identity of the leased member for the lane-scoped drain query. The lease
+    // itself is handed over on the finalize path, so the lane is snapshotted
+    // here while the lease is still valid.
+    PoolLaneKey pooled_lane{};
     size_t credit_jfc_index{0};
     uint64_t credit_token{0};
     // The claim anchor: snapshotted before the lease, compared after it, and
@@ -132,8 +136,11 @@ UbWorkers::UbWorkers(std::shared_ptr<UrmaAdapter> adapter,
     for (const auto& context : contexts_) {
         if (!context) continue;
         context_by_topology_id_[context->topologyId()] = context;
+        auto drain = context->drainController();
         for (const auto& jfc : context->jfcs()) {
-            if (jfc) business_slots_.push_back(BusinessSlot{jfc, context});
+            if (jfc) {
+                business_slots_.push_back(BusinessSlot{jfc, context, drain});
+            }
         }
     }
     for (auto& slot : probe_jfcs) {
@@ -382,6 +389,7 @@ Status UbWorkers::stop() {
             still_inflight.push_back(std::move(record));
         }
         records_.clear();
+        pooled_lane_refs_.clear();
     }
     for (const auto& record : still_inflight) {
         // The bottom-out shares every claim bit with the CQE and timeout exits:
@@ -712,8 +720,41 @@ void UbWorkers::logBusinessSummary(uint64_t now_ns) {
         return;
     }
     const auto stats = businessStats();
+    // Drain-chain summary (design §10.2). The controller owns the stage
+    // counters; this is the periodic outlet that makes them observable without
+    // a per-WR log line.
+    DrainStats drain{};
+    for (const auto& context : contexts_) {
+        if (!context) continue;
+        auto controller = context->drainController();
+        if (!controller) continue;
+        const DrainStats one = controller->stats();
+        drain.drain_begin += one.drain_begin;
+        drain.drain_begin_failed += one.drain_begin_failed;
+        drain.drain_delete_ready += one.drain_delete_ready;
+        drain.drain_timeout += one.drain_timeout;
+        drain.drain_quarantined += one.drain_quarantined;
+        drain.modify_error_ok += one.modify_error_ok;
+        drain.modify_error_fail += one.modify_error_fail;
+        drain.marker_flush_done += one.marker_flush_done;
+        drain.marker_suspend_done += one.marker_suspend_done;
+        drain.marker_dup += one.marker_dup;
+        drain.marker_stale += one.marker_stale;
+        drain.marker_before_error += one.marker_before_error;
+        drain.entity_event_on_drain += one.entity_event_on_drain;
+        drain.software_flush_calls += one.software_flush_calls;
+        drain.software_flush_wrs += one.software_flush_wrs;
+        drain.software_flush_unhandled += one.software_flush_unhandled;
+        drain.drained_after_settle += one.drained_after_settle;
+        drain.drain_pending += one.drain_pending;
+        drain.drain_oldest_age_ms =
+            std::max(drain.drain_oldest_age_ms, one.drain_oldest_age_ms);
+        drain.async_drain_supported =
+            drain.async_drain_supported && one.async_drain_supported;
+        drain.async_drain_disabled += one.async_drain_disabled;
+    }
     if (stats.queue_depth == 0 && stats.parked_depth == 0 &&
-        stats.pool_lease_attempts == 0) {
+        stats.pool_lease_attempts == 0 && drain.drain_begin == 0) {
         return;
     }
     LOG(INFO) << "UB business: queued=" << stats.queue_depth
@@ -744,7 +785,27 @@ void UbWorkers::logBusinessSummary(uint64_t now_ns) {
               << " path_peak=" << stats.path_inflight_peak
               << " imbalance=" << stats.path_load_imbalance
               << " double_return=" << stats.pool_return_double
-              << " unknown_tombstoned=" << stats.unknown_token_tombstoned;
+              << " unknown_tombstoned=" << stats.unknown_token_tombstoned
+              << " drain{begin=" << drain.drain_begin
+              << ",begin_failed=" << drain.drain_begin_failed
+              << ",ready=" << drain.drain_delete_ready
+              << ",pending=" << drain.drain_pending
+              << ",oldest_ms=" << drain.drain_oldest_age_ms
+              << ",timeout=" << drain.drain_timeout
+              << ",quarantine=" << drain.drain_quarantined
+              << ",modify_ok=" << drain.modify_error_ok
+              << ",modify_fail=" << drain.modify_error_fail
+              << ",marker=" << drain.marker_flush_done
+              << ",marker_stale=" << drain.marker_stale
+              << ",marker_dup=" << drain.marker_dup
+              << ",marker_early=" << drain.marker_before_error
+              << ",event_on_drain=" << drain.entity_event_on_drain
+              << ",flush=" << drain.software_flush_calls
+              << ",flush_wrs=" << drain.software_flush_wrs
+              << ",flush_marker=" << drain.software_flush_unhandled
+              << ",settled_late=" << drain.drained_after_settle
+              << ",supported=" << (drain.async_drain_supported ? 1 : 0)
+              << ",disabled=" << drain.async_drain_disabled << "}";
 }
 
 bool UbWorkers::pollBusinessSlot(size_t slot_index) {
@@ -807,13 +868,46 @@ bool UbWorkers::dispatchCompletion(const Completion& completion, int local_nic,
     // P0-B supplies, so the W4 classification hangs off this single call site
     // (IN-9: token 0 never reaches the business registry).
     if (completion.token == 0) {
+        // W4 classification (design tent-ub-async-drain-design §4.3): a
+        // token==0 record may be a provider entity marker owned by an
+        // in-flight pooled drain. The controller claims it first; only an
+        // unowned record falls through to the legacy accounting. The poller
+        // performs one hash lookup and flag writes, never a provider call.
+        const BusinessSlot* slot = nullptr;
+        for (const auto& candidate : business_slots_) {
+            if (candidate.jfc && candidate.jfc->index() == jfc_index &&
+                candidate.context &&
+                candidate.context->topologyId() == local_nic) {
+                slot = &candidate;
+                break;
+            }
+        }
+        if (slot != nullptr && slot->drain != nullptr &&
+            slot->drain->onEntityEvent(completion, jfc_index)) {
+            return true;
+        }
+        // Classification is observation only here: a marker with no drain
+        // owner still goes through the unknown-token path below (the controller
+        // already counted an owned-but-unusable marker).
+        EntityEventKind kind = EntityEventKind::kUnclassified;
+        switch (adapter_ ? adapter_->classifyEntityMarker(completion)
+                         : EntityMarkerKind::kNone) {
+            case EntityMarkerKind::kFlushDone:
+                kind = EntityEventKind::kMarkerFlushDone;
+                break;
+            case EntityMarkerKind::kSuspendDone:
+                kind = EntityEventKind::kMarkerSuspendDone;
+                break;
+            case EntityMarkerKind::kNone:
+                break;
+        }
         EntityEvidence evidence;
         evidence.token = completion.token;
         evidence.jetty_id = completion.local_jetty_id;
         evidence.native_status = completion.native_status;
         evidence.completed_bytes = completion.completed_bytes;
         entity_events_.onEntityEvent(local_nic, EntityType::kJfc, jfc_index,
-                                     EntityEventKind::kUnclassified, evidence);
+                                     kind, evidence);
         return false;
     }
     // Step 2: namespace first (probe design §11.2). A probe completion may
@@ -1629,6 +1723,9 @@ void UbWorkers::postLegacy(const PendingSlice& pending, size_t worker_index,
         {
             std::lock_guard<std::mutex> lock(records_mutex_);
             records_.emplace(record->core.token, record);
+            if (record->pool && record->pooled_lane.lane_generation != 0) {
+                ++pooled_lane_refs_[record->pooled_lane.lane_generation];
+            }
         }
         gate_ctx_.stats.record_published.fetch_add(1,
                                                    std::memory_order_relaxed);
@@ -1815,6 +1912,7 @@ void UbWorkers::processPendingPooled(
     auto record = makeRecord(pending, endpoint, path, reservation, local,
                              remote, attempt);
     record->pool = pool;
+    record->pooled_lane = leased.lease.lane();
     record->lease = std::move(leased.lease);
     record->credit_jfc_index = leased.jfc_index;
     record->credit_token = leased.jfc_credit_token;
@@ -1849,6 +1947,9 @@ void UbWorkers::processPendingPooled(
         {
             std::lock_guard<std::mutex> lock(records_mutex_);
             records_.emplace(record->core.token, record);
+            if (record->pool && record->pooled_lane.lane_generation != 0) {
+                ++pooled_lane_refs_[record->pooled_lane.lane_generation];
+            }
         }
         gate_ctx_.stats.record_published.fetch_add(1,
                                                    std::memory_order_relaxed);
@@ -2208,6 +2309,39 @@ void UbWorkers::scanTimeouts() {
     }
 }
 
+bool UbWorkers::settleDrainedWr(const Completion& completion,
+                                uint64_t jfc_index) {
+    (void)jfc_index;
+    if (completion.token == 0) return false;
+    // A software-flush WR is a WR the provider accepted but never completed. It
+    // settles through the same gate as a real CQE, exactly once. Looking the
+    // record up here and settling it directly keeps two properties that routing
+    // through dispatchCompletion() could not:
+    //   - a token that was already claimed and disposed is reported as "not
+    //     settled" instead of being counted as an unknown token (it is a
+    //     duplicate of a settled WR, not a topology fault);
+    //   - the one-shot gate claim (cr_claimed / finalize_claimed) is still the
+    //     exactly-once authority, so a concurrent disposal cannot double
+    //     release even if it happens after the lookup.
+    auto record = findRecord(completion.token);
+    if (!record) return false;
+    if (probe_manager_ != nullptr && isProbeToken(completion.token)) {
+        // Namespace first, exactly like dispatchCompletion().
+        (void)probe_manager_->onProbeCompletion(completion);
+        return true;
+    }
+    gate::HandlerRef handler(record->core, *this, gate_ctx_);
+    gate::onRealCr(record->core, makeWrFacts(completion), *this, gate_ctx_);
+    return true;
+}
+
+bool UbWorkers::pooledLaneConverged(const PoolLaneKey& lane) const {
+    if (lane.lane_generation == 0) return true;
+    std::lock_guard<std::mutex> lock(records_mutex_);
+    auto refs = pooled_lane_refs_.find(lane.lane_generation);
+    return refs == pooled_lane_refs_.end() || refs->second == 0;
+}
+
 std::shared_ptr<UbWorkers::BusinessRecord> UbWorkers::findRecord(
     uint64_t token) const {
     // The registry lock is only held to take a shared_ptr; every consumer works
@@ -2298,6 +2432,17 @@ void UbWorkers::eraseRecord(uint64_t token, const BusinessRecord* record) {
         auto it = records_.find(token);
         if (it != records_.end() && it->second.get() == record) {
             records_.erase(it);
+            const uint64_t generation = record->pooled_lane.lane_generation;
+            if (generation != 0) {
+                auto refs = pooled_lane_refs_.find(generation);
+                if (refs != pooled_lane_refs_.end()) {
+                    if (refs->second <= 1) {
+                        pooled_lane_refs_.erase(refs);
+                    } else {
+                        --refs->second;
+                    }
+                }
+            }
             erased = true;
         }
     }

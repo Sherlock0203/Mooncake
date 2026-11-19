@@ -527,6 +527,19 @@ struct UbTransport::Impl {
             // destructions and is what authorizes a final budget release.
             tombstones =
                 std::make_shared<ub::TombstoneTable>(params.tombstone_budget);
+            if (params.jetty_pool.async_drain) {
+                // Every drain step runs here, never on a JFC poller and never
+                // on the error-return path. A refused thread degrades to the
+                // synchronous fence instead of terminating the process.
+                drain_executor = std::make_unique<ub::ThreadedControlExecutor>(
+                    "ub-jetty-drain");
+                if (!drain_executor->start()) {
+                    LOG(WARNING)
+                        << "UB cannot start the Jetty drain control executor; "
+                           "falling back to the synchronous retirement fence";
+                    drain_executor.reset();
+                }
+            }
             std::unordered_set<std::string> configured_devices;
             for (const auto& context : contexts) {
                 const auto& device = context->deviceInfo();
@@ -592,11 +605,72 @@ struct UbTransport::Impl {
                 pool_options.quarantine_budget = params.quarantine_budget;
                 pool_options.tombstones = tombstones;
                 pool_options.jetty_options = jetty_options;
-                context->attachPooledSendPool(
-                    std::make_shared<ub::SendJettyPool>(
-                        adapter, context->handle(), context->jfcs(),
-                        native_budget, ub::physicalDeviceKey(device), credits,
-                        pool_options));
+                // Asynchronous drain (design §4.4). The chain is only armed
+                // when a control executor exists; otherwise the pool keeps the
+                // synchronous fence and says so once at install.
+                pool_options.async_drain =
+                    params.jetty_pool.async_drain && drain_executor != nullptr;
+                pool_options.drain_flush_batch =
+                    params.jetty_pool.drain_flush_batch;
+                pool_options.drain_quarantine_threshold =
+                    params.jetty_pool.drain_quarantine_threshold;
+                auto pool = std::make_shared<ub::SendJettyPool>(
+                    adapter, context->handle(), context->jfcs(), native_budget,
+                    ub::physicalDeviceKey(device), credits, pool_options);
+                context->attachPooledSendPool(pool);
+                if (pool_options.async_drain) {
+                    // The pool owns the verdicts; the workers own the two
+                    // settlement queries. Both are resolved lazily at call time
+                    // so the controller can be built before the workers exist.
+                    std::weak_ptr<ub::SendJettyPool> weak_pool = pool;
+                    ub::DrainCallbacks callbacks;
+                    callbacks.resolveJetty =
+                        [weak_pool](
+                            const ub::PoolLaneKey& lane) -> ub::JettyPtr {
+                        auto pool = weak_pool.lock();
+                        return pool ? pool->drainJettyFor(lane) : nullptr;
+                    };
+                    callbacks.markDeleteReady = [weak_pool](
+                                                    const ub::PoolLaneKey& lane,
+                                                    uint64_t error_epoch) {
+                        auto pool = weak_pool.lock();
+                        if (pool) {
+                            (void)pool->markDrainDeleteReady(lane, error_epoch);
+                        }
+                    };
+                    callbacks.quarantine = [weak_pool](
+                                               const ub::PoolLaneKey& lane,
+                                               const std::string& reason) {
+                        auto pool = weak_pool.lock();
+                        if (pool) (void)pool->quarantineDrain(lane, reason);
+                    };
+                    callbacks.settleDrainedWr =
+                        [this](const ub::Completion& completion,
+                               uint64_t jfc_index) {
+                            return workers != nullptr &&
+                                   workers->settleDrainedWr(completion,
+                                                            jfc_index);
+                        };
+                    callbacks.responsibilityConverged =
+                        [this](const ub::PoolLaneKey& lane) {
+                            // No workers means no record book: fail closed.
+                            return workers != nullptr &&
+                                   workers->pooledLaneConverged(lane);
+                        };
+                    ub::DrainOptions drain_options;
+                    drain_options.retire_timeout_ms =
+                        params.jetty_pool.retire_timeout_ms;
+                    drain_options.flush_batch =
+                        params.jetty_pool.drain_flush_batch;
+                    drain_options.quarantine_threshold =
+                        params.jetty_pool.drain_quarantine_threshold;
+                    auto controller =
+                        std::make_shared<ub::JettyDrainController>(
+                            adapter, tombstones.get(), drain_executor.get(),
+                            std::move(callbacks), drain_options);
+                    context->attachDrainController(controller);
+                    pool->attachDrainController(std::move(controller));
+                }
             }
         }
         ub::RailMonitorConfig rail_config;
@@ -814,6 +888,14 @@ struct UbTransport::Impl {
                 }
                 return status;
             }
+            // drainIdle() already degraded every in-flight drain to the
+            // synchronous fence, so no callback may still need the workers.
+            // Stopping the executor here bounds the thread's lifetime to the
+            // ownership graph that references it.
+            if (drain_executor) {
+                drain_executor->stop();
+                drain_executor.reset();
+            }
             workers.reset();
         }
         // Workers joined the scheduler through drainBeforePollStop(); destroy
@@ -886,6 +968,12 @@ struct UbTransport::Impl {
         local_segment_name.clear();
         auto_import_snapshot.clear();
         auto_import_snapshot_valid = false;
+        // Failed installs may never have created the workers; the drain
+        // executor still must not outlive this ownership graph.
+        if (drain_executor) {
+            drain_executor->stop();
+            drain_executor.reset();
+        }
         shutting_down.store(false, std::memory_order_release);
         return Status::OK();
     }
@@ -1204,6 +1292,11 @@ struct UbTransport::Impl {
     // manager -> provider/poster (the workers hold a raw manager pointer).
     // probe_directory is declared before probe_provider so it is destroyed
     // after the provider that borrows it.
+    // Asynchronous Jetty drain chain (design §4.2). Declared before the probe
+    // block/workers/contexts so they are destroyed after both: destruction of a
+    // controller never invokes a callback, and the pools (owned by the
+    // contexts) are expected to be gone by then.
+    std::unique_ptr<ub::ThreadedControlExecutor> drain_executor;
     ub::ProbePeerDescriptorSource* probe_peer_source{nullptr};
     std::shared_ptr<ub::HandshakeProbePeerDirectory> probe_directory;
     std::shared_ptr<ub::ProbeResourceProvider> probe_provider;

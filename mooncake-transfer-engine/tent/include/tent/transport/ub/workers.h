@@ -24,6 +24,7 @@
 #include "tent/transport/ub/completion_record.h"
 #include "tent/transport/ub/context.h"
 #include "tent/transport/ub/entity_event.h"
+#include "tent/transport/ub/jetty_drain_controller.h"
 #include "tent/transport/ub/params.h"
 #include "tent/transport/ub/path_load_ledger.h"
 #include "tent/transport/ub/post_scheduler.h"
@@ -235,6 +236,19 @@ class UbWorkers final : public gate::Sink {
         return entity_events_;
     }
 
+    // Asynchronous drain chain entry points (design §4.3/§6.3). Both run on
+    // the control executor, never on a poller.
+    //
+    // settleDrainedWr(): a WR recovered by the software flush settles exactly
+    // once through the normal completion path. Returns true when this call
+    // settled it, false when the token was already claimed and disposed.
+    bool settleDrainedWr(const Completion& completion, uint64_t jfc_index);
+    // True once no registered record still holds the lane's lease, i.e. the
+    // completion gate claimed and disposed of every owner. This is the
+    // evidence DELETE_READY condition ⑤ asks for, derived from the existing
+    // record table (no counter on PoolMember).
+    [[nodiscard]] bool pooledLaneConverged(const PoolLaneKey& lane) const;
+
    private:
     struct PendingSlice {
         // Keep the task alive until every queued/in-flight slice reaches a
@@ -435,6 +449,10 @@ class UbWorkers final : public gate::Sink {
     // Keyed by completion token. Renamed from `inflight_` because W5 adds a
     // second, deadline-ordered index next to it.
     std::unordered_map<uint64_t, std::shared_ptr<BusinessRecord>> records_;
+    // Live records per pooled lane generation. Maintained under records_mutex_
+    // so the drain controller can ask "is this lane fully claimed?" in O(1)
+    // instead of scanning every in-flight business record on each tick.
+    std::unordered_map<uint64_t, size_t> pooled_lane_refs_;
     // Endpoints whose ERROR transition has not yet reached its native flush
     // fence remain owned here even if every logical token completes naturally.
     std::unordered_map<uint64_t, std::shared_ptr<UbEndpoint>>
@@ -443,6 +461,9 @@ class UbWorkers final : public gate::Sink {
     struct BusinessSlot {
         std::shared_ptr<UbJfc> jfc;
         UbContextPtr context;
+        // Drain controller of the slot's context (design §4.3). Kept per slot
+        // so a marker never has to look it up on the poll path.
+        std::shared_ptr<JettyDrainController> drain;
     };
     struct ProbeSlot {
         JfcPtr jfc;

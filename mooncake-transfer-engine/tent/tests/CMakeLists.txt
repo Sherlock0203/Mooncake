@@ -576,7 +576,7 @@ if(USE_UB)
   add_executable(
     tent_ub_tombstone_test
     ub_tombstone_test.cpp ../src/transport/ub/native_budget.cpp
-    ../src/transport/ub/admission.cpp ../src/transport/ub/business_jetty_pool.cpp ../src/transport/ub/jetty_retire_worker.cpp ../src/transport/ub/jetty_refill_worker.cpp
+    ../src/transport/ub/admission.cpp ../src/transport/ub/business_jetty_pool.cpp ../src/transport/ub/jetty_retire_worker.cpp ../src/transport/ub/jetty_refill_worker.cpp ../src/transport/ub/jetty_drain_controller.cpp ../src/transport/ub/control_executor.cpp
     ../src/transport/ub/tombstone.cpp ../src/transport/ub/jfc.cpp)
   target_link_libraries(tent_ub_tombstone_test PRIVATE tent_common gtest
                                                        gtest_main)
@@ -591,7 +591,7 @@ if(USE_UB)
     tent_ub_post_claim_test ub_post_claim_test.cpp
                                ../src/transport/ub/native_budget.cpp
                                ../src/transport/ub/admission.cpp
-                               ../src/transport/ub/business_jetty_pool.cpp ../src/transport/ub/jetty_retire_worker.cpp ../src/transport/ub/jetty_refill_worker.cpp
+                               ../src/transport/ub/business_jetty_pool.cpp ../src/transport/ub/jetty_retire_worker.cpp ../src/transport/ub/jetty_refill_worker.cpp ../src/transport/ub/jetty_drain_controller.cpp ../src/transport/ub/control_executor.cpp
                                ../src/transport/ub/tombstone.cpp
                                ../src/transport/ub/jfc.cpp
                                ../src/transport/ub/probe_link_manager.cpp)
@@ -606,7 +606,7 @@ if(USE_UB)
     ub_pooled_core_test.cpp
     ../src/transport/ub/native_budget.cpp
     ../src/transport/ub/admission.cpp
-    ../src/transport/ub/business_jetty_pool.cpp ../src/transport/ub/jetty_retire_worker.cpp ../src/transport/ub/jetty_refill_worker.cpp
+    ../src/transport/ub/business_jetty_pool.cpp ../src/transport/ub/jetty_retire_worker.cpp ../src/transport/ub/jetty_refill_worker.cpp ../src/transport/ub/jetty_drain_controller.cpp ../src/transport/ub/control_executor.cpp
     ../src/transport/ub/tombstone.cpp
     ../src/transport/ub/attempt_gate.cpp
     ../src/transport/ub/jfc.cpp
@@ -621,6 +621,30 @@ if(USE_UB)
   add_test(NAME tent_ub_pooled_core_test COMMAND tent_ub_pooled_core_test)
   set_tests_properties(tent_ub_pooled_core_test PROPERTIES TIMEOUT 300)
 
+  # Asynchronous pooled-Jetty drain chain (design tent-ub-async-drain-design
+  # §11.1): the controller state machine, marker attribution, software flush /
+  # settlement, timeout, delete outcomes and the sync fallback. Deterministic
+  # fake adapter + manual control executor + fake clock.
+  add_executable(
+    tent_ub_drain_controller_test
+    ub_drain_controller_test.cpp
+    ../src/transport/ub/native_budget.cpp
+    ../src/transport/ub/admission.cpp
+    ../src/transport/ub/business_jetty_pool.cpp
+    ../src/transport/ub/jetty_retire_worker.cpp
+    ../src/transport/ub/jetty_refill_worker.cpp
+    ../src/transport/ub/jetty_drain_controller.cpp
+    ../src/transport/ub/control_executor.cpp
+    ../src/transport/ub/tombstone.cpp
+    ../src/transport/ub/jfc.cpp)
+  target_link_libraries(tent_ub_drain_controller_test
+                        PRIVATE tent_common gtest gtest_main)
+  target_include_directories(tent_ub_drain_controller_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_drain_controller_test
+           COMMAND tent_ub_drain_controller_test)
+  set_tests_properties(tent_ub_drain_controller_test PROPERTIES TIMEOUT 300)
+
   add_executable(
     tent_ub_teardown_test
     ub_teardown_test.cpp
@@ -633,7 +657,7 @@ if(USE_UB)
     ../src/transport/ub/jfc.cpp
     ../src/transport/ub/native_budget.cpp
     ../src/transport/ub/admission.cpp
-    ../src/transport/ub/business_jetty_pool.cpp ../src/transport/ub/jetty_retire_worker.cpp ../src/transport/ub/jetty_refill_worker.cpp
+    ../src/transport/ub/business_jetty_pool.cpp ../src/transport/ub/jetty_retire_worker.cpp ../src/transport/ub/jetty_refill_worker.cpp ../src/transport/ub/jetty_drain_controller.cpp ../src/transport/ub/control_executor.cpp
     ../src/transport/ub/tombstone.cpp
     ../src/transport/ub/target_registry.cpp)
   target_link_libraries(tent_ub_teardown_test PRIVATE tent_common gtest

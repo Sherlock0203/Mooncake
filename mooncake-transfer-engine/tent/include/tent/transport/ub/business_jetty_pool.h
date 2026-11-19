@@ -30,6 +30,7 @@
 #include "tent/transport/ub/admission.h"
 #include "tent/transport/ub/jfc.h"
 #include "tent/transport/ub/native_budget.h"
+#include "tent/transport/ub/pool_key.h"
 #include "tent/transport/ub/tombstone.h"
 #include "tent/transport/ub/urma_adapter.h"
 
@@ -38,59 +39,11 @@ class UbSendJettyPoolTest_DoubleReturnRejected_Test;
 
 namespace mooncake::tent::ub {
 
-// PoolKey partitions send Jetties by Context and LocalSendProfile (D01).
-// Two attempts with different profiles never share a member.
-struct PoolKey {
-    uint64_t context_incarnation = 0;
-    uint16_t trans_mode = 0;
-    uint8_t priority = 0;
-    uint32_t bind_tp_type_mask = 0;
+// PoolKey / AttemptKey / PoolLaneKey live in pool_key.h so the asynchronous
+// drain controller can share the exact identities without including this
+// header (this header includes the controller's forward declaration below).
 
-    bool operator==(const PoolKey&) const = default;
-};
-
-struct PoolKeyHash {
-    size_t operator()(const PoolKey& key) const noexcept {
-        size_t seed = std::hash<uint64_t>{}(key.context_incarnation);
-        auto combine = [&seed](size_t value) {
-            seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
-        };
-        combine(std::hash<uint16_t>{}(key.trans_mode));
-        combine(std::hash<uint8_t>{}(key.priority));
-        combine(std::hash<uint32_t>{}(key.bind_tp_type_mask));
-        return seed;
-    }
-};
-
-// AttemptKey identifies one business attempt of one slice (D01). Retries
-// must use a new attempt_generation; a lease is bound to exactly one
-// attempt and one native post of exactly one WR (INV03).
-struct AttemptKey {
-    uint64_t task_id = 0;
-    uint64_t slice_id = 0;
-    uint64_t attempt_generation = 0;
-
-    bool operator==(const AttemptKey&) const = default;
-
-    [[nodiscard]] bool valid() const noexcept {
-        return task_id != 0 && slice_id != 0 && attempt_generation != 0;
-    }
-};
-
-// PoolLaneKey identifies one pooled member generation. A retired member keeps
-// its lane so late completions can be attributed; the generation is never
-// reused by a fresh native Jetty (D01/INV15).
-//
-// Merge note (M-1): the pooling side spells this type `LaneKey`, but this
-// baseline's W1 probe contract already froze `LaneKey` as the probe channel
-// identity (probe_resources.h) in the same namespace. Only the name differs;
-// the shape and the "generation is never reused" rule are unchanged.
-struct PoolLaneKey {
-    uint32_t jetty_id = 0;
-    uint64_t lane_generation = 0;
-
-    bool operator==(const PoolLaneKey&) const = default;
-};
+class JettyDrainController;
 
 enum class PoolMemberState : uint8_t {
     kCreating = 0,
@@ -102,11 +55,16 @@ enum class PoolMemberState : uint8_t {
     kIdle,
     kInUse,
     kFaulted,
+    // The member left kInUse and no claim can succeed on it any more: the
+    // post gate is closed (state + error_epoch under the pool mutex). In the
+    // asynchronous chain this is the observable "drain registered, modify not
+    // yet done" stage (design §5.1: kDraining); the synchronous legacy fence
+    // never rests here.
     kDraining,
-    // The member has left kInUse and the hardware retirement fence
-    // (modify ERROR -> flush-done -> software flush) is in progress. It is not
-    // delete-ready yet: no native destruction may start before the fence is
-    // proven. This is the design's FLUSHING stage.
+    // The member's native Jetty is in ERROR and the drain chain is waiting for
+    // the current epoch's flush-done marker. No native destruction may start
+    // before marker + software-SQ-empty + responsibility convergence are all
+    // proven (design §5.3).
     kFlushing,
     kDeleteReady,
     kDeleting,
@@ -158,6 +116,10 @@ struct PoolMember {
     // erased (design §5.3/§7.2).
     bool tombstone_recorded = false;
     std::string retire_reason;
+    // Native delete attempts that the provider answered with "still valid"
+    // (DeleteOutcome::kRetained). Only drives the retry backoff; it is not a
+    // responsibility counter.
+    uint32_t delete_retry_attempts = 0;
 };
 
 class BusinessJettyPool;
@@ -303,11 +265,25 @@ struct SendJettyPoolOptions {
     // the completion/return path. Disabled by default for the same reason.
     bool background_delete = false;
     uint32_t refill_interval_ms = 50;
-    // Upper bound for the hardware retirement fence (modify ERROR + flush-done
-    // + software flush) before a faulted member is handed to the delete
-    // executor. A fence failure never deletes the handle: the pool keeps it
-    // quarantined because destruction is unproven.
+    // Upper bound for one drain step: the hardware retirement fence (modify
+    // ERROR + flush-done + software flush) in synchronous mode, and the total
+    // from beginDrain() to DELETE_READY in asynchronous mode (design §10.1).
     uint32_t retire_timeout_ms = 1000;
+    // Asynchronous drain chain (design §4.4). Enabled only when the transport
+    // attaches a JettyDrainController; a pool without one always retires
+    // synchronously, so direct-pool users keep the pre-drain behavior.
+    bool async_drain = false;
+    // Bound on flushJettyOnce() rounds the control executor runs before it
+    // yields to its next task (design §10.1 drain_flush_batch).
+    uint32_t drain_flush_batch = 64;
+    // Consecutive failed drains after which the controller reports the
+    // provider as unable to drain (design §9 fail-closed escalation).
+    uint32_t drain_quarantine_threshold = 3;
+    // UMDK requires a reset before a deleted Jetty in the current contract, so
+    // the default keeps the shipped behavior. The knob exists because the
+    // provider contract may relax it (source design §1.4) and a future
+    // "handles delete an ERROR Jetty" provider must not be forced to reset.
+    bool reset_before_delete = true;
     // Cap for the per-PoolKey creation backoff (design §7.3 BACKOFF).
     uint32_t cooldown_ms = 1000;
     // Bound on quarantined members. Reaching it stops admission instead of
@@ -325,6 +301,7 @@ struct SendJettyPoolStats {
     size_t creating_members = 0;
     size_t retired_members = 0;
     size_t flushing_members = 0;
+    size_t draining_members = 0;
     size_t delete_ready_members = 0;
     size_t quarantined_members = 0;
     // PoolKeys currently in creation backoff (bucket-level, not members).
@@ -341,6 +318,16 @@ struct SendJettyPoolStats {
     // Completions returned by a retirement fence. A pooled member serves one
     // WR, so a non-zero value is diagnostic, never a responsibility path.
     uint64_t fence_drained_completions = 0;
+    // Asynchronous drain chain counters (design §10.2). The controller owns the
+    // per-stage numbers; these are the ones the pool advances.
+    uint64_t drain_begin = 0;
+    uint64_t drain_delete_ready = 0;
+    uint64_t drain_quarantined = 0;
+    // Native delete outcomes (design §8.1). A retained or unknown outcome
+    // never releases the member's budget.
+    uint64_t delete_consumed = 0;
+    uint64_t delete_retained = 0;
+    uint64_t delete_unknown = 0;
     // Tombstone / recovery-budget observability (design §12.1).
     size_t tombstone_entries = 0;
     size_t tombstone_capacity = 0;
@@ -349,6 +336,10 @@ struct SendJettyPoolStats {
     uint64_t backpressure_rejections = 0;
     bool tombstone_backpressure = false;
     bool quarantine_backpressure = false;
+    // Design §9 admission brake: the drain controller proved that the provider
+    // cannot drain this device, so new slices are no longer admitted. It is a
+    // process-lifetime decision and has no automatic reset.
+    bool drain_admission_stopped = false;
 };
 
 // Per-attempt business send-Jetty pool (C06, INV03/INV04/INV06). One pool
@@ -412,14 +403,44 @@ class BusinessJettyPool final
     Status retireFaulted(SliceJettyLease lease, const std::string& reason);
 
     // Same, but runs the hardware retirement fence first when `fence_hardware`
-    // is true: the member moves to kFlushing, the adapter modifies the Jetty
-    // to ERROR, consumes its flush-done marker and flushes the software SQ.
-    // Only a proven fence hands the handle to reset+delete; a failed fence
-    // leaves the member quarantined with its budget charged. The caller passes
-    // true only for a real error completion (a proven timeout fence and the
-    // shutdown drain have already fenced the member).
+    // is true. With an attached JettyDrainController and async_drain enabled,
+    // the fence is registered with the controller and completes on the control
+    // executor (`beginDrain` -> modify ERROR -> poller marker -> software flush
+    // -> DELETE_READY). Without one, the legacy synchronous fence runs here:
+    // the member moves to kFlushing, the adapter modifies the Jetty to ERROR,
+    // consumes its flush-done marker and flushes the software SQ. Only a proven
+    // fence hands the handle to reset+delete; a failed fence leaves the member
+    // quarantined with its budget charged. The caller passes true only for a
+    // real error completion (a proven timeout fence and the shutdown drain have
+    // already fenced the member).
     Status retireFaulted(SliceJettyLease lease, const std::string& reason,
                          bool fence_hardware);
+
+    // Asynchronous drain chain hooks (design §4.4). The transport attaches the
+    // per-context controller after the pool and the workers exist; a null
+    // controller (or async_drain=false) keeps every retirement synchronous.
+    void attachDrainController(
+        std::shared_ptr<JettyDrainController> controller);
+    [[nodiscard]] std::shared_ptr<JettyDrainController> drainController() const;
+
+    // Controller -> pool verdicts. They run on the control executor thread and
+    // are never called under the controller lock.
+    //
+    // markDrainDeleteReady: every DELETE_READY condition holds (post gate
+    // closed, modify done, current-epoch marker seen, software SQ empty, gate
+    // responsibility converged). Only the pool moves the member and enqueues
+    // it for native destruction; the native delete still runs on the retire
+    // executor or on this thread when no executor is running.
+    //
+    // quarantineDrain: responsibility is unknown (timeout, unowned marker,
+    // provider capability missing). The member keeps its handle, tombstone and
+    // budget and no longer counts as serving.
+    Status markDrainDeleteReady(const PoolLaneKey& lane, uint64_t error_epoch);
+    Status quarantineDrain(const PoolLaneKey& lane, const std::string& reason);
+    // Resolves the live native handle of one draining lane for a drain step.
+    // The controller never retains it: ownership stays with the member so the
+    // eventual delete still sees use_count()==1.
+    [[nodiscard]] JettyPtr drainJettyFor(const PoolLaneKey& lane) const;
 
     // Stops new leases/creations and joins both background executors (when
     // enabled), draining any pending asynchronous deletes synchronously.
@@ -441,6 +462,11 @@ class BusinessJettyPool final
     // Attempts to delete quarantined members (e.g. during shutdown after
     // their responsibilities drained). Successful deletes release budget.
     Status drainQuarantined();
+
+    // Retries every kRetained native delete whose backoff elapsed. Returns the
+    // number of members retried. Driven by the refill pass and by the shutdown
+    // drains; it never blocks and never drops responsibility.
+    size_t retryRetainedDeletes();
 
     [[nodiscard]] SendJettyPoolStats stats() const;
     [[nodiscard]] std::vector<PoolMemberState> memberStates() const;
@@ -489,6 +515,13 @@ class BusinessJettyPool final
     void clearCreateBackoffLocked(const PoolKey& pool_key);
     [[nodiscard]] bool inCreateBackoffLocked(const PoolKey& pool_key) const;
     void destroyRetired(std::vector<std::shared_ptr<PoolMember>> members);
+    // Applies one classified native delete outcome (design §8.2). Only
+    // kConsumed releases the budget and erases the tombstone.
+    void finishDelete(const std::shared_ptr<PoolMember>& member,
+                      DeleteOutcome outcome);
+    // Native reset+delete of one member through deleteJettyWithOutcome. Returns
+    // the outcome; the caller owns the member either way.
+    [[nodiscard]] DeleteOutcome resetAndDeleteMember(PoolMember& member);
     void onLeaseLeaked(const std::shared_ptr<PoolMember>& member);
     // Records unproven destruction for one member. Called whenever a member
     // leaves circulation; a full table raises tombstone backpressure instead of
@@ -519,6 +552,15 @@ class BusinessJettyPool final
     std::unordered_map<PoolKey, PoolBucket, PoolKeyHash> buckets_;
     std::vector<std::shared_ptr<PoolMember>> retired_;
     std::vector<std::shared_ptr<PoolMember>> quarantined_;
+    // Members owned by the asynchronous drain chain, keyed by lane generation.
+    // The pool retains them (not the controller: an entry must not keep a
+    // member alive, design §7) until markDrainDeleteReady/quarantineDrain
+    // hands them to the retirement path.
+    std::unordered_map<uint64_t, std::shared_ptr<PoolMember>> draining_;
+    // Members whose native delete returned kRetained, keyed by lane
+    // generation, with the earliest retry time for each.
+    std::unordered_map<uint64_t, std::shared_ptr<PoolMember>> retained_;
+    std::unordered_map<uint64_t, uint64_t> delete_retry_at_ns_;
     uint64_t next_lane_generation_ = 1;
     size_t next_jfc_rotation_ = 0;
     bool stopping_ = false;
@@ -530,6 +572,8 @@ class BusinessJettyPool final
     // synchronous destruction / demand-driven creation.
     std::unique_ptr<JettyRetireWorker> retire_worker_;
     std::unique_ptr<JettyRefillWorker> refill_worker_;
+    // Null means "not attached": every retirement uses the synchronous fence.
+    std::shared_ptr<JettyDrainController> drain_controller_;
 
     // Diagnostics counters (protected by mutex_).
     uint64_t total_leases_ = 0;
@@ -542,6 +586,12 @@ class BusinessJettyPool final
     uint64_t double_returns_ = 0;
     uint64_t create_backoffs_ = 0;
     uint64_t fence_drained_completions_ = 0;
+    uint64_t drain_begin_ = 0;
+    uint64_t drain_delete_ready_ = 0;
+    uint64_t drain_quarantined_ = 0;
+    uint64_t delete_consumed_ = 0;
+    uint64_t delete_retained_ = 0;
+    uint64_t delete_unknown_ = 0;
     uint64_t tombstone_insert_failures_ = 0;
     uint64_t tombstone_erase_misses_ = 0;
     uint64_t backpressure_rejections_ = 0;
