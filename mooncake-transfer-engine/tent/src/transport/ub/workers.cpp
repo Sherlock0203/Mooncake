@@ -68,6 +68,8 @@ struct UbWorkers::Route {
     BufferDesc* remote_buffer{nullptr};
     UbBufferMetadata metadata;
     std::vector<Topology::NicID> remote_devices;
+    // Declaration gate for this peer, computed once per route.
+    AdjacencyView adjacency;
 };
 
 // Owner-side half of a completion record (design §5.3). The shared kernel
@@ -119,7 +121,8 @@ UbWorkers::UbWorkers(std::shared_ptr<UrmaAdapter> adapter,
                      LocalDeviceFailureHandler local_device_failure_handler,
                      ProbeLinkManager* probe_manager,
                      std::vector<ProbeJfcSlot> probe_jfcs,
-                     std::shared_ptr<TombstoneTable> tombstones)
+                     std::shared_ptr<TombstoneTable> tombstones,
+                     const ProbeTopology* probe_topology)
     : adapter_(std::move(adapter)),
       contexts_(std::move(contexts)),
       local_topology_(std::move(local_topology)),
@@ -132,6 +135,7 @@ UbWorkers::UbWorkers(std::shared_ptr<UrmaAdapter> adapter,
       endpoint_retirer_(std::move(endpoint_retirer)),
       local_device_failure_handler_(std::move(local_device_failure_handler)),
       probe_manager_(probe_manager),
+      probe_topology_(probe_topology),
       tombstones_(std::move(tombstones)) {
     for (const auto& context : contexts_) {
         if (!context) continue;
@@ -1070,6 +1074,10 @@ Status UbWorkers::buildRoute(const PendingSlice& pending, Route& route) {
             route.remote_buffer = buffer;
             route.metadata = std::move(metadata);
             route.remote_devices = orderedRemoteDevices(*segment, *buffer);
+            if (probe_topology_ != nullptr) {
+                route.adjacency =
+                    probe_topology_->viewFor(segment->name, *segment);
+            }
             if (route.remote_devices.empty()) {
                 return Status::DeviceNotFound(
                     "UB target has no active advertised device" LOC_MARK);
@@ -1274,10 +1282,31 @@ Status UbWorkers::chooseAndResolveEndpoint(
     std::vector<RailCandidate> rails;
     rails.reserve(combinations);
     bool health_screened_out = false;
+    // Declared adjacency is a static configuration fence and runs before any
+    // health/load judgement (design §5.1 step 2). The first denial is kept for
+    // a precise error when no candidate survives.
+    bool adjacency_screened_out = false;
+    AdjacencyDecision first_adjacency_denial = AdjacencyDecision::kAllowed;
+    Topology::NicID first_denied_local = -1;
+    Topology::NicID first_denied_remote = -1;
     for (size_t flat = 0; flat < combinations; ++flat) {
         const auto& local = local_devices[flat / route.remote_devices.size()];
         const auto remote_id =
             route.remote_devices[flat % route.remote_devices.size()];
+        if (route.adjacency.enforced) {
+            bool local_declared = false;
+            const auto decision =
+                route.adjacency.check(local.id, remote_id, &local_declared);
+            if (decision != AdjacencyDecision::kAllowed) {
+                if (!adjacency_screened_out) {
+                    first_adjacency_denial = decision;
+                    first_denied_local = local.id;
+                    first_denied_remote = remote_id;
+                }
+                adjacency_screened_out = true;
+                continue;
+            }
+        }
         const UbPostPath probe_path{local.id, pending.target_id, remote_id,
                                     kRailProbeEndpointGeneration};
         // W3 health gate (design §7.1 rule 1 / D-10). Health is a pure
@@ -1304,6 +1333,14 @@ Status UbWorkers::chooseAndResolveEndpoint(
             (flat + combinations - start) % combinations, probe_path,
             std::move(rail_stats),
             quota_->availability(probe_path, pending.slice->spec().length)});
+    }
+    if (rails.empty() && adjacency_screened_out) {
+        return Status::InvalidArgument(
+            "UB adjacency rejects every posting candidate: peer=" +
+            (route.pin ? route.pin->name : std::string("<unknown>")) +
+            " local_nic=" + std::to_string(first_denied_local) +
+            " remote_nic=" + std::to_string(first_denied_remote) + " reason=" +
+            adjacencyDecisionName(first_adjacency_denial) + LOC_MARK);
     }
     std::stable_sort(rails.begin(), rails.end(),
                      [&](const RailCandidate& lhs, const RailCandidate& rhs) {

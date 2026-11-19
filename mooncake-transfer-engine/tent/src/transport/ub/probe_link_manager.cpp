@@ -1321,6 +1321,15 @@ bool ProbeLinkManager::businessPathUsable(const UbPostPath& path) {
         ++stats_.business_path_not_in_graph;
         return true;
     }
+    // A path in the graph also has to pass the peer's published gates
+    // (node/port/profile). They are part of the same subtraction as health:
+    // an edge whose peer is draining or rebuilding must not attract business
+    // traffic (design §5.1).
+    const auto edge = edges_.find(*version);
+    if (edge == edges_.end() || !externalGateOk(edge->second)) {
+        ++stats_.business_path_gate_blocked;
+        return false;
+    }
     const bool usable = runtime->health == LinkHealth::kHealthy ||
                         runtime->health == LinkHealth::kEligibleUnverified;
     if (!usable) ++stats_.business_path_health_blocked;

@@ -28,6 +28,7 @@
 #include "tent/transport/ub/params.h"
 #include "tent/transport/ub/path_load_ledger.h"
 #include "tent/transport/ub/post_scheduler.h"
+#include "tent/transport/ub/probe_topology.h"
 #include "tent/transport/ub/probe_link_manager.h"
 #include "tent/transport/ub/quota.h"
 #include "tent/transport/ub/rail_monitor.h"
@@ -203,7 +204,8 @@ class UbWorkers final : public gate::Sink {
               LocalDeviceFailureHandler local_device_failure_handler = {},
               ProbeLinkManager* probe_manager = nullptr,
               std::vector<ProbeJfcSlot> probe_jfcs = {},
-              std::shared_ptr<TombstoneTable> tombstones = nullptr);
+              std::shared_ptr<TombstoneTable> tombstones = nullptr,
+              const ProbeTopology* probe_topology = nullptr);
     ~UbWorkers();
 
     UbWorkers(const UbWorkers&) = delete;
@@ -472,6 +474,8 @@ class UbWorkers final : public gate::Sink {
     std::vector<BusinessSlot> business_slots_;
     std::vector<ProbeSlot> probe_slots_;
     ProbeLinkManager* probe_manager_{nullptr};
+    // Read-only adjacency policy; nullptr when no topology was declared.
+    const ProbeTopology* probe_topology_{nullptr};
     // Bounded record of unproven destructions, used to attribute a completion
     // whose token no longer maps to a live record (design §7.1/§7.2).
     std::shared_ptr<TombstoneTable> tombstones_;

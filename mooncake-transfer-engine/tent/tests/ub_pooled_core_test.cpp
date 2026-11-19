@@ -1343,10 +1343,26 @@ TEST(UbParamsPooledTest, ParsesDeclaredProbeTopologyAndRejectsBadEdges) {
     ASSERT_TRUE(parseUbParams(R"({
         "transports": {
             "ub": {
+                "runtime_profile": "rm_legacy",
+                "trans_mode": "rm",
                 "probe": {
-                    "local_ports": ["P0", "P1"],
-                    "adjacency": {"P0": ["peer-a", "peer-b"], "P1": ["peer-a"]},
-                    "target_map": {"P0": ["t0"]}
+                    "enabled": true,
+                    "provider": "standalone",
+                    "local_ports": [
+                        {"id": "P0", "bind": "ub:udma0:eid0"},
+                        {"id": "P1", "bind": "ub:udma1:eid0"}
+                    ],
+                    "peers": {
+                        "node-b": {
+                            "ports": [
+                                {"id": "R0", "eid": "0000:0000:0000:0000:0000:0000:0000:0021"},
+                                {"id": "R1", "eid": "0000:0000:0000:0000:0000:0000:0000:0022"}
+                            ]
+                        }
+                    },
+                    "adjacency": {
+                        "node-b": {"P0": ["R0", "R1"], "P1": ["R0"]}
+                    }
                 }
             }
         }
@@ -1354,31 +1370,118 @@ TEST(UbParamsPooledTest, ParsesDeclaredProbeTopologyAndRejectsBadEdges) {
                               params)
                     .ok());
     ASSERT_EQ(params.probe.local_ports.size(), 2u);
-    ASSERT_EQ(params.probe.adjacency.at("P0").size(), 2u);
+    EXPECT_EQ(params.probe.local_ports[0].id, "P0");
+    EXPECT_EQ(params.probe.local_ports[0].bind, "ub:udma0:eid0");
+    ASSERT_EQ(params.probe.peers.count("node-b"), 1u);
+    ASSERT_EQ(params.probe.peers.at("node-b").ports.size(), 2u);
+    ASSERT_EQ(params.probe.adjacency.at("node-b").at("P0").size(), 2u);
+    EXPECT_TRUE(params.probe.dynamic_edges);
+    EXPECT_TRUE(params.probe.enforcesAdjacency());
 
-    // An edge to an undeclared port is fail-closed.
-    EXPECT_TRUE(parseUbParams(R"({
-        "transports": {
-            "ub": {
-                "probe": {
-                    "local_ports": ["P0"],
-                    "adjacency": {"P9": ["peer-a"]}
-                }
+    // Bare-string local port: id == bind.
+    ASSERT_TRUE(parseUbParams(R"({
+        "transports": {"ub": {
+            "runtime_profile": "rm_legacy", "trans_mode": "rm",
+            "probe": {
+                "enabled": true, "provider": "standalone",
+                "local_ports": ["P0"],
+                "peers": {"node-b": {"ports": [
+                    {"id": "R0", "eid": "0000:0000:0000:0000:0000:0000:0000:0021"}
+                ]}},
+                "adjacency": {"node-b": {"P0": ["R0"]}}
             }
-        }
+        }}
+    })",
+                              params)
+                    .ok());
+    EXPECT_EQ(params.probe.local_ports[0].bind, "P0");
+
+    // The removed shape ({local: [peer...]}) is rejected, not reinterpreted.
+    EXPECT_TRUE(parseUbParams(R"({
+        "transports": {"ub": {
+            "runtime_profile": "rm_legacy", "trans_mode": "rm",
+            "probe": {
+                "enabled": true, "provider": "standalone",
+                "local_ports": ["P0"],
+                "peers": {"peer-a": {"ports": [
+                    {"id": "R0", "eid": "0000:0000:0000:0000:0000:0000:0000:0021"}
+                ]}},
+                "adjacency": {"P0": ["peer-a"]}
+            }
+        }}
     })",
                               params)
                     .IsInvalidArgument());
-    // A duplicate edge target is rejected.
+
+    // target_map was removed in favour of peers[].ports[].eid.
     EXPECT_TRUE(parseUbParams(R"({
-        "transports": {
-            "ub": {
-                "probe": {
-                    "local_ports": ["P0"],
-                    "adjacency": {"P0": ["peer-a", "peer-a"]}
-                }
+        "transports": {"ub": {"probe": {"target_map": {"P0": ["t0"]}}}}
+    })",
+                              params)
+                    .IsInvalidArgument());
+
+    // An edge to an undeclared local port is fail-closed.
+    EXPECT_TRUE(parseUbParams(R"({
+        "transports": {"ub": {
+            "runtime_profile": "rm_legacy", "trans_mode": "rm",
+            "probe": {
+                "enabled": true, "provider": "standalone",
+                "local_ports": ["P0"],
+                "peers": {"peer-a": {"ports": [
+                    {"id": "R0", "eid": "0000:0000:0000:0000:0000:0000:0000:0021"}
+                ]}},
+                "adjacency": {"peer-a": {"P9": ["R0"]}}
             }
-        }
+        }}
+    })",
+                              params)
+                    .IsInvalidArgument());
+
+    // Duplicate remote id in one local list is rejected.
+    EXPECT_TRUE(parseUbParams(R"({
+        "transports": {"ub": {
+            "runtime_profile": "rm_legacy", "trans_mode": "rm",
+            "probe": {
+                "enabled": true, "provider": "standalone",
+                "local_ports": ["P0"],
+                "peers": {"peer-a": {"ports": [
+                    {"id": "R0", "eid": "0000:0000:0000:0000:0000:0000:0000:0021"}
+                ]}},
+                "adjacency": {"peer-a": {"P0": ["R0", "R0"]}}
+            }
+        }}
+    })",
+                              params)
+                    .IsInvalidArgument());
+
+    // A declaration without probe enabled, or with the injected pool
+    // provider, cannot form a mapping and is rejected.
+    EXPECT_TRUE(parseUbParams(R"({
+        "transports": {"ub": {
+            "runtime_profile": "rm_legacy", "trans_mode": "rm",
+            "probe": {
+                "local_ports": ["P0"],
+                "peers": {"peer-a": {"ports": [
+                    {"id": "R0", "eid": "0000:0000:0000:0000:0000:0000:0000:0021"}
+                ]}},
+                "adjacency": {"peer-a": {"P0": ["R0"]}}
+            }
+        }}
+    })",
+                              params)
+                    .IsInvalidArgument());
+    EXPECT_TRUE(parseUbParams(R"({
+        "transports": {"ub": {
+            "runtime_profile": "rm_legacy", "trans_mode": "rm",
+            "probe": {
+                "enabled": true, "provider": "pool",
+                "local_ports": ["P0"],
+                "peers": {"peer-a": {"ports": [
+                    {"id": "R0", "eid": "0000:0000:0000:0000:0000:0000:0000:0021"}
+                ]}},
+                "adjacency": {"peer-a": {"P0": ["R0"]}}
+            }
+        }}
     })",
                               params)
                     .IsInvalidArgument());

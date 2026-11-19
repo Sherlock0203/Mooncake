@@ -568,6 +568,16 @@ if(USE_UB)
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_ub_core_test COMMAND tent_ub_core_test)
 
+  # Declared probe topology (design §4–§5): config resolution, binding
+  # uniqueness and the per-slice adjacency view. Software-only.
+  add_executable(tent_ub_probe_topology_test ub_probe_topology_test.cpp)
+  target_link_libraries(tent_ub_probe_topology_test
+                        PRIVATE tent_link_group gtest gtest_main)
+  target_include_directories(tent_ub_probe_topology_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_probe_topology_test
+           COMMAND tent_ub_probe_topology_test)
+
   # Pooled rm_pool core components (C05/C06/C07): budget ledger, admission
   # tickets, per-attempt send pool and completion gate. Software-only: the
   # fake adapter needs no provider or NIC.

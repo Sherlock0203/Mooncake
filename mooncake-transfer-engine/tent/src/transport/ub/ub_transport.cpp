@@ -5,6 +5,7 @@
 #include "tent/transport/ub/probe_peer_handshake.h"
 #include "tent/transport/ub/probe_poster_urma.h"
 #include "tent/transport/ub/probe_provider_standalone.h"
+#include "tent/transport/ub/probe_topology.h"
 #include "tent/transport/ub/probe_scheduler.h"
 #include "tent/transport/ub/ub_transport.h"
 
@@ -260,6 +261,15 @@ struct UbTransport::Impl {
         }
         status = ub::resolveDeviceKindIdentities(params.device_identities,
                                                  discovered);
+        if (!status.ok()) return failInstall(status);
+
+        // Declared topology is resolved once, against the same discovery
+        // snapshot that selects the business devices. A declared binding that
+        // matches zero or multiple physical EIDs fails the install (design
+        // §4.3 rule 9); it is never skipped or guessed.
+        probe_topology = std::make_shared<ub::ProbeTopology>();
+        status = ub::ProbeTopology::resolve(params.probe, discovered,
+                                            *local_topology, *probe_topology);
         if (!status.ok()) return failInstall(status);
 
         const bool explicit_filter = !params.device_filter.empty();
@@ -804,7 +814,8 @@ struct UbTransport::Impl {
                 }
                 return endpoints->retireLocalDevice(local_topology_id);
             },
-            probe_manager.get(), std::move(probe_jfcs), tombstones);
+            probe_manager.get(), std::move(probe_jfcs), tombstones,
+            probe_topology.get());
         status = workers->start();
         if (!status.ok()) return failInstall(status);
 
@@ -902,6 +913,7 @@ struct UbTransport::Impl {
         // the PLM only after the workers that reference it are gone.
         probe_scheduler.reset();
         probe_manager.reset();
+        probe_topology.reset();
         probe_poster.reset();
         // Unimport remote probe areas while the probe Contexts are still
         // alive; the self-owned provider closes them in its shutdown.
@@ -1301,6 +1313,9 @@ struct UbTransport::Impl {
     std::shared_ptr<ub::HandshakeProbePeerDirectory> probe_directory;
     std::shared_ptr<ub::ProbeResourceProvider> probe_provider;
     std::shared_ptr<ub::ProbePoster> probe_poster;
+    // Declared adjacency policy for the business routing gate. Destroyed
+    // after the workers that borrow it.
+    std::shared_ptr<ub::ProbeTopology> probe_topology;
     std::unique_ptr<ub::ProbeLinkManager> probe_manager;
     std::unique_ptr<ub::ProbeScheduler> probe_scheduler;
     std::unique_ptr<ub::UbWorkers> workers;

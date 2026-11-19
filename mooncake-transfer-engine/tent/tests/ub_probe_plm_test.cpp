@@ -77,6 +77,29 @@ TEST(UbProbeLinkManagerTest, InitializesEligibleAndBusinessSuccessPromotes) {
     EXPECT_EQ(plm.stats().probe_unknown_token, 1U);
 }
 
+TEST(UbProbeLinkManagerTest, BusinessGateRequiresExternalPeerGates) {
+    TestClock clock;
+    ProbeLinkManager plm(defaultParams(), clock.clock());
+    auto graph =
+        makeGraph({makePortSupply(0, 1)}, {makeEdgeSupply(0, 10, 0, 1, 1, 1,
+                                                          /*gates_ok=*/false)});
+    ASSERT_TRUE(plm.initialize(graph).ok());
+
+    // The path is in the graph and healthy-unverified, but the peer's
+    // published node/port/profile gate is closed: business must not use it.
+    EXPECT_FALSE(plm.businessPathUsable(makeEvidence(0, 10, 0)));
+    EXPECT_EQ(plm.stats().business_path_gate_blocked, 1U);
+
+    ProbeEvent event;
+    event.kind = ProbeEventKind::kGateChanged;
+    event.local_nic = 0;
+    event.graph_epoch = 1;
+    event.event_seq = 1;
+    event.gate = GateBits{true, true, true};
+    ASSERT_TRUE(plm.onPoolAvailabilityChange(event).ok());
+    EXPECT_TRUE(plm.businessPathUsable(makeEvidence(0, 10, 0)));
+}
+
 TEST(UbProbeLinkManagerTest, BusinessSuccessNeverClearsIsolation) {
     TestClock clock;
     ProbeLinkManager plm(defaultParams(), clock.clock());

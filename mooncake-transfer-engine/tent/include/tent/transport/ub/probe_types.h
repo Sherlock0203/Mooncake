@@ -24,6 +24,7 @@
 #include <functional>
 #include <map>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <vector>
 
@@ -264,6 +265,61 @@ enum class ProbeProviderKind : uint8_t {
     kStandalone,
 };
 
+// One declared local probe port. `bind` selects exactly one physical EID at
+// install time; `eid` is an optional static assertion against the discovered
+// identity. A bare string declaration sets id == bind.
+struct ProbeLocalPortDecl {
+    std::string id;
+    std::string bind;
+    std::string eid;
+
+    bool operator==(const ProbeLocalPortDecl&) const = default;
+};
+
+// One declared remote probe port. `id` is a local alias used only in this
+// node's configuration and logs; `eid` is the cross-node identity.
+struct ProbePeerPortDecl {
+    std::string id;
+    std::string eid;
+
+    bool operator==(const ProbePeerPortDecl&) const = default;
+};
+
+struct ProbePeerDecl {
+    std::string segment;
+    std::vector<ProbePeerPortDecl> ports;
+};
+
+// Bootstrap handshake scheduling (design §4.1). Distinct from the probe
+// scheduler's interval/timeout: this is the control-plane refresh loop.
+struct ProbeHandshakeParams {
+    uint64_t refresh_interval_ms{30000};
+    uint64_t retry_backoff_ms{1000};
+    uint64_t timeout_ms{2000};
+    uint32_t threads{2};
+    bool require_peer_ports{false};
+    uint32_t withdraw_grace{3};
+};
+
+// Canonical URMA EID text: eight groups of four hex digits separated by ':'.
+// Kept dependency-free so configuration parsing and topology resolution share
+// one validator without pulling in the native adapter headers.
+inline bool isCanonicalEid(std::string_view eid) {
+    if (eid.size() != 39) return false;
+    for (size_t index = 0; index < eid.size(); ++index) {
+        const char value = eid[index];
+        if (index % 5 == 4) {
+            if (value != ':') return false;
+            continue;
+        }
+        const bool hex = (value >= '0' && value <= '9') ||
+                         (value >= 'a' && value <= 'f') ||
+                         (value >= 'A' && value <= 'F');
+        if (!hex) return false;
+    }
+    return true;
+}
+
 struct ProbeParams {
     static constexpr uint64_t kNsPerMs = 1'000'000;
 
@@ -293,15 +349,28 @@ struct ProbeParams {
     uint64_t test_interval_ms{5000};
     bool test_apply_health{true};
 
-    // Declared probe topology (design §9.1). These are the operator's
-    // declaration of local ports and legal adjacency edges. They are validated
-    // fail-closed (non-empty, no duplicate edge) and are the configuration
-    // source a configured probe directory uses; the standalone provider still
-    // derives its live graph from trusted discovery, so a mismatch is visible
-    // instead of silently inventing a topology.
-    std::vector<std::string> local_ports;
-    std::map<std::string, std::vector<std::string>> adjacency;
-    std::map<std::string, std::vector<std::string>> target_map;
+    // Declared probe topology (design §4). These are the operator's
+    // declaration of local ports, peer ports and the legal adjacency edges.
+    // They are the only source of business routing and probe-graph edges; the
+    // handshake fills runtime handles for declared ports only.
+    std::vector<ProbeLocalPortDecl> local_ports;
+    std::map<std::string, ProbePeerDecl> peers;
+    // peer -> (local_id -> remote_id list).
+    std::map<std::string, std::map<std::string, std::vector<std::string>>>
+        adjacency;
+    // When true and a declaration exists, the declared set becomes the first
+    // gate of business path selection. Defaults to true (fail-closed); a
+    // two-step rollout can start with false and flip it after the probe graph
+    // converged.
+    bool enforce_adjacency{true};
+    // ProbeLinkManager accepts a zero-edge graph at install and adds edges
+    // incrementally. Derived from the declaration, never configured directly.
+    bool dynamic_edges{false};
+    ProbeHandshakeParams handshake;
+
+    [[nodiscard]] bool hasDeclaredTopology() const {
+        return !local_ports.empty() || !peers.empty() || !adjacency.empty();
+    }
 
     [[nodiscard]] uint64_t intervalNs() const { return interval_ms * kNsPerMs; }
     [[nodiscard]] uint64_t timeoutNs() const { return timeout_ms * kNsPerMs; }
@@ -310,6 +379,12 @@ struct ProbeParams {
     }
     [[nodiscard]] uint64_t testIntervalNs() const {
         return test_interval_ms * kNsPerMs;
+    }
+    [[nodiscard]] uint64_t handshakeRefreshNs() const {
+        return handshake.refresh_interval_ms * kNsPerMs;
+    }
+    [[nodiscard]] uint64_t handshakeTimeoutNs() const {
+        return handshake.timeout_ms * kNsPerMs;
     }
 
     [[nodiscard]] bool valid() const {
@@ -331,7 +406,40 @@ struct ProbeParams {
         }
         if (test_interval_ms == 0) return false;
         if (test_periodic_all && !enabled) return false;
+        // Handshake schedule (design §4.1/§4.3 rule 5).
+        if (handshake.refresh_interval_ms == 0 ||
+            handshake.refresh_interval_ms < 1000 ||
+            handshake.refresh_interval_ms > 600000) {
+            return false;
+        }
+        if (handshake.retry_backoff_ms < 100 ||
+            handshake.retry_backoff_ms > 60000) {
+            return false;
+        }
+        if (handshake.timeout_ms < 100 || handshake.timeout_ms > 30000 ||
+            handshake.timeout_ms > handshake.refresh_interval_ms) {
+            return false;
+        }
+        if (handshake.threads < 1 || handshake.threads > 4) return false;
+        if (handshake.withdraw_grace == 0) return false;
+        // A declaration is only meaningful together with probing (design
+        // §4.3 rules 7 and 8): rejecting half a mapping is safer than
+        // silently enforcing an incomplete path set.
+        if (hasDeclaredTopology()) {
+            if (!enabled) return false;
+            if (local_ports.empty() || peers.empty() || adjacency.empty()) {
+                return false;
+            }
+        }
+        if (dynamic_edges != !adjacency.empty()) return false;
         return true;
+    }
+
+    // Enforcement only exists when an adjacency was declared. The default
+    // enforce_adjacency=true therefore does not affect the legacy/injected
+    // seams, which never declare a topology.
+    [[nodiscard]] bool enforcesAdjacency() const {
+        return enforce_adjacency && !adjacency.empty();
     }
 };
 
@@ -409,6 +517,7 @@ struct ProbeStats {
     // incomplete rather than that traffic is being filtered.
     uint64_t business_path_not_in_graph{0};
     uint64_t business_path_health_blocked{0};
+    uint64_t business_path_gate_blocked{0};
 };
 
 }  // namespace ub

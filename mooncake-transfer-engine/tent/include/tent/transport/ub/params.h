@@ -17,6 +17,7 @@
 
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
@@ -564,6 +565,39 @@ struct UbParams {
                               parsed.probe.test_apply_health,
                               parsed.probe.test_apply_health));
 
+        // Declared topology cross-checks (design §4.3/§4.5). A declaration is
+        // only meaningful in standalone mode with binding-based selection:
+        // an injected provider decides its own resource mapping, and a
+        // device_filter would make the declared bind ambiguous.
+        if (parsed.probe.hasDeclaredTopology()) {
+            if (parsed.probe.provider != ProbeProviderKind::kStandalone) {
+                return Status::InvalidArgument(
+                    "declared probe topology requires "
+                    "transports/ub/probe/provider=standalone");
+            }
+            if (!parsed.probe.device_filter.empty() ||
+                !parsed.device_filter.empty()) {
+                return Status::InvalidArgument(
+                    "declared probe topology cannot be combined with "
+                    "transports/ub/device_filter or "
+                    "transports/ub/probe/device_filter; local_ports bind "
+                    "selects the probe devices");
+            }
+            if (parsed.runtime_profile == UbRuntimeProfile::kRcLegacy) {
+                return Status::InvalidArgument(
+                    "declared probe topology requires an RM runtime "
+                    "(runtime_profile=rm_legacy or rm_pool); RC legacy has no "
+                    "probe transport");
+            }
+            if (!config.get<json>("transports/ub/probe/enabled", json())
+                     .is_null() &&
+                !parsed.probe.enabled) {
+                return Status::InvalidArgument(
+                    "declared probe topology requires "
+                    "transports/ub/probe/enabled=true");
+            }
+        }
+
         // Cross-key constraints (design §13.1). Each one has its own message
         // so an operator can tell which pair is inconsistent.
         if (parsed.probe.backoff_max_ms < parsed.probe.interval_ms) {
@@ -1016,110 +1050,304 @@ struct UbParams {
         return readPositive(config, old_key, output, output);
     }
 
-    // Declared probe topology (design §9.1): fail-closed validation, because a
-    // malformed adjacency becomes a silently wrong path set at runtime.
+    // Declared probe topology (design §4): fail-closed validation, because a
+    // malformed adjacency becomes a silently wrong path set at runtime. The
+    // old shape (adjacency: {local: [peer...]}, target_map) is rejected with a
+    // migration example instead of being reinterpreted.
     static Status readProbeTopology(const Config& config, ProbeParams& probe) {
-        std::vector<std::string> ports;
-        CHECK_STATUS(
-            readStringList(config, "transports/ub/probe/local_ports", ports));
+        const json target_map =
+            config.get<json>("transports/ub/probe/target_map", json());
+        if (!target_map.is_null()) {
+            return Status::InvalidArgument(
+                "transports/ub/probe/target_map was removed; declare remote "
+                "port EIDs under transports/ub/probe/peers/.../ports[] and "
+                "edges under transports/ub/probe/adjacency/{peer}/{local_id}");
+        }
+
         std::unordered_set<std::string> unique_ports;
-        for (const auto& port : ports) {
-            if (port.empty()) {
+        const json ports_json =
+            config.get<json>("transports/ub/probe/local_ports", json());
+        if (!ports_json.is_null()) {
+            if (!ports_json.is_array()) {
                 return Status::InvalidArgument(
-                    "transports/ub/probe/local_ports contains an empty port");
+                    "transports/ub/probe/local_ports must be an array");
             }
-            if (!unique_ports.insert(port).second) {
-                return Status::InvalidArgument(
-                    "transports/ub/probe/local_ports contains a duplicate "
-                    "port");
-            }
-        }
-        probe.local_ports = ports;
-
-        std::map<std::string, std::vector<std::string>> adjacency;
-        CHECK_STATUS(readStringListMap(config, "transports/ub/probe/adjacency",
-                                       adjacency));
-        for (const auto& [port, peers] : adjacency) {
-            if (port.empty() || peers.empty()) {
-                return Status::InvalidArgument(
-                    "transports/ub/probe/adjacency has an empty port or edge "
-                    "list");
-            }
-            if (!unique_ports.empty() && unique_ports.count(port) == 0) {
-                return Status::InvalidArgument(
-                    "transports/ub/probe/adjacency references an undeclared "
-                    "local port '" +
-                    port + "'");
-            }
-            std::unordered_set<std::string> unique_peers;
-            for (const auto& peer : peers) {
-                if (peer.empty() || !unique_peers.insert(peer).second) {
+            for (const auto& entry : ports_json) {
+                ProbeLocalPortDecl port;
+                if (entry.is_string()) {
+                    port.id = entry.get<std::string>();
+                    port.bind = port.id;
+                } else if (entry.is_object()) {
+                    if (!entry.contains("id") || !entry["id"].is_string() ||
+                        !entry.contains("bind") || !entry["bind"].is_string()) {
+                        return Status::InvalidArgument(
+                            "transports/ub/probe/local_ports entries need a "
+                            "string id and bind");
+                    }
+                    port.id = entry["id"].get<std::string>();
+                    port.bind = entry["bind"].get<std::string>();
+                    if (entry.contains("eid")) {
+                        if (!entry["eid"].is_string()) {
+                            return Status::InvalidArgument(
+                                "transports/ub/probe/local_ports eid must be "
+                                "a string");
+                        }
+                        port.eid = entry["eid"].get<std::string>();
+                    }
+                } else {
                     return Status::InvalidArgument(
-                        "transports/ub/probe/adjacency has an empty or "
-                        "duplicate peer");
+                        "transports/ub/probe/local_ports entries must be a "
+                        "string or an object");
                 }
-            }
-        }
-        probe.adjacency = std::move(adjacency);
-
-        std::map<std::string, std::vector<std::string>> target_map;
-        CHECK_STATUS(readStringListMap(config, "transports/ub/probe/target_map",
-                                       target_map));
-        for (const auto& [port, targets] : target_map) {
-            if (port.empty() || targets.empty()) {
-                return Status::InvalidArgument(
-                    "transports/ub/probe/target_map has an empty port or "
-                    "target list");
-            }
-            if (!unique_ports.empty() && unique_ports.count(port) == 0) {
-                return Status::InvalidArgument(
-                    "transports/ub/probe/target_map references an undeclared "
-                    "local port '" +
-                    port + "'");
-            }
-            std::unordered_set<std::string> unique_targets;
-            for (const auto& target : targets) {
-                if (target.empty() || !unique_targets.insert(target).second) {
+                if (port.id.empty() || port.id.size() > 64) {
                     return Status::InvalidArgument(
-                        "transports/ub/probe/target_map has an empty or "
-                        "duplicate target");
+                        "transports/ub/probe/local_ports id must be non-empty "
+                        "and at most 64 bytes");
                 }
-            }
-        }
-        probe.target_map = std::move(target_map);
-        return Status::OK();
-    }
-
-    // JSON object whose values are string arrays. Used for the declared probe
-    // adjacency/target map; a wrong shape is a config error.
-    static Status readStringListMap(
-        const Config& config, const char* key,
-        std::map<std::string, std::vector<std::string>>& output) {
-        const json value = config.get<json>(key, json());
-        if (value.is_null()) return Status::OK();
-        if (!value.is_object()) {
-            return Status::InvalidArgument(std::string(key) +
-                                           " must be an object of arrays");
-        }
-        std::map<std::string, std::vector<std::string>> parsed;
-        for (const auto& item : value.items()) {
-            if (!item.value().is_array()) {
-                return Status::InvalidArgument(std::string(key) + "/" +
-                                               item.key() +
-                                               " must be an array of strings");
-            }
-            std::vector<std::string> entries;
-            for (const auto& entry : item.value()) {
-                if (!entry.is_string()) {
+                if (port.bind.empty()) {
                     return Status::InvalidArgument(
-                        std::string(key) + "/" + item.key() +
-                        " must contain only strings");
+                        "transports/ub/probe/local_ports bind must be "
+                        "non-empty");
                 }
-                entries.push_back(entry.get<std::string>());
+                if (!port.eid.empty() && !isCanonicalEid(port.eid)) {
+                    return Status::InvalidArgument(
+                        "transports/ub/probe/local_ports eid must be a "
+                        "canonical URMA EID");
+                }
+                if (!unique_ports.insert(port.id).second) {
+                    return Status::InvalidArgument(
+                        "transports/ub/probe/local_ports contains a duplicate "
+                        "port id");
+                }
+                probe.local_ports.push_back(std::move(port));
             }
-            parsed.emplace(item.key(), std::move(entries));
         }
-        output = std::move(parsed);
+
+        const json peers_json =
+            config.get<json>("transports/ub/probe/peers", json());
+        if (!peers_json.is_null()) {
+            if (!peers_json.is_object()) {
+                return Status::InvalidArgument(
+                    "transports/ub/probe/peers must be an object");
+            }
+            for (const auto& item : peers_json.items()) {
+                if (item.key().empty()) {
+                    return Status::InvalidArgument(
+                        "transports/ub/probe/peers has an empty peer name");
+                }
+                const json& peer_value = item.value();
+                if (!peer_value.is_object() || !peer_value.contains("ports") ||
+                    !peer_value["ports"].is_array()) {
+                    return Status::InvalidArgument(
+                        "transports/ub/probe/peers/" + item.key() +
+                        " must be an object with a ports array");
+                }
+                ProbePeerDecl peer;
+                peer.segment = item.key();
+                std::unordered_set<std::string> port_ids;
+                std::unordered_set<std::string> port_eids;
+                for (const auto& port_entry : peer_value["ports"]) {
+                    if (!port_entry.is_object() || !port_entry.contains("id") ||
+                        !port_entry["id"].is_string() ||
+                        !port_entry.contains("eid") ||
+                        !port_entry["eid"].is_string()) {
+                        return Status::InvalidArgument(
+                            "transports/ub/probe/peers/" + item.key() +
+                            "/ports entries need string id and eid");
+                    }
+                    ProbePeerPortDecl port;
+                    port.id = port_entry["id"].get<std::string>();
+                    port.eid = port_entry["eid"].get<std::string>();
+                    if (port.id.empty()) {
+                        return Status::InvalidArgument(
+                            "transports/ub/probe/peers/" + item.key() +
+                            "/ports has an empty id");
+                    }
+                    if (!isCanonicalEid(port.eid)) {
+                        return Status::InvalidArgument(
+                            "transports/ub/probe/peers/" + item.key() +
+                            "/ports eid must be a canonical URMA EID");
+                    }
+                    if (!port_ids.insert(port.id).second) {
+                        return Status::InvalidArgument(
+                            "transports/ub/probe/peers/" + item.key() +
+                            "/ports has a duplicate id");
+                    }
+                    if (!port_eids.insert(port.eid).second) {
+                        return Status::InvalidArgument(
+                            "transports/ub/probe/peers/" + item.key() +
+                            "/ports has a duplicate eid");
+                    }
+                    peer.ports.push_back(std::move(port));
+                }
+                if (peer.ports.empty()) {
+                    return Status::InvalidArgument(
+                        "transports/ub/probe/peers/" + item.key() +
+                        "/ports must not be empty");
+                }
+                probe.peers.emplace(peer.segment, std::move(peer));
+            }
+        }
+
+        const json adjacency_json =
+            config.get<json>("transports/ub/probe/adjacency", json());
+        if (!adjacency_json.is_null()) {
+            if (!adjacency_json.is_object()) {
+                return Status::InvalidArgument(
+                    "transports/ub/probe/adjacency must be an object");
+            }
+            for (const auto& peer_item : adjacency_json.items()) {
+                const std::string& peer_name = peer_item.key();
+                const json& peer_value = peer_item.value();
+                if (peer_value.is_array()) {
+                    return Status::InvalidArgument(
+                        "transports/ub/probe/adjacency has the removed shape "
+                        "{local: [peer...]}; use {peer: {local_id: "
+                        "[remote_id...]}} and declare peer ports under "
+                        "transports/ub/probe/peers");
+                }
+                auto peer = probe.peers.find(peer_name);
+                if (peer == probe.peers.end()) {
+                    return Status::InvalidArgument(
+                        "transports/ub/probe/adjacency references an "
+                        "undeclared peer '" +
+                        peer_name + "'");
+                }
+                if (!peer_value.is_object()) {
+                    return Status::InvalidArgument(
+                        "transports/ub/probe/adjacency/" + peer_name +
+                        " must be an object of remote-id arrays");
+                }
+                std::map<std::string, std::vector<std::string>> edges;
+                // A peer with no declared local edge still needs an entry so
+                // the declared set can express "this peer is blocked
+                // entirely"; an empty map is valid but the top-level
+                // adjacency must be non-empty.
+                for (const auto& local_item : peer_value.items()) {
+                    const std::string& local_id = local_item.key();
+                    if (unique_ports.count(local_id) == 0) {
+                        return Status::InvalidArgument(
+                            "transports/ub/probe/adjacency/" + peer_name +
+                            " references an undeclared local port '" +
+                            local_id + "'");
+                    }
+                    if (!local_item.value().is_array()) {
+                        return Status::InvalidArgument(
+                            "transports/ub/probe/adjacency/" + peer_name + "/" +
+                            local_id + " must be an array of remote ids");
+                    }
+                    std::vector<std::string> remote_ids;
+                    std::unordered_set<std::string> unique_remotes;
+                    for (const auto& remote : local_item.value()) {
+                        if (!remote.is_string()) {
+                            return Status::InvalidArgument(
+                                "transports/ub/probe/adjacency/" + peer_name +
+                                "/" + local_id +
+                                " must contain only remote-id strings");
+                        }
+                        const std::string remote_id = remote.get<std::string>();
+                        if (remote_id.empty() ||
+                            !unique_remotes.insert(remote_id).second) {
+                            return Status::InvalidArgument(
+                                "transports/ub/probe/adjacency/" + peer_name +
+                                "/" + local_id +
+                                " has an empty or duplicate remote id");
+                        }
+                        const bool declared =
+                            std::any_of(peer->second.ports.begin(),
+                                        peer->second.ports.end(),
+                                        [&](const ProbePeerPortDecl& port) {
+                                            return port.id == remote_id;
+                                        });
+                        if (!declared) {
+                            return Status::InvalidArgument(
+                                "transports/ub/probe/adjacency/" + peer_name +
+                                "/" + local_id +
+                                " references undeclared "
+                                "remote id '" +
+                                remote_id + "'");
+                        }
+                        remote_ids.push_back(remote_id);
+                    }
+                    if (remote_ids.empty()) {
+                        return Status::InvalidArgument(
+                            "transports/ub/probe/adjacency/" + peer_name + "/" +
+                            local_id + " must not be empty");
+                    }
+                    edges.emplace(local_id, std::move(remote_ids));
+                }
+                probe.adjacency.emplace(peer_name, std::move(edges));
+            }
+        }
+
+        // enforce_adjacency defaults to true, but a declaration-less install
+        // (injected seam or probe off) simply has nothing to enforce. Only an
+        // explicit true without a declaration is an operator error.
+        const json enforce_json =
+            config.get<json>("transports/ub/probe/enforce_adjacency", json());
+        if (!enforce_json.is_null()) {
+            if (!enforce_json.is_boolean()) {
+                return Status::InvalidArgument(
+                    "transports/ub/probe/enforce_adjacency must be a boolean");
+            }
+            probe.enforce_adjacency = enforce_json.get<bool>();
+            if (probe.enforce_adjacency && probe.adjacency.empty()) {
+                return Status::InvalidArgument(
+                    "transports/ub/probe/enforce_adjacency=true requires a "
+                    "non-empty transports/ub/probe/adjacency");
+            }
+        }
+        probe.dynamic_edges = !probe.adjacency.empty();
+
+        CHECK_STATUS(readPositive(config,
+                                  "transports/ub/probe/handshake/"
+                                  "refresh_interval_ms",
+                                  probe.handshake.refresh_interval_ms,
+                                  probe.handshake.refresh_interval_ms));
+        CHECK_STATUS(readPositive(config,
+                                  "transports/ub/probe/handshake/"
+                                  "retry_backoff_ms",
+                                  probe.handshake.retry_backoff_ms,
+                                  probe.handshake.retry_backoff_ms));
+        CHECK_STATUS(readPositive(
+            config, "transports/ub/probe/handshake/timeout_ms",
+            probe.handshake.timeout_ms, probe.handshake.timeout_ms));
+        CHECK_STATUS(
+            readPositive(config, "transports/ub/probe/handshake/threads",
+                         probe.handshake.threads, probe.handshake.threads));
+        CHECK_STATUS(readBool(config,
+                              "transports/ub/probe/handshake/"
+                              "require_peer_ports",
+                              probe.handshake.require_peer_ports,
+                              probe.handshake.require_peer_ports));
+        CHECK_STATUS(readPositive(config,
+                                  "transports/ub/probe/handshake/"
+                                  "withdraw_grace",
+                                  probe.handshake.withdraw_grace,
+                                  probe.handshake.withdraw_grace));
+        if (probe.handshake.refresh_interval_ms < 1000 ||
+            probe.handshake.refresh_interval_ms > 600000) {
+            return Status::InvalidArgument(
+                "transports/ub/probe/handshake/refresh_interval_ms must be in "
+                "[1000, 600000]");
+        }
+        if (probe.handshake.retry_backoff_ms < 100 ||
+            probe.handshake.retry_backoff_ms > 60000) {
+            return Status::InvalidArgument(
+                "transports/ub/probe/handshake/retry_backoff_ms must be in "
+                "[100, 60000]");
+        }
+        if (probe.handshake.timeout_ms < 100 ||
+            probe.handshake.timeout_ms > 30000 ||
+            probe.handshake.timeout_ms > probe.handshake.refresh_interval_ms) {
+            return Status::InvalidArgument(
+                "transports/ub/probe/handshake/timeout_ms must be in "
+                "[100, 30000] and <= refresh_interval_ms");
+        }
+        if (probe.handshake.threads < 1 || probe.handshake.threads > 4) {
+            return Status::InvalidArgument(
+                "transports/ub/probe/handshake/threads must be in [1, 4]");
+        }
         return Status::OK();
     }
 };

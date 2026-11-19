@@ -1,0 +1,157 @@
+// Copyright 2026 KVCache.AI
+// SPDX-License-Identifier: Apache-2.0
+//
+// Declared probe topology and business adjacency policy.
+//
+// The configuration declares local ports (id -> physical EID binding), peer
+// ports (id -> real EID) and the legal edges between them. This header turns
+// that declaration into:
+//   * one resolved local binding per declared port (id -> Topology::NicID),
+//   * one read-only adjacency view per (peer, slice) that answers the business
+//     routing gate without any string lookup on the hot path.
+//
+// Topology is never discovered here: a declared binding must match exactly one
+// discovered physical EID, and a declared peer EID must match exactly one UB
+// NIC in the peer segment metadata. Anything else fails closed.
+
+#ifndef TENT_TRANSPORT_UB_PROBE_TOPOLOGY_H_
+#define TENT_TRANSPORT_UB_PROBE_TOPOLOGY_H_
+
+#include <cstdint>
+#include <map>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
+
+#include "tent/common/status.h"
+#include "tent/runtime/segment.h"
+#include "tent/runtime/topology.h"
+#include "tent/transport/ub/probe_types.h"
+#include "tent/transport/ub/urma_adapter.h"
+
+namespace mooncake {
+namespace tent {
+namespace ub {
+
+// One declared local port resolved against the discovered devices.
+struct ProbeLocalPortBinding {
+    std::string id;
+    std::string bind;
+    std::string eid;
+    std::string topology_name;
+    std::string native_device_name;
+    Topology::NicID local_nic{-1};
+};
+
+enum class AdjacencyDecision : uint8_t {
+    kAllowed = 0,
+    kUndeclaredPeer,
+    kUndeclaredLocal,
+    kUndeclaredRemote,
+    kPeerEidUnmatched,
+};
+
+constexpr const char* adjacencyDecisionName(AdjacencyDecision decision) {
+    switch (decision) {
+        case AdjacencyDecision::kAllowed:
+            return "allowed";
+        case AdjacencyDecision::kUndeclaredPeer:
+            return "adjacency_undeclared_peer";
+        case AdjacencyDecision::kUndeclaredLocal:
+            return "adjacency_undeclared_local";
+        case AdjacencyDecision::kUndeclaredRemote:
+            return "adjacency_undeclared_remote";
+        case AdjacencyDecision::kPeerEidUnmatched:
+            return "adjacency_peer_eid_unmatched";
+    }
+    return "unknown";
+}
+
+// Per-(peer, slice) read-only view. `allowed` is a dense bitmap indexed by
+// local slot * remote_nics.size() + remote slot, so a candidate test is one
+// integer index lookup plus one byte read.
+struct AdjacencyView {
+    bool enforced{false};
+    bool peer_declared{false};
+    // At least one declared peer EID could not be matched to exactly one UB
+    // NIC in the peer segment metadata: every candidate for this peer is
+    // rejected until the metadata changes (fail-closed).
+    bool peer_eid_unmatched{false};
+    std::vector<Topology::NicID> local_nics;
+    std::vector<Topology::NicID> remote_nics;
+    std::vector<uint8_t> allowed;
+
+    [[nodiscard]] bool empty() const {
+        return local_nics.empty() || remote_nics.empty();
+    }
+
+    // `local_declared` is set when the local NIC is declared for this peer at
+    // all, so the caller can distinguish "this port may not talk to that port"
+    // from "this port is not part of the declared topology".
+    [[nodiscard]] AdjacencyDecision check(Topology::NicID local_nic,
+                                          Topology::NicID remote_nic,
+                                          bool* local_declared = nullptr) const;
+};
+
+// Immutable after resolve(); shared by the workers' read-only routing gate.
+class ProbeTopology {
+   public:
+    ProbeTopology() = default;
+
+    // Validates the declaration and resolves every local binding. The device
+    // list is the install-time discovery snapshot and `topology` the business
+    // topology the workers use. An empty declaration resolves to an empty,
+    // non-enforcing topology.
+    static Status resolve(const ProbeParams& params,
+                          const std::vector<DeviceInfo>& devices,
+                          const Topology& topology, ProbeTopology& output);
+
+    [[nodiscard]] bool declared() const { return declared_; }
+    [[nodiscard]] bool enforces() const { return enforces_; }
+    [[nodiscard]] const std::vector<ProbeLocalPortBinding>& ports() const {
+        return ports_;
+    }
+    [[nodiscard]] const std::map<std::string, ProbePeerDecl>& peers() const {
+        return peers_;
+    }
+    [[nodiscard]] bool hasPeer(const std::string& peer) const {
+        return peers_.count(peer) != 0;
+    }
+    [[nodiscard]] std::optional<Topology::NicID> localNic(
+        const std::string& local_id) const {
+        auto found = bindings_.find(local_id);
+        if (found == bindings_.end()) return std::nullopt;
+        return found->second;
+    }
+    [[nodiscard]] std::optional<std::string> localIdForNic(
+        Topology::NicID local_nic) const {
+        auto found = local_by_nic_.find(local_nic);
+        if (found == local_by_nic_.end()) return std::nullopt;
+        return found->second;
+    }
+
+    // Builds the per-slice view. Never fails: an unmatched declared EID is
+    // reported through AdjacencyView::peer_eid_unmatched so the routing gate
+    // can fail closed with a specific reason.
+    [[nodiscard]] AdjacencyView viewFor(const std::string& peer,
+                                        const SegmentDesc& remote) const;
+
+   private:
+    bool declared_{false};
+    bool enforces_{false};
+    std::vector<ProbeLocalPortBinding> ports_;
+    std::unordered_map<std::string, Topology::NicID> bindings_;
+    // local NicID -> declared local id (for diagnostics).
+    std::unordered_map<Topology::NicID, std::string> local_by_nic_;
+    std::map<std::string, ProbePeerDecl> peers_;
+    std::map<std::string, std::map<std::string, std::vector<std::string>>>
+        adjacency_;
+};
+
+}  // namespace ub
+}  // namespace tent
+}  // namespace mooncake
+
+#endif  // TENT_TRANSPORT_UB_PROBE_TOPOLOGY_H_
