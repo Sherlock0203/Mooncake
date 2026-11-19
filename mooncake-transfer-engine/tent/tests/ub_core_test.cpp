@@ -26,6 +26,7 @@
 #include "tent/transport/ub/params.h"
 #include "tent/transport/ub/rail_monitor.h"
 #include "tent/transport/ub/slice.h"
+#include "tent/transport/ub/urma_adapter.h"
 #include "tent/transport/ub/workers.h"
 
 namespace mooncake::tent::ub {
@@ -1230,6 +1231,94 @@ TEST(UbRailSelectionTest, AttemptOrderVisitsEveryRailExactlyOnce) {
     for (size_t index = 0; index < ids.size(); ++index) {
         EXPECT_EQ(std::count(order.begin(), order.end(), index), 1);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Transport mode normalization.
+//
+// The adapter options carry the same "is this RM?" concept twice:
+// transport_mode (probe path, rm_pool) and trans_mode (RM Legacy). A caller
+// may set only one of them, so JFC creation, JFS creation and the post gate
+// must all derive the native mode from isReliableMessage(). These tests pin
+// the four production profiles and the native invariants they depend on.
+// ---------------------------------------------------------------------------
+
+TEST(UbTransportModeNormalizationTest, AllProfilesResolveConsistently) {
+    struct Case {
+        const char* name;
+        JettyTransportMode transport_mode;
+        uint16_t trans_mode;
+        bool reliable_message;
+    };
+    const Case cases[] = {
+        // Probe: only the adapter-level spelling is set. Before the fix this
+        // combination created an RC JFR and an RC JFS.
+        {"probe", JettyTransportMode::kRm, kUrmaTransportModeRc, true},
+        // RM Legacy: only the native spelling is set.
+        {"rm_legacy", JettyTransportMode::kRc, kUrmaTransportModeRm, true},
+        // rm_pool: both spellings are set.
+        {"rm_pool", JettyTransportMode::kRm, kUrmaTransportModeRm, true},
+        // RC Legacy: neither spelling selects RM.
+        {"rc_legacy", JettyTransportMode::kRc, kUrmaTransportModeRc, false},
+    };
+    for (const Case& test_case : cases) {
+        SCOPED_TRACE(test_case.name);
+        JfcOptions jfc_options;
+        jfc_options.transport_mode = test_case.transport_mode;
+        jfc_options.trans_mode = test_case.trans_mode;
+        JettyOptions jetty_options;
+        jetty_options.transport_mode = test_case.transport_mode;
+        jetty_options.trans_mode = test_case.trans_mode;
+
+        EXPECT_EQ(isReliableMessage(jfc_options), test_case.reliable_message);
+        EXPECT_EQ(isReliableMessage(jetty_options), test_case.reliable_message);
+
+        const uint16_t expected_native = test_case.reliable_message
+                                             ? kUrmaTransportModeRm
+                                             : kUrmaTransportModeRc;
+        // INV-1: the JFR mode comes from the same predicate as the shared-JFC
+        // decision (shared_jfc_ is true exactly when the predicate is true).
+        EXPECT_EQ(nativeTransportMode(isReliableMessage(jfc_options)),
+                  expected_native);
+        // INV-2: the JFS mode and reliableMessage() agree.
+        EXPECT_EQ(nativeTransportMode(isReliableMessage(jetty_options)),
+                  expected_native);
+        // INV-3: JFS.trans_mode == shared JFR.trans_mode.
+        EXPECT_EQ(nativeTransportMode(isReliableMessage(jfc_options)),
+                  nativeTransportMode(isReliableMessage(jetty_options)));
+    }
+}
+
+TEST(UbTransportModeNormalizationTest, ProbeRmIsPostableBeforeBind) {
+    JettyOptions options;
+    options.transport_mode = JettyTransportMode::kRm;
+    // trans_mode keeps its RC default: this is the single-flag probe caller.
+    ASSERT_EQ(options.trans_mode, kUrmaTransportModeRc);
+    ASSERT_TRUE(isReliableMessage(options));
+
+    // INV-4: a native RM Jetty posts per-WR targets and needs no bind.
+    EXPECT_TRUE(isJettyPostable(true, /*created=*/true, /*bound=*/false));
+    EXPECT_TRUE(isJettyPostable(true, /*created=*/false, /*bound=*/true));
+    // An ERROR or RESET RM Jetty is still not postable.
+    EXPECT_FALSE(isJettyPostable(true, /*created=*/false, /*bound=*/false));
+}
+
+TEST(UbTransportModeNormalizationTest, RcLegacyStillRequiresBind) {
+    JettyOptions options;
+    ASSERT_FALSE(isReliableMessage(options));
+
+    EXPECT_FALSE(isJettyPostable(false, /*created=*/true, /*bound=*/false));
+    EXPECT_TRUE(isJettyPostable(false, /*created=*/false, /*bound=*/true));
+    EXPECT_FALSE(isJettyPostable(false, /*created=*/false, /*bound=*/false));
+}
+
+TEST(UbTransportModeNormalizationTest, NativeValuesMatchUrmaConstants) {
+    // The adapter-neutral constants are static_asserted against UMDK in
+    // urma_adapter.cpp; this pins the normalized result the probe log reports.
+    EXPECT_EQ(kUrmaTransportModeRm, 0x1);
+    EXPECT_EQ(kUrmaTransportModeRc, 0x2);
+    EXPECT_EQ(nativeTransportMode(true), kUrmaTransportModeRm);
+    EXPECT_EQ(nativeTransportMode(false), kUrmaTransportModeRc);
 }
 
 }  // namespace

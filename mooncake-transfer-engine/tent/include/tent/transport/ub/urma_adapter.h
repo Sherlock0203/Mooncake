@@ -300,8 +300,9 @@ struct JfcOptions {
     // Experimental send-only mode; not used by the probe path because UMDK
     // currently validates JFS/JFR mode through the shared JFR.
     bool send_only = false;
-    // RM Legacy: drives the native JFR transport mode. Defaults to RC so the
-    // RC legacy baseline is byte-for-byte unchanged.
+    // RM Legacy: one of the two RM spellings normalized by
+    // isReliableMessage(). Never read directly to build the JFR. Defaults to
+    // RC so the RC legacy baseline is byte-for-byte unchanged.
     uint16_t trans_mode = kUrmaTransportModeRc;
 };
 
@@ -312,13 +313,49 @@ struct JettyOptions {
     uint8_t rnr_retry = 7;
     uint8_t error_timeout = 17;
     JettyTransportMode transport_mode{JettyTransportMode::kRc};
-    // RM Legacy: drives the native JFS transport mode and the CTP bind mask.
-    // Both are derived from the trusted LocalSendProfile at install time and
-    // are never taken from peer-supplied bootstrap fields. Defaults keep the
-    // RC legacy creation path unchanged.
+    // RM Legacy: selects reliable-message semantics through
+    // isReliableMessage() and drives the CTP bind mask. Both are derived from
+    // the trusted LocalSendProfile at install time and are never taken from
+    // peer-supplied bootstrap fields. Defaults keep the RC legacy creation path
+    // unchanged.
     uint16_t trans_mode = kUrmaTransportModeRc;
     uint32_t bind_tp_type_mask = 0;
 };
+
+// The options above carry the same "is this RM?" concept in two spellings.
+// transport_mode is the adapter-level spelling used by the probe path and by
+// rm_pool; trans_mode is the native URMA value used by RM Legacy. A caller is
+// allowed to set only one of them, so every native decision (JFR/JFS mode,
+// min_rnr_timer, post gate) must be derived from this single predicate instead
+// of reading either field directly.
+[[nodiscard]] inline bool isReliableMessage(
+    const JfcOptions& options) noexcept {
+    return options.transport_mode == JettyTransportMode::kRm ||
+           options.trans_mode == kUrmaTransportModeRm;
+}
+
+[[nodiscard]] inline bool isReliableMessage(
+    const JettyOptions& options) noexcept {
+    return options.transport_mode == JettyTransportMode::kRm ||
+           options.trans_mode == kUrmaTransportModeRm;
+}
+
+// Native URMA transport mode selected by the normalized predicate. The
+// adapter-neutral constants are pinned to the UMDK enum by static_asserts in
+// urma_adapter.cpp.
+[[nodiscard]] inline uint16_t nativeTransportMode(
+    bool reliable_message) noexcept {
+    return reliable_message ? kUrmaTransportModeRm : kUrmaTransportModeRc;
+}
+
+// A native RM Jetty carries an explicit imported target on every WR, so a
+// freshly created Jetty is postable without a bind. A native RC Jetty must
+// complete a bind first. A Jetty in ERROR/RESET is never postable. Kept here
+// so the post gate and its unit tests share one definition.
+[[nodiscard]] inline bool isJettyPostable(bool reliable_message, bool created,
+                                          bool bound) noexcept {
+    return reliable_message ? (created || bound) : bound;
+}
 
 struct RemoteJettyInfo {
     std::string eid;

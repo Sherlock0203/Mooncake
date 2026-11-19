@@ -460,7 +460,12 @@ class RealJfc final : public Jfc {
             return nativePointerError("urma_create_jfc(send)");
         if (send_only_) return Status::OK();
 
-        if (options.transport_mode == JettyTransportMode::kRm) {
+        // One predicate decides the shared JFC, the JFR transport mode and the
+        // RM receive timer. Reading transport_mode for one decision and
+        // trans_mode for another is what made probe JFCs a shared JFC with an
+        // RC JFR.
+        const bool rm_transport = isReliableMessage(options);
+        if (rm_transport) {
             // UMDK's RM health probe uses one JFC for both the JFS and the JFR.
             shared_jfc_ = true;
             receive_jfc_ = send_jfc_;
@@ -476,25 +481,24 @@ class RealJfc final : public Jfc {
         urma_jfr_cfg_t receiver_cfg{};
         receiver_cfg.depth = options.receiver_depth;
         receiver_cfg.flag.bs.tag_matching = 0;
-        // The receive-side JFR transport mode follows the JFC options so an
-        // RM Legacy context creates an RM receiver. The static_asserts above
-        // pin the TENT constants to the UMDK enum values.
-        receiver_cfg.trans_mode =
-            static_cast<urma_transport_mode_t>(options.trans_mode);
+        // The receive-side JFR transport mode follows the same predicate, so a
+        // probe JFC (transport_mode=RM only) and an RM Legacy JFC
+        // (trans_mode=RM only) both create an RM receiver. The static_asserts
+        // above pin the TENT constants to the UMDK enum values.
+        receiver_cfg.trans_mode = static_cast<urma_transport_mode_t>(
+            nativeTransportMode(rm_transport));
         receiver_cfg.max_sge = 1;
         // UMDK's own RM health probe leaves min_rnr_timer at 0 and uses a
-        // depth-1 JFR; mirror it for the probe JFC.
+        // depth-1 JFR; mirror it for every RM JFR.
         receiver_cfg.min_rnr_timer =
-            options.transport_mode == JettyTransportMode::kRm
-                ? 0
-                : URMA_TYPICAL_MIN_RNR_TIMER;
+            rm_transport ? 0 : URMA_TYPICAL_MIN_RNR_TIMER;
         receiver_cfg.jfc = receive_jfc_;
         receiver_cfg.token_value.token = options.token;
         receiver_jfr_ = urma_create_jfr(context_->native(), &receiver_cfg);
         if (receiver_jfr_ == nullptr)
             return nativePointerError("urma_create_jfr");
-        if (options.transport_mode == JettyTransportMode::kRm) {
-            LOG(INFO) << "probe RM JFC created: jfr_depth="
+        if (rm_transport) {
+            LOG(INFO) << "URMA RM JFC created: jfr_depth="
                       << receiver_jfr_->jfr_cfg.depth << " jfr_trans_mode="
                       << static_cast<int>(receiver_jfr_->jfr_cfg.trans_mode)
                       << " jfr_min_rnr_timer="
@@ -765,19 +769,19 @@ class RealJetty final : public Jetty {
         urma_jetty_cfg_t config{};
         // RM is selected natively by trans_mode, which both RM runtime
         // profiles set; transport_mode is the adapter-level spelling and is
-        // only set by rm_pool. Treat either as RM so an RM Legacy JFS gets the
-        // RM JFS profile (max_rsge/err_timeout), releases its cached targets on
-        // unbind/close, and never requires a bind.
-        reliable_message_ = options.transport_mode == JettyTransportMode::kRm ||
-                            options.trans_mode == kUrmaTransportModeRm;
+        // set by rm_pool and by the probe path. Normalize both spellings so an
+        // RM Legacy JFS, an rm_pool JFS and a probe JFS all get the same
+        // native mode, the RM JFS profile (max_rsge/err_timeout), cached
+        // target release on unbind/close, and no bind requirement.
+        reliable_message_ = isReliableMessage(options);
         // UMDK requires JFS.trans_mode == shared JFR.trans_mode; the probe JFC
-        // is created with an RM JFR so RM Jetties share it like RC ones do.
+        // and every RM runtime profile create an RM JFR.
         config.flag.bs.share_jfr = 1;
         config.jfs_cfg.depth = options.depth;
-        // The JFS transport mode follows the trusted LocalSendProfile. RM
-        // Legacy never falls back to RC here.
-        config.jfs_cfg.trans_mode =
-            static_cast<urma_transport_mode_t>(options.trans_mode);
+        // The JFS transport mode is the same normalized predicate that built
+        // the shared JFR. RM never falls back to RC here.
+        config.jfs_cfg.trans_mode = static_cast<urma_transport_mode_t>(
+            nativeTransportMode(reliable_message_));
         config.jfs_cfg.priority = static_cast<uint8_t>(
             context_->isBondingDevice() ? context_->ctpPriority()
                                         : options.priority);
@@ -842,12 +846,12 @@ class RealJetty final : public Jetty {
     bool reliableMessage() const noexcept { return reliable_message_; }
     // RM Legacy never binds a remote Jetty: each WR carries its own imported
     // target, so an unbound RM JFS is still postable. RC keeps requiring a
-    // completed bind. Gating on the native trans_mode covers both RM runtime
-    // profiles, including RM Legacy where the adapter-level transport_mode is
-    // still RC.
+    // completed bind. Gate on the normalized native mode (reliable_message_),
+    // not on rm_mode_: the probe Jetty is natively RM without being RM Legacy
+    // business, and an RM Legacy JFS sets only trans_mode.
     bool postable() const noexcept {
-        return rm_mode_ ? (state_ == State::CREATED || state_ == State::BOUND)
-                        : state_ == State::BOUND;
+        return isJettyPostable(reliable_message_, state_ == State::CREATED,
+                               state_ == State::BOUND);
     }
 
     bool rmMode() const noexcept { return rm_mode_; }
