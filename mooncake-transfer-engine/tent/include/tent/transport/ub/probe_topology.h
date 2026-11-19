@@ -35,6 +35,8 @@ namespace mooncake {
 namespace tent {
 namespace ub {
 
+class ProbePeerRegistry;
+
 // One declared local port resolved against the discovered devices.
 struct ProbeLocalPortBinding {
     std::string id;
@@ -51,6 +53,8 @@ enum class AdjacencyDecision : uint8_t {
     kUndeclaredLocal,
     kUndeclaredRemote,
     kPeerEidUnmatched,
+    kPortMissing,
+    kPeerGateBlocked,
 };
 
 constexpr const char* adjacencyDecisionName(AdjacencyDecision decision) {
@@ -65,6 +69,10 @@ constexpr const char* adjacencyDecisionName(AdjacencyDecision decision) {
             return "adjacency_undeclared_remote";
         case AdjacencyDecision::kPeerEidUnmatched:
             return "adjacency_peer_eid_unmatched";
+        case AdjacencyDecision::kPortMissing:
+            return "adjacency_port_missing";
+        case AdjacencyDecision::kPeerGateBlocked:
+            return "adjacency_peer_gate_blocked";
     }
     return "unknown";
 }
@@ -79,9 +87,16 @@ struct AdjacencyView {
     // NIC in the peer segment metadata: every candidate for this peer is
     // rejected until the metadata changes (fail-closed).
     bool peer_eid_unmatched{false};
+    // True once the peer has successfully published at least one snapshot.
+    // Until then the declared edges are allowed as ELIGIBLE_UNVERIFIED.
+    bool publication_seen{false};
     std::vector<Topology::NicID> local_nics;
     std::vector<Topology::NicID> remote_nics;
     std::vector<uint8_t> allowed;
+    // Per remote slot: 0 = published and gated, 1 = port missing/withdrawn,
+    // 2 = published but a node/port/profile gate is closed. Ignored while
+    // publication_seen is false.
+    std::vector<uint8_t> remote_status;
 
     [[nodiscard]] bool empty() const {
         return local_nics.empty() || remote_nics.empty();
@@ -119,6 +134,42 @@ class ProbeTopology {
     [[nodiscard]] bool hasPeer(const std::string& peer) const {
         return peers_.count(peer) != 0;
     }
+    [[nodiscard]] const std::map<std::string, ProbePeerDecl>& peerDecls()
+        const {
+        return peers_;
+    }
+    [[nodiscard]] const std::map<std::string, std::vector<std::string>>*
+    adjacencyFor(const std::string& peer) const {
+        auto found = adjacency_.find(peer);
+        return found == adjacency_.end() ? nullptr : &found->second;
+    }
+    [[nodiscard]] const std::vector<ProbePeerPortDecl>* peerPorts(
+        const std::string& peer) const {
+        auto found = peers_.find(peer);
+        return found == peers_.end() ? nullptr : &found->second.ports;
+    }
+    [[nodiscard]] const ProbePeerPortDecl* peerPort(
+        const std::string& peer, const std::string& remote_id) const {
+        auto found = peers_.find(peer);
+        if (found == peers_.end()) return nullptr;
+        for (const auto& port : found->second.ports) {
+            if (port.id == remote_id) return &port;
+        }
+        return nullptr;
+    }
+    // Synthetic probe peer id (1<<63 + declaration order); never a business
+    // SegmentID. Absent when the peer is not declared.
+    [[nodiscard]] std::optional<uint64_t> probePeerId(
+        const std::string& peer) const {
+        auto found = peers_.find(peer);
+        if (found == peers_.end()) return std::nullopt;
+        const auto index =
+            static_cast<uint64_t>(std::distance(peers_.begin(), found));
+        return kProbePeerIdBase + index;
+    }
+    void setPeerRegistry(const ProbePeerRegistry* registry) {
+        peer_registry_ = registry;
+    }
     [[nodiscard]] std::optional<Topology::NicID> localNic(
         const std::string& local_id) const {
         auto found = bindings_.find(local_id);
@@ -148,6 +199,7 @@ class ProbeTopology {
     std::map<std::string, ProbePeerDecl> peers_;
     std::map<std::string, std::map<std::string, std::vector<std::string>>>
         adjacency_;
+    const ProbePeerRegistry* peer_registry_{nullptr};
 };
 
 }  // namespace ub

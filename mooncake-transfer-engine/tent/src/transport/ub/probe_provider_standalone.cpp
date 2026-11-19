@@ -105,13 +105,13 @@ Status StandaloneProbeResourceProvider::bindPorts(
             return Status::InvalidArgument("declared probe port has no id");
         }
         if (spec.local_nic < 0 || spec.device.topology_name.empty()) {
-            return Status::InvalidArgument(
-                "declared probe port '" + spec.port_id +
-                "' has no resolved device identity");
+            return Status::InvalidArgument("declared probe port '" +
+                                           spec.port_id +
+                                           "' has no resolved device identity");
         }
         if (!port_ids.insert(spec.port_id).second) {
-            return Status::InvalidArgument(
-                "declared probe port '" + spec.port_id + "' is duplicated");
+            return Status::InvalidArgument("declared probe port '" +
+                                           spec.port_id + "' is duplicated");
         }
         if (!local_nics.insert(spec.local_nic).second) {
             return Status::InvalidArgument(
@@ -214,8 +214,7 @@ uint64_t StandaloneProbeResourceProvider::publicationEpoch() const {
 
 void StandaloneProbeResourceProvider::bumpPublicationEpochLocked() {
     ++publication_epoch_;
-    LOG(INFO) << "UB probe publication bumped to epoch "
-              << publication_epoch_;
+    LOG(INFO) << "UB probe publication bumped to epoch " << publication_epoch_;
 }
 
 namespace {
@@ -778,10 +777,157 @@ Status StandaloneProbeResourceProvider::snapshot(ProbeGraph& graph) {
     ++next_graph_epoch_;
     graph_epoch_ = built.graph_epoch;
     event_seq_ = 0;
+    current_edges_.clear();
+    for (const auto& edge : built.edges) {
+        current_edges_.emplace(edge.version, edge);
+    }
     initialized_ = true;
     graph = std::move(built);
     LOG(INFO) << "UB standalone probe provider created " << available
               << " probe port(s)";
+    return Status::OK();
+}
+
+Status StandaloneProbeResourceProvider::refreshPeerEdges() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (shut_down_) return Status::OK();
+    if (!initialized_ || graph_epoch_ == 0) {
+        return Status::InvalidArgument("probe graph is not initialized");
+    }
+    if (directory_ == nullptr || availability_sink_ == nullptr) {
+        return Status::OK();
+    }
+    std::vector<ProbeEdgeSupply> edges;
+    auto status = directory_->snapshotEdges(edges);
+    if (!status.ok()) return status;
+    std::map<PathVersion, ProbeEdgeSupply> next;
+    for (auto& edge : edges) {
+        if (!edge.version.valid()) continue;
+        next.emplace(edge.version, std::move(edge));
+    }
+    return applyEdgeDiffLocked(next);
+}
+
+Status StandaloneProbeResourceProvider::applyEdgeDiffLocked(
+    const std::map<PathVersion, ProbeEdgeSupply>& next) {
+    auto emit = [&](ProbeEventKind kind, const ProbeEdgeSupply& edge,
+                    const std::optional<PathVersion>& version) -> Status {
+        ProbeEvent event;
+        event.kind = kind;
+        event.local_nic = edge.version.path.local_nic;
+        event.graph_epoch = graph_epoch_;
+        event.event_seq = event_seq_ + 1;
+        event.version = version;
+        event.edge = edge;
+        auto status = availability_sink_->onPoolAvailabilityChange(event);
+        if (status.ok()) ++event_seq_;
+        return status;
+    };
+    const auto same_volatile = [](const ProbeEdgeSupply& lhs,
+                                  const ProbeEdgeSupply& rhs) {
+        return lhs.area_epoch == rhs.area_epoch &&
+               lhs.area_address == rhs.area_address &&
+               lhs.area_length == rhs.area_length &&
+               lhs.remote_jetty.id == rhs.remote_jetty.id &&
+               lhs.remote_jetty.uasid == rhs.remote_jetty.uasid &&
+               lhs.remote_jetty.token == rhs.remote_jetty.token &&
+               lhs.node_gate_ok == rhs.node_gate_ok &&
+               lhs.port_gate_ok == rhs.port_gate_ok &&
+               lhs.profile_gate_ok == rhs.profile_gate_ok &&
+               lhs.endpoint_generation == rhs.endpoint_generation;
+    };
+    const auto same_path = [](const PathVersion& lhs, const PathVersion& rhs) {
+        return lhs.path == rhs.path;
+    };
+    auto applied = current_edges_;
+
+    // 1. New adjacency edges.
+    for (const auto& [version, edge] : next) {
+        if (applied.count(version) != 0) continue;
+        bool replaces_version = false;
+        for (const auto& [old_version, old_edge] : applied) {
+            (void)old_edge;
+            if (same_path(old_version, version)) {
+                replaces_version = true;
+                break;
+            }
+        }
+        if (replaces_version) continue;
+        auto status = emit(ProbeEventKind::kEdgeAdded, edge, std::nullopt);
+        if (!status.ok()) {
+            current_edges_ = std::move(applied);
+            return status;
+        }
+        applied.emplace(version, edge);
+    }
+
+    // 2. Same PathVersion, refreshed volatile handles/gates.
+    for (const auto& [version, edge] : next) {
+        auto existing = applied.find(version);
+        if (existing == applied.end()) continue;
+        if (same_volatile(existing->second, edge)) continue;
+        auto status = emit(ProbeEventKind::kAreaReplaced, edge, std::nullopt);
+        if (!status.ok()) {
+            current_edges_ = std::move(applied);
+            return status;
+        }
+        existing->second = edge;
+    }
+
+    // 3. Same adjacency path, new topology/target epoch: replace atomically.
+    for (const auto& [version, edge] : next) {
+        if (applied.count(version) != 0) continue;
+        std::vector<PathVersion> replaced;
+        for (const auto& [old_version, old_edge] : applied) {
+            (void)old_edge;
+            if (same_path(old_version, version))
+                replaced.push_back(old_version);
+        }
+        if (replaced.empty()) continue;
+        auto status =
+            emit(ProbeEventKind::kTargetEpochChanged, edge, std::nullopt);
+        if (!status.ok()) {
+            current_edges_ = std::move(applied);
+            return status;
+        }
+        for (const auto& old_version : replaced) applied.erase(old_version);
+        applied.emplace(version, edge);
+    }
+
+    // 4. Edges that disappeared (and were not replaced by a newer version).
+    for (auto it = applied.begin(); it != applied.end();) {
+        if (next.count(it->first) != 0) {
+            ++it;
+            continue;
+        }
+        bool replaced = false;
+        for (const auto& [version, edge] : next) {
+            (void)edge;
+            if (same_path(version, it->first)) {
+                replaced = true;
+                break;
+            }
+        }
+        if (replaced) {
+            ++it;
+            continue;
+        }
+        ProbeEvent event;
+        event.kind = ProbeEventKind::kEdgeRemoved;
+        event.local_nic = it->first.path.local_nic;
+        event.graph_epoch = graph_epoch_;
+        event.event_seq = event_seq_ + 1;
+        event.version = it->first;
+        auto status = availability_sink_->onPoolAvailabilityChange(event);
+        if (!status.ok()) {
+            current_edges_ = std::move(applied);
+            return status;
+        }
+        ++event_seq_;
+        it = applied.erase(it);
+    }
+
+    current_edges_ = std::move(applied);
     return Status::OK();
 }
 

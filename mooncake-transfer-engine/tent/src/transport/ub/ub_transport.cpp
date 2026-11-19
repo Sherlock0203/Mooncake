@@ -3,6 +3,9 @@
 
 #include "tent/transport/ub/probe_bootstrap.h"
 #include "tent/transport/ub/probe_link_manager.h"
+#include "tent/transport/ub/probe_peer_coordinator.h"
+#include "tent/transport/ub/probe_peer_registry.h"
+#include "tent/transport/ub/probe_peer_source.h"
 #include "tent/transport/ub/probe_peer_handshake.h"
 #include "tent/transport/ub/probe_poster_urma.h"
 #include "tent/transport/ub/probe_provider_standalone.h"
@@ -733,10 +736,14 @@ struct UbTransport::Impl {
                         "installed; inject one or set "
                         "transports/ub/probe/provider=standalone" LOC_MARK));
                 }
-                if (probe_peer_source == nullptr) {
+                // Production declared mode builds its own registry/source;
+                // the injected source remains the test/legacy seam.
+                if (probe_peer_source == nullptr &&
+                    !probe_topology->declared()) {
                     return failInstall(Status::InvalidArgument(
-                        "UB probe provider=standalone requires a peer "
-                        "descriptor source" LOC_MARK));
+                        "UB probe provider=standalone requires declared "
+                        "adjacency or an injected peer descriptor "
+                        "source" LOC_MARK));
                 }
                 auto standalone =
                     std::make_shared<ub::StandaloneProbeResourceProvider>(
@@ -775,9 +782,33 @@ struct UbTransport::Impl {
                     auto discover = standalone->discover();
                     if (!discover.ok()) return failInstall(discover);
                 }
+                if (probe_peer_source == nullptr) {
+                    std::map<std::string,
+                             std::vector<ub::ProbeDeclaredPeerPort>>
+                        declared;
+                    for (const auto& [peer, decl] :
+                         probe_topology->peerDecls()) {
+                        auto& ports = declared[peer];
+                        for (const auto& port : decl.ports) {
+                            ports.push_back(
+                                ub::ProbeDeclaredPeerPort{port.id, port.eid});
+                        }
+                    }
+                    probe_registry = std::make_unique<ub::ProbePeerRegistry>(
+                        declared, params.probe.handshake.withdraw_grace);
+                    probe_source =
+                        std::make_unique<ub::BootstrapProbePeerSource>(
+                            probe_topology.get(), probe_registry.get());
+                    probe_topology->setPeerRegistry(probe_registry.get());
+                }
+                auto* directory_source =
+                    probe_peer_source != nullptr
+                        ? probe_peer_source
+                        : static_cast<ub::ProbePeerDescriptorSource*>(
+                              probe_source.get());
                 probe_directory =
                     std::make_shared<ub::HandshakeProbePeerDirectory>(
-                        adapter, standalone->contexts(), probe_peer_source);
+                        adapter, standalone->contexts(), directory_source);
                 standalone->setRemoteDirectory(probe_directory.get());
                 probe_provider = standalone;
                 probe_poster = std::make_shared<ub::UrmaProbePoster>(adapter);
@@ -833,6 +864,31 @@ struct UbTransport::Impl {
                 probe_jfcs.push_back(
                     ub::ProbeJfcSlot{supply.local_nic, supply.probe_jfc});
             }
+            if (probe_registry && probe_source) {
+                auto* standalone =
+                    dynamic_cast<ub::StandaloneProbeResourceProvider*>(
+                        probe_provider.get());
+                if (standalone == nullptr) {
+                    return failInstall(Status::InvalidArgument(
+                        "declared probe topology requires the standalone "
+                        "probe provider" LOC_MARK));
+                }
+                ub::ProbePeerCoordinator::Dependencies dependencies;
+                dependencies.segment_manager = &metadata->segmentManager();
+                dependencies.registry = probe_registry.get();
+                dependencies.provider = standalone;
+                dependencies.topology = probe_topology.get();
+                dependencies.rpc = [](const std::string& server_addr,
+                                      const ub::ProbeBootstrapRequest& request,
+                                      ub::ProbeBootstrapResponse& response) {
+                    return ControlClient::probeBootstrapUb(server_addr, request,
+                                                           response);
+                };
+                probe_coordinator = std::make_unique<ub::ProbePeerCoordinator>(
+                    params.probe, std::move(dependencies));
+                status = probe_coordinator->start();
+                if (!status.ok()) return failInstall(status);
+            }
         }
 
         workers = std::make_unique<ub::UbWorkers>(
@@ -855,6 +911,13 @@ struct UbTransport::Impl {
             },
             probe_manager.get(), std::move(probe_jfcs), tombstones,
             probe_topology.get());
+        if (probe_coordinator) {
+            workers->setProbeRefreshHint([this](uint64_t peer_id) {
+                if (probe_coordinator) {
+                    probe_coordinator->noteBusinessPathError(peer_id);
+                }
+            });
+        }
         status = workers->start();
         if (!status.ok()) return failInstall(status);
 
@@ -918,6 +981,8 @@ struct UbTransport::Impl {
             metadata->setProbeBootstrapCallback({});
             probe_bootstrap_callback_installed = false;
         }
+        // Fence the control plane before any probe resource is released.
+        if (probe_coordinator) probe_coordinator->stop();
         // Stop interface-7 rebuilds before draining workers: a retire during
         // teardown must stay a record, not create resources that are about to
         // be destroyed.
@@ -956,13 +1021,16 @@ struct UbTransport::Impl {
         // the PLM only after the workers that reference it are gone.
         probe_scheduler.reset();
         probe_manager.reset();
-        probe_topology.reset();
+        probe_coordinator.reset();
         probe_poster.reset();
         // Unimport remote probe areas while the probe Contexts are still
         // alive; the self-owned provider closes them in its shutdown.
         if (probe_directory) (void)probe_directory->shutdown();
         probe_provider.reset();
         probe_directory.reset();
+        probe_source.reset();
+        probe_registry.reset();
+        probe_topology.reset();
         // W3 pooled teardown safety net (design §11.2). workers->stop() already
         // drained the pools, but an install that failed before the workers
         // existed can leave a pool attached to its context. beginStop() and
@@ -1173,8 +1241,7 @@ struct UbTransport::Impl {
         response.topology_epoch = topology_epoch;
         response.transport_mode = ub::kProbeBootstrapTransportMode;
         response.device_kind = ub::kProbeBootstrapDeviceKind;
-        if (shutting_down.load(std::memory_order_acquire) ||
-            !probe_provider) {
+        if (shutting_down.load(std::memory_order_acquire) || !probe_provider) {
             response.reply_msg = "probe not ready";
             return -1;
         }
@@ -1231,16 +1298,16 @@ struct UbTransport::Impl {
                 const auto* nic =
                     topology.getNicEntry(static_cast<Topology::NicID>(id));
                 if (!nic || nic->type != Topology::NIC_UB) continue;
-                auto eid = nic->device_attrs.find(
-                    std::string(ub::kTopologyEidAttr));
+                auto eid =
+                    nic->device_attrs.find(std::string(ub::kTopologyEidAttr));
                 if (eid == nic->device_attrs.end()) continue;
                 if (nic->name != port.topology_name) continue;
                 if (lower(eid->second) != lower(port.eid)) continue;
                 auto kind = nic->device_attrs.find(
                     std::string(ub::kTopologyDeviceKindAttr));
                 if (kind != nic->device_attrs.end() &&
-                    kind->second != ub::deviceKindName(
-                                        ub::DeviceKind::PHYSICAL)) {
+                    kind->second !=
+                        ub::deviceKindName(ub::DeviceKind::PHYSICAL)) {
                     physical = false;
                 }
                 ++matches;
@@ -1462,7 +1529,10 @@ struct UbTransport::Impl {
     // contexts) are expected to be gone by then.
     std::unique_ptr<ub::ThreadedControlExecutor> drain_executor;
     ub::ProbePeerDescriptorSource* probe_peer_source{nullptr};
+    std::unique_ptr<ub::ProbePeerRegistry> probe_registry;
+    std::unique_ptr<ub::BootstrapProbePeerSource> probe_source;
     std::shared_ptr<ub::HandshakeProbePeerDirectory> probe_directory;
+    std::unique_ptr<ub::ProbePeerCoordinator> probe_coordinator;
     std::shared_ptr<ub::ProbeResourceProvider> probe_provider;
     std::shared_ptr<ub::ProbePoster> probe_poster;
     // Declared adjacency policy for the business routing gate. Destroyed

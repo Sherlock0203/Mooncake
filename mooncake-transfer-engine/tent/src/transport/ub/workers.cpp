@@ -70,6 +70,8 @@ struct UbWorkers::Route {
     std::vector<Topology::NicID> remote_devices;
     // Declaration gate for this peer, computed once per route.
     AdjacencyView adjacency;
+    // Synthetic peer id for the probe graph; 0 when the peer is not declared.
+    uint64_t probe_peer_id{LOCAL_SEGMENT_ID};
 };
 
 // Owner-side half of a completion record (design §5.3). The shared kernel
@@ -82,6 +84,7 @@ struct UbWorkers::BusinessRecord {
     // attempt_key is only an observability/claiming scalar.
     UbAttemptToken attempt;
     UbPostPath path;
+    ProbePathKey probe_key;
     std::shared_ptr<UbEndpoint> endpoint;
     LocalSegmentPtr local_segment;
     RemoteSegmentPtr remote_segment;
@@ -1077,6 +1080,9 @@ Status UbWorkers::buildRoute(const PendingSlice& pending, Route& route) {
             if (probe_topology_ != nullptr) {
                 route.adjacency =
                     probe_topology_->viewFor(segment->name, *segment);
+                route.probe_peer_id =
+                    probe_topology_->probePeerId(segment->name)
+                        .value_or(LOCAL_SEGMENT_ID);
             }
             if (route.remote_devices.empty()) {
                 return Status::DeviceNotFound(
@@ -1318,10 +1324,17 @@ Status UbWorkers::chooseAndResolveEndpoint(
         // Rail pause is GONE here (design §7.2): the pause state was a local
         // substitute for isolation, and keeping both would double-penalize a
         // path that PLM already excludes.
-        if (probe_manager_ != nullptr &&
-            !probe_manager_->businessPathUsable(probe_path)) {
-            health_screened_out = true;
-            continue;
+        if (probe_manager_ != nullptr) {
+            const bool usable =
+                route.probe_peer_id != LOCAL_SEGMENT_ID
+                    ? probe_manager_->businessPathUsable(ProbePathKey{
+                          local.id, static_cast<SegmentID>(route.probe_peer_id),
+                          remote_id})
+                    : probe_manager_->businessPathUsable(probe_path);
+            if (!usable) {
+                health_screened_out = true;
+                continue;
+            }
         }
         // A non-inserting lookup: an unknown rail scores as "no health history
         // yet" without being added to the map, so probing every local x remote
@@ -1538,7 +1551,8 @@ PoolKey UbWorkers::poolKeyFor(const std::shared_ptr<UbEndpoint>& endpoint) {
 UbWorkers::ClaimDecision UbWorkers::claimPost(
     const std::shared_ptr<SendJettyPool>& pool, const PoolKey& pool_key,
     const AttemptKey& attempt, const LeaseWithCredit& leased,
-    const UbPostPath& path, uint64_t fault_epoch_snapshot) {
+    const UbPostPath& path, const ProbePathKey& probe_key,
+    uint64_t fault_epoch_snapshot) {
     // W3g R-1. Two independent inputs decide whether the WR may be posted:
     //   1. the pool's synchronized verdict (stopping / member / generation /
     //      error epoch), authoritative for the leased resource;
@@ -1548,9 +1562,13 @@ UbWorkers::ClaimDecision UbWorkers::claimPost(
     // Both are lock-free from this thread's perspective and allocation-free;
     // this runs between the last rollback point and the native post.
     ClaimDecision decision;
-    if (probe_manager_ != nullptr &&
-        probe_manager_->businessFaultEpoch(path) != fault_epoch_snapshot) {
-        decision.path_epoch_changed = true;
+    if (probe_manager_ != nullptr) {
+        const uint64_t current =
+            probe_key.valid() ? probe_manager_->businessFaultEpoch(probe_key)
+                              : probe_manager_->businessFaultEpoch(path);
+        if (current != fault_epoch_snapshot) {
+            decision.path_epoch_changed = true;
+        }
     }
     if (!params_.claim.enabled) {
         // D-9 rollback lever: the pre-W3g recheck only. Counted so a config
@@ -1588,11 +1606,21 @@ WorkRequest UbWorkers::makeWorkRequest(const PendingSlice& pending,
     return work;
 }
 
+ProbePathKey UbWorkers::probeKeyFor(const Route& route,
+                                    const UbPostPath& path) const {
+    ProbePathKey key;
+    if (route.probe_peer_id == LOCAL_SEGMENT_ID) return key;
+    key.local_nic = path.local_topology_id;
+    key.segment_id = static_cast<SegmentID>(route.probe_peer_id);
+    key.remote_nic = path.remote_device_id;
+    return key;
+}
+
 std::shared_ptr<UbWorkers::BusinessRecord> UbWorkers::makeRecord(
     const PendingSlice& pending, const std::shared_ptr<UbEndpoint>& endpoint,
-    const UbPostPath& path, const QuotaReservation& reservation,
-    const LocalSegmentRef& local, const ImportedSegmentRef& remote,
-    const UbAttemptToken& attempt) {
+    const UbPostPath& path, const ProbePathKey& probe_key,
+    const QuotaReservation& reservation, const LocalSegmentRef& local,
+    const ImportedSegmentRef& remote, const UbAttemptToken& attempt) {
     const uint64_t completion_token = nextCompletionToken();
     auto record = std::make_shared<BusinessRecord>();
     record->core.token = completion_token;
@@ -1605,6 +1633,7 @@ std::shared_ptr<UbWorkers::BusinessRecord> UbWorkers::makeRecord(
     record->pending = pending;
     record->attempt = attempt;
     record->path = path;
+    record->probe_key = probe_key;
     record->endpoint = endpoint;
     record->local_segment = local.segment;
     record->remote_segment = remote.segment;
@@ -1710,24 +1739,26 @@ void UbWorkers::processPending(const PendingSlice& pending,
     // `pooledSendPool() != nullptr` selects the W3 pool-aware admission below;
     // otherwise the W2 path runs byte for byte, touching no lease, credit or K
     // slot (RK10).
+    const ProbePathKey probe_key = probeKeyFor(route, path);
     if (pooledPoolFor(endpoint)) {
         processPendingPooled(pending, worker_index, route, endpoint, path,
-                             reservation, local, remote, *attempt);
+                             probe_key, reservation, local, remote, *attempt);
         return;
     }
-    postLegacy(pending, worker_index, endpoint, path, reservation, local,
-               remote, *attempt);
+    postLegacy(pending, worker_index, probe_key, endpoint, path, reservation,
+               local, remote, *attempt);
 }
 
 void UbWorkers::postLegacy(const PendingSlice& pending, size_t worker_index,
+                           const ProbePathKey& probe_key,
                            const std::shared_ptr<UbEndpoint>& endpoint,
                            const UbPostPath& path,
                            const QuotaReservation& reservation,
                            const LocalSegmentRef& local,
                            const ImportedSegmentRef& remote,
                            const UbAttemptToken& attempt) {
-    auto record = makeRecord(pending, endpoint, path, reservation, local,
-                             remote, attempt);
+    auto record = makeRecord(pending, endpoint, path, probe_key, reservation,
+                             local, remote, attempt);
     const size_t length = pending.slice->spec().length;
 
     if (!pending.slice->tryCommitPost(attempt, record->posted_ns)) {
@@ -1819,8 +1850,9 @@ void UbWorkers::postLegacy(const PendingSlice& pending, size_t worker_index,
 void UbWorkers::processPendingPooled(
     const PendingSlice& pending, size_t worker_index, const Route& route,
     const std::shared_ptr<UbEndpoint>& endpoint, const UbPostPath& path,
-    const QuotaReservation& reservation, const LocalSegmentRef& local,
-    const ImportedSegmentRef& remote, const UbAttemptToken& attempt) {
+    const ProbePathKey& probe_key, const QuotaReservation& reservation,
+    const LocalSegmentRef& local, const ImportedSegmentRef& remote,
+    const UbAttemptToken& attempt) {
     (void)route;
     const size_t length = pending.slice->spec().length;
     auto pool = pooledPoolFor(endpoint);
@@ -1848,8 +1880,10 @@ void UbWorkers::processPendingPooled(
     // lease covers the longest window in the attempt (selection -> lease), see
     // design §8.1 note 2.
     const uint64_t fault_epoch_snapshot =
-        probe_manager_ != nullptr ? probe_manager_->businessFaultEpoch(path)
-                                  : 0;
+        probe_manager_ == nullptr
+            ? 0
+            : (probe_key.valid() ? probe_manager_->businessFaultEpoch(probe_key)
+                                 : probe_manager_->businessFaultEpoch(path));
 
     // ⑥ Lease (+ JFC credit). tryLease is non-blocking and already performs the
     // LIFO scan, the credit reservation and the budget gate, so this side never
@@ -1898,8 +1932,9 @@ void UbWorkers::processPendingPooled(
 
     // ⑦ W3g claim (R-1). The pool synchronizes the verdict with retirement and
     // stop; the PLM fault epoch remains a separate scalar input.
-    const ClaimDecision claim = claimPost(pool, pool_key, attempt_key, leased,
-                                          path, fault_epoch_snapshot);
+    const ClaimDecision claim =
+        claimPost(pool, pool_key, attempt_key, leased, path, probe_key,
+                  fault_epoch_snapshot);
     if (!claim.claimed()) {
         switch (claim.closed) {
             case ClaimClosed::kPoolStopping:
@@ -1946,8 +1981,8 @@ void UbWorkers::processPendingPooled(
     // ⑧ Record + commit. The record owns the lease and the credit token from
     // here on, so every exit below (including a late CQE, a timeout fence and
     // shutdown) releases them through onOwners() exactly once.
-    auto record = makeRecord(pending, endpoint, path, reservation, local,
-                             remote, attempt);
+    auto record = makeRecord(pending, endpoint, path, probe_key, reservation,
+                             local, remote, attempt);
     record->pool = pool;
     record->pooled_lane = leased.lease.lane();
     record->lease = std::move(leased.lease);
@@ -2038,9 +2073,14 @@ void UbWorkers::processPendingPooled(
         }
         // Observation only: how often the claim window actually leaked a post
         // onto a path that had just been isolated (design §8.2, RK1 urgency).
-        if (probe_manager_ != nullptr &&
-            probe_manager_->businessFaultEpoch(path) != fault_epoch_snapshot) {
-            post_on_isolated_path_.fetch_add(1, std::memory_order_relaxed);
+        if (probe_manager_ != nullptr) {
+            const uint64_t current =
+                probe_key.valid()
+                    ? probe_manager_->businessFaultEpoch(probe_key)
+                    : probe_manager_->businessFaultEpoch(path);
+            if (current != fault_epoch_snapshot) {
+                post_on_isolated_path_.fetch_add(1, std::memory_order_relaxed);
+            }
         }
         gate::onPostReturn(
             record->core,
@@ -2143,6 +2183,23 @@ void UbWorkers::onFault(CompletionRecord& record, FaultKind kind) {
     auto* business = static_cast<BusinessRecord*>(record.owner);
     if (business == nullptr) return;
     const uint64_t now = steadyNowNs();
+    const auto report_error = [&](BusinessErrorKind kind) {
+        if (probe_manager_ == nullptr) return;
+        if (business->probe_key.valid()) {
+            probe_manager_->onBusinessPathError(business->probe_key, kind, now);
+        } else {
+            probe_manager_->onBusinessPathError(business->path, kind, now);
+        }
+        if (kind == BusinessErrorKind::kPathFault &&
+            business->probe_key.valid()) {
+            std::function<void(uint64_t)> hint;
+            {
+                std::lock_guard<std::mutex> lock(probe_hint_mutex_);
+                hint = probe_refresh_hint_;
+            }
+            if (hint) hint(business->probe_key.segment_id);
+        }
+    };
     if (kind == FaultKind::kTimeout) {
         // Deadline evidence without a placeable completion. A late completion
         // resolves the same one-shot, so the rail sees exactly one timeout.
@@ -2157,47 +2214,41 @@ void UbWorkers::onFault(CompletionRecord& record, FaultKind kind) {
             if (probe_manager_ != nullptr) {
                 // kContextFailure disables every path on the port; the PLM fans
                 // it out to onContextUnavailable().
-                probe_manager_->onBusinessPathError(
-                    business->path, BusinessErrorKind::kContextFailure, now);
+                report_error(BusinessErrorKind::kContextFailure);
             }
             rail_monitor_->recordError(business->path, now);
             if (endpoint_retirer_) endpoint_retirer_(business->endpoint);
             return;
         case CompletionOutcome::kRemotePathError:
             if (probe_manager_ != nullptr) {
-                probe_manager_->onBusinessPathError(
-                    business->path, BusinessErrorKind::kPathFault, now);
+                report_error(BusinessErrorKind::kPathFault);
             }
             rail_monitor_->recordError(business->path, now);
             if (endpoint_retirer_) endpoint_retirer_(business->endpoint);
             return;
         case CompletionOutcome::kEndpointError:
             if (probe_manager_ != nullptr) {
-                probe_manager_->onBusinessPathError(
-                    business->path, BusinessErrorKind::kLaneError, now);
+                report_error(BusinessErrorKind::kLaneError);
             }
             rail_monitor_->recordError(business->path, now);
             if (endpoint_retirer_) endpoint_retirer_(business->endpoint);
             return;
         case CompletionOutcome::kMemoryError:
             if (probe_manager_ != nullptr) {
-                probe_manager_->onBusinessPathError(
-                    business->path, BusinessErrorKind::kParamError, now);
+                report_error(BusinessErrorKind::kParamError);
             }
             rail_monitor_->recordError(business->path, now);
             return;
         case CompletionOutcome::kUnknownError:
             if (probe_manager_ != nullptr) {
-                probe_manager_->onBusinessPathError(
-                    business->path, BusinessErrorKind::kUnknown, now);
+                report_error(BusinessErrorKind::kUnknown);
             }
             rail_monitor_->recordError(business->path, now);
             return;
         case CompletionOutcome::kTimeout:
             // Adapter-level TIMEOUT category (not the deadline scan).
             if (probe_manager_ != nullptr) {
-                probe_manager_->onBusinessPathError(
-                    business->path, BusinessErrorKind::kPathFault, now);
+                report_error(BusinessErrorKind::kPathFault);
             }
             rail_monitor_->recordTimeout(business->path, now);
             if (endpoint_retirer_) endpoint_retirer_(business->endpoint);
@@ -2528,7 +2579,11 @@ void UbWorkers::recordSuccessEvidence(BusinessRecord& record) {
     const uint64_t latency =
         now >= record.posted_ns ? now - record.posted_ns : 0;
     if (probe_manager_ != nullptr) {
-        probe_manager_->onBusinessPathSuccess(record.path, now);
+        if (record.probe_key.valid()) {
+            probe_manager_->onBusinessPathSuccess(record.probe_key, now);
+        } else {
+            probe_manager_->onBusinessPathSuccess(record.path, now);
+        }
     }
     rail_monitor_->recordSuccess(
         record.path, record.pending.slice->spec().length, latency, now);

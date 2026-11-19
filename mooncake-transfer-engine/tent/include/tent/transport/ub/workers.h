@@ -251,6 +251,13 @@ class UbWorkers final : public gate::Sink {
     // record table (no counter on PoolMember).
     [[nodiscard]] bool pooledLaneConverged(const PoolLaneKey& lane) const;
 
+    // Business path-error hint used by the probe coordinator to refresh the
+    // affected peer early. Called outside the PLM lock; nullptr disables it.
+    void setProbeRefreshHint(std::function<void(uint64_t)> hint) {
+        std::lock_guard<std::mutex> lock(probe_hint_mutex_);
+        probe_refresh_hint_ = std::move(hint);
+    }
+
    private:
     struct PendingSlice {
         // Keep the task alive until every queued/in-flight slice reaches a
@@ -323,10 +330,12 @@ class UbWorkers final : public gate::Sink {
     void processPendingPooled(
         const PendingSlice& pending, size_t worker_index, const Route& route,
         const std::shared_ptr<UbEndpoint>& endpoint, const UbPostPath& path,
-        const QuotaReservation& reservation, const LocalSegmentRef& local,
-        const ImportedSegmentRef& remote, const UbAttemptToken& attempt);
+        const ProbePathKey& probe_key, const QuotaReservation& reservation,
+        const LocalSegmentRef& local, const ImportedSegmentRef& remote,
+        const UbAttemptToken& attempt);
     // W2 tail of processPending, kept byte-for-byte for pool == nullptr.
     void postLegacy(const PendingSlice& pending, size_t worker_index,
+                    const ProbePathKey& probe_key,
                     const std::shared_ptr<UbEndpoint>& endpoint,
                     const UbPostPath& path, const QuotaReservation& reservation,
                     const LocalSegmentRef& local,
@@ -335,8 +344,13 @@ class UbWorkers final : public gate::Sink {
     std::shared_ptr<BusinessRecord> makeRecord(
         const PendingSlice& pending,
         const std::shared_ptr<UbEndpoint>& endpoint, const UbPostPath& path,
-        const QuotaReservation& reservation, const LocalSegmentRef& local,
-        const ImportedSegmentRef& remote, const UbAttemptToken& attempt);
+        const ProbePathKey& probe_key, const QuotaReservation& reservation,
+        const LocalSegmentRef& local, const ImportedSegmentRef& remote,
+        const UbAttemptToken& attempt);
+    // Maps a business path to the synthetic probe identity when its peer is
+    // declared. An invalid key means "not modelled by the probe graph".
+    [[nodiscard]] ProbePathKey probeKeyFor(const Route& route,
+                                           const UbPostPath& path) const;
     // W3g-a claim decision. `closed` is the pool authority's verdict (R-1);
     // `path_epoch_changed` is the pre-W3g PLM scalar check, which stays a
     // separate input (design D-2: sampling is kept, authority moves).
@@ -355,7 +369,8 @@ class UbWorkers final : public gate::Sink {
     [[nodiscard]] ClaimDecision claimPost(
         const std::shared_ptr<SendJettyPool>& pool, const PoolKey& pool_key,
         const AttemptKey& attempt, const LeaseWithCredit& leased,
-        const UbPostPath& path, uint64_t fault_epoch_snapshot);
+        const UbPostPath& path, const ProbePathKey& probe_key,
+        uint64_t fault_epoch_snapshot);
     [[nodiscard]] static PoolKey poolKeyFor(
         const std::shared_ptr<UbEndpoint>& endpoint);
     [[nodiscard]] DeferEpochs readDeferEpochs() const;
@@ -474,6 +489,8 @@ class UbWorkers final : public gate::Sink {
     std::vector<BusinessSlot> business_slots_;
     std::vector<ProbeSlot> probe_slots_;
     ProbeLinkManager* probe_manager_{nullptr};
+    mutable std::mutex probe_hint_mutex_;
+    std::function<void(uint64_t)> probe_refresh_hint_;
     // Read-only adjacency policy; nullptr when no topology was declared.
     const ProbeTopology* probe_topology_{nullptr};
     // Bounded record of unproven destructions, used to attribute a completion

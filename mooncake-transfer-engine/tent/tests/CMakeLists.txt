@@ -588,6 +588,28 @@ if(USE_UB)
   add_test(NAME tent_ub_probe_publication_test
            COMMAND tent_ub_probe_publication_test)
 
+  # Peer publication registry withdrawal semantics and the descriptor source
+  # join (design §6.3/§7.6).
+  add_executable(tent_ub_probe_peer_registry_test
+                 ub_probe_peer_registry_test.cpp)
+  target_link_libraries(tent_ub_probe_peer_registry_test
+                        PRIVATE tent_link_group gtest gtest_main)
+  target_include_directories(tent_ub_probe_peer_registry_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_probe_peer_registry_test
+           COMMAND tent_ub_probe_peer_registry_test)
+
+  # Handshake scheduling/apply and the publication -> registry -> source ->
+  # provider diff path (design §7).
+  add_executable(tent_ub_probe_peer_coordinator_test
+                 ub_probe_peer_coordinator_test.cpp)
+  target_link_libraries(tent_ub_probe_peer_coordinator_test
+                        PRIVATE tent_link_group gtest gtest_main)
+  target_include_directories(tent_ub_probe_peer_coordinator_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_probe_peer_coordinator_test
+           COMMAND tent_ub_probe_peer_coordinator_test)
+
   # Pooled rm_pool core components (C05/C06/C07): budget ledger, admission
   # tickets, per-attempt send pool and completion gate. Software-only: the
   # fake adapter needs no provider or NIC.

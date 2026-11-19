@@ -10,6 +10,7 @@
 #include <glog/logging.h>
 
 #include "tent/transport/ub/device_selection.h"
+#include "tent/transport/ub/probe_peer_registry.h"
 #include "tent/transport/ub/topology_attrs.h"
 
 namespace mooncake {
@@ -93,6 +94,14 @@ AdjacencyDecision AdjacencyView::check(Topology::NicID local_nic,
     const size_t index = local_slot * remote_nics.size() + remote_slot;
     if (index >= allowed.size() || allowed[index] == 0) {
         return AdjacencyDecision::kUndeclaredRemote;
+    }
+    if (publication_seen && remote_slot < remote_status.size()) {
+        if (remote_status[remote_slot] == 1) {
+            return AdjacencyDecision::kPortMissing;
+        }
+        if (remote_status[remote_slot] == 2) {
+            return AdjacencyDecision::kPeerGateBlocked;
+        }
     }
     return AdjacencyDecision::kAllowed;
 }
@@ -298,6 +307,41 @@ AdjacencyView ProbeTopology::viewFor(const std::string& peer,
                 std::distance(view.remote_nics.begin(), remote_it));
             view.allowed[local_slot * view.remote_nics.size() + remote_slot] =
                 1;
+        }
+    }
+
+    // Publication state (design §5.3). Before the first successful
+    // publication every declared edge stays allowed (ELIGIBLE_UNVERIFIED);
+    // afterwards a missing/withdrawn port or a closed peer gate rejects it.
+    if (peer_registry_ == nullptr) return view;
+    auto publication = peer_registry_->find(peer);
+    if (!publication || !publication->published) return view;
+    view.publication_seen = true;
+    view.remote_status.assign(view.remote_nics.size(), 0);
+    for (size_t remote_slot = 0; remote_slot < view.remote_nics.size();
+         ++remote_slot) {
+        const auto remote_nic = view.remote_nics[remote_slot];
+        const ProbePeerPortDecl* declared_port = nullptr;
+        for (const auto& port : peer_decl->second.ports) {
+            auto mapped = remote_by_id.find(port.id);
+            if (mapped != remote_by_id.end() && mapped->second == remote_nic) {
+                declared_port = &port;
+                break;
+            }
+        }
+        if (declared_port == nullptr) continue;
+        auto published =
+            std::find_if(publication->ports.begin(), publication->ports.end(),
+                         [&](const ProbePeerPortBinding& port) {
+                             return port.id == declared_port->id;
+                         });
+        if (published == publication->ports.end() || published->withdrawn) {
+            view.remote_status[remote_slot] = 1;
+            continue;
+        }
+        if (!published->node_gate_ok || !published->port_gate_ok ||
+            !published->profile_gate_ok) {
+            view.remote_status[remote_slot] = 2;
         }
     }
     return view;

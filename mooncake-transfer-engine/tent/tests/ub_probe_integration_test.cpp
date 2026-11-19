@@ -548,6 +548,70 @@ TEST(UbProbeIntegrationTest, TransportBuildsStandaloneProbeProvider) {
     EXPECT_TRUE(adapter->shutdown().ok());
 }
 
+TEST(UbProbeIntegrationTest, DeclaredProbeTopologyInstallsWithAnEmptyGraph) {
+    auto device = fakeDevice();
+    device.kind = DeviceKind::PHYSICAL;
+    device.capabilities.transport_modes = 3;  // RC | RM
+    device.capabilities.max_jfc = 4;
+    device.capabilities.max_jetty = 64;
+    device.capabilities.rm_tp_cap = kUrmaTpTypeCtpMask;
+    device.capabilities.priority_tp_type_masks[kUrmaMaxPriority] =
+        kUrmaTpTypeCtpMask;
+    auto adapter = std::make_shared<FakeUrmaAdapter>(device);
+    auto topology = std::make_shared<Topology>();
+    Topology::NicEntry nic;
+    nic.name = device.topology_name;
+    nic.type = Topology::NIC_UB;
+    nic.numa_node = 0;
+    encodeTopologyDeviceAttributes(device, 0, nic.device_attrs);
+    topology->nic_list_.push_back(std::move(nic));
+    Topology::MemEntry memory;
+    memory.name = kWildcardLocation;
+    memory.type = Topology::MEM_HOST;
+    memory.numa_node = -1;
+    memory.device_list[0].push_back(0);
+    topology->mem_list_.push_back(std::move(memory));
+
+    std::string segment_name;
+    auto control = startFakeControl(topology, segment_name);
+    ASSERT_NE(control, nullptr);
+
+    auto config = makeTransportConfig(/*probe_enabled=*/true);
+    config->set("transports/ub/runtime_profile", "rm_legacy");
+    config->set("transports/ub/trans_mode", "rm");
+    config->set("transports/ub/physical_only", true);
+    config->set("transports/ub/probe/provider", "standalone");
+    config->set("transports/ub/probe/local_ports",
+                nlohmann::json::array({nlohmann::json{
+                    {"id", "P0"}, {"bind", device.topology_name}}}));
+    config->set(
+        "transports/ub/probe/peers",
+        nlohmann::json{
+            {"node-b",
+             nlohmann::json{
+                 {"ports",
+                  nlohmann::json::array({nlohmann::json{
+                      {"id", "R0"},
+                      {"eid",
+                       "0000:0000:0000:0000:0000:0000:0000:0020"}}})}}}});
+    config->set(
+        "transports/ub/probe/adjacency",
+        nlohmann::json{
+            {"node-b", nlohmann::json{{"P0", nlohmann::json::array({"R0"})}}}});
+
+    UbTransport transport(adapter);
+    std::string mutable_segment_name = segment_name;
+    const auto status =
+        transport.install(mutable_segment_name, control, topology, config);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    // The peer publication has not arrived: the graph starts with its declared
+    // port and zero edges, and the coordinator retries in the background.
+    EXPECT_EQ(transport.probeLinkCount(), 0U);
+    EXPECT_GE(transport.probeGeneration(), 1U);
+
+    ASSERT_TRUE(transport.uninstall().ok());
+}
+
 TEST(UbProbeIntegrationTest, StandaloneProbeWithoutPeerSourceFailsInstall) {
     auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
     auto topology = fakeTopology();

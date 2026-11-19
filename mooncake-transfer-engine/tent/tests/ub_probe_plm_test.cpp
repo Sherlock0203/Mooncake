@@ -77,6 +77,64 @@ TEST(UbProbeLinkManagerTest, InitializesEligibleAndBusinessSuccessPromotes) {
     EXPECT_EQ(plm.stats().probe_unknown_token, 1U);
 }
 
+TEST(UbProbeLinkManagerTest,
+     ProbePathKeyBusinessEntriesMatchTheSyntheticGraph) {
+    TestClock clock;
+    ProbeLinkManager plm(defaultParams(), clock.clock());
+    auto edge = makeEdgeSupply(0, 10, 0);
+    edge.version.path.segment_id = static_cast<SegmentID>(kProbePeerIdBase);
+    auto graph = makeGraph({makePortSupply(0, 1)}, {edge});
+    ASSERT_TRUE(plm.initialize(graph).ok());
+    const ProbePathKey key{0, static_cast<SegmentID>(kProbePeerIdBase), 0};
+
+    EXPECT_TRUE(plm.businessPathUsable(key));
+    EXPECT_EQ(plm.businessFaultEpoch(key), 0U);
+    plm.onBusinessPathError(key, BusinessErrorKind::kPathFault, clock.now());
+    EXPECT_EQ(plm.businessFaultEpoch(key), 1U);
+    EXPECT_FALSE(plm.businessPathUsable(key));
+
+    // An invalid key (no synthetic peer) is a no-op for every entry point.
+    const ProbePathKey invalid{0, LOCAL_SEGMENT_ID, 0};
+    EXPECT_TRUE(plm.businessPathUsable(invalid));
+    EXPECT_EQ(plm.businessFaultEpoch(invalid), 0U);
+    plm.onBusinessPathSuccess(invalid, clock.now());
+    plm.onBusinessPathError(invalid, BusinessErrorKind::kPathFault,
+                            clock.now());
+}
+
+TEST(UbProbeLinkManagerTest, TargetEpochChangeReplacesAcrossTopologyEpochs) {
+    TestClock clock;
+    ProbeLinkManager plm(defaultParams(), clock.clock());
+    auto graph = makeGraph({makePortSupply(0, 1)}, {makeEdgeSupply(0, 10, 0)});
+    ASSERT_TRUE(plm.initialize(graph).ok());
+    const PathVersion old_version{ProbePathKey{0, 10, 0}, 1, 1};
+    ASSERT_TRUE(hasHealth(plm, old_version));
+
+    // Node-level epoch change: topology_epoch and target_epoch both move.
+    ProbeEvent event;
+    event.kind = ProbeEventKind::kTargetEpochChanged;
+    event.graph_epoch = 1;
+    event.event_seq = 1;
+    event.edge = makeEdgeSupply(0, 10, 0, /*topology_epoch=*/2,
+                                /*target_epoch=*/2);
+    ASSERT_TRUE(plm.onPoolAvailabilityChange(event).ok());
+    EXPECT_FALSE(hasHealth(plm, old_version));
+    const PathVersion new_version{ProbePathKey{0, 10, 0}, 2, 2};
+    EXPECT_TRUE(hasHealth(plm, new_version));
+    EXPECT_EQ(plm.pathCount(), 1U);
+    EXPECT_EQ(healthOf(plm, new_version).health,
+              LinkHealth::kEligibleUnverified);
+
+    // The replacement is atomic: no "multiple versions for one path" error.
+    ProbeEvent same_path_added;
+    same_path_added.kind = ProbeEventKind::kEdgeAdded;
+    same_path_added.graph_epoch = 1;
+    same_path_added.event_seq = 2;
+    same_path_added.edge = makeEdgeSupply(0, 10, 0, 3, 3);
+    EXPECT_TRUE(
+        plm.onPoolAvailabilityChange(same_path_added).IsInvalidArgument());
+}
+
 TEST(UbProbeLinkManagerTest, DynamicEdgesAllowAnEmptyStartupGraph) {
     TestClock clock;
     auto params = defaultParams();

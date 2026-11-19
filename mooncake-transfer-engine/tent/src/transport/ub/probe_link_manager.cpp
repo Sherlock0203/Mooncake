@@ -1145,22 +1145,20 @@ void ProbeLinkManager::cancelCampaignEntriesLocked(const PathVersion& version) {
 }
 
 std::optional<PathVersion> ProbeLinkManager::resolveVersionLocked(
-    const UbPostPath& evidence, bool require_matching_generation) {
+    const ProbePathKey& key, uint64_t endpoint_generation,
+    bool require_matching_generation) {
     // W3 M4: the business routing gate asks this question once per candidate
     // (local x remote) on every attempt, and once more at claim time. A linear
     // scan over every path row under the global PLM lock made that O(paths) per
     // candidate, so the (local_nic, segment, remote_nic) -> PathVersion index
     // is consulted first. The index is maintained wherever a row is created or
     // dropped, and the scan below stays as the fallback/miss path.
-    const ProbePathKey key{evidence.local_topology_id,
-                           evidence.remote_segment_id,
-                           evidence.remote_device_id};
     auto resolveOne =
         [&](const PathVersion& version) -> std::optional<PathVersion> {
         auto edge = edges_.find(version);
         if (edge == edges_.end()) return std::nullopt;
         const uint64_t anchor = edge->second.endpoint_generation;
-        if (anchor == 0 || anchor == evidence.endpoint_generation) {
+        if (anchor == 0 || anchor == endpoint_generation) {
             return version;
         }
         // L-7: an unmappable fault is attributed to the rail's current
@@ -1169,7 +1167,7 @@ std::optional<PathVersion> ProbeLinkManager::resolveVersionLocked(
         LOG_EVERY_N(WARNING, 100)
             << "UB probe business evidence generation does not map: "
             << pathText(version) << " anchor=" << anchor
-            << " evidence=" << evidence.endpoint_generation;
+            << " evidence=" << endpoint_generation;
         ++stats_.probe_evidence_unmapped;
         if (require_matching_generation) return std::nullopt;
         return version;
@@ -1184,26 +1182,21 @@ std::optional<PathVersion> ProbeLinkManager::resolveVersionLocked(
     bool found = false;
     std::optional<PathVersion> resolved;
     for (const auto& [version, runtime] : paths_) {
-        if (version.path.local_nic != evidence.local_topology_id) continue;
-        if (version.path.segment_id != evidence.remote_segment_id) continue;
-        if (version.path.remote_nic != evidence.remote_device_id) continue;
+        if (version.path.local_nic != key.local_nic) continue;
+        if (version.path.segment_id != key.segment_id) continue;
+        if (version.path.remote_nic != key.remote_nic) continue;
         found = true;
         auto edge = edges_.find(version);
         if (edge == edges_.end()) continue;
         const uint64_t anchor = edge->second.endpoint_generation;
-        const bool generation_matches =
-            anchor == 0 || anchor == evidence.endpoint_generation;
-        if (generation_matches) {
+        if (anchor == 0 || anchor == endpoint_generation) {
             resolved = version;
             break;
         }
-        // L-7: an unmappable fault is attributed to the rail's current
-        // version anyway, so a real fault is never lost; a success, however,
-        // must not promote a path version it does not belong to.
         LOG_EVERY_N(WARNING, 100)
             << "UB probe business evidence generation does not map: "
             << pathText(version) << " anchor=" << anchor
-            << " evidence=" << evidence.endpoint_generation;
+            << " evidence=" << endpoint_generation;
         ++stats_.probe_evidence_unmapped;
         if (require_matching_generation) return std::nullopt;
         resolved = version;
@@ -1212,16 +1205,23 @@ std::optional<PathVersion> ProbeLinkManager::resolveVersionLocked(
     if (!found) {
         LOG_EVERY_N(WARNING, 100)
             << "UB probe business evidence has no path row: local_nic="
-            << evidence.local_topology_id
-            << " peer=" << evidence.remote_segment_id
-            << " remote_nic=" << evidence.remote_device_id;
+            << key.local_nic << " peer=" << key.segment_id
+            << " remote_nic=" << key.remote_nic;
         ++stats_.probe_evidence_unmapped;
     }
     return resolved;
 }
 
-void ProbeLinkManager::onBusinessPathSuccess(const UbPostPath& path,
-                                             uint64_t now_ns) {
+std::optional<PathVersion> ProbeLinkManager::resolveVersionLocked(
+    const UbPostPath& evidence, bool require_matching_generation) {
+    return resolveVersionLocked(
+        ProbePathKey{evidence.local_topology_id, evidence.remote_segment_id,
+                     evidence.remote_device_id},
+        evidence.endpoint_generation, require_matching_generation);
+}
+
+void ProbeLinkManager::onBusinessPathSuccessResolved(
+    const ProbePathKey& key, uint64_t endpoint_generation, uint64_t now_ns) {
     (void)now_ns;
     // Shutdown only settles existing responsibility: no new health evidence is
     // published after posting has been closed (design §14.1-8).
@@ -1229,8 +1229,8 @@ void ProbeLinkManager::onBusinessPathSuccess(const UbPostPath& path,
     Effects effects;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        auto version =
-            resolveVersionLocked(path, /*require_matching_generation=*/true);
+        auto version = resolveVersionLocked(
+            key, endpoint_generation, /*require_matching_generation=*/true);
         if (!version) return;
         PathRuntime* runtime = findPathLocked(*version);
         if (runtime == nullptr) return;
@@ -1243,9 +1243,23 @@ void ProbeLinkManager::onBusinessPathSuccess(const UbPostPath& path,
     emitEffects(effects);
 }
 
-void ProbeLinkManager::onBusinessPathError(const UbPostPath& path,
-                                           BusinessErrorKind kind,
-                                           uint64_t now_ns) {
+void ProbeLinkManager::onBusinessPathSuccess(const UbPostPath& path,
+                                             uint64_t now_ns) {
+    onBusinessPathSuccessResolved(
+        ProbePathKey{path.local_topology_id, path.remote_segment_id,
+                     path.remote_device_id},
+        path.endpoint_generation, now_ns);
+}
+
+void ProbeLinkManager::onBusinessPathSuccess(const ProbePathKey& key,
+                                             uint64_t now_ns) {
+    onBusinessPathSuccessResolved(key, 0, now_ns);
+}
+
+void ProbeLinkManager::onBusinessPathErrorResolved(const ProbePathKey& key,
+                                                   uint64_t endpoint_generation,
+                                                   BusinessErrorKind kind,
+                                                   uint64_t now_ns) {
     // Shutdown only settles existing responsibility: no new campaign and no new
     // isolation (design §14.1-8).
     if (!accepting_.load()) return;
@@ -1257,14 +1271,13 @@ void ProbeLinkManager::onBusinessPathError(const UbPostPath& path,
         LOG_EVERY_N(WARNING, 100)
             << "UB probe: local parameter/length/permission business error on "
                "local_nic="
-            << path.local_topology_id << " peer=" << path.remote_segment_id
-            << " remote_nic=" << path.remote_device_id
-            << "; not isolating the path";
+            << key.local_nic << " peer=" << key.segment_id
+            << " remote_nic=" << key.remote_nic << "; not isolating the path";
         return;
     }
     if (kind == BusinessErrorKind::kContextFailure) {
         // A context failure is a port-level event, not a path fault.
-        onContextUnavailable(path.local_topology_id, now);
+        onContextUnavailable(key.local_nic, now);
         return;
     }
     if (kind == BusinessErrorKind::kLaneError ||
@@ -1282,8 +1295,8 @@ void ProbeLinkManager::onBusinessPathError(const UbPostPath& path,
     Effects effects;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        auto version =
-            resolveVersionLocked(path, /*require_matching_generation=*/false);
+        auto version = resolveVersionLocked(
+            key, endpoint_generation, /*require_matching_generation=*/false);
         if (!version) return;
         PathRuntime* runtime = findPathLocked(*version);
         if (runtime == nullptr) return;
@@ -1308,6 +1321,21 @@ void ProbeLinkManager::onBusinessPathError(const UbPostPath& path,
         mergeOrCreateCampaignLocked(runtime->peer, now);
     }
     emitEffects(effects);
+}
+
+void ProbeLinkManager::onBusinessPathError(const UbPostPath& path,
+                                           BusinessErrorKind kind,
+                                           uint64_t now_ns) {
+    onBusinessPathErrorResolved(
+        ProbePathKey{path.local_topology_id, path.remote_segment_id,
+                     path.remote_device_id},
+        path.endpoint_generation, kind, now_ns);
+}
+
+void ProbeLinkManager::onBusinessPathError(const ProbePathKey& key,
+                                           BusinessErrorKind kind,
+                                           uint64_t now_ns) {
+    onBusinessPathErrorResolved(key, 0, kind, now_ns);
 }
 
 bool ProbeLinkManager::businessPathUsable(const UbPostPath& path) {
@@ -1339,10 +1367,44 @@ bool ProbeLinkManager::businessPathUsable(const UbPostPath& path) {
     return usable;
 }
 
+bool ProbeLinkManager::businessPathUsable(const ProbePathKey& key) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto version =
+        resolveVersionLocked(key, 0, /*require_matching_generation=*/false);
+    if (!version) {
+        // Not modelled by the probe graph: usable by design (D-10/RK8).
+        ++stats_.business_path_not_in_graph;
+        return true;
+    }
+    const PathRuntime* runtime = findPathLocked(*version);
+    if (runtime == nullptr) {
+        ++stats_.business_path_not_in_graph;
+        return true;
+    }
+    const auto edge = edges_.find(*version);
+    if (edge == edges_.end() || !externalGateOk(edge->second)) {
+        ++stats_.business_path_gate_blocked;
+        return false;
+    }
+    const bool usable = runtime->health == LinkHealth::kHealthy ||
+                        runtime->health == LinkHealth::kEligibleUnverified;
+    if (!usable) ++stats_.business_path_health_blocked;
+    return usable;
+}
+
 uint64_t ProbeLinkManager::businessFaultEpoch(const UbPostPath& path) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto version =
         resolveVersionLocked(path, /*require_matching_generation=*/false);
+    if (!version) return 0;
+    const PathRuntime* runtime = findPathLocked(*version);
+    return runtime == nullptr ? 0 : runtime->fault_epoch;
+}
+
+uint64_t ProbeLinkManager::businessFaultEpoch(const ProbePathKey& key) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto version =
+        resolveVersionLocked(key, 0, /*require_matching_generation=*/false);
     if (!version) return 0;
     const PathRuntime* runtime = findPathLocked(*version);
     return runtime == nullptr ? 0 : runtime->fault_epoch;
@@ -1540,9 +1602,10 @@ bool ProbeLinkManager::validateEventPayloadLocked(
             for (const auto& [version, existing] : edges_) {
                 if (version == edge.version) continue;
                 if (!(version.path == edge.version.path)) continue;
-                if (event.kind == ProbeEventKind::kTargetEpochChanged &&
-                    version.topology_epoch == edge.version.topology_epoch) {
-                    // The row this event is about to replace.
+                if (event.kind == ProbeEventKind::kTargetEpochChanged) {
+                    // A target/topology epoch change replaces every older
+                    // version of this adjacency atomically (design §6.5); the
+                    // handler deletes them all before inserting the new row.
                     continue;
                 }
                 return false;
@@ -1649,8 +1712,7 @@ Status ProbeLinkManager::applyEventLocked(const ProbeEvent& event,
             std::vector<PathVersion> retired;
             for (const auto& [version, runtime] : paths_) {
                 if (version == next) continue;
-                if (version.path == next.path &&
-                    version.topology_epoch == next.topology_epoch) {
+                if (version.path == next.path) {
                     retired.push_back(version);
                 }
             }

@@ -125,6 +125,11 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
     // A duplicate id or NIC is a configuration error.
     Status bindPorts(const std::vector<ProbePortSpec>& specs);
 
+    // Recomputes the peer edge set and emits the incremental graph events
+    // (kEdgeAdded / kAreaReplaced / kTargetEpochChanged / kEdgeRemoved) under
+    // one graph epoch. Runs on the coordinator thread, never on a poller.
+    Status refreshPeerEdges();
+
     // Node identity published in ProbeBootstrapUb. Supplied by the transport;
     // defaults keep selftest/unit builds usable.
     void setNodeIdentity(std::string segment, uint64_t node_incarnation,
@@ -271,6 +276,8 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
     Status rebuildPortLocked(PortState& port, uint64_t error_epoch,
                              std::vector<Completion>& completions);
     Status emitHandleReplacedLocked(const ProbePortSupply& supply);
+    Status applyEdgeDiffLocked(
+        const std::map<PathVersion, ProbeEdgeSupply>& next);
 
     mutable std::mutex mutex_;
     std::thread maintenance_;
@@ -299,6 +306,7 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
     ProbeCompletionSink completion_sink_;
     uint64_t graph_epoch_{0};
     uint64_t event_seq_{0};
+    std::map<PathVersion, ProbeEdgeSupply> current_edges_;
     std::atomic<uint64_t> retire_calls_{0};
     uint64_t next_graph_epoch_{1};
     bool resources_ready_{false};

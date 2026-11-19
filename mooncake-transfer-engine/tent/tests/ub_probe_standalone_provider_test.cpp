@@ -49,8 +49,20 @@ class StubPeerDirectory final : public ProbePeerDirectory {
         return Status::OK();
     }
 
+    void set(std::vector<ProbeEdgeSupply> edges) { edges_ = std::move(edges); }
+
    private:
     std::vector<ProbeEdgeSupply> edges_;
+};
+
+class RecordingAvailabilitySink final : public ProbeAvailabilitySink {
+   public:
+    Status onPoolAvailabilityChange(const ProbeEvent& event) override {
+        events.push_back(event);
+        return Status::OK();
+    }
+
+    std::vector<ProbeEvent> events;
 };
 
 ProbeEdgeSupply makeEdge(Topology::NicID local_nic, SegmentID peer_id,
@@ -275,6 +287,72 @@ TEST(UbProbeStandaloneProviderTest, RecordsRetireAndHandoffUntilShutdown) {
     EXPECT_EQ(adapter->liveJettyCount(), 0U);
     EXPECT_EQ(adapter->liveLocalSegmentCount(), 0U);
 
+    EXPECT_TRUE(adapter->closeContext(context).ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
+TEST(UbProbeStandaloneProviderTest, RefreshEmitsIncrementalGraphEvents) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+    ContextPtr context;
+    ASSERT_TRUE(adapter->openContext(fakeDevice(), context).ok());
+
+    StubPeerDirectory directory({makeEdge(0, 42, 0), makeEdge(0, 42, 1)});
+    auto params = makeProbeParams();
+    params.dynamic_edges = true;
+    StandaloneProbeResourceProvider provider(
+        adapter, params, {ProbeLocalPortConfig{0, context, nullptr, 1}},
+        &directory);
+    ProbeGraph graph;
+    ASSERT_TRUE(provider.snapshot(graph).ok());
+    ASSERT_EQ(graph.edges.size(), 2U);
+
+    RecordingAvailabilitySink sink;
+    provider.setAvailabilitySink(&sink);
+
+    // Add a new edge and remove both old ones. Additions are emitted before
+    // removals so the graph never loses an unrelated edge first.
+    directory.set({makeEdge(0, 43, 0)});
+    ASSERT_TRUE(provider.refreshPeerEdges().ok());
+    ASSERT_EQ(sink.events.size(), 3U);
+    std::vector<ProbeEventKind> kinds;
+    for (const auto& event : sink.events) kinds.push_back(event.kind);
+    EXPECT_EQ(
+        std::count(kinds.begin(), kinds.end(), ProbeEventKind::kEdgeAdded), 1);
+    EXPECT_EQ(
+        std::count(kinds.begin(), kinds.end(), ProbeEventKind::kEdgeRemoved),
+        2);
+    EXPECT_EQ(sink.events[0].event_seq, 1U);
+    EXPECT_EQ(sink.events[1].event_seq, 2U);
+    EXPECT_EQ(sink.events[2].event_seq, 3U);
+
+    // Same PathVersion with a new area epoch: in-place replacement.
+    sink.events.clear();
+    auto refreshed = makeEdge(0, 43, 0);
+    refreshed.area_epoch = 2;
+    directory.set({refreshed});
+    ASSERT_TRUE(provider.refreshPeerEdges().ok());
+    ASSERT_EQ(sink.events.size(), 1U);
+    EXPECT_EQ(sink.events[0].kind, ProbeEventKind::kAreaReplaced);
+    EXPECT_EQ(sink.events[0].event_seq, 4U);
+
+    // Same adjacency path with a new target epoch: one atomic replacement.
+    sink.events.clear();
+    auto changed = makeEdge(0, 43, 0);
+    changed.version.target_epoch = 2;
+    directory.set({changed});
+    ASSERT_TRUE(provider.refreshPeerEdges().ok());
+    ASSERT_EQ(sink.events.size(), 1U);
+    EXPECT_EQ(sink.events[0].kind, ProbeEventKind::kTargetEpochChanged);
+    ASSERT_TRUE(sink.events[0].edge.has_value());
+    EXPECT_EQ(sink.events[0].edge->version.target_epoch, 2U);
+
+    // No diff produces no event.
+    sink.events.clear();
+    ASSERT_TRUE(provider.refreshPeerEdges().ok());
+    EXPECT_TRUE(sink.events.empty());
+
+    ASSERT_TRUE(provider.shutdown().ok());
     EXPECT_TRUE(adapter->closeContext(context).ok());
     EXPECT_TRUE(adapter->shutdown().ok());
 }

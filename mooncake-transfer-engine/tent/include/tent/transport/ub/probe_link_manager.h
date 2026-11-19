@@ -270,6 +270,16 @@ class ProbeLinkManager final : public ProbeAvailabilitySink {
     [[nodiscard]] bool businessPathUsable(const UbPostPath& path);
     [[nodiscard]] uint64_t businessFaultEpoch(const UbPostPath& path);
 
+    // Synthetic probe identity (design §5.4). Configured peers use these
+    // entries so business open/closeRemote churn cannot move a probe path.
+    // An invalid key (segment_id == LOCAL_SEGMENT_ID) is a no-op: the path is
+    // not modelled by the probe graph.
+    [[nodiscard]] bool businessPathUsable(const ProbePathKey& key);
+    [[nodiscard]] uint64_t businessFaultEpoch(const ProbePathKey& key);
+    void onBusinessPathSuccess(const ProbePathKey& key, uint64_t now_ns = 0);
+    void onBusinessPathError(const ProbePathKey& key, BusinessErrorKind kind,
+                             uint64_t now_ns = 0);
+
     // ---- interface 7 (design §12.3) --------------------------------------
     // Synchronous, bounded update. A repeated (graph_epoch, event_seq) is
     // acknowledged without being applied. A gap or a malformed payload is
@@ -439,6 +449,15 @@ class ProbeLinkManager final : public ProbeAvailabilitySink {
     // because they must not promote a path they do not belong to.
     std::optional<PathVersion> resolveVersionLocked(
         const UbPostPath& evidence, bool require_matching_generation);
+    std::optional<PathVersion> resolveVersionLocked(
+        const ProbePathKey& key, uint64_t endpoint_generation,
+        bool require_matching_generation);
+    void onBusinessPathSuccessResolved(const ProbePathKey& key,
+                                       uint64_t endpoint_generation,
+                                       uint64_t now_ns);
+    void onBusinessPathErrorResolved(const ProbePathKey& key,
+                                     uint64_t endpoint_generation,
+                                     BusinessErrorKind kind, uint64_t now_ns);
 
     mutable std::mutex mutex_;
     // Guards the externally installed hooks (report sink, wake callback and

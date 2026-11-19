@@ -56,6 +56,10 @@ constexpr bool isProbeToken(uint64_t token) {
     return (token >> kProbeTokenKindShift) == kProbeTokenKindProbe;
 }
 
+// Synthetic peer ids for the probe graph start above every business
+// SegmentID allocation domain (design §3/§5.4).
+inline constexpr uint64_t kProbePeerIdBase = 1ULL << 63;
+
 // ---------------------------------------------------------------------------
 // Identity (design §5.1).
 //
@@ -431,7 +435,6 @@ struct ProbeParams {
                 return false;
             }
         }
-        if (dynamic_edges != !adjacency.empty()) return false;
         return true;
     }
 
