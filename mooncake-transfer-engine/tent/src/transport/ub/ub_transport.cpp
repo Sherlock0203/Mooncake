@@ -1184,6 +1184,11 @@ struct UbTransport::Impl {
                         "Local segment is not memory-backed" LOC_MARK);
                 }
                 auto& detail = std::get<MemorySegmentDesc>(segment.detail);
+                // setupLocalSegment() copied topology_ before install ran, so
+                // the published snapshot still carries the raw discovery kind
+                // (unknown). Refresh it from the install-time topology that
+                // applyUbDeviceKinds() has already patched.
+                if (local_topology) detail.topology = *local_topology;
                 detail.transport_attrs[TransportType::UB] = nlohmann::json{
                     {"schema_version", 1},
                     {"protocol", "urma"},
