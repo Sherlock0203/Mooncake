@@ -99,6 +99,9 @@ class UbTransport final : public Transport {
     [[nodiscard]] ub::ProbeCoordinatorStats probeCoordinatorStats() const;
     // Responder-side identity failures (topology_name/EID/kind mismatch).
     [[nodiscard]] uint64_t probePublicationIdentityFailures() const;
+    // ProbeLinkManager counters (probe test/post/health/campaign). Intended
+    // for machine-readable verification exporters.
+    [[nodiscard]] ub::ProbeStats probeLinkStats() const;
     // Largest installed Context incarnation. Pool members are keyed by it, so
     // a summary that prints it can be correlated with a pool generation.
     [[nodiscard]] uint64_t poolGeneration() const;

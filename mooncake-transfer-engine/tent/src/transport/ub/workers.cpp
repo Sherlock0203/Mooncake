@@ -767,10 +767,29 @@ void UbWorkers::logBusinessSummary(uint64_t now_ns) {
             drain.async_drain_supported && one.async_drain_supported;
         drain.async_drain_disabled += one.async_drain_disabled;
     }
+    for (const auto& context : contexts_) {
+        if (!context) continue;
+        const auto pool = context->pooledSendPool();
+        if (!pool) continue;
+        const auto budget = pool->budgetSnapshot();
+        if (!budget || budget->total_jetties == 0) continue;
+        LOG(INFO) << "UB native budget: device_key=" << budget->device_key
+                  << " configured=" << budget->configured_budget_jetties
+                  << " reserve=" << budget->replacement_reserve_jetties
+                  << " verified_limit=" << budget->verified_device_limit_jetties
+                  << " total=" << budget->total_jetties
+                  << " active=" << budget->active_jetties
+                  << " creating=" << budget->creating_jetties
+                  << " retiring=" << budget->retiring_jetties
+                  << " quarantined=" << budget->quarantined_jetties
+                  << " rejected=" << budget->rejected_reservations
+                  << " leaked=" << budget->leaked_reservations;
+    }
     if (stats.queue_depth == 0 && stats.parked_depth == 0 &&
         stats.pool_lease_attempts == 0 && drain.drain_begin == 0) {
         return;
     }
+    const auto gate = completionStats();
     LOG(INFO) << "UB business: queued=" << stats.queue_depth
               << " parked=" << stats.parked_depth
               << " submit_rejected=" << stats.submit_backpressure
@@ -823,7 +842,14 @@ void UbWorkers::logBusinessSummary(uint64_t now_ns) {
               << ",flush_marker=" << drain.software_flush_unhandled
               << ",settled_late=" << drain.drained_after_settle
               << ",supported=" << (drain.async_drain_supported ? 1 : 0)
-              << ",disabled=" << drain.async_drain_disabled << "}";
+              << ",disabled=" << drain.async_drain_disabled << "}"
+              << " gate{post_return=" << gate.gate_blocked_by_post_return
+              << ",cqe=" << gate.gate_blocked_by_cqe
+              << ",responsibility=" << gate.gate_blocked_by_responsibility
+              << ",refs=" << gate.gate_blocked_by_handler_refs
+              << ",fault=" << gate.gate_blocked_by_fault
+              << ",not_accepted=" << gate.gate_blocked_by_not_accepted
+              << ",acceptance=" << gate.gate_blocked_by_acceptance << "}";
     if (probe_topology_ != nullptr) {
         const auto probe = probe_topology_->stats();
         LOG(INFO) << "UB probe topology: ports=" << probe.ports
@@ -1486,6 +1512,14 @@ Status UbWorkers::chooseAndResolveEndpoint(
             adjacency_denied + invalid_edge_denied, std::memory_order_relaxed);
     }
     if (rails.empty() && invalid_edge_denied == combinations) {
+        LOG_EVERY_N(WARNING, params_.observability.leaseSampleEvery())
+            << "UB endpoint select denied: task="
+            << reinterpret_cast<uint64_t>(pending.task.get())
+            << " slice=" << pending.slice->snapshot().id
+            << " policy=" << (route.adjacency.enforced ? "declared" : "legacy")
+            << " candidates=" << combinations
+            << " denied{adjacency=" << adjacency_denied
+            << ",invalid_edge=" << invalid_edge_denied << ",quota=0}";
         return Status::InvalidArgument(
             "Every declared edge was invalidated after repeated "
             "parameter/memory errors" LOC_MARK);
@@ -1493,6 +1527,16 @@ Status UbWorkers::chooseAndResolveEndpoint(
     if (rails.empty() && adjacency_screened_out &&
         adjacency_denied == combinations) {
         if (adjacency_hard_denied > 0) {
+            LOG_EVERY_N(WARNING, params_.observability.leaseSampleEvery())
+                << "UB endpoint select denied: task="
+                << reinterpret_cast<uint64_t>(pending.task.get())
+                << " slice=" << pending.slice->snapshot().id
+                << " candidates=" << combinations
+                << " denied{adjacency=" << adjacency_denied
+                << ",invalid_edge=" << invalid_edge_denied << ",quota=0}"
+                << " first=" << adjacencyDecisionName(first_adjacency_denial)
+                << " local=" << first_denied_local
+                << " remote=" << first_denied_remote;
             return Status::InvalidArgument(
                 "UB adjacency rejects every posting candidate: peer=" +
                 (route.pin ? route.pin->name : std::string("<unknown>")) +
@@ -1655,6 +1699,46 @@ Status UbWorkers::chooseAndResolveEndpoint(
     endpoint = selected->endpoint;
     path = selected->path;
     reservation = *acquired;
+    {
+        const auto slice = pending.slice->snapshot();
+        const uint64_t task_id = reinterpret_cast<uint64_t>(pending.task.get());
+        const bool declared = route.adjacency.enforced;
+        if (params_.observability.verbose_events) {
+            LOG(INFO) << "UB endpoint select: task=" << task_id
+                      << " slice=" << slice.id << " attempt=" << slice.attempt
+                      << " policy=" << (declared ? "declared" : "legacy")
+                      << " candidates=" << combinations << " start=" << start
+                      << " chosen=" << selected->score.local_topology_id << ":"
+                      << selected->score.remote_device_id
+                      << " rank=" << selected->score.topology_rank
+                      << " probe_path=" << (route.probe_peer_id != 0 ? 1 : 0)
+                      << " denied{adjacency=" << adjacency_denied
+                      << ",invalid_edge=" << invalid_edge_denied << ",quota=0}";
+        } else if (VLOG_IS_ON(1)) {
+            VLOG(1) << "UB endpoint select: task=" << task_id
+                    << " slice=" << slice.id << " attempt=" << slice.attempt
+                    << " policy=" << (declared ? "declared" : "legacy")
+                    << " candidates=" << combinations << " start=" << start
+                    << " chosen=" << selected->score.local_topology_id << ":"
+                    << selected->score.remote_device_id
+                    << " rank=" << selected->score.topology_rank
+                    << " probe_path=" << (route.probe_peer_id != 0 ? 1 : 0)
+                    << " denied{adjacency=" << adjacency_denied
+                    << ",invalid_edge=" << invalid_edge_denied << ",quota=0}";
+        } else {
+            LOG_EVERY_N(INFO, params_.observability.leaseSampleEvery())
+                << "UB endpoint select: task=" << task_id
+                << " slice=" << slice.id << " attempt=" << slice.attempt
+                << " policy=" << (declared ? "declared" : "legacy")
+                << " candidates=" << combinations << " start=" << start
+                << " chosen=" << selected->score.local_topology_id << ":"
+                << selected->score.remote_device_id
+                << " rank=" << selected->score.topology_rank
+                << " probe_path=" << (route.probe_peer_id != 0 ? 1 : 0)
+                << " denied{adjacency=" << adjacency_denied
+                << ",invalid_edge=" << invalid_edge_denied << ",quota=0}";
+        }
+    }
     return Status::OK();
 }
 
@@ -2375,6 +2459,46 @@ void UbWorkers::onFault(CompletionRecord& record, FaultKind kind) {
             if (hint) hint(business->probe_key.segment_id);
         }
     };
+    const char* category = "unknown";
+    switch (record.terminal.outcome) {
+        case CompletionOutcome::kRemotePathError:
+            category = "path_fault";
+            break;
+        case CompletionOutcome::kTimeout:
+            category = "timeout";
+            break;
+        case CompletionOutcome::kMemoryError:
+            category = "param_error";
+            break;
+        case CompletionOutcome::kLocalDeviceError:
+            category = "context_failure";
+            break;
+        case CompletionOutcome::kEndpointError:
+            category = "lane_error";
+            break;
+        case CompletionOutcome::kUnknownError:
+            category = "unknown";
+            break;
+        case CompletionOutcome::kSuccess:
+            category = "success";
+            break;
+    }
+    LOG_EVERY_N(WARNING, 20)
+        << "UB business error: token=" << record.token
+        << " task=" << reinterpret_cast<uint64_t>(business->pending.task.get())
+        << " slice=" << business->attempt.slice_id
+        << " attempt=" << business->attempt.attempt
+        << " kind=" << recordKindName(record.kind)
+        << " local_nic=" << record.path.local_nic
+        << " remote_device=" << record.path.remote_nic
+        << " remote_segment=" << record.path.segment_id << " acceptance="
+        << postAcceptanceName(record.acceptance.load(std::memory_order_relaxed))
+        << " terminal=" << completionOutcomeName(record.terminal.outcome)
+        << " category=" << category << " jetty_gen=" << record.jetty_generation
+        << " lane_gen=" << business->pooled_lane.lane_generation << " pool_gen="
+        << (business->endpoint && business->endpoint->context()
+                ? business->endpoint->context()->incarnation()
+                : 0);
     if (kind == FaultKind::kTimeout) {
         // Deadline evidence without a placeable completion. A late completion
         // resolves the same one-shot, so the rail sees exactly one timeout.
@@ -2471,9 +2595,55 @@ void UbWorkers::onOwners(CompletionRecord& record,
 
 void UbWorkers::onBlocked(CompletionRecord& record, BlockReason reason) {
     // Observational only: the gate already maintains gate_blocked_by_*.
-    // W3 hangs the defer/backpressure wake-up here, W4 the classified logging.
-    (void)record;
-    (void)reason;
+    if (params_.observability.verbose_events || VLOG_IS_ON(1)) {
+        if (params_.observability.verbose_events) {
+            LOG(INFO)
+                << "UB completion gate blocked: token=" << record.token
+                << " kind=" << recordKindName(record.kind)
+                << " path=" << recordPathText(record.path)
+                << " generation=" << record.jetty_generation << " acceptance="
+                << postAcceptanceName(
+                       record.acceptance.load(std::memory_order_relaxed))
+                << " blocked_by=" << blockReasonName(reason)
+                << " post_returned="
+                << (record.post_returned.load(std::memory_order_acquire) ? 1
+                                                                         : 0)
+                << " early_cqe="
+                << ((record.wr_terminal.load(std::memory_order_acquire) &&
+                     !record.post_returned.load(std::memory_order_acquire))
+                        ? 1
+                        : 0)
+                << " handler_refs="
+                << record.handler_refs.load(std::memory_order_relaxed)
+                << " fault="
+                << (record.fault_reported.load(std::memory_order_relaxed) ? 1
+                                                                          : 0);
+        } else {
+            VLOG(1) << "UB completion gate blocked: token=" << record.token
+                    << " kind=" << recordKindName(record.kind)
+                    << " path=" << recordPathText(record.path)
+                    << " generation=" << record.jetty_generation
+                    << " acceptance="
+                    << postAcceptanceName(
+                           record.acceptance.load(std::memory_order_relaxed))
+                    << " blocked_by=" << blockReasonName(reason)
+                    << " post_returned="
+                    << (record.post_returned.load(std::memory_order_acquire)
+                            ? 1
+                            : 0)
+                    << " early_cqe="
+                    << ((record.wr_terminal.load(std::memory_order_acquire) &&
+                         !record.post_returned.load(std::memory_order_acquire))
+                            ? 1
+                            : 0)
+                    << " handler_refs="
+                    << record.handler_refs.load(std::memory_order_relaxed)
+                    << " fault="
+                    << (record.fault_reported.load(std::memory_order_relaxed)
+                            ? 1
+                            : 0);
+        }
+    }
 }
 
 void UbWorkers::onDuplicate(CompletionRecord& record) {

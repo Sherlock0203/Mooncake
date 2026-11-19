@@ -135,7 +135,8 @@ class ProbeTopology {
     // non-enforcing topology.
     static Status resolve(const ProbeParams& params,
                           const std::vector<DeviceInfo>& devices,
-                          const Topology& topology, ProbeTopology& output);
+                          const Topology& topology, ProbeTopology& output,
+                          uint32_t topology_dump_limit = 0);
 
     [[nodiscard]] bool declared() const { return declared_; }
     [[nodiscard]] bool enforces() const { return enforces_; }

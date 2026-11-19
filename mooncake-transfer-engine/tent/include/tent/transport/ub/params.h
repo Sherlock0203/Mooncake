@@ -202,6 +202,23 @@ inline const char* ubTransportModeName(UbTransportMode mode) noexcept {
     return mode == UbTransportMode::kRm ? "rm" : "rc";
 }
 
+// Event-level observability (closed-loop verification guide). All switches
+// only gate logging; they never change a verdict or a state machine.
+struct UbObservabilityParams {
+    bool verbose_events = false;
+    // 0 keeps the component default (lease/return 1024, probe/health 100).
+    uint32_t sample_every = 0;
+    // 0 means no limit on the install-time declared-topology dump.
+    uint32_t topology_dump_limit = 0;
+
+    [[nodiscard]] uint32_t leaseSampleEvery() const {
+        return sample_every == 0 ? 1024 : sample_every;
+    }
+    [[nodiscard]] uint32_t probeSampleEvery() const {
+        return sample_every == 0 ? 100 : sample_every;
+    }
+};
+
 struct UbParams {
     // UB is opt-in until a real URMA provider and NIC topology are present.
     bool enable = false;
@@ -258,6 +275,7 @@ struct UbParams {
 
     // Probe-link parameters, read from transports/ub/probe/* below.
     ProbeParams probe;
+    UbObservabilityParams observability;
 
     // Reads every UB setting from transports/ub/*. Numeric settings are
     // deliberately read as signed JSON integers first so a negative value is
@@ -564,6 +582,18 @@ struct UbParams {
         CHECK_STATUS(readBool(config, "transports/ub/probe/test/apply_health",
                               parsed.probe.test_apply_health,
                               parsed.probe.test_apply_health));
+        CHECK_STATUS(readBool(config,
+                              "transports/ub/observability/verbose_events",
+                              parsed.observability.verbose_events,
+                              parsed.observability.verbose_events));
+        CHECK_STATUS(readNonNegative(config,
+                                     "transports/ub/observability/sample_every",
+                                     parsed.observability.sample_every,
+                                     parsed.observability.sample_every));
+        CHECK_STATUS(readNonNegative(
+            config, "transports/ub/observability/topology_dump_limit",
+            parsed.observability.topology_dump_limit,
+            parsed.observability.topology_dump_limit));
 
         // Declared topology cross-checks (design §4.3/§4.5). A declaration is
         // only meaningful in standalone mode with binding-based selection:

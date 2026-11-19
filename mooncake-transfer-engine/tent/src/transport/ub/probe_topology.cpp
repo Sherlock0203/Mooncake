@@ -184,7 +184,8 @@ AdjacencyDecision AdjacencyView::check(Topology::NicID local_nic,
 
 Status ProbeTopology::resolve(const ProbeParams& params,
                               const std::vector<DeviceInfo>& devices,
-                              const Topology& topology, ProbeTopology& output) {
+                              const Topology& topology, ProbeTopology& output,
+                              uint32_t topology_dump_limit) {
     ProbeTopology resolved;
     resolved.peers_ = params.peers;
     resolved.adjacency_ = params.adjacency;
@@ -345,6 +346,62 @@ Status ProbeTopology::resolve(const ProbeParams& params,
               << " peer(s), " << resolved.adjacency_.size()
               << " adjacency group(s), enforce="
               << (resolved.enforces_ ? "true" : "false");
+    {
+        size_t dumped = 0;
+        bool truncated = false;
+        auto may_dump = [&]() {
+            if (topology_dump_limit != 0 && dumped >= topology_dump_limit) {
+                truncated = true;
+                return false;
+            }
+            ++dumped;
+            return true;
+        };
+        LOG(INFO) << "UB probe topology dump: local_ports="
+                  << resolved.ports_.size()
+                  << " peers=" << resolved.peers_.size()
+                  << " adjacency_groups=" << resolved.adjacency_.size()
+                  << " enforce=" << (resolved.enforces_ ? "true" : "false");
+        for (const auto& binding : resolved.ports_) {
+            if (!may_dump()) break;
+            const auto scope = eidScopeForEid(binding.eid);
+            LOG(INFO) << "UB probe topology port: id=" << binding.id
+                      << " bind=" << binding.bind
+                      << " device=" << binding.native_device_name
+                      << " local_nic=" << binding.local_nic
+                      << " eid=" << binding.eid << " scope=" << scope.key;
+        }
+        if (!truncated) {
+            for (const auto& [peer_name, peer] : resolved.peers_) {
+                for (const auto& port : peer.ports) {
+                    if (!may_dump()) break;
+                    const auto scope = eidScopeForEid(port.eid);
+                    LOG(INFO) << "UB probe topology peer: peer=" << peer_name
+                              << " port=" << port.id << " eid=" << port.eid
+                              << " scope=" << scope.key;
+                }
+                if (truncated) break;
+            }
+        }
+        if (!truncated) {
+            for (const auto& [peer_name, edges] : resolved.adjacency_) {
+                for (const auto& [local_id, remote_ids] : edges) {
+                    for (const auto& remote_id : remote_ids) {
+                        if (!may_dump()) break;
+                        LOG(INFO)
+                            << "UB probe topology edge: peer=" << peer_name
+                            << " " << local_id << "->" << remote_id;
+                    }
+                    if (truncated) break;
+                }
+                if (truncated) break;
+            }
+        }
+        if (truncated) {
+            LOG(INFO) << "UB probe topology dump truncated at "
+                      << topology_dump_limit << " line(s)";
+        }
+    }
     output = std::move(resolved);
     return Status::OK();
 }

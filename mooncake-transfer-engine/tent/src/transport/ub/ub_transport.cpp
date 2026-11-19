@@ -328,8 +328,9 @@ struct UbTransport::Impl {
         // matches zero or multiple physical EIDs fails the install (design
         // §4.3 rule 9); it is never skipped or guessed.
         probe_topology = std::make_shared<ub::ProbeTopology>();
-        status = ub::ProbeTopology::resolve(params.probe, discovered,
-                                            *local_topology, *probe_topology);
+        status = ub::ProbeTopology::resolve(
+            params.probe, discovered, *local_topology, *probe_topology,
+            params.observability.topology_dump_limit);
         if (!status.ok()) return failInstall(status);
 
         const bool explicit_filter = !params.device_filter.empty();
@@ -679,6 +680,10 @@ struct UbTransport::Impl {
                 pool_options.quarantine_budget = params.quarantine_budget;
                 pool_options.tombstones = tombstones;
                 pool_options.jetty_options = jetty_options;
+                pool_options.verbose_events =
+                    params.observability.verbose_events;
+                pool_options.sample_every =
+                    params.observability.leaseSampleEvery();
                 // Asynchronous drain (design §4.4). The chain is only armed
                 // when a control executor exists; otherwise the pool keeps the
                 // synchronous fence and says so once at install.
@@ -884,6 +889,8 @@ struct UbTransport::Impl {
             if (!status.ok()) return failInstall(status);
             probe_manager =
                 std::make_unique<ub::ProbeLinkManager>(params.probe);
+            probe_manager->setVerboseEvents(
+                params.observability.verbose_events);
             probe_manager->setReportSink(probe_provider.get());
             status = probe_manager->initialize(graph);
             if (!status.ok()) return failInstall(status);
@@ -1934,6 +1941,12 @@ uint64_t UbTransport::probePublicationIdentityFailures() const {
     std::lock_guard<std::mutex> lock(impl_->lifecycle_mutex);
     return impl_->probe_publication_identity_fail.load(
         std::memory_order_relaxed);
+}
+
+ub::ProbeStats UbTransport::probeLinkStats() const {
+    std::lock_guard<std::mutex> lock(impl_->lifecycle_mutex);
+    if (!impl_->probe_manager) return ub::ProbeStats{};
+    return impl_->probe_manager->stats();
 }
 
 uint64_t UbTransport::poolGeneration() const {

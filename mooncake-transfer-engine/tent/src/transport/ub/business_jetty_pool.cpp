@@ -116,6 +116,8 @@ Status BusinessJettyPool::tryLease(const PoolKey& pool_key,
         uint64_t credit_token = 0;
         uint64_t chosen_error_epoch = 0;
         bool can_create = false;
+        size_t idle_before = 0;
+        size_t in_use_before = 0;
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -133,6 +135,8 @@ Status BusinessJettyPool::tryLease(const PoolKey& pool_key,
                     "attempt" LOC_MARK);
             }
             PoolBucket& bucket = buckets_[pool_key];
+            idle_before = bucket.idle.size();
+            in_use_before = bucket.in_use;
             // LIFO scan: newest returned member first; JFC credit matching
             // happens inside the LIFO order (non-blocking reservation).
             for (auto it = bucket.idle.begin(); it != bucket.idle.end(); ++it) {
@@ -161,17 +165,81 @@ Status BusinessJettyPool::tryLease(const PoolKey& pool_key,
         }
 
         if (chosen != nullptr) {
+            const uint32_t lane_jetty = chosen->lane.jetty_id;
+            const uint64_t lane_generation = chosen->lane.lane_generation;
+            const uint64_t pool_generation = pool_key.context_incarnation;
             out.lease =
                 SliceJettyLease(weak_from_this(), std::move(chosen), attempt);
             out.jfc_index = chosen_jfc;
             out.jfc_credit_token = credit_token;
             out.error_epoch = chosen_error_epoch;
+            if (options_.verbose_events || VLOG_IS_ON(1)) {
+                if (options_.verbose_events) {
+                    LOG(INFO)
+                        << "UB pool lease: device_key=" << device_key_
+                        << " pool_gen=" << pool_generation
+                        << " lane_gen=" << lane_generation
+                        << " jetty=" << lane_jetty
+                        << " task=" << attempt.task_id
+                        << " slice=" << attempt.slice_id
+                        << " attempt=" << attempt.attempt_generation
+                        << " jfc=" << chosen_jfc << " credit=" << credit_token
+                        << " idle_before=" << idle_before
+                        << " in_use_before=" << in_use_before << " status=ok";
+                } else {
+                    VLOG(1)
+                        << "UB pool lease: device_key=" << device_key_
+                        << " pool_gen=" << pool_generation
+                        << " lane_gen=" << lane_generation
+                        << " jetty=" << lane_jetty
+                        << " task=" << attempt.task_id
+                        << " slice=" << attempt.slice_id
+                        << " attempt=" << attempt.attempt_generation
+                        << " jfc=" << chosen_jfc << " credit=" << credit_token
+                        << " idle_before=" << idle_before
+                        << " in_use_before=" << in_use_before << " status=ok";
+                }
+            } else {
+                LOG_EVERY_N(INFO, options_.sample_every == 0
+                                      ? 1024
+                                      : options_.sample_every)
+                    << "UB pool lease: device_key=" << device_key_
+                    << " pool_gen=" << pool_generation
+                    << " lane_gen=" << lane_generation
+                    << " jetty=" << lane_jetty << " task=" << attempt.task_id
+                    << " slice=" << attempt.slice_id
+                    << " attempt=" << attempt.attempt_generation
+                    << " jfc=" << chosen_jfc << " credit=" << credit_token
+                    << " idle_before=" << idle_before
+                    << " in_use_before=" << in_use_before << " status=ok";
+            }
             return Status::OK();
         }
 
         if (!can_create) {
             std::lock_guard<std::mutex> lock(mutex_);
             ++pool_misses_;
+            if (options_.verbose_events || VLOG_IS_ON(1)) {
+                if (options_.verbose_events) {
+                    LOG(INFO) << "UB pool lease: device_key=" << device_key_
+                              << " pool_gen=" << pool_key.context_incarnation
+                              << " task=" << attempt.task_id
+                              << " slice=" << attempt.slice_id
+                              << " attempt=" << attempt.attempt_generation
+                              << " idle_before=" << idle_before
+                              << " in_use_before=" << in_use_before
+                              << " status=miss reason=no_leaseable_member";
+                } else {
+                    VLOG(1) << "UB pool lease: device_key=" << device_key_
+                            << " pool_gen=" << pool_key.context_incarnation
+                            << " task=" << attempt.task_id
+                            << " slice=" << attempt.slice_id
+                            << " attempt=" << attempt.attempt_generation
+                            << " idle_before=" << idle_before
+                            << " in_use_before=" << in_use_before
+                            << " status=miss reason=no_leaseable_member";
+                }
+            }
             return Status::TooManyRequests(
                 "UB send pool has no leaseable member; defer the "
                 "attempt" LOC_MARK);
@@ -299,6 +367,10 @@ Status BusinessJettyPool::createAndPublish(const PoolKey& pool_key) {
         }
         ++create_failures_;
         noteCreateFailureLocked(pool_key);
+        LOG_EVERY_N(WARNING, 100)
+            << "UB pool member create failed: device_key=" << device_key_
+            << " pool_gen=" << pool_key.context_incarnation
+            << " reason=budget_exhausted";
         return Status::TooManyRequests(
             "UB native budget exhausted for device " + device_key_ + LOC_MARK);
     }
@@ -333,6 +405,10 @@ Status BusinessJettyPool::createAndPublish(const PoolKey& pool_key) {
         }
         ++create_failures_;
         noteCreateFailureLocked(pool_key);
+        LOG_EVERY_N(WARNING, 100)
+            << "UB pool member create failed: device_key=" << device_key_
+            << " pool_gen=" << pool_key.context_incarnation
+            << " reason=provider status=" << created.ToString();
         return created;
     }
 
@@ -365,7 +441,16 @@ Status BusinessJettyPool::createAndPublish(const PoolKey& pool_key) {
         }
     }
 
-    if (publish) return Status::OK();
+    if (publish) {
+        if (VLOG_IS_ON(1)) {
+            VLOG(1) << "UB pool member created: device_key=" << device_key_
+                    << " pool_gen=" << member->pool_key.context_incarnation
+                    << " lane_gen=" << member->lane.lane_generation
+                    << " jetty=" << member->lane.jetty_id
+                    << " jfc=" << member->jfc_index;
+        }
+        return Status::OK();
+    }
 
     // Stopped (or activation failed) after creation: retire the fresh
     // object. It never posted a WR, so deletion proves destruction and the
@@ -435,10 +520,16 @@ Status BusinessJettyPool::returnOnce(SliceJettyLease lease,
     lease.detach();
 
     std::vector<std::shared_ptr<PoolMember>> to_destroy;
+    size_t idle_after = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (member->state != PoolMemberState::kInUse) {
             ++double_returns_;
+            LOG(ERROR) << "UB pool double return: device_key=" << device_key_
+                       << " pool_gen=" << member->pool_key.context_incarnation
+                       << " lane_gen=" << member->lane.lane_generation
+                       << " jetty=" << member->lane.jetty_id
+                       << " state=" << static_cast<int>(member->state);
             return Status::InvalidArgument(
                 "UB send pool lease returned twice" LOC_MARK);
         }
@@ -456,8 +547,37 @@ Status BusinessJettyPool::returnOnce(SliceJettyLease lease,
             to_destroy = retired_;
             retired_.clear();
         }
+        idle_after = member->pool_key.context_incarnation == 0
+                         ? 0
+                         : buckets_[member->pool_key].idle.size();
     }
 
+    if (options_.verbose_events || VLOG_IS_ON(1)) {
+        if (options_.verbose_events) {
+            LOG(INFO) << "UB pool return: device_key=" << device_key_
+                      << " pool_gen=" << member->pool_key.context_incarnation
+                      << " lane_gen=" << member->lane.lane_generation
+                      << " jetty=" << member->lane.jetty_id
+                      << " gate=" << (completion_gate_passed ? "pass" : "fail")
+                      << " idle_after=" << idle_after;
+        } else {
+            VLOG(1) << "UB pool return: device_key=" << device_key_
+                    << " pool_gen=" << member->pool_key.context_incarnation
+                    << " lane_gen=" << member->lane.lane_generation
+                    << " jetty=" << member->lane.jetty_id
+                    << " gate=" << (completion_gate_passed ? "pass" : "fail")
+                    << " idle_after=" << idle_after;
+        }
+    } else {
+        LOG_EVERY_N(INFO,
+                    options_.sample_every == 0 ? 1024 : options_.sample_every)
+            << "UB pool return: device_key=" << device_key_
+            << " pool_gen=" << member->pool_key.context_incarnation
+            << " lane_gen=" << member->lane.lane_generation
+            << " jetty=" << member->lane.jetty_id
+            << " gate=" << (completion_gate_passed ? "pass" : "fail")
+            << " idle_after=" << idle_after;
+    }
     if (!to_destroy.empty()) destroyRetired(std::move(to_destroy));
     return Status::OK();
 }
@@ -518,6 +638,13 @@ Status BusinessJettyPool::retireFaulted(SliceJettyLease lease,
         }
     }
 
+    LOG(WARNING) << "UB pool retire: device_key=" << device_key_
+                 << " pool_gen=" << member->pool_key.context_incarnation
+                 << " lane_gen=" << member->lane.lane_generation
+                 << " jetty=" << member->lane.jetty_id
+                 << " reason=" << member->retire_reason
+                 << " state=" << static_cast<int>(member->state)
+                 << " epoch=" << member->error_epoch;
     if (controller != nullptr) {
         // Non-blocking hand-off: the chain continues on the control executor.
         DrainRequest request;
@@ -761,6 +888,11 @@ void BusinessJettyPool::finishDelete(const std::shared_ptr<PoolMember>& member,
             (void)budget_->transition(member->budget,
                                       BudgetObjectState::kRetiring);
             budget_->releaseAfterProvenDestruction(member->budget, true);
+            LOG_EVERY_N(INFO, 100)
+                << "UB pool member deleted: device_key=" << device_key_
+                << " pool_gen=" << member->pool_key.context_incarnation
+                << " lane_gen=" << member->lane.lane_generation
+                << " jetty=" << member->lane.jetty_id << " outcome=consumed";
             return;
         }
         case DeleteOutcome::Kind::kRetained: {
@@ -780,6 +912,12 @@ void BusinessJettyPool::finishDelete(const std::shared_ptr<PoolMember>& member,
             delete_retry_at_ns_[member->lane.lane_generation] =
                 steadyNowNs() + delay_ms * 1'000'000ULL;
             retained_[member->lane.lane_generation] = member;
+            LOG_EVERY_N(WARNING, 100)
+                << "UB pool member delete retained: device_key=" << device_key_
+                << " pool_gen=" << member->pool_key.context_incarnation
+                << " lane_gen=" << member->lane.lane_generation
+                << " jetty=" << member->lane.jetty_id
+                << " retry_attempts=" << member->delete_retry_attempts;
             return;
         }
         case DeleteOutcome::Kind::kUnknown: {
@@ -829,23 +967,34 @@ void BusinessJettyPool::onLeaseLeaked(
     // A lease dropped without returnOnce(): responsibility is unknown, so
     // the member is quarantined with its budget retained; it never returns
     // to circulation.
-    std::lock_guard<std::mutex> lock(mutex_);
-    ++leaked_leases_;
-    if (member == nullptr) return;
-    if (member->state == PoolMemberState::kInUse) {
-        auto bucket = buckets_.find(member->pool_key);
-        if (bucket != buckets_.end() && bucket->second.in_use > 0) {
-            --bucket->second.in_use;
+    uint64_t pool_generation = 0;
+    uint64_t lane_generation = 0;
+    uint32_t jetty_id = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++leaked_leases_;
+        if (member == nullptr) return;
+        if (member->state == PoolMemberState::kInUse) {
+            auto bucket = buckets_.find(member->pool_key);
+            if (bucket != buckets_.end() && bucket->second.in_use > 0) {
+                --bucket->second.in_use;
+            }
         }
+        member->state = PoolMemberState::kQuarantined;
+        // A leaked lease removes the member from circulation just like a
+        // retirement, so the epoch must move; a stale claim cannot succeed.
+        ++member->error_epoch;
+        noteTombstoneLocked(member);
+        budget_->transition(member->budget, BudgetObjectState::kQuarantined);
+        quarantined_.push_back(member);
+        refreshBackpressureLocked();
+        pool_generation = member->pool_key.context_incarnation;
+        lane_generation = member->lane.lane_generation;
+        jetty_id = member->lane.jetty_id;
     }
-    member->state = PoolMemberState::kQuarantined;
-    // A leaked lease removes the member from circulation just like a
-    // retirement, so the epoch must move; a stale claim cannot succeed.
-    ++member->error_epoch;
-    noteTombstoneLocked(member);
-    budget_->transition(member->budget, BudgetObjectState::kQuarantined);
-    quarantined_.push_back(member);
-    refreshBackpressureLocked();
+    LOG(WARNING) << "UB pool lease leaked: device_key=" << device_key_
+                 << " pool_gen=" << pool_generation
+                 << " lane_gen=" << lane_generation << " jetty=" << jetty_id;
 }
 
 ClaimVerdict BusinessJettyPool::tryClaimPost(
@@ -1008,6 +1157,15 @@ void BusinessJettyPool::refillPass() {
     // Every known PoolKey is topped back up to the static Serving size even
     // while no business attempt is in flight.
     std::vector<PoolKey> batch;
+    struct RefillSnapshot {
+        PoolKey key;
+        size_t desired;
+        size_t idle;
+        size_t in_use;
+        size_t creating;
+        size_t deficit;
+    };
+    std::vector<RefillSnapshot> refill_logs;
     for (auto& entry : buckets_) {
         PoolBucket& bucket = entry.second;
         // BACKOFF: a failed creation must not be mistaken for an immediate
@@ -1020,12 +1178,34 @@ void BusinessJettyPool::refillPass() {
         if (bucket.creating >= options_.max_creating) continue;
         size_t slots = options_.desired_serving - serving - bucket.creating;
         slots = std::min(slots, options_.max_creating - bucket.creating);
+        refill_logs.push_back(RefillSnapshot{
+            entry.first, options_.desired_serving, bucket.idle.size(),
+            bucket.in_use, bucket.creating, slots});
         bucket.creating += slots;
         for (size_t slot = 0; slot < slots; ++slot) {
             batch.push_back(entry.first);
         }
     }
     lock.unlock();
+    if (options_.verbose_events || VLOG_IS_ON(1)) {
+        for (const auto& log : refill_logs) {
+            if (options_.verbose_events) {
+                LOG(INFO) << "UB pool refill: device_key=" << device_key_
+                          << " pool_gen=" << log.key.context_incarnation
+                          << " desired=" << log.desired << " idle=" << log.idle
+                          << " in_use=" << log.in_use
+                          << " creating=" << log.creating
+                          << " deficit=" << log.deficit;
+            } else {
+                VLOG(1) << "UB pool refill: device_key=" << device_key_
+                        << " pool_gen=" << log.key.context_incarnation
+                        << " desired=" << log.desired << " idle=" << log.idle
+                        << " in_use=" << log.in_use
+                        << " creating=" << log.creating
+                        << " deficit=" << log.deficit;
+            }
+        }
+    }
     for (const auto& pool_key : batch) {
         (void)createAndPublish(pool_key);
     }
@@ -1059,6 +1239,11 @@ void BusinessJettyPool::stopWorkers() {
         refill_worker_->stop();
         refill_worker_.reset();
     }
+}
+
+std::optional<BudgetDeviceSnapshot> BusinessJettyPool::budgetSnapshot() const {
+    if (budget_ == nullptr) return std::nullopt;
+    return budget_->snapshot(device_key_);
 }
 
 SendJettyPoolStats BusinessJettyPool::stats() const {

@@ -182,6 +182,8 @@ class ProbeLinkManager final : public ProbeAvailabilitySink {
     // same object that supplies resources, or a narrower sink. The hook mutex
     // makes the setter safe against concurrent emitEffects().
     void setReportSink(ProbeReportSink* sink);
+    void setVerboseEvents(bool verbose) { verbose_events_ = verbose; }
+    [[nodiscard]] bool verboseEvents() const { return verbose_events_; }
     // Invoked outside the PLM mutex whenever scheduling state changed.
     void setWakeCallback(WakeCallback callback);
 
@@ -366,6 +368,16 @@ class ProbeLinkManager final : public ProbeAvailabilitySink {
         PathVersion path;
         Status reason;
         bool bump{false};
+        struct HealthTransition {
+            PathVersion version;
+            LinkHealth from{LinkHealth::kEligibleUnverified};
+            LinkHealth to{LinkHealth::kEligibleUnverified};
+            const char* reason{"state_change"};
+            uint64_t fault_epoch{0};
+            uint64_t consecutive_failures{0};
+            uint64_t backoff_ns{0};
+        };
+        std::vector<HealthTransition> health_transitions;
     };
 
     enum class StaleReason : uint8_t {
@@ -390,9 +402,11 @@ class ProbeLinkManager final : public ProbeAvailabilitySink {
 
     // State helpers. setHealthLocked() owns the path_state counters and the
     // availability bump.
-    void setHealthLocked(PathRuntime& runtime, LinkHealth health,
+    void setHealthLocked(const PathVersion& version, PathRuntime& runtime,
+                         LinkHealth health, const char* reason,
                          Effects& effects);
-    void publishHealthyLocked(PathRuntime& runtime, Effects& effects);
+    void publishHealthyLocked(const PathVersion& version, PathRuntime& runtime,
+                              const char* reason, Effects& effects);
     static bool externalGateOk(const ProbeEdgeSupply& edge);
     uint64_t backoffDelayLocked(uint64_t consecutive_failures) const;
 
@@ -497,6 +511,7 @@ class ProbeLinkManager final : public ProbeAvailabilitySink {
     uint64_t lane_error_epoch_{0};
 
     ProbeStats stats_;
+    bool verbose_events_{false};
 };
 
 }  // namespace ub

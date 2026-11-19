@@ -3,6 +3,8 @@
 
 #include "tent/transport/ub/native_budget.h"
 
+#include <glog/logging.h>
+
 #include <limits>
 #include <utility>
 
@@ -87,6 +89,12 @@ std::optional<BudgetReservation> NativeBudget::tryReserve(
     if (addWouldOverflow(total, quantities.jetties) ||
         total + quantities.jetties > ceiling) {
         ++ledger.rejected_reservations;
+        LOG_EVERY_N(WARNING, 100)
+            << "UB native budget reserve rejected: device_key=" << device_key
+            << " role=" << budgetRoleName(role)
+            << " jetties=" << quantities.jetties << " total=" << total
+            << " limit=" << ceiling
+            << " rejected=" << ledger.rejected_reservations;
         return std::nullopt;
     }
 
@@ -163,8 +171,16 @@ Status NativeBudget::releaseAfterProvenDestruction(
             "UB budget release requires a retiring or quarantined "
             "reservation" LOC_MARK);
     }
+    const BudgetObjectState released_state = entry->second.state;
     device->second.entries.erase(entry);
     reservation_device_.erase(reservation.reservation_id);
+    if (VLOG_IS_ON(1)) {
+        VLOG(1) << "UB native budget released: device_key="
+                << reservation.device_key
+                << " role=" << budgetRoleName(reservation.role)
+                << " reservation=" << reservation.reservation_id
+                << " state=" << budgetObjectStateName(released_state);
+    }
     reservation.reservation_id = 0;
     return Status::OK();
 }
@@ -176,6 +192,10 @@ void NativeBudget::recordLeakedReservation(
     auto device = devices_.find(reservation.device_key);
     if (device == devices_.end()) return;
     ++device->second.leaked_reservations;
+    LOG(WARNING) << "UB native budget leak: device_key="
+                 << reservation.device_key
+                 << " role=" << budgetRoleName(reservation.role)
+                 << " reservation=" << reservation.reservation_id;
 }
 
 BudgetDeviceSnapshot NativeBudget::snapshot(

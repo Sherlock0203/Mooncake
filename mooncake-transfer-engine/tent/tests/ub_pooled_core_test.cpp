@@ -1487,6 +1487,35 @@ TEST(UbParamsPooledTest, ParsesDeclaredProbeTopologyAndRejectsBadEdges) {
                     .IsInvalidArgument());
 }
 
+TEST(UbParamsPooledTest, ParsesObservabilitySwitches) {
+    UbParams params;
+    ASSERT_TRUE(parseUbParams(R"({
+        "transports": {"ub": {"observability": {
+            "verbose_events": true,
+            "sample_every": 256,
+            "topology_dump_limit": 128
+        }}}
+    })",
+                              params)
+                    .ok());
+    EXPECT_TRUE(params.observability.verbose_events);
+    EXPECT_EQ(params.observability.sample_every, 256U);
+    EXPECT_EQ(params.observability.topology_dump_limit, 128U);
+    EXPECT_EQ(params.observability.leaseSampleEvery(), 256U);
+    EXPECT_EQ(params.observability.probeSampleEvery(), 256U);
+
+    ASSERT_TRUE(parseUbParams("{}", params).ok());
+    EXPECT_FALSE(params.observability.verbose_events);
+    EXPECT_EQ(params.observability.leaseSampleEvery(), 1024U);
+    EXPECT_EQ(params.observability.probeSampleEvery(), 100U);
+
+    EXPECT_TRUE(parseUbParams(R"({
+        "transports": {"ub": {"observability": {"sample_every": -1}}}
+    })",
+                              params)
+                    .IsInvalidArgument());
+}
+
 TEST(UbParamsPooledTest, ParsesExplicitPoolKeys) {
     const std::string config_json = R"({
         "transports": {

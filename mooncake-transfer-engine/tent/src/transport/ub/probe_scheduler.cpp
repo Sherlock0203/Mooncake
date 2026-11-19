@@ -172,6 +172,44 @@ void ProbeScheduler::postOne(const ProbeAction& action, uint64_t now_ns) {
     } else if (!status.ok()) {
         outcome = ProbePostOutcome::kRejected;
     }
+    if (plm_.verboseEvents() || VLOG_IS_ON(1)) {
+        const char* outcome_name =
+            outcome == ProbePostOutcome::kAccepted
+                ? "accepted"
+                : (outcome == ProbePostOutcome::kRejected ? "rejected"
+                                                          : "unknown");
+        if (plm_.verboseEvents()) {
+            LOG(INFO) << "UB probe post: local_nic=" << action.local_nic
+                      << " peer=" << action.peer.segment_id
+                      << " remote_nic=" << action.version.path.remote_nic
+                      << " topo_epoch=" << action.version.topology_epoch
+                      << " target_epoch=" << action.version.target_epoch
+                      << " fault_epoch=" << record->key.fault_epoch
+                      << " probe_seq=" << record->key.probe_seq
+                      << " jetty_gen=" << action.jetty_generation
+                      << " area_epoch=" << action.area_epoch
+                      << " campaign=" << record->key.campaign_id << "/"
+                      << record->key.campaign_epoch << " token=" << token
+                      << " outcome=" << outcome_name << " posted=" << posted
+                      << " blocked_us=" << blocked_us
+                      << " test=" << (action.test ? 1 : 0);
+        } else {
+            VLOG(1) << "UB probe post: local_nic=" << action.local_nic
+                    << " peer=" << action.peer.segment_id
+                    << " remote_nic=" << action.version.path.remote_nic
+                    << " topo_epoch=" << action.version.topology_epoch
+                    << " target_epoch=" << action.version.target_epoch
+                    << " fault_epoch=" << record->key.fault_epoch
+                    << " probe_seq=" << record->key.probe_seq
+                    << " jetty_gen=" << action.jetty_generation
+                    << " area_epoch=" << action.area_epoch
+                    << " campaign=" << record->key.campaign_id << "/"
+                    << record->key.campaign_epoch << " token=" << token
+                    << " outcome=" << outcome_name << " posted=" << posted
+                    << " blocked_us=" << blocked_us
+                    << " test=" << (action.test ? 1 : 0);
+        }
+    }
     plm_.onPostResult(record, outcome, normalizedNow());
 }
 

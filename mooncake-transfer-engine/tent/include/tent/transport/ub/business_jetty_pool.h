@@ -293,6 +293,9 @@ struct SendJettyPoolOptions {
     // table (direct-pool users) and keeps the pre-tombstone budget behavior.
     std::shared_ptr<TombstoneTable> tombstones;
     JettyOptions jetty_options;
+    // Event-level observability (verification guide O-1/O-2). Logging only.
+    bool verbose_events = false;
+    uint32_t sample_every = 1024;
 };
 
 struct SendJettyPoolStats {
@@ -469,6 +472,8 @@ class BusinessJettyPool final
     size_t retryRetainedDeletes();
 
     [[nodiscard]] SendJettyPoolStats stats() const;
+    // Native budget snapshot for this pool's device (diagnostics only).
+    [[nodiscard]] std::optional<BudgetDeviceSnapshot> budgetSnapshot() const;
     [[nodiscard]] std::vector<PoolMemberState> memberStates() const;
     [[nodiscard]] size_t servingCount(const PoolKey& pool_key) const;
 

@@ -428,6 +428,26 @@ enum class CompletionCategory : uint8_t {
     UNKNOWN_ERROR,
 };
 
+inline const char* completionCategoryName(CompletionCategory category) {
+    switch (category) {
+        case CompletionCategory::SUCCESS:
+            return "SUCCESS";
+        case CompletionCategory::LOCAL_DEVICE_ERROR:
+            return "LOCAL_DEVICE_ERROR";
+        case CompletionCategory::REMOTE_PATH_ERROR:
+            return "REMOTE_PATH_ERROR";
+        case CompletionCategory::ENDPOINT_ERROR:
+            return "ENDPOINT_ERROR";
+        case CompletionCategory::MEMORY_ERROR:
+            return "MEMORY_ERROR";
+        case CompletionCategory::TIMEOUT:
+            return "TIMEOUT";
+        case CompletionCategory::UNKNOWN_ERROR:
+            return "UNKNOWN_ERROR";
+    }
+    return "UNKNOWN_ERROR";
+}
+
 struct Completion {
     CompletionCategory category = CompletionCategory::UNKNOWN_ERROR;
     int native_status = 0;

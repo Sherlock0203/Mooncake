@@ -273,6 +273,20 @@ void ProbeLinkManager::emitEffects(const Effects& effects) {
         report = report_;
         wake = wake_;
     }
+    for (const auto& transition : effects.health_transitions) {
+        LOG(INFO) << "UB probe path state: local_nic="
+                  << transition.version.path.local_nic
+                  << " peer=" << transition.version.path.segment_id
+                  << " remote_nic=" << transition.version.path.remote_nic
+                  << " topo_epoch=" << transition.version.topology_epoch
+                  << " target_epoch=" << transition.version.target_epoch
+                  << " from=" << linkHealthName(transition.from)
+                  << " to=" << linkHealthName(transition.to)
+                  << " reason=" << transition.reason
+                  << " fault_epoch=" << transition.fault_epoch
+                  << " consecutive_failures=" << transition.consecutive_failures
+                  << " backoff_ns=" << transition.backoff_ns;
+    }
     if (effects.retire_lane && report != nullptr) {
         report->retireProbeLane(effects.lane, effects.generation,
                                 effects.error_epoch, effects.path,
@@ -288,10 +302,15 @@ bool ProbeLinkManager::externalGateOk(const ProbeEdgeSupply& edge) {
     return edge.node_gate_ok && edge.port_gate_ok && edge.profile_gate_ok;
 }
 
-void ProbeLinkManager::setHealthLocked(PathRuntime& runtime, LinkHealth health,
-                                       Effects& effects) {
+void ProbeLinkManager::setHealthLocked(const PathVersion& version,
+                                       PathRuntime& runtime, LinkHealth health,
+                                       const char* reason, Effects& effects) {
     if (runtime.health == health) return;
+    const LinkHealth previous = runtime.health;
     runtime.health = health;
+    effects.health_transitions.push_back(Effects::HealthTransition{
+        version, previous, health, reason, runtime.fault_epoch,
+        runtime.consecutive_failures, runtime.backoff_ns});
     switch (health) {
         case LinkHealth::kEligibleUnverified:
             ++stats_.path_state_eligible;
@@ -319,10 +338,12 @@ void ProbeLinkManager::setHealthLocked(PathRuntime& runtime, LinkHealth health,
     }
 }
 
-void ProbeLinkManager::publishHealthyLocked(PathRuntime& runtime,
+void ProbeLinkManager::publishHealthyLocked(const PathVersion& version,
+                                            PathRuntime& runtime,
+                                            const char* reason,
                                             Effects& effects) {
     runtime.next_probe_ns = 0;
-    setHealthLocked(runtime, LinkHealth::kHealthy, effects);
+    setHealthLocked(version, runtime, LinkHealth::kHealthy, reason, effects);
 }
 
 uint64_t ProbeLinkManager::backoffDelayLocked(
@@ -755,6 +776,29 @@ bool ProbeLinkManager::onProbeCompletion(const Completion& completion,
             }
         } else {
             auto record = inflight->second;
+            if (verbose_events_ || VLOG_IS_ON(1)) {
+                if (verbose_events_) {
+                    LOG(INFO)
+                        << "UB probe completion: local_nic="
+                        << record->key.version.path.local_nic
+                        << " peer=" << record->key.version.path.segment_id
+                        << " remote_nic=" << record->key.version.path.remote_nic
+                        << " token=" << completion.token << " category="
+                        << completionCategoryName(completion.category)
+                        << " campaign=" << record->key.campaign_id << "/"
+                        << record->key.campaign_epoch;
+                } else {
+                    VLOG(1)
+                        << "UB probe completion: local_nic="
+                        << record->key.version.path.local_nic
+                        << " peer=" << record->key.version.path.segment_id
+                        << " remote_nic=" << record->key.version.path.remote_nic
+                        << " token=" << completion.token << " category="
+                        << completionCategoryName(completion.category)
+                        << " campaign=" << record->key.campaign_id << "/"
+                        << record->key.campaign_epoch;
+                }
+            }
             if (record->core.finalize_claimed.exchange(true)) return true;
             inflight_.erase(inflight);
             record->state = RecordState::kSettled;
@@ -880,12 +924,14 @@ void ProbeLinkManager::applyLocked(const Completion& completion,
                 return;
             }
             if (runtime.health == LinkHealth::kIsolated) {
-                setHealthLocked(runtime, LinkHealth::kRecovering, effects);
+                setHealthLocked(version, runtime, LinkHealth::kRecovering,
+                                "probe_success", effects);
             }
             if (externalGateOk(edge)) {
                 LOG_EVERY_N(INFO, 100)
                     << "UB probe path recovered: " << pathText(version);
-                publishHealthyLocked(runtime, effects);
+                publishHealthyLocked(version, runtime, "probe_success",
+                                     effects);
             } else {
                 // Probe proved liveness, but an external gate is closed:
                 // stay RECOVERING and keep proving liveness on the normal
@@ -909,7 +955,8 @@ void ProbeLinkManager::applyLocked(const Completion& completion,
                 // "Newly discovered bad" bumps the fault epoch; failing again
                 // while already isolated is only "not recovered yet".
                 ++runtime.fault_epoch;
-                setHealthLocked(runtime, LinkHealth::kIsolated, effects);
+                setHealthLocked(version, runtime, LinkHealth::kIsolated,
+                                "probe_failure", effects);
             }
             if (!test_probe) {
                 // Test-mode failures drive health but never apply exponential
@@ -944,7 +991,8 @@ void ProbeLinkManager::applyLocked(const Completion& completion,
                 // the lane and let the next interval re-check the link.
                 if (runtime.health != LinkHealth::kIsolated) {
                     ++runtime.fault_epoch;
-                    setHealthLocked(runtime, LinkHealth::kIsolated, effects);
+                    setHealthLocked(version, runtime, LinkHealth::kIsolated,
+                                    "probe_failure", effects);
                 }
                 runtime.next_probe_ns = now_ns + params_.intervalNs();
                 return;
@@ -966,7 +1014,8 @@ void ProbeLinkManager::applyLocked(const Completion& completion,
                 if (test_probe) ++stats_.probe_test_fail;
                 if (runtime.health != LinkHealth::kIsolated) {
                     ++runtime.fault_epoch;
-                    setHealthLocked(runtime, LinkHealth::kIsolated, effects);
+                    setHealthLocked(version, runtime, LinkHealth::kIsolated,
+                                    "probe_failure", effects);
                 }
                 runtime.next_probe_ns = now_ns + params_.intervalNs();
                 return;
@@ -1040,7 +1089,30 @@ void ProbeLinkManager::campaignProgressLocked(const ProbeKey& key,
         if (entry == campaign.entries.end()) break;
         if (entry->second.state != EntryState::kInflight) break;
         if (entry->second.entry_epoch != key.campaign_epoch) break;
+        const uint64_t entry_epoch = entry->second.entry_epoch;
         entry->second.state = outcome;
+        if (verbose_events_ || VLOG_IS_ON(1)) {
+            const char* state =
+                outcome == EntryState::kOk
+                    ? "ok"
+                    : (outcome == EntryState::kFail ? "fail" : "canceled");
+            if (verbose_events_) {
+                LOG(INFO) << "UB probe campaign entry: peer=" << peer.segment_id
+                          << " campaign=" << campaign.id
+                          << " epoch=" << campaign.epoch
+                          << " local_nic=" << key.version.path.local_nic
+                          << " remote_nic=" << key.version.path.remote_nic
+                          << " entry_epoch=" << entry_epoch
+                          << " state=" << state;
+            } else {
+                VLOG(1) << "UB probe campaign entry: peer=" << peer.segment_id
+                        << " campaign=" << campaign.id
+                        << " epoch=" << campaign.epoch
+                        << " local_nic=" << key.version.path.local_nic
+                        << " remote_nic=" << key.version.path.remote_nic
+                        << " entry_epoch=" << entry_epoch << " state=" << state;
+            }
+        }
         switch (outcome) {
             case EntryState::kOk:
                 ++stats_.campaign_entry_ok;
@@ -1073,6 +1145,31 @@ void ProbeLinkManager::exitFinishedCampaignsLocked() {
         if (active) {
             ++it;
         } else {
+            size_t entries = 0;
+            size_t ok = 0;
+            size_t fail = 0;
+            size_t canceled = 0;
+            for (const auto& [version, entry] : it->second.entries) {
+                (void)version;
+                ++entries;
+                switch (entry.state) {
+                    case EntryState::kOk:
+                        ++ok;
+                        break;
+                    case EntryState::kFail:
+                        ++fail;
+                        break;
+                    default:
+                        ++canceled;
+                        break;
+                }
+            }
+            LOG(INFO) << "UB probe campaign summary: peer="
+                      << it->second.peer.segment_id
+                      << " campaign=" << it->second.id
+                      << " epoch=" << it->second.epoch << " entries=" << entries
+                      << " ok=" << ok << " fail=" << fail
+                      << " canceled=" << canceled;
             LOG_EVERY_N(INFO, 100)
                 << "UB probe campaign exited: peer="
                 << it->second.peer.segment_id << " campaign=" << it->second.id
@@ -1235,7 +1332,7 @@ void ProbeLinkManager::onBusinessPathSuccessResolved(
         PathRuntime* runtime = findPathLocked(*version);
         if (runtime == nullptr) return;
         if (runtime->health != LinkHealth::kEligibleUnverified) return;
-        publishHealthyLocked(*runtime, effects);
+        publishHealthyLocked(*version, *runtime, "business_success", effects);
         // Business eligibility did not change (both states are usable), so no
         // path-bucket bump is needed (design §6.2).
         effects.bump = false;
@@ -1314,7 +1411,8 @@ void ProbeLinkManager::onBusinessPathErrorResolved(const ProbePathKey& key,
             return;
         }
         ++runtime->fault_epoch;
-        setHealthLocked(*runtime, LinkHealth::kIsolated, effects);
+        setHealthLocked(*version, *runtime, LinkHealth::kIsolated,
+                        "business_path_error", effects);
         runtime->backoff_ns = 0;
         runtime->next_probe_ns = now;
         runtime->consecutive_failures = 0;
@@ -1425,7 +1523,8 @@ void ProbeLinkManager::onContextUnavailable(Topology::NicID local_nic,
             if (runtime == nullptr) continue;
             cancelCampaignEntriesLocked(version);
             runtime->task = TaskState::kIdle;
-            setHealthLocked(*runtime, LinkHealth::kDisabled, effects);
+            setHealthLocked(version, *runtime, LinkHealth::kDisabled,
+                            "context_failure", effects);
         }
         markPortPendingLocked(*port, PendingReason::kContextFailure, now);
     }
@@ -1746,7 +1845,8 @@ Status ProbeLinkManager::applyEventLocked(const ProbeEvent& event,
                 auto edge = edges_.find(version);
                 if (runtime == nullptr || edge == edges_.end()) continue;
                 if (externalGateOk(edge->second)) {
-                    publishHealthyLocked(*runtime, effects);
+                    publishHealthyLocked(version, *runtime,
+                                         "peer_gate_reopened", effects);
                 } else {
                     ++stats_.probe_gate_blocked_by_external;
                 }
