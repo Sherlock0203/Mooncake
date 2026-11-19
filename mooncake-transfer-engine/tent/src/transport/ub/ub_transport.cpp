@@ -185,6 +185,13 @@ struct UbTransport::Impl {
                 "A real or injected URMA adapter is unavailable" LOC_MARK);
         }
         if (!config) config = std::make_shared<Config>();
+        {
+            uint64_t next_epoch = generationSeed();
+            while (next_epoch == topology_epoch) {
+                next_epoch = generationSeed();
+            }
+            topology_epoch = next_epoch;
+        }
 
         // RM auto-import pre-pass: when physical-only selection is requested
         // without explicit identities, collect them from the provider and
@@ -794,8 +801,16 @@ struct UbTransport::Impl {
                                 ub::ProbeDeclaredPeerPort{port.id, port.eid});
                         }
                     }
+                    std::map<std::string, uint64_t> peer_ids;
+                    for (const auto& [peer, decl] :
+                         probe_topology->peerDecls()) {
+                        (void)decl;
+                        auto id = probe_topology->probePeerId(peer);
+                        if (id.has_value()) peer_ids.emplace(peer, *id);
+                    }
                     probe_registry = std::make_unique<ub::ProbePeerRegistry>(
-                        declared, params.probe.handshake.withdraw_grace);
+                        declared, params.probe.handshake.withdraw_grace,
+                        peer_ids);
                     probe_source =
                         std::make_unique<ub::BootstrapProbePeerSource>(
                             probe_topology.get(), probe_registry.get());
@@ -980,6 +995,14 @@ struct UbTransport::Impl {
         if (probe_bootstrap_callback_installed && metadata) {
             metadata->setProbeBootstrapCallback({});
             probe_bootstrap_callback_installed = false;
+        }
+        if (probe_provider) {
+            auto* standalone =
+                dynamic_cast<ub::StandaloneProbeResourceProvider*>(
+                    probe_provider.get());
+            if (standalone != nullptr) {
+                standalone->setPublicationChangedCallback({});
+            }
         }
         // Fence the control plane before any probe resource is released.
         if (probe_coordinator) probe_coordinator->stop();
@@ -1329,6 +1352,28 @@ struct UbTransport::Impl {
                 << " peer(s), local declares " << params.probe.peers.size();
         }
 
+        // The request carries the requester's publication. Hand it to the
+        // coordinator, which applies it on a control executor (never on this
+        // RPC thread) and refreshes the graph. If this side did not declare
+        // the requester, the coordinator drops it.
+        if (probe_coordinator) {
+            ub::ProbeBootstrapResponse requester_publication;
+            requester_publication.responder_segment = request.requester_segment;
+            requester_publication.node_incarnation =
+                request.requester_node_incarnation;
+            requester_publication.topology_epoch =
+                request.requester_topology_epoch;
+            requester_publication.publication_epoch =
+                request.requester_publication_epoch;
+            requester_publication.transport_mode =
+                ub::kProbeBootstrapTransportMode;
+            requester_publication.device_kind = ub::kProbeBootstrapDeviceKind;
+            requester_publication.ports = request.ports;
+            (void)probe_coordinator->ingestPeerPublication(
+                request.requester_segment, requester_segment,
+                std::move(requester_publication));
+        }
+
         auto publication = standalone->publication();
         if (publication.ports.empty()) {
             response.reply_msg = "probe not ready";
@@ -1506,7 +1551,10 @@ struct UbTransport::Impl {
     // v2 descriptors; both are transport-lifetime stable in the P1 baseline.
     ub::UbRuntimeMode runtime_mode{ub::UbRuntimeMode::kRcLegacy};
     const uint64_t node_incarnation{generationSeed()};
-    const uint64_t topology_epoch{generationSeed()};
+    // topology_epoch identifies one transport install. It must change on
+    // every install (including uninstall/reinstall of the same object), since
+    // the provider publication epoch restarts at 1.
+    uint64_t topology_epoch{generationSeed()};
     std::string local_segment_name;
     std::shared_ptr<ControlService> metadata;
     std::shared_ptr<Topology> local_topology;

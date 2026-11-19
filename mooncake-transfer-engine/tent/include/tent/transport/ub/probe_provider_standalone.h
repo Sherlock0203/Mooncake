@@ -22,9 +22,9 @@
 //   * one page-aligned probe source page per port and generation.
 //
 // Remote probe areas and remote probe Jetty identities come through
-// ProbePeerDirectory. P1 ships this seam with a test/stub implementation; the
-// peer handshake (bootstrap extension) lands in P2. Lane retire/rebuild and
-// quarantine transfer are recorded here and become native in P4.
+// ProbePeerDirectory. Production builds it from the ProbeBootstrapUb handshake
+// and ProbePeerRegistry; tests inject a stub. Lane retire/rebuild performs a
+// native Jetty rebuild and emits kProbeHandleReplaced.
 //
 // Design: docs/analyze/tent-ub-probe-standalone-supply.md.
 
@@ -79,8 +79,8 @@ struct ProbePortSpec {
 };
 
 // Supplies the remote half of the probe graph: per-edge probe area descriptor
-// and remote probe Jetty identity. P2 replaces the stub with the bootstrap
-// handshake; the provider itself does not parse peer metadata. The directory
+// and remote probe Jetty identity. Production uses the bootstrap handshake
+// publication; the provider itself does not parse peer metadata. The directory
 // must outlive the provider and must not call back into it.
 class ProbePeerDirectory {
    public:
@@ -134,6 +134,11 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
     // defaults keep selftest/unit builds usable.
     void setNodeIdentity(std::string segment, uint64_t node_incarnation,
                          uint64_t topology_epoch);
+
+    // Invoked after a local probe Jetty rebuild bumps publication_epoch, so
+    // the coordinator can push the new publication immediately instead of
+    // waiting for its periodic refresh.
+    void setPublicationChangedCallback(std::function<void(uint64_t)> callback);
 
     // Responder snapshot (design §6.3/§7.2). Available once the local
     // resources exist; ports without a Jetty/area are omitted.
@@ -303,6 +308,7 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
     std::vector<ProbeHandoff> quarantine_;
     std::vector<RetiredPage> retired_pages_;
     ProbeAvailabilitySink* availability_sink_{nullptr};
+    std::function<void(uint64_t)> publication_changed_;
     ProbeCompletionSink completion_sink_;
     uint64_t graph_epoch_{0};
     uint64_t event_seq_{0};

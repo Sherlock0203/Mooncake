@@ -66,9 +66,9 @@ struct ProbePeerDescriptor {
     uint64_t endpoint_generation{0};
 };
 
-// Peer descriptor supply. P5 fills this from the bootstrap/control channel;
-// P2 tests use a stub. Must outlive the directory and must not call back into
-// it.
+// Peer descriptor supply. Production uses BootstrapProbePeerSource
+// (topology + peer publication registry); tests use a stub. Must outlive the
+// directory and must not call back into it.
 class ProbePeerDescriptorSource {
    public:
     virtual ~ProbePeerDescriptorSource() = default;

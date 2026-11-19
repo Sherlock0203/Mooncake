@@ -132,6 +132,29 @@ Status ControlClient::probeBootstrapUb(const std::string& server_addr,
 }
 #endif  // USE_UB
 
+void ControlClient::probeBootstrapUbAsync(
+    const std::string& server_addr, const ub::ProbeBootstrapRequest& request,
+    std::function<void(Status, ub::ProbeBootstrapResponse)> callback) {
+    std::string request_raw;
+    auto encoded = ub::encodeProbeBootstrapRequest(request, request_raw);
+    if (!encoded.ok()) {
+        callback(encoded, ub::ProbeBootstrapResponse{});
+        return;
+    }
+    tl_rpc_agent.callAsync(
+        server_addr, ProbeBootstrapUb, request_raw,
+        [callback = std::move(callback)](Status status,
+                                         std::string response_raw) mutable {
+            ub::ProbeBootstrapResponse response;
+            if (status.ok()) {
+                auto decoded =
+                    ub::decodeProbeBootstrapResponse(response_raw, response);
+                if (!decoded.ok()) status = decoded;
+            }
+            callback(status, std::move(response));
+        });
+}
+
 Status ControlClient::sendData(const std::string& server_addr,
                                uint64_t peer_mem_addr, void* local_mem_addr,
                                size_t length) {
@@ -335,11 +358,14 @@ ControlService::ControlService(const std::string& type,
             onBootstrapUb(request, response);
         });
 #ifdef USE_UB
+    // The handler may fetch the requester's segment metadata, so run it on
+    // the blocking executor instead of the io_context (P1-5).
     rpc_server_->registerFunction(
         ProbeBootstrapUb,
         [this](const std::string_view& request, std::string& response) {
             onProbeBootstrap(request, response);
-        });
+        },
+        /*offload=*/true);
 #endif
     rpc_server_->registerFunction(
         SendData,
@@ -561,22 +587,44 @@ void ControlService::onProbeBootstrap(const std::string_view& request,
                            : "ProbeBootstrapUb response encoding failed";
             return;
         }
-        int ret = -1;
+        OnProbeBootstrap callback;
         {
-            // Callback replacement during uninstall is serialized with
-            // invocation, so an in-flight handshake cannot outlive the UB
-            // transport object it targets.
             std::lock_guard<std::mutex> lock(probe_bootstrap_callback_mutex_);
             if (probe_bootstrap_callback_) {
-                ret = probe_bootstrap_callback_(request_desc, response_desc);
+                callback = probe_bootstrap_callback_;
+                ++probe_bootstrap_inflight_;
             } else {
                 response_desc.reply_msg =
                     "Probe bootstrap callback is not registered";
             }
         }
-        if (ret != 0 && response_desc.reply_msg.empty()) {
-            response_desc.reply_msg =
-                "Probe bootstrap callback failed, ret=" + std::to_string(ret);
+        if (callback) {
+            int ret = -1;
+            try {
+                ret = callback(request_desc, response_desc);
+            } catch (const std::exception& e) {
+                response_desc.reply_msg =
+                    std::string("Probe bootstrap callback failed: ") + e.what();
+            } catch (...) {
+                response_desc.reply_msg =
+                    "Probe bootstrap callback failed with an unknown "
+                    "exception";
+            }
+            {
+                std::lock_guard<std::mutex> lock(
+                    probe_bootstrap_callback_mutex_);
+                if (probe_bootstrap_inflight_ > 0) {
+                    --probe_bootstrap_inflight_;
+                }
+                if (probe_bootstrap_inflight_ == 0) {
+                    probe_bootstrap_callback_cv_.notify_all();
+                }
+            }
+            if (ret != 0 && response_desc.reply_msg.empty()) {
+                response_desc.reply_msg =
+                    "Probe bootstrap callback failed, ret=" +
+                    std::to_string(ret);
+            }
         }
     } catch (const std::exception& e) {
         response_desc.reply_msg =

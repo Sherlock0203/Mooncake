@@ -1094,6 +1094,7 @@ probe_refresh_hint
 实施说明：
 
 - `AdjacencyPolicy` 与 `ProbeTopology` 合并：`ProbeTopology` 持有声明、绑定与每个切片的 `AdjacencyView`，避免再引入一个可变的策略对象。
-- 握手 RPC 在独立控制线程上同步执行；`handshake/timeout_ms` 当前作为调度/观测预算，底层 `CoroRpcAgent::call` 没有独立的 socket 超时参数。后续可换成 `callAsync` + 控制执行器定时器实现硬超时，不影响本设计的配置/身份/图语义。
+- 握手 RPC 走 `ControlClient::probeBootstrapUbAsync`，由控制执行器上的 deadline 任务执行 `handshake/timeout_ms`；超时后迟到的回调被丢弃，不触碰 Registry/Provider。
+- 代次比较按 `(node_incarnation, topology_epoch, publication_epoch)` 语义：前两者不同即视为新代次（`generationSeed()` 非单调，不能比较大小），只有同一代次内才比较 `publication_epoch`；`topology_epoch` 每次安装重新生成，因此同进程卸载重装也能被接受。
 - `ProbePathKey` 只对“配置中声明了对端”的业务路径启用；未声明对端（注入 seam/未启用探测）继续走 `UbPostPath` 兼容入口，保持既有行为。
 - 基线中的 `probe_peer_source` 注入 seam 完全保留；声明模式在生产装配时自建 Registry/Source/Coordinator。

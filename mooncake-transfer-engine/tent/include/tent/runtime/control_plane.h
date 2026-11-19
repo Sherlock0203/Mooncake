@@ -118,6 +118,11 @@ class ControlClient {
     static Status probeBootstrapUb(const std::string& server_addr,
                                    const ub::ProbeBootstrapRequest& request,
                                    ub::ProbeBootstrapResponse& response);
+    // Non-blocking variant. The callback runs on the RPC completion thread.
+    static void probeBootstrapUbAsync(
+        const std::string& server_addr,
+        const ub::ProbeBootstrapRequest& request,
+        std::function<void(Status, ub::ProbeBootstrapResponse)> callback);
 #endif
 
     static Status sendData(const std::string& server_addr,
@@ -182,8 +187,17 @@ class ControlService {
 
 #ifdef USE_UB
     void setProbeBootstrapCallback(const OnProbeBootstrap& callback) {
-        std::lock_guard<std::mutex> lock(probe_bootstrap_callback_mutex_);
-        probe_bootstrap_callback_ = callback;
+        std::unique_lock<std::mutex> lock(probe_bootstrap_callback_mutex_);
+        if (callback) {
+            probe_bootstrap_callback_ = callback;
+            return;
+        }
+        // Fence new invocations, then wait for an already running handler.
+        // The handler does not hold this mutex while it fetches peer metadata,
+        // so clearing does not block sibling handshakes.
+        probe_bootstrap_callback_ = {};
+        probe_bootstrap_callback_cv_.wait(
+            lock, [this] { return probe_bootstrap_inflight_ == 0; });
     }
 #endif
 
@@ -247,6 +261,8 @@ class ControlService {
 
 #ifdef USE_UB
     std::mutex probe_bootstrap_callback_mutex_;
+    std::condition_variable probe_bootstrap_callback_cv_;
+    size_t probe_bootstrap_inflight_{0};
     OnProbeBootstrap probe_bootstrap_callback_;
 #endif
 

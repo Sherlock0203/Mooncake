@@ -47,6 +47,19 @@ struct ProbePeerPortBinding {
     bool withdrawn{false};
 };
 
+// Lightweight publication view for the business hot path: no area descriptor
+// or Jetty payload, only the per-port gate/withdrawal state.
+struct ProbePeerPortView {
+    bool withdrawn{false};
+    bool gates_ok{false};
+};
+
+struct ProbePeerPublicationView {
+    bool published{false};
+    bool stale{false};
+    std::map<std::string, ProbePeerPortView> ports;
+};
+
 struct ProbePeerBinding {
     std::string segment;
     uint64_t peer_id{0};
@@ -73,13 +86,19 @@ class ProbePeerRegistry {
     explicit ProbePeerRegistry(
         const std::map<std::string, std::vector<ProbeDeclaredPeerPort>>&
             declared,
-        uint32_t withdraw_grace = 3);
+        uint32_t withdraw_grace = 3,
+        const std::map<std::string, uint64_t>& peer_ids = {});
 
     // Applies a validated publication. A stale incarn/epoch is acknowledged
     // but not applied (`applied=false`). Ports absent from `publication` are
     // carried over until withdraw_grace consecutive misses, then withdrawn.
     Status apply(const ProbePeerBinding& publication, uint64_t now_ns,
-                 bool* applied = nullptr);
+                 bool* applied = nullptr, bool* stale = nullptr);
+
+    // Cheap snapshot used by ProbeTopology::viewFor() on every route; it
+    // deliberately omits handles and descriptor hex.
+    [[nodiscard]] std::optional<ProbePeerPublicationView> publicationView(
+        const std::string& peer) const;
 
     // A failed handshake keeps the last usable publication but marks it stale
     // for observation; it never removes edges or blocks business by itself.

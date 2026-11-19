@@ -113,12 +113,59 @@ TEST(UbProbePeerRegistryTest, AppliesPublicationsAndShortCircuitsUnchanged) {
         registry.apply(makePublication(11, 1, true), 200, &applied).ok());
     EXPECT_FALSE(applied);
 
-    // A stale incarnation is ignored.
+    // A different node incarnation is a new generation even though the
+    // numeric value is smaller (the seed is not monotonic).
+    applied = false;
+    auto restarted = makePublication(10, 2, true);
+    restarted.topology_epoch = 8;
+    ASSERT_TRUE(registry.apply(restarted, 300, &applied).ok());
+    EXPECT_TRUE(applied);
+    EXPECT_EQ(registry.find("node-b")->node_incarnation, 10U);
+
+    // An in-generation older publication is still ignored.
     applied = true;
-    ASSERT_TRUE(
-        registry.apply(makePublication(10, 2, true), 300, &applied).ok());
+    auto older = makePublication(10, 1, true);
+    older.topology_epoch = 8;
+    ASSERT_TRUE(registry.apply(older, 400, &applied).ok());
     EXPECT_FALSE(applied);
-    EXPECT_EQ(registry.find("node-b")->node_incarnation, 11U);
+    EXPECT_EQ(registry.find("node-b")->publication_epoch, 2U);
+}
+
+TEST(UbProbePeerRegistryTest, RejectsAPublicationWithTheWrongPeerId) {
+    ProbePeerRegistry registry(declaredPeers(), 3);
+    auto publication = makePublication(11, 1, true);
+    publication.peer_id = kProbePeerIdBase + 7;
+    EXPECT_TRUE(registry.apply(publication, 100).IsInvalidArgument());
+    EXPECT_FALSE(registry.find("node-b")->published);
+}
+
+TEST(UbProbePeerRegistryTest, ReinstallWithAResetPublicationEpochIsAccepted) {
+    ProbePeerRegistry registry(declaredPeers(), 3);
+    ASSERT_TRUE(registry.apply(makePublication(11, 9, true), 100).ok());
+
+    // Same process incarnation, new install: topology_epoch changes but the
+    // provider publication epoch restarts at 1. This must be accepted.
+    auto reinstall = makePublication(11, 1, true);
+    reinstall.topology_epoch = 8;
+    bool applied = false;
+    ASSERT_TRUE(registry.apply(reinstall, 200, &applied).ok());
+    EXPECT_TRUE(applied);
+    EXPECT_EQ(registry.find("node-b")->publication_epoch, 1U);
+    EXPECT_EQ(registry.find("node-b")->topology_epoch, 8U);
+}
+
+TEST(UbProbePeerRegistryTest, SamePublicationClearsStale) {
+    ProbePeerRegistry registry(declaredPeers(), 3);
+    ASSERT_TRUE(registry.apply(makePublication(11, 1, true), 100).ok());
+    registry.markStale("node-b", 200);
+    ASSERT_TRUE(registry.find("node-b")->stale);
+
+    bool applied = true;
+    ASSERT_TRUE(
+        registry.apply(makePublication(11, 1, true), 300, &applied).ok());
+    EXPECT_FALSE(applied);
+    EXPECT_FALSE(registry.find("node-b")->stale);
+    EXPECT_EQ(registry.find("node-b")->last_success_ns, 300U);
 }
 
 TEST(UbProbePeerRegistryTest, WithdrawsAfterGraceAndReturnsOnReappearance) {
@@ -269,6 +316,23 @@ TEST(UbProbePeerRegistryTest, AdjacencyViewTracksPublicationAndGates) {
     view = topology.viewFor("node-b", segment);
     EXPECT_EQ(view.check(0, 0), AdjacencyDecision::kAllowed);
     EXPECT_EQ(view.check(0, 1), AdjacencyDecision::kPortMissing);
+}
+
+TEST(UbProbePeerRegistryTest, AdjacencyViewFailsClosedForFileSegments) {
+    Topology local;
+    DeviceInfo device;
+    auto topology = makeTopology(local, device);
+    ProbePeerRegistry registry(declaredPeers(), 3);
+    topology.setPeerRegistry(&registry);
+
+    SegmentDesc file_segment;
+    file_segment.name = "node-b";
+    file_segment.type = SegmentType::File;
+
+    const auto view = topology.viewFor("node-b", file_segment);
+    EXPECT_TRUE(view.enforced);
+    EXPECT_TRUE(view.peer_eid_unmatched);
+    EXPECT_EQ(view.check(0, 0), AdjacencyDecision::kPeerEidUnmatched);
 }
 
 }  // namespace

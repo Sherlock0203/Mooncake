@@ -357,6 +357,38 @@ TEST(UbProbeStandaloneProviderTest, RefreshEmitsIncrementalGraphEvents) {
     EXPECT_TRUE(adapter->shutdown().ok());
 }
 
+TEST(UbProbeStandaloneProviderTest, RebuildPushesTheNewPublicationEpoch) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+    ContextPtr context;
+    ASSERT_TRUE(adapter->openContext(fakeDevice(), context).ok());
+
+    StubPeerDirectory directory({makeEdge(0, 42, 0)});
+    StandaloneProbeResourceProvider provider(
+        adapter, makeProbeParams(),
+        {ProbeLocalPortConfig{0, context, nullptr, 1}}, &directory);
+    ProbeGraph graph;
+    ASSERT_TRUE(provider.snapshot(graph).ok());
+    RecordingAvailabilitySink sink;
+    provider.setAvailabilitySink(&sink);
+    provider.setCompletionSink([](const Completion&) { return Status::OK(); });
+    uint64_t pushed_epoch = 0;
+    provider.setPublicationChangedCallback(
+        [&](uint64_t epoch) { pushed_epoch = epoch; });
+
+    const uint32_t jetty_id = graph.ports[0].probe_jetty->id();
+    const PathVersion version{ProbePathKey{0, 42, 0}, 1, 1};
+    provider.retireProbeLane(LaneKey{0, jetty_id, 1}, 1, 7, version,
+                             Status::InternalError("injected retire"));
+    ASSERT_TRUE(provider.waitForRebuilds(2000));
+    EXPECT_GT(provider.publicationEpoch(), 1U);
+    EXPECT_EQ(pushed_epoch, provider.publicationEpoch());
+
+    ASSERT_TRUE(provider.shutdown().ok());
+    EXPECT_TRUE(adapter->closeContext(context).ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
 TEST(UbProbeStandaloneProviderTest, DeclaredPortsPublishNodeIdentityAndArea) {
     auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
     ASSERT_TRUE(adapter->initialize().ok());

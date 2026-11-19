@@ -255,7 +255,7 @@ constexpr const char* entryStateName(EntryState state) {
 
 // ---------------------------------------------------------------------------
 // Tuning (design §13.1). Parsing/validation of the transports/ub/probe/* keys
-// is a separate milestone; these are the locked defaults.
+// lives in params.h; these are the locked defaults.
 enum class ProbeJfcMode : uint8_t {
     kDedicated,
     kShared,
@@ -402,8 +402,8 @@ struct ProbeParams {
         if (jfc_depth < 8) return false;
         if (jfc_mode == ProbeJfcMode::kShared && credit_reserve == 0)
             return false;
-        // Standalone currently builds its probe JFC itself; shared mode needs
-        // a business JFC injected per port, which lands with the P5 follow-up.
+        // Standalone builds its probe JFC itself; shared mode needs a business
+        // JFC injected per port and is not supported by this profile.
         if (provider == ProbeProviderKind::kStandalone &&
             jfc_mode == ProbeJfcMode::kShared) {
             return false;

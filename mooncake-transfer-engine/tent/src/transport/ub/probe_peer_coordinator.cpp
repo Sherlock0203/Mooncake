@@ -125,14 +125,26 @@ Status ProbePeerCoordinator::start() {
 }
 
 void ProbePeerCoordinator::stop() {
-    if (!running_.exchange(false, std::memory_order_acq_rel)) {
-        for (auto& executor : executors_) executor->stop();
-        executors_.clear();
-        return;
-    }
     stopping_.store(true, std::memory_order_release);
-    for (auto& executor : executors_) executor->stop();
-    executors_.clear();
+    running_.store(false, std::memory_order_release);
+    std::vector<std::unique_ptr<ThreadedControlExecutor>> executors;
+    {
+        std::lock_guard<std::mutex> lock(executor_mutex_);
+        executors.swap(executors_);
+    }
+    for (auto& executor : executors) executor->stop();
+    lifetime_->stopping.store(true, std::memory_order_release);
+    {
+        // Callbacks that already passed the stopping check decrement inflight
+        // before they finish; bound the wait so a wedged peer cannot hang
+        // uninstall forever.
+        std::unique_lock<std::mutex> wait(lifetime_->mutex);
+        const auto budget = std::chrono::milliseconds(
+            std::max<uint64_t>(params_.handshake.timeout_ms * 2, 1000));
+        lifetime_->cv.wait_for(wait, budget, [this] {
+            return lifetime_->inflight.load(std::memory_order_acquire) == 0;
+        });
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto& [peer, state] : peers_) {
         (void)peer;
@@ -146,15 +158,29 @@ bool ProbePeerCoordinator::running() const {
     return running_.load(std::memory_order_acquire);
 }
 
-void ProbePeerCoordinator::scheduleTick(uint64_t delay_ns) {
+Status ProbePeerCoordinator::submitControlTask(std::function<void()> task) {
+    std::lock_guard<std::mutex> lock(executor_mutex_);
+    if (executors_.empty()) {
+        return Status::InvalidArgument("probe coordinator is stopped");
+    }
+    auto& executor = executors_[round_robin_++ % executors_.size()];
+    return executor->submit(std::move(task));
+}
+
+void ProbePeerCoordinator::scheduleControlTask(uint64_t delay_ns,
+                                               std::function<void()> task) {
+    std::lock_guard<std::mutex> lock(executor_mutex_);
     if (executors_.empty()) return;
-    auto status =
-        executors_.front()->scheduleAfter(delay_ns, [this] { tickChain(); });
+    auto status = executors_.front()->scheduleAfter(delay_ns, std::move(task));
     if (!status.ok() && !stopping_.load(std::memory_order_acquire)) {
         LOG_EVERY_N(WARNING, 100)
-            << "UB probe: cannot schedule handshake tick: "
+            << "UB probe: cannot schedule handshake task: "
             << status.ToString();
     }
+}
+
+void ProbePeerCoordinator::scheduleTick(uint64_t delay_ns) {
+    scheduleControlTask(delay_ns, [this] { tickChain(); });
 }
 
 void ProbePeerCoordinator::tickChain() {
@@ -243,28 +269,39 @@ void ProbePeerCoordinator::processDue() {
 
 void ProbePeerCoordinator::submitAttempt(const std::string& peer,
                                          uint64_t now_ns) {
-    if (executors_.empty()) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto found = peers_.find(peer);
-        if (found != peers_.end()) found->second.in_flight = false;
-        return;
-    }
-    auto& executor = executors_[round_robin_++ % executors_.size()];
-    auto status = executor->submit([this, peer, now_ns] {
+    auto status = submitControlTask([this, peer, now_ns] {
         if (stopping_.load(std::memory_order_acquire)) {
             std::lock_guard<std::mutex> lock(mutex_);
             auto found = peers_.find(peer);
             if (found != peers_.end()) found->second.in_flight = false;
             return;
         }
+        if (deps_.async_rpc) {
+            (void)startAsyncAttempt(peer, now_ns);
+            return;
+        }
         auto result = runAttempt(peer, now_ns);
         const uint64_t finished = nowNs();
-        std::lock_guard<std::mutex> lock(mutex_);
-        noteAttemptFinishedLocked(peer, finished, result.ok());
-        auto found = peers_.find(peer);
-        if (found != peers_.end() && found->second.refresh_queued) {
-            found->second.refresh_queued = false;
-            found->second.next_attempt_ns = finished;
+        bool wake = false;
+        uint64_t delay = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            noteAttemptFinishedLocked(peer, finished, result.ok());
+            auto found = peers_.find(peer);
+            if (found != peers_.end() && found->second.refresh_queued) {
+                found->second.refresh_queued = false;
+                found->second.next_attempt_ns = finished;
+            }
+            if (found != peers_.end() &&
+                found->second.next_attempt_ns > finished) {
+                wake = true;
+                delay = found->second.next_attempt_ns - finished;
+            }
+        }
+        if (wake) {
+            // Failure backoff must wake on its own; the periodic tick alone
+            // would stretch a 1 s retry to refresh_interval (P1-3).
+            scheduleControlTask(delay, [this] { processDue(); });
         }
     });
     if (!status.ok()) {
@@ -342,6 +379,164 @@ Status ProbePeerCoordinator::buildRequest(
     return Status::OK();
 }
 
+Status ProbePeerCoordinator::startAsyncAttempt(const std::string& peer,
+                                               uint64_t now_ns) {
+    auto finish_without_attempt = [this, &peer, now_ns](bool success) {
+        bool wake = false;
+        uint64_t delay = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            noteAttemptFinishedLocked(peer, now_ns, success);
+            auto found = peers_.find(peer);
+            if (found != peers_.end() &&
+                found->second.next_attempt_ns > now_ns) {
+                wake = true;
+                delay = found->second.next_attempt_ns - now_ns;
+            }
+        }
+        if (wake) {
+            scheduleControlTask(delay, [this] { processDue(); });
+        }
+    };
+    auto publication = deps_.provider->publication();
+    if (publication.ports.empty()) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++stats_.not_ready;
+        finish_without_attempt(false);
+        return Status::InvalidArgument("probe not ready");
+    }
+    SegmentDescRef segment;
+    auto resolve = deps_.segment_manager->getRemote(segment, peer);
+    if (!resolve.ok() || !segment) {
+        deps_.registry->markStale(peer, now_ns);
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++stats_.peer_unresolved;
+        finish_without_attempt(false);
+        return Status::DeviceNotFound("probe peer is unresolved");
+    }
+    ProbeBootstrapRequest request;
+    auto status = buildRequest(request);
+    if (!status.ok()) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++stats_.not_ready;
+        finish_without_attempt(false);
+        return status;
+    }
+    auto attempt = std::make_shared<AttemptState>(peer);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        async_attempts_[peer] = attempt;
+        ++stats_.attempts;
+    }
+    auto lifetime = lifetime_;
+    lifetime->inflight.fetch_add(1, std::memory_order_acq_rel);
+    deps_.async_rpc(
+        segment->rpc_server_addr, request,
+        [this, attempt, lifetime, segment = std::move(segment)](
+            Status rpc_status, ProbeBootstrapResponse response) mutable {
+            bool expected = false;
+            if (!attempt->finished.compare_exchange_strong(
+                    expected, true, std::memory_order_acq_rel)) {
+                // The timeout path owns the single inflight release.
+                return;
+            }
+            if (lifetime->stopping.load(std::memory_order_acquire)) {
+                if (lifetime->inflight.fetch_sub(
+                        1, std::memory_order_acq_rel) == 1) {
+                    lifetime->cv.notify_all();
+                }
+                return;
+            }
+            auto task = [this, attempt, lifetime, rpc_status,
+                         response = std::move(response),
+                         segment = std::move(segment)]() mutable {
+                if (stopping_.load(std::memory_order_acquire)) {
+                    if (lifetime->inflight.fetch_sub(
+                            1, std::memory_order_acq_rel) == 1) {
+                        lifetime->cv.notify_all();
+                    }
+                    return;
+                }
+                bool success = false;
+                if (rpc_status.ok()) {
+                    auto applied = applyResponse(attempt->peer, *segment,
+                                                 response, nowNs());
+                    success = applied.ok();
+                    if (!success) {
+                        deps_.registry->markStale(attempt->peer, nowNs());
+                    }
+                } else {
+                    deps_.registry->markStale(attempt->peer, nowNs());
+                    LOG_EVERY_N(WARNING, 100)
+                        << "UB probe handshake failed: peer=" << attempt->peer
+                        << " status=" << rpc_status.ToString();
+                }
+                finishAsyncAttempt(attempt, success, /*timeout=*/false);
+                if (lifetime->inflight.fetch_sub(
+                        1, std::memory_order_acq_rel) == 1) {
+                    lifetime->cv.notify_all();
+                }
+            };
+            if (!submitControlTask(std::move(task)).ok()) {
+                deps_.registry->markStale(attempt->peer, nowNs());
+                finishAsyncAttempt(attempt, false, /*timeout=*/false);
+                if (lifetime->inflight.fetch_sub(
+                        1, std::memory_order_acq_rel) == 1) {
+                    lifetime->cv.notify_all();
+                }
+            }
+        });
+    scheduleControlTask(params_.handshakeTimeoutNs(), [this, attempt,
+                                                       lifetime] {
+        bool expected = false;
+        if (!attempt->finished.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel)) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ++stats_.timeout;
+        }
+        deps_.registry->markStale(attempt->peer, nowNs());
+        LOG_EVERY_N(WARNING, 100)
+            << "UB probe handshake timed out: peer=" << attempt->peer;
+        finishAsyncAttempt(attempt, false, /*timeout=*/true);
+        if (lifetime->inflight.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            lifetime->cv.notify_all();
+        }
+    });
+    return Status::OK();
+}
+
+void ProbePeerCoordinator::finishAsyncAttempt(
+    const std::shared_ptr<AttemptState>& attempt, bool success, bool timeout) {
+    (void)timeout;
+    const uint64_t now = nowNs();
+    bool wake = false;
+    uint64_t wake_delay = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto found = async_attempts_.find(attempt->peer);
+        if (found != async_attempts_.end() && found->second == attempt) {
+            async_attempts_.erase(found);
+        }
+        if (success) {
+            ++stats_.success;
+        } else {
+            ++stats_.failure;
+        }
+        noteAttemptFinishedLocked(attempt->peer, now, success);
+        auto peer = peers_.find(attempt->peer);
+        if (peer != peers_.end() && peer->second.next_attempt_ns > now) {
+            wake = true;
+            wake_delay = peer->second.next_attempt_ns - now;
+        }
+    }
+    if (wake) {
+        scheduleControlTask(wake_delay, [this] { processDue(); });
+    }
+}
+
 Status ProbePeerCoordinator::runAttempt(const std::string& peer,
                                         uint64_t now_ns) {
     if (stopping_.load(std::memory_order_acquire)) {
@@ -406,11 +601,20 @@ Status ProbePeerCoordinator::runAttempt(const std::string& peer,
 Status ProbePeerCoordinator::applyResponse(
     const std::string& peer, const SegmentDesc& segment,
     const ProbeBootstrapResponse& response, uint64_t now_ns) {
+    if (response.schema_version != kProbeBootstrapSchemaVersion) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++stats_.unsupported;
+        return Status::InvalidArgument("unsupported probe schema version");
+    }
     auto validation = validateProbeBootstrapResponse(response);
     if (!validation.ok()) return validation;
     if (response.responder_segment != peer) {
         return Status::InvalidArgument(
             "probe responder segment does not match the configured peer");
+    }
+    if (segment.type != SegmentType::Memory) {
+        return Status::InvalidArgument(
+            "probe peer segment is not memory-backed");
     }
     const auto peer_id = deps_.topology->probePeerId(peer);
     if (!peer_id.has_value()) {
@@ -472,17 +676,29 @@ Status ProbePeerCoordinator::applyResponse(
         std::lock_guard<std::mutex> lock(mutex_);
         stats_.publication_unknown_port += response.ports.size() - matched;
     }
+    if (matched < declared_ports->size()) {
+        const size_t missing = declared_ports->size() - matched;
+        std::lock_guard<std::mutex> lock(mutex_);
+        stats_.missing_remote_ports += missing;
+        if (params_.handshake.require_peer_ports) {
+            LOG(WARNING) << "UB probe publication is missing " << missing
+                         << " declared peer port(s): peer=" << peer;
+        }
+    }
     if (matched == 0) {
         return Status::InvalidArgument(
             "probe publication matched no declared peer port");
     }
     bool applied = false;
-    auto status = deps_.registry->apply(binding, now_ns, &applied);
+    bool stale = false;
+    auto status = deps_.registry->apply(binding, now_ns, &applied, &stale);
     if (!status.ok()) return status;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (applied) {
             ++stats_.publication_apply;
+        } else if (stale) {
+            ++stats_.publication_stale;
         } else {
             ++stats_.publication_unchanged;
         }
@@ -519,9 +735,7 @@ void ProbePeerCoordinator::requestRefresh(const std::string& peer,
         LOG_EVERY_N(INFO, 100) << "UB probe refresh requested: peer=" << peer
                                << " reason=" << (reason ? reason : "");
     }
-    if (!executors_.empty()) {
-        (void)executors_.front()->submit([this] { processDue(); });
-    }
+    (void)submitControlTask([this] { processDue(); });
 }
 
 void ProbePeerCoordinator::onLocalPublicationChanged(
@@ -541,9 +755,35 @@ void ProbePeerCoordinator::onLocalPublicationChanged(
             }
         }
     }
-    if (changed && !executors_.empty()) {
-        (void)executors_.front()->submit([this] { processDue(); });
+    if (changed) {
+        (void)submitControlTask([this] { processDue(); });
     }
+}
+
+bool ProbePeerCoordinator::acceptsPeer(const std::string& peer) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return peers_.count(peer) != 0;
+}
+
+Status ProbePeerCoordinator::ingestPeerPublication(
+    const std::string& peer, SegmentDescRef segment,
+    ProbeBootstrapResponse publication) {
+    if (!acceptsPeer(peer)) return Status::OK();
+    if (!running_.load(std::memory_order_acquire) || !segment) {
+        // The peer retries on its next refresh; dropping is safe and never
+        // blocks the RPC handler.
+        return Status::OK();
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++stats_.publication_ingest;
+    }
+    submitControlTask([this, peer = std::string(peer), segment,
+                       publication = std::move(publication)]() mutable {
+        if (stopping_.load(std::memory_order_acquire)) return;
+        (void)applyResponse(peer, *segment, publication, nowNs());
+    });
+    return Status::OK();
 }
 
 void ProbePeerCoordinator::noteBusinessPathError(uint64_t peer_id) {
@@ -571,9 +811,7 @@ void ProbePeerCoordinator::noteBusinessPathError(uint64_t peer_id) {
         if (found->second.in_flight) found->second.refresh_queued = true;
         ++stats_.refresh_hint;
     }
-    if (!executors_.empty()) {
-        (void)executors_.front()->submit([this] { processDue(); });
-    }
+    (void)submitControlTask([this] { processDue(); });
 }
 
 uint64_t ProbePeerCoordinator::localPublicationEpoch() const {

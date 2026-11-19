@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "tent/common/status.h"
+#include "tent/transport/ub/probe_stats.h"
 #include "tent/runtime/segment.h"
 #include "tent/runtime/topology.h"
 #include "tent/transport/ub/probe_types.h"
@@ -110,19 +111,6 @@ struct AdjacencyView {
     [[nodiscard]] AdjacencyDecision check(Topology::NicID local_nic,
                                           Topology::NicID remote_nic,
                                           bool* local_declared = nullptr) const;
-};
-
-struct ProbeTopologyStats {
-    uint64_t ports{0};
-    uint64_t edges{0};
-    uint64_t adjacency_allowed{0};
-    uint64_t adjacency_undeclared_peer{0};
-    uint64_t adjacency_undeclared_local{0};
-    uint64_t adjacency_undeclared_remote{0};
-    uint64_t adjacency_peer_eid_unmatched{0};
-    uint64_t adjacency_port_missing{0};
-    uint64_t adjacency_peer_gate_blocked{0};
-    uint64_t adjacency_unverified_peer{0};
 };
 
 // Immutable after resolve(); shared by the workers' read-only routing gate.

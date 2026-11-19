@@ -6,8 +6,11 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <functional>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "tent/runtime/segment_manager.h"
@@ -315,6 +318,108 @@ TEST(UbProbePeerCoordinatorTest, UnknownPublicationPortsAreIgnored) {
     ASSERT_TRUE(coordinator.handshakeOnce("node-b", 1000).ok());
     EXPECT_EQ(coordinator.stats().publication_unknown_port, 1U);
     EXPECT_EQ(fixture.registry->find("node-b")->ports.size(), 2U);
+}
+
+TEST(UbProbePeerCoordinatorTest, IngestAppliesTheRequestersPublication) {
+    Fixture fixture;
+    ASSERT_TRUE(fixture.build());
+    ProbePeerCoordinator::Dependencies deps;
+    deps.segment_manager = fixture.segments.get();
+    deps.registry = fixture.registry.get();
+    deps.provider = fixture.provider.get();
+    deps.topology = fixture.topology_owner.get();
+    deps.rpc = [](const std::string&, const ProbeBootstrapRequest&,
+                  ProbeBootstrapResponse&) {
+        return Status::RpcServiceError("unused");
+    };
+    ProbePeerCoordinator coordinator(fixture.params, deps);
+    ASSERT_TRUE(coordinator.start().ok());
+    ASSERT_TRUE(coordinator
+                    .ingestPeerPublication("node-b", fixture.peer_segment,
+                                           fixture.response())
+                    .ok());
+    auto published = [&] {
+        auto binding = fixture.registry->find("node-b");
+        return binding.has_value() && binding->published;
+    };
+    for (int i = 0; i < 200 && !published(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_TRUE(fixture.registry->find("node-b").has_value());
+    EXPECT_TRUE(fixture.registry->find("node-b")->published);
+    coordinator.stop();
+}
+
+TEST(UbProbePeerCoordinatorTest, FailureWakesOnItsBackoffDeadline) {
+    Fixture fixture;
+    ASSERT_TRUE(fixture.build());
+    fixture.params.handshake.retry_backoff_ms = 100;
+    fixture.params.handshake.refresh_interval_ms = 1000;
+    int calls = 0;
+    ProbePeerCoordinator::Dependencies deps;
+    deps.segment_manager = fixture.segments.get();
+    deps.registry = fixture.registry.get();
+    deps.provider = fixture.provider.get();
+    deps.topology = fixture.topology_owner.get();
+    deps.rpc = [&](const std::string&, const ProbeBootstrapRequest&,
+                   ProbeBootstrapResponse&) {
+        ++calls;
+        return Status::RpcServiceError("peer down");
+    };
+    ProbePeerCoordinator coordinator(fixture.params, deps);
+    ASSERT_TRUE(coordinator.start().ok());
+    for (int i = 0; i < 300 && calls < 2; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    EXPECT_GE(calls, 2);
+    coordinator.stop();
+}
+
+TEST(UbProbePeerCoordinatorTest, AsyncHandshakeTimesOutAndMarksStale) {
+    Fixture fixture;
+    ASSERT_TRUE(fixture.build());
+    fixture.params.handshake.timeout_ms = 100;
+    fixture.params.handshake.refresh_interval_ms = 1000;
+    fixture.params.handshake.retry_backoff_ms = 100;
+    ProbePeerCoordinator::Dependencies deps;
+    deps.segment_manager = fixture.segments.get();
+    deps.registry = fixture.registry.get();
+    deps.provider = fixture.provider.get();
+    deps.topology = fixture.topology_owner.get();
+    deps.rpc = [](const std::string&, const ProbeBootstrapRequest&,
+                  ProbeBootstrapResponse&) { return Status::OK(); };
+    // Never completes: the coordinator's own deadline must fire.
+    deps.async_rpc = [](const std::string&, const ProbeBootstrapRequest&,
+                        std::function<void(Status, ProbeBootstrapResponse)>) {};
+    ProbePeerCoordinator coordinator(fixture.params, deps);
+    ASSERT_TRUE(coordinator.start().ok());
+    for (int i = 0; i < 300 && coordinator.stats().timeout == 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    EXPECT_GE(coordinator.stats().timeout, 1U);
+    coordinator.stop();
+}
+
+TEST(UbProbePeerCoordinatorTest, OlderSameGenerationPublicationIsCountedStale) {
+    Fixture fixture;
+    ASSERT_TRUE(fixture.build());
+    ProbePeerCoordinator::Dependencies deps;
+    deps.segment_manager = fixture.segments.get();
+    deps.registry = fixture.registry.get();
+    deps.provider = fixture.provider.get();
+    deps.topology = fixture.topology_owner.get();
+    uint64_t epoch = 2;
+    deps.rpc = [&](const std::string&, const ProbeBootstrapRequest&,
+                   ProbeBootstrapResponse& response) {
+        response = fixture.response(11, epoch);
+        return Status::OK();
+    };
+    ProbePeerCoordinator coordinator(fixture.params, deps);
+    ASSERT_TRUE(coordinator.handshakeOnce("node-b", 1000).ok());
+    epoch = 1;
+    ASSERT_TRUE(coordinator.handshakeOnce("node-b", 2000).ok());
+    EXPECT_GE(coordinator.stats().publication_stale, 1U);
+    EXPECT_EQ(fixture.registry->find("node-b")->publication_epoch, 2U);
 }
 
 }  // namespace

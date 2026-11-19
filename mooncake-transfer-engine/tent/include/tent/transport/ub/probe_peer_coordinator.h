@@ -11,6 +11,7 @@
 #define TENT_TRANSPORT_UB_PROBE_PEER_COORDINATOR_H_
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -25,31 +26,12 @@
 #include "tent/transport/ub/probe_bootstrap.h"
 #include "tent/transport/ub/probe_peer_registry.h"
 #include "tent/transport/ub/probe_provider_standalone.h"
+#include "tent/transport/ub/probe_stats.h"
 #include "tent/transport/ub/probe_topology.h"
 
 namespace mooncake {
 namespace tent {
 namespace ub {
-
-struct ProbeCoordinatorStats {
-    uint64_t attempts{0};
-    uint64_t success{0};
-    uint64_t failure{0};
-    uint64_t timeout{0};
-    uint64_t skipped_inflight{0};
-    uint64_t peer_unresolved{0};
-    uint64_t unsupported{0};
-    uint64_t not_ready{0};
-    uint64_t publication_apply{0};
-    uint64_t publication_unchanged{0};
-    uint64_t publication_stale{0};
-    uint64_t publication_unknown_port{0};
-    uint64_t publication_identity_mismatch{0};
-    uint64_t peer_publication_stale{0};
-    uint64_t graph_event_failed{0};
-    uint64_t refresh_hint{0};
-    uint64_t publication_bump{0};
-};
 
 class ProbePeerCoordinator {
    public:
@@ -60,6 +42,11 @@ class ProbePeerCoordinator {
     using HandshakeRpc = std::function<Status(
         const std::string& server_addr, const ProbeBootstrapRequest& request,
         ProbeBootstrapResponse& response)>;
+    // Non-blocking variant used in production: the callback runs on the RPC
+    // completion thread and must only hand work back to the coordinator.
+    using AsyncHandshakeRpc = std::function<void(
+        const std::string& server_addr, const ProbeBootstrapRequest& request,
+        std::function<void(Status, ProbeBootstrapResponse)> callback)>;
 
     struct Dependencies {
         SegmentManager* segment_manager{nullptr};
@@ -67,6 +54,7 @@ class ProbePeerCoordinator {
         StandaloneProbeResourceProvider* provider{nullptr};
         const ProbeTopology* topology{nullptr};
         HandshakeRpc rpc;
+        AsyncHandshakeRpc async_rpc;
     };
 
     ProbePeerCoordinator(ProbeParams params, Dependencies dependencies,
@@ -85,6 +73,14 @@ class ProbePeerCoordinator {
     void onLocalPublicationChanged(uint64_t publication_epoch);
     void noteBusinessPathError(uint64_t peer_id);
 
+    // Responder side: a validated request publication from `peer`. Returns OK
+    // without adopting it when the peer is not declared here. The native
+    // provider refresh runs on a control executor, never on the RPC thread.
+    bool acceptsPeer(const std::string& peer) const;
+    Status ingestPeerPublication(const std::string& peer,
+                                 SegmentDescRef segment,
+                                 ProbeBootstrapResponse publication);
+
     [[nodiscard]] uint64_t localPublicationEpoch() const;
     [[nodiscard]] ProbeCoordinatorStats stats() const;
     [[nodiscard]] uint64_t nextAttemptNs(const std::string& peer) const;
@@ -95,6 +91,22 @@ class ProbePeerCoordinator {
     Status handshakeOnce(const std::string& peer, uint64_t now_ns = 0);
 
    private:
+    struct AttemptState {
+        explicit AttemptState(std::string peer_name)
+            : peer(std::move(peer_name)) {}
+        std::string peer;
+        std::atomic<bool> finished{false};
+    };
+
+    // Kept alive by the async RPC callbacks so a late completion can never
+    // touch a destroyed coordinator (P1-4).
+    struct Lifetime {
+        std::atomic<bool> stopping{false};
+        std::atomic<uint32_t> inflight{0};
+        std::mutex mutex;
+        std::condition_variable cv;
+    };
+
     struct PeerState {
         bool in_flight{false};
         bool refresh_queued{false};
@@ -109,6 +121,9 @@ class ProbePeerCoordinator {
     void tickChain();
     void submitAttempt(const std::string& peer, uint64_t now_ns);
     Status runAttempt(const std::string& peer, uint64_t now_ns);
+    Status startAsyncAttempt(const std::string& peer, uint64_t now_ns);
+    void finishAsyncAttempt(const std::shared_ptr<AttemptState>& attempt,
+                            bool success, bool timeout);
     Status buildRequest(ProbeBootstrapRequest& request) const;
     Status applyResponse(const std::string& peer, const SegmentDesc& segment,
                          const ProbeBootstrapResponse& response,
@@ -116,16 +131,22 @@ class ProbePeerCoordinator {
     void noteAttemptFinishedLocked(const std::string& peer, uint64_t now_ns,
                                    bool success);
     void scheduleTick(uint64_t delay_ns);
+    // Serializes executor lifetime against worker/poller-thread hints (P1-6).
+    Status submitControlTask(std::function<void()> task);
+    void scheduleControlTask(uint64_t delay_ns, std::function<void()> task);
 
     ProbeParams params_;
     Dependencies deps_;
     Clock clock_;
     mutable std::mutex mutex_;
     std::map<std::string, PeerState> peers_;
+    std::mutex executor_mutex_;
     std::vector<std::unique_ptr<ThreadedControlExecutor>> executors_;
     std::atomic<bool> running_{false};
     std::atomic<bool> stopping_{false};
     size_t round_robin_{0};
+    std::shared_ptr<Lifetime> lifetime_{std::make_shared<Lifetime>()};
+    std::map<std::string, std::shared_ptr<AttemptState>> async_attempts_;
     uint64_t last_local_publication_epoch_{0};
     uint64_t last_summary_ns_{0};
     ProbeCoordinatorStats stats_;

@@ -11,14 +11,15 @@
 
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/transport.h"
-#include "tent/transport/ub/probe_peer_coordinator.h"
 #include "tent/transport/ub/probe_resources.h"
-#include "tent/transport/ub/probe_topology.h"
+#include "tent/transport/ub/probe_stats.h"
 
 namespace mooncake::tent {
 
 namespace ub {
 class UrmaAdapter;
+class ProbePeerCoordinator;
+class ProbeTopology;
 struct UbTask;
 }  // namespace ub
 

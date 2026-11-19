@@ -157,6 +157,12 @@ Status StandaloneProbeResourceProvider::ensureBoundContextsLocked() {
     return Status::OK();
 }
 
+void StandaloneProbeResourceProvider::setPublicationChangedCallback(
+    std::function<void(uint64_t)> callback) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    publication_changed_ = std::move(callback);
+}
+
 void StandaloneProbeResourceProvider::setNodeIdentity(std::string segment,
                                                       uint64_t node_incarnation,
                                                       uint64_t topology_epoch) {
@@ -990,6 +996,8 @@ void StandaloneProbeResourceProvider::processRetire(
     const RetireRequest& request) {
     std::vector<Completion> completions;
     Status rebuild_status = Status::OK();
+    uint64_t publication_epoch = 0;
+    std::function<void(uint64_t)> publication_changed;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!initialized_ || shut_down_) return;
@@ -1028,6 +1036,8 @@ void StandaloneProbeResourceProvider::processRetire(
         rebuild_status =
             rebuildPortLocked(*port, request.error_epoch, completions);
         if (rebuild_status.ok()) {
+            publication_epoch = publication_epoch_;
+            publication_changed = publication_changed_;
             LOG(INFO) << "UB standalone probe provider: rebuilt probe lane "
                       << request.path.path.local_nic << "/"
                       << request.path.path.segment_id << "/"
@@ -1035,6 +1045,9 @@ void StandaloneProbeResourceProvider::processRetire(
                       << request.generation << " -> "
                       << port->config.generation;
         }
+    }
+    if (publication_epoch != 0 && publication_changed) {
+        publication_changed(publication_epoch);
     }
 
     // Dispatch quiesced completions outside the provider lock: the sink may

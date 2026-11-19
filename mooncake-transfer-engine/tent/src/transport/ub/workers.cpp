@@ -1311,6 +1311,9 @@ Status UbWorkers::chooseAndResolveEndpoint(
     // health/load judgement (design §5.1 step 2). The first denial is kept for
     // a precise error when no candidate survives.
     bool adjacency_screened_out = false;
+    size_t adjacency_denied = 0;
+    size_t adjacency_hard_denied = 0;
+    size_t adjacency_transient_denied = 0;
     AdjacencyDecision first_adjacency_denial = AdjacencyDecision::kAllowed;
     Topology::NicID first_denied_local = -1;
     Topology::NicID first_denied_remote = -1;
@@ -1328,10 +1331,20 @@ Status UbWorkers::chooseAndResolveEndpoint(
                                   !route.adjacency.publication_seen);
             }
             if (decision != AdjacencyDecision::kAllowed) {
-                if (!adjacency_screened_out) {
+                const bool hard =
+                    decision == AdjacencyDecision::kUndeclaredPeer ||
+                    decision == AdjacencyDecision::kUndeclaredLocal ||
+                    decision == AdjacencyDecision::kUndeclaredRemote;
+                if (!adjacency_screened_out || hard) {
                     first_adjacency_denial = decision;
                     first_denied_local = local.id;
                     first_denied_remote = remote_id;
+                }
+                ++adjacency_denied;
+                if (hard) {
+                    ++adjacency_hard_denied;
+                } else {
+                    ++adjacency_transient_denied;
                 }
                 adjacency_screened_out = true;
                 continue;
@@ -1371,13 +1384,31 @@ Status UbWorkers::chooseAndResolveEndpoint(
             std::move(rail_stats),
             quota_->availability(probe_path, pending.slice->spec().length)});
     }
-    if (rails.empty() && adjacency_screened_out) {
-        return Status::InvalidArgument(
-            "UB adjacency rejects every posting candidate: peer=" +
-            (route.pin ? route.pin->name : std::string("<unknown>")) +
-            " local_nic=" + std::to_string(first_denied_local) +
-            " remote_nic=" + std::to_string(first_denied_remote) + " reason=" +
-            adjacencyDecisionName(first_adjacency_denial) + LOC_MARK);
+    if (rails.empty() && adjacency_screened_out &&
+        adjacency_denied == combinations) {
+        if (adjacency_hard_denied > 0) {
+            return Status::InvalidArgument(
+                "UB adjacency rejects every posting candidate: peer=" +
+                (route.pin ? route.pin->name : std::string("<unknown>")) +
+                " local_nic=" + std::to_string(first_denied_local) +
+                " remote_nic=" + std::to_string(first_denied_remote) +
+                " reason=" + adjacencyDecisionName(first_adjacency_denial) +
+                LOC_MARK);
+        }
+        if (adjacency_transient_denied > 0) {
+            // A peer EID that is not in the current metadata, a port inside
+            // its withdraw grace, or a peer gate that is temporarily closed
+            // are all recoverable: defer instead of failing the slice.
+            if (plan != nullptr) {
+                plan->reason = DeferReason::kPathUnavailable;
+                plan->expire_ns = deadlineAfter(steadyNowNs(), kTimedDeferNs);
+            }
+            return Status::TooManyRequests(
+                "Every UB posting path is transiently unavailable (adjacency) "
+                "reason=" +
+                std::string(adjacencyDecisionName(first_adjacency_denial)) +
+                LOC_MARK);
+        }
     }
     std::stable_sort(rails.begin(), rails.end(),
                      [&](const RailCandidate& lhs, const RailCandidate& rhs) {

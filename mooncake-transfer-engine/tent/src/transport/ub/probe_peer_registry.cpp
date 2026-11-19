@@ -11,13 +11,15 @@ namespace mooncake::tent::ub {
 
 ProbePeerRegistry::ProbePeerRegistry(
     const std::map<std::string, std::vector<ProbeDeclaredPeerPort>>& declared,
-    uint32_t withdraw_grace)
+    uint32_t withdraw_grace, const std::map<std::string, uint64_t>& peer_ids)
     : declared_(declared),
       withdraw_grace_(withdraw_grace == 0 ? 1 : withdraw_grace) {
     for (const auto& [peer, ports] : declared_) {
         ProbePeerBinding binding;
         binding.segment = peer;
-        binding.peer_id = next_peer_id_++;
+        auto provided = peer_ids.find(peer);
+        binding.peer_id =
+            provided != peer_ids.end() ? provided->second : next_peer_id_++;
         binding.ports.resize(ports.size());
         for (size_t index = 0; index < ports.size(); ++index) {
             binding.ports[index].id = ports[index].id;
@@ -28,8 +30,9 @@ ProbePeerRegistry::ProbePeerRegistry(
 }
 
 Status ProbePeerRegistry::apply(const ProbePeerBinding& publication,
-                                uint64_t now_ns, bool* applied) {
+                                uint64_t now_ns, bool* applied, bool* stale) {
     if (applied != nullptr) *applied = false;
+    if (stale != nullptr) *stale = false;
     std::lock_guard<std::mutex> lock(mutex_);
     auto existing = bindings_.find(publication.segment);
     if (existing == bindings_.end()) {
@@ -38,25 +41,37 @@ Status ProbePeerRegistry::apply(const ProbePeerBinding& publication,
             "'");
     }
     ProbePeerBinding& current = existing->second;
-    // Stale incarnations are ignored: the peer may have restarted before this
-    // response was sent, and a late response must not roll the registry back.
-    if (current.published && publication.node_incarnation != 0 &&
-        current.node_incarnation != 0 &&
-        publication.node_incarnation < current.node_incarnation) {
-        return Status::OK();
+    if (publication.peer_id != 0 && current.peer_id != 0 &&
+        publication.peer_id != current.peer_id) {
+        return Status::InvalidArgument(
+            "probe publication peer id does not match the declared peer");
     }
-    if (current.published &&
+    // The incarnation and topology epochs come from a non-monotonic seed, so
+    // numeric ordering cannot decide freshness. A different node incarnation
+    // or topology epoch is a new generation and is always accepted; only
+    // within one generation is publication_epoch ordered. The coordinator
+    // serializes attempts per peer, so an older response cannot race a newer
+    // one from the same peer.
+    const bool same_generation =
+        current.published &&
         publication.node_incarnation == current.node_incarnation &&
-        publication.publication_epoch != 0 &&
-        publication.publication_epoch < current.publication_epoch) {
-        return Status::OK();
-    }
-    if (current.published &&
-        publication.node_incarnation == current.node_incarnation &&
-        publication.publication_epoch == current.publication_epoch) {
-        // Repeated handshake with the same publication: acknowledged without
-        // rebuilding the edge set (design §9.3).
-        return Status::OK();
+        publication.topology_epoch == current.topology_epoch;
+    if (same_generation) {
+        if (publication.publication_epoch < current.publication_epoch) {
+            // A late response from the current generation: keep the incumbent.
+            if (stale != nullptr) *stale = true;
+            return Status::OK();
+        }
+        if (publication.publication_epoch == current.publication_epoch) {
+            // Repeated handshake with the same publication: acknowledged
+            // without rebuilding the edge set, but it proves the peer is
+            // reachable again and clears a stale marker (design §9.3).
+            if (current.stale) {
+                current.stale = false;
+                current.last_success_ns = now_ns;
+            }
+            return Status::OK();
+        }
     }
 
     std::vector<ProbePeerPortBinding> next;
@@ -137,6 +152,23 @@ void ProbePeerRegistry::markStale(const std::string& peer, uint64_t now_ns) {
     found->second.last_success_ns = found->second.last_success_ns == 0
                                         ? now_ns
                                         : found->second.last_success_ns;
+}
+
+std::optional<ProbePeerPublicationView> ProbePeerRegistry::publicationView(
+    const std::string& peer) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto found = bindings_.find(peer);
+    if (found == bindings_.end()) return std::nullopt;
+    ProbePeerPublicationView view;
+    view.published = found->second.published;
+    view.stale = found->second.stale;
+    for (const auto& port : found->second.ports) {
+        view.ports.emplace(
+            port.id, ProbePeerPortView{port.withdrawn,
+                                       port.node_gate_ok && port.port_gate_ok &&
+                                           port.profile_gate_ok});
+    }
+    return view;
 }
 
 std::optional<ProbePeerBinding> ProbePeerRegistry::find(

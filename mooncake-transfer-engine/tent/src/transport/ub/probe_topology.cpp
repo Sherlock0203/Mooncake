@@ -307,6 +307,10 @@ AdjacencyView ProbeTopology::viewFor(const std::string& peer,
         return view;
     }
 
+    if (remote.type != SegmentType::Memory) {
+        view.peer_eid_unmatched = true;
+        return view;
+    }
     const auto& remote_topology = remote.getMemory().topology;
     std::unordered_map<std::string, Topology::NicID> remote_by_id;
     for (const auto& port : peer_decl->second.ports) {
@@ -380,7 +384,7 @@ AdjacencyView ProbeTopology::viewFor(const std::string& peer,
     // publication every declared edge stays allowed (ELIGIBLE_UNVERIFIED);
     // afterwards a missing/withdrawn port or a closed peer gate rejects it.
     if (peer_registry_ == nullptr) return view;
-    auto publication = peer_registry_->find(peer);
+    auto publication = peer_registry_->publicationView(peer);
     if (!publication || !publication->published) return view;
     view.publication_seen = true;
     view.remote_status.assign(view.remote_nics.size(), 0);
@@ -396,17 +400,13 @@ AdjacencyView ProbeTopology::viewFor(const std::string& peer,
             }
         }
         if (declared_port == nullptr) continue;
-        auto published =
-            std::find_if(publication->ports.begin(), publication->ports.end(),
-                         [&](const ProbePeerPortBinding& port) {
-                             return port.id == declared_port->id;
-                         });
-        if (published == publication->ports.end() || published->withdrawn) {
+        auto published = publication->ports.find(declared_port->id);
+        if (published == publication->ports.end() ||
+            published->second.withdrawn) {
             view.remote_status[remote_slot] = 1;
             continue;
         }
-        if (!published->node_gate_ok || !published->port_gate_ok ||
-            !published->profile_gate_ok) {
+        if (!published->second.gates_ok) {
             view.remote_status[remote_slot] = 2;
         }
     }
