@@ -115,6 +115,7 @@ bool logicalRetryable(const CompletionRecord& record, LogicalOutcome outcome) {
                 case CompletionOutcome::kLocalDeviceError:
                 case CompletionOutcome::kRemotePathError:
                 case CompletionOutcome::kEndpointError:
+                case CompletionOutcome::kLocalAccessError:
                     return true;
                 case CompletionOutcome::kMemoryError:
                 case CompletionOutcome::kUnknownError:
@@ -173,6 +174,8 @@ const char* completionOutcomeName(CompletionOutcome outcome) {
             return "ENDPOINT_ERROR";
         case CompletionOutcome::kMemoryError:
             return "MEMORY_ERROR";
+        case CompletionOutcome::kLocalAccessError:
+            return "LOCAL_ACCESS_ERROR";
         case CompletionOutcome::kUnknownError:
             return "UNKNOWN_ERROR";
     }

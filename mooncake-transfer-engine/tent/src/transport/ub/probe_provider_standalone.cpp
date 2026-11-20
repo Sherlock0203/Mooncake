@@ -15,6 +15,7 @@
 #include "tent/transport/ub/probe_provider_standalone.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <set>
@@ -220,7 +221,16 @@ uint64_t StandaloneProbeResourceProvider::publicationEpoch() const {
 
 void StandaloneProbeResourceProvider::bumpPublicationEpochLocked() {
     ++publication_epoch_;
+    publication_bump_ns_ = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
     LOG(INFO) << "UB probe publication bumped to epoch " << publication_epoch_;
+}
+
+uint64_t StandaloneProbeResourceProvider::publicationBumpNs() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return publication_bump_ns_;
 }
 
 namespace {

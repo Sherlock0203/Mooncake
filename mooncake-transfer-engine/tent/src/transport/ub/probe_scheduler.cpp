@@ -106,7 +106,22 @@ void ProbeScheduler::run() {
             if (stopping_.load()) return;
             postOne(action, now);
         }
-        plm_.scanTimeouts(normalizedNow());
+        const uint64_t scanned_at = normalizedNow();
+        plm_.scanTimeouts(scanned_at);
+        if (last_link_summary_ns_ == 0 ||
+            scanned_at - last_link_summary_ns_ >= 30'000'000'000ULL) {
+            last_link_summary_ns_ = scanned_at;
+            const auto stats = plm_.stats();
+            LOG(INFO) << "UB probe link summary:"
+                      << " lane_retire=" << stats.probe_lane_retire
+                      << " lane_rebuild=" << stats.probe_lane_rebuild
+                      << " failure_path=" << stats.probe_failure_path
+                      << " failure_lane=" << stats.probe_failure_lane
+                      << " post_rejected=" << stats.probe_post_rejected
+                      << " post_unknown=" << stats.probe_post_unknown
+                      << " area_config_error=" << stats.probe_area_config_error
+                      << " success=" << stats.probe_success;
+        }
 
         uint64_t deadline = 0;
         {

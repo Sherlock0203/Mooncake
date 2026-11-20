@@ -160,6 +160,7 @@ struct UbBusinessStatsSnapshot {
     uint64_t pool_stop_rejections{0};
     uint64_t pool_hard_errors{0};
     uint64_t business_param_error_invalid_edge{0};
+    uint64_t business_deadline_timeouts{0};
     uint64_t declared_candidates_total{0};
     uint64_t declared_candidates_denied{0};
     // W3g claim (R-1): rejections by pool-authority reason, the pre-W3g
@@ -499,6 +500,8 @@ class UbWorkers final : public gate::Sink {
     const ProbeTopology* probe_topology_{nullptr};
     // Declared-edge kParamError invalidation (closed-loop design §5.6.3).
     ParamErrorEdgeTracker param_error_edges_;
+    std::atomic<uint64_t> business_deadline_timeouts_{0};
+    std::atomic<uint64_t> last_rail_log_ns_{0};
     std::atomic<uint64_t> declared_candidates_total_{0};
     std::atomic<uint64_t> declared_candidates_denied_{0};
     // Bounded record of unproven destructions, used to attribute a completion

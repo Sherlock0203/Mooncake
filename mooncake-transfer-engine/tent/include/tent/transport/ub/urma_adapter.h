@@ -424,6 +424,9 @@ enum class CompletionCategory : uint8_t {
     REMOTE_PATH_ERROR,
     ENDPOINT_ERROR,
     MEMORY_ERROR,
+    // A link-down can surface as a local access error. Kept separate from
+    // MEMORY_ERROR so the business path treats it as retryable.
+    LOCAL_ACCESS_ERROR,
     TIMEOUT,
     UNKNOWN_ERROR,
 };
@@ -440,6 +443,8 @@ inline const char* completionCategoryName(CompletionCategory category) {
             return "ENDPOINT_ERROR";
         case CompletionCategory::MEMORY_ERROR:
             return "MEMORY_ERROR";
+        case CompletionCategory::LOCAL_ACCESS_ERROR:
+            return "LOCAL_ACCESS_ERROR";
         case CompletionCategory::TIMEOUT:
             return "TIMEOUT";
         case CompletionCategory::UNKNOWN_ERROR:

@@ -959,6 +959,27 @@ struct UbTransport::Impl {
                 };
                 probe_coordinator = std::make_unique<ub::ProbePeerCoordinator>(
                     params.probe, std::move(dependencies));
+                // The provider bumps the publication epoch after a lane
+                // rebuild. Without this callback the coordinator only notices
+                // it on the next handshake refresh tick (30s by default), so a
+                // recovered link can stay unused for that whole window. The
+                // callback only wakes the coordinator; it never reads provider
+                // state, so it cannot deadlock against the provider mutex.
+                if (probe_provider) {
+                    auto* standalone =
+                        dynamic_cast<ub::StandaloneProbeResourceProvider*>(
+                            probe_provider.get());
+                    if (standalone != nullptr) {
+                        standalone->setPublicationChangedCallback(
+                            [coordinator = probe_coordinator.get()](
+                                uint64_t publication_epoch) {
+                                if (coordinator != nullptr) {
+                                    coordinator->onLocalPublicationChanged(
+                                        publication_epoch);
+                                }
+                            });
+                    }
+                }
                 status = probe_coordinator->start();
                 if (!status.ok()) return failInstall(status);
             }
@@ -1261,7 +1282,29 @@ struct UbTransport::Impl {
                               request.remote_topology_id, peer_path};
         CHECK_STATUS(
             endpoints->getOrCreate(key, request.local_context, endpoint));
+        const uint64_t resolve_total =
+            endpoint_resolve_total.fetch_add(1, std::memory_order_relaxed) + 1;
+        auto log_resolve_summary = [&]() {
+            const uint64_t bootstraps =
+                endpoint_resolve_bootstrap.load(std::memory_order_relaxed);
+            LOG(INFO)
+                << "UB endpoint resolve summary: total=" << resolve_total
+                << " cache_hit="
+                << endpoint_resolve_cache_hit.load(std::memory_order_relaxed)
+                << " bootstrap=" << bootstraps << " bootstrap_fail="
+                << endpoint_resolve_bootstrap_fail.load(
+                       std::memory_order_relaxed)
+                << " rpc_us_avg="
+                << (bootstraps == 0 ? 0
+                                    : endpoint_resolve_rpc_us_sum.load(
+                                          std::memory_order_relaxed) /
+                                          bootstraps)
+                << " rpc_us_max="
+                << endpoint_resolve_rpc_us_max.load(std::memory_order_relaxed);
+        };
         if (endpoint->ready()) {
+            endpoint_resolve_cache_hit.fetch_add(1, std::memory_order_relaxed);
+            if (resolve_total % 5000 == 0) log_resolve_summary();
             recordReadyEndpoint(endpoint);
             return Status::OK();
         }
@@ -1290,8 +1333,31 @@ struct UbTransport::Impl {
             return status;
         }
         UbBootstrapDesc response;
+        const auto rpc_begin = std::chrono::steady_clock::now();
         status = ControlClient::bootstrapUb(
             request.remote_segment->rpc_server_addr, bootstrap, response);
+        const uint64_t rpc_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - rpc_begin)
+                .count());
+        endpoint_resolve_bootstrap.fetch_add(1, std::memory_order_relaxed);
+        endpoint_resolve_rpc_us_sum.fetch_add(rpc_us,
+                                              std::memory_order_relaxed);
+        uint64_t prev_max =
+            endpoint_resolve_rpc_us_max.load(std::memory_order_relaxed);
+        while (rpc_us > prev_max &&
+               !endpoint_resolve_rpc_us_max.compare_exchange_weak(
+                   prev_max, rpc_us, std::memory_order_relaxed)) {
+        }
+        if (!status.ok()) {
+            endpoint_resolve_bootstrap_fail.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        LOG_EVERY_N(INFO, 50) << "UB endpoint resolve: local_nic="
+                              << request.local_context->topologyId()
+                              << " remote_nic=" << request.remote_topology_id
+                              << " cache_hit=0 rpc_us=" << rpc_us
+                              << " status=" << status.ToString();
         if (status.ok()) {
             if (rm_endpoint_runtime) {
                 // Trusted anchor for the peer identity: the device metadata
@@ -1669,6 +1735,12 @@ struct UbTransport::Impl {
     // v1 peers that carried a v2 block (sanitized ignore, design §6.4).
     std::atomic<uint64_t> bootstrap_v2_ignored{0};
     std::atomic<uint64_t> probe_publication_identity_fail{0};
+    std::atomic<uint64_t> endpoint_resolve_total{0};
+    std::atomic<uint64_t> endpoint_resolve_cache_hit{0};
+    std::atomic<uint64_t> endpoint_resolve_bootstrap{0};
+    std::atomic<uint64_t> endpoint_resolve_bootstrap_fail{0};
+    std::atomic<uint64_t> endpoint_resolve_rpc_us_sum{0};
+    std::atomic<uint64_t> endpoint_resolve_rpc_us_max{0};
     bool probe_bootstrap_callback_installed{false};
 };
 

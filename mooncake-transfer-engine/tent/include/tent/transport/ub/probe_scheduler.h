@@ -86,6 +86,8 @@ class ProbeScheduler {
     uint64_t wake_seq_{0};
     // Only the scheduler thread advances this sequence.
     uint64_t token_seq_{0};
+    // Only the scheduler thread advances this watermark.
+    uint64_t last_link_summary_ns_{0};
 };
 
 }  // namespace ub

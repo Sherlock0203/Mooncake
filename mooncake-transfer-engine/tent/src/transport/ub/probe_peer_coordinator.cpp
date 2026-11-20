@@ -204,8 +204,14 @@ void ProbePeerCoordinator::tickChain() {
         }
     }
     if (bumped) {
+        const uint64_t bump_ns = deps_.provider->publicationBumpNs();
+        const uint64_t detected_after_ms =
+            bump_ns != 0 && now > bump_ns ? (now - bump_ns) / 1'000'000ULL : 0;
         LOG(INFO) << "UB probe local publication changed to epoch "
-                  << publication_epoch << "; refreshing every peer";
+                  << publication_epoch << "; refreshing every peer"
+                  << " detected_after_ms=" << detected_after_ms
+                  << " next_tick_in_ms="
+                  << params_.handshakeRefreshNs() / 1'000'000ULL;
     }
     processDue();
     if (now - last_summary_ns_ >= 30'000'000'000ULL) {
@@ -756,6 +762,15 @@ void ProbePeerCoordinator::onLocalPublicationChanged(
         }
     }
     if (changed) {
+        const uint64_t bump_ns =
+            deps_.provider ? deps_.provider->publicationBumpNs() : 0;
+        const uint64_t detected_after_ms =
+            bump_ns != 0 && now > bump_ns ? (now - bump_ns) / 1'000'000ULL : 0;
+        LOG(INFO) << "UB probe local publication changed to epoch "
+                  << publication_epoch << "; refreshing every peer"
+                  << " detected_after_ms=" << detected_after_ms
+                  << " next_tick_in_ms="
+                  << params_.handshakeRefreshNs() / 1'000'000ULL;
         (void)submitControlTask([this] { processDue(); });
     }
 }

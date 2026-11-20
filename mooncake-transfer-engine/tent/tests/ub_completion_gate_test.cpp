@@ -297,6 +297,31 @@ TEST(UbCompletionGateTest, CompletionErrorFinalizesWithoutReturn) {
     EXPECT_EQ(stats.record_returned, 0U);
 }
 
+// A local access error is the local-side form of a link-down: it must stay
+// retryable so the slice can move to another path instead of failing outright.
+TEST(UbCompletionGateTest, LocalAccessErrorIsRetryable) {
+    CompletionRecord record;
+    RecordingSink sink;
+    GateContext context;
+
+    {
+        HandlerRef post(record, sink, context);
+        onPostReturn(record, acceptedPost(), context);
+    }
+    {
+        HandlerRef cqe(record, sink, context);
+        onRealCr(record, facts(CompletionOutcome::kLocalAccessError), sink,
+                 context);
+    }
+
+    ASSERT_EQ(sink.settles().size(), 1U);
+    EXPECT_EQ(sink.settles().front(), LogicalOutcome::kFailed);
+    EXPECT_TRUE(record.logical_retryable);
+    const auto stats = context.stats.snapshot();
+    EXPECT_EQ(stats.record_finalized, 1U);
+    EXPECT_EQ(stats.record_returned, 0U);
+}
+
 // ---------------------------------------------------------------------------
 // G-7: the deadline wins over a late SUCCESS completion (baseline `timed_out`
 // branch). The logical result stays TIMEOUT and the owners are finalized.

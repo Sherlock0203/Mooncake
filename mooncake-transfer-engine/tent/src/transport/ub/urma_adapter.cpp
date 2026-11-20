@@ -1225,9 +1225,14 @@ CompletionCategory classifyCompletion(int status) {
         case URMA_CR_LOC_OPERATION_ERR:
             return CompletionCategory::LOCAL_DEVICE_ERROR;
         case URMA_CR_LOC_LEN_ERR:
-        case URMA_CR_LOC_ACCESS_ERR:
         case URMA_CR_LOC_DATA_POISON:
             return CompletionCategory::MEMORY_ERROR;
+        case URMA_CR_LOC_ACCESS_ERR:
+            // A link-down can surface as a local access error. Classifying it
+            // as a path fault keeps the slice retryable on another path and
+            // lets the probe isolate the broken one; a genuine token/permission
+            // error still fails after the bounded retry budget.
+            return CompletionCategory::LOCAL_ACCESS_ERROR;
         case URMA_CR_REM_RESP_LEN_ERR:
         case URMA_CR_REM_UNSUPPORTED_REQ_ERR:
         case URMA_CR_REM_OPERATION_ERR:

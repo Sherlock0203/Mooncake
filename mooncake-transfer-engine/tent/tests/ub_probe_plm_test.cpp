@@ -401,6 +401,7 @@ TEST(UbProbeLinkManagerTest, LaneErrorRetiresLaneOnceAndMarksPortPending) {
     EXPECT_EQ(reports.retire_calls[0].jetty_generation, 1U);
     EXPECT_EQ(reports.retire_calls[0].lane.local_nic, 0);
     EXPECT_EQ(plm.stats().probe_failure_lane, 1U);
+    EXPECT_EQ(plm.stats().probe_lane_retire, 1U);
     EXPECT_EQ(plm.inflightCount(), 0U);
 
     // Duplicate CQE: claimed already, so it only shows up as an unknown token;
@@ -610,6 +611,33 @@ TEST(UbProbeLinkManagerTest, PeerBudgetGatesCrossPortScheduling) {
     EXPECT_EQ(healthOf(plm, first).health, LinkHealth::kIsolated);
 }
 
+TEST(UbProbeLinkManagerTest, LocalAccessErrorIsolatesAndRetiresLaneOnce) {
+    TestClock clock;
+    ProbeLinkManager plm(defaultParams(), clock.clock());
+    RecordingReportSink reports;
+    plm.setReportSink(&reports);
+    auto graph = makeGraph({makePortSupply(0, 1)}, {makeEdgeSupply(0, 10, 0)});
+    ASSERT_TRUE(plm.initialize(graph).ok());
+    const PathVersion version{ProbePathKey{0, 10, 0}, 1, 1};
+
+    plm.onBusinessPathError(makeEvidence(0, 10, 0),
+                            BusinessErrorKind::kPathFault, clock.now());
+    uint64_t token_seq = 0;
+    auto probe = postNext(plm, token_seq, clock.now());
+    ASSERT_TRUE(probe.has_value());
+    ASSERT_TRUE(plm.onProbeCompletion(
+        makeCompletion(probe->token, CompletionCategory::LOCAL_ACCESS_ERROR),
+        clock.now()));
+
+    const auto health = healthOf(plm, version);
+    EXPECT_EQ(health.health, LinkHealth::kIsolated);
+    EXPECT_TRUE(health.pending);
+    EXPECT_EQ(health.pending_reason, PendingReason::kLaneRetired);
+    EXPECT_EQ(plm.stats().probe_failure_path, 1U);
+    EXPECT_EQ(plm.stats().probe_lane_retire, 1U);
+    ASSERT_EQ(reports.retire_calls.size(), 1U);
+}
+
 TEST(UbProbeLinkManagerTest, HandleReplacedPreservesBackoff) {
     TestClock clock;
     ProbeLinkManager plm(defaultParams(), clock.clock());
@@ -636,6 +664,7 @@ TEST(UbProbeLinkManagerTest, HandleReplacedPreservesBackoff) {
     event.event_seq = 1;
     event.port = makePortSupply(0, 2);
     ASSERT_TRUE(plm.onPoolAvailabilityChange(event).ok());
+    EXPECT_EQ(plm.stats().probe_lane_rebuild, 1U);
 
     EXPECT_TRUE(plm.pendingActions(now).empty());
     clock.advance(1000ULL * 1000 * 1000);

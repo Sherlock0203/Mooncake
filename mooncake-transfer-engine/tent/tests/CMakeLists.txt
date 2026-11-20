@@ -568,6 +568,18 @@ if(USE_UB)
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_ub_core_test COMMAND tent_ub_core_test)
 
+  # Completion gate unit tests (W2a). Links only completion_record.cpp, so the
+  # retryability table can be checked without the workers or the adapter.
+  add_executable(tent_ub_completion_gate_test
+                 ub_completion_gate_test.cpp
+                 ../src/transport/ub/completion_record.cpp)
+  target_link_libraries(tent_ub_completion_gate_test
+                        PRIVATE tent_common gtest gtest_main)
+  target_include_directories(tent_ub_completion_gate_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_completion_gate_test
+           COMMAND tent_ub_completion_gate_test)
+
   # Declared probe topology (design §4–§5): config resolution, binding
   # uniqueness and the per-slice adjacency view. Software-only.
   add_executable(tent_ub_probe_topology_test ub_probe_topology_test.cpp)

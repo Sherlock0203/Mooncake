@@ -560,6 +560,8 @@ UbBusinessStatsSnapshot UbWorkers::businessStats() const {
         pool_stop_rejections_.load(std::memory_order_relaxed);
     out.pool_hard_errors = pool_hard_errors_.load(std::memory_order_relaxed);
     out.business_param_error_invalid_edge = param_error_edges_.invalidations();
+    out.business_deadline_timeouts =
+        business_deadline_timeouts_.load(std::memory_order_relaxed);
     out.declared_candidates_total =
         declared_candidates_total_.load(std::memory_order_relaxed);
     out.declared_candidates_denied =
@@ -789,6 +791,33 @@ void UbWorkers::logBusinessSummary(uint64_t now_ns) {
         stats.pool_lease_attempts == 0 && drain.drain_begin == 0) {
         return;
     }
+    uint64_t last_rail = last_rail_log_ns_.load(std::memory_order_acquire);
+    if (now_ns - last_rail >= 30'000'000'000ULL &&
+        last_rail_log_ns_.compare_exchange_strong(last_rail, now_ns,
+                                                  std::memory_order_acq_rel) &&
+        rail_monitor_ != nullptr) {
+        for (const auto& rail : rail_monitor_->allStats(now_ns)) {
+            LOG(INFO) << "UB rail business: local_topology_id="
+                      << rail.key.local_topology_id
+                      << " remote_device_id=" << rail.key.remote_device_id
+                      << " remote_segment_id=" << rail.key.remote_segment_id
+                      << " paused=" << (rail.paused ? 1 : 0)
+                      << " ok=" << rail.successful_completions
+                      << " err=" << rail.completion_errors
+                      << " timeout=" << rail.timeouts
+                      << " recoveries=" << rail.recoveries
+                      << " rebuilds=" << rail.endpoint_rebuilds
+                      << " pauses=" << rail.pauses << " ewma_lat_us="
+                      << (rail.ewma_latency_ns < 0
+                              ? -1.0
+                              : rail.ewma_latency_ns / 1000.0)
+                      << " ewma_bw_mbps="
+                      << (rail.ewma_bandwidth_bytes_per_second < 0
+                              ? -1.0
+                              : rail.ewma_bandwidth_bytes_per_second * 8.0 /
+                                    1e6);
+        }
+    }
     const auto gate = completionStats();
     LOG(INFO) << "UB business: queued=" << stats.queue_depth
               << " parked=" << stats.parked_depth
@@ -819,6 +848,7 @@ void UbWorkers::logBusinessSummary(uint64_t now_ns) {
               << " declared_candidates=" << stats.declared_candidates_total
               << "/" << stats.declared_candidates_denied
               << " retire=" << stats.pooled_retire
+              << " deadline_timeout=" << stats.business_deadline_timeouts
               << " path_peak=" << stats.path_inflight_peak
               << " imbalance=" << stats.path_load_imbalance
               << " double_return=" << stats.pool_return_double
@@ -2401,6 +2431,9 @@ WrFacts UbWorkers::makeWrFacts(const Completion& completion) {
         case CompletionCategory::MEMORY_ERROR:
             facts.outcome = CompletionOutcome::kMemoryError;
             break;
+        case CompletionCategory::LOCAL_ACCESS_ERROR:
+            facts.outcome = CompletionOutcome::kLocalAccessError;
+            break;
         case CompletionCategory::UNKNOWN_ERROR:
             facts.outcome = CompletionOutcome::kUnknownError;
             break;
@@ -2459,6 +2492,29 @@ void UbWorkers::onFault(CompletionRecord& record, FaultKind kind) {
             if (hint) hint(business->probe_key.segment_id);
         }
     };
+    if (kind == FaultKind::kTimeout) {
+        // Deadline evidence without a placeable completion. A late completion
+        // resolves the same one-shot, so the rail sees exactly one timeout.
+        business_deadline_timeouts_.fetch_add(1, std::memory_order_relaxed);
+        rail_monitor_->recordTimeout(business->path, now);
+        const uint64_t age_us = now > business->posted_ns
+                                    ? (now - business->posted_ns) / 1000ULL
+                                    : 0ULL;
+        LOG_EVERY_N(WARNING, 100)
+            << "UB business deadline timeout: token=" << record.token
+            << " task="
+            << reinterpret_cast<uint64_t>(business->pending.task.get())
+            << " slice=" << business->attempt.slice_id
+            << " attempt=" << business->attempt.attempt
+            << " local_nic=" << record.path.local_nic
+            << " remote_device=" << record.path.remote_nic
+            << " remote_segment=" << record.path.segment_id
+            << " jetty_gen=" << record.jetty_generation
+            << " lane_gen=" << business->pooled_lane.lane_generation
+            << " posted_age_us=" << age_us
+            << " deadline_us=" << params_.slice_timeout_ms * 1000ULL;
+        return;
+    }
     const char* category = "unknown";
     switch (record.terminal.outcome) {
         case CompletionOutcome::kRemotePathError:
@@ -2469,6 +2525,9 @@ void UbWorkers::onFault(CompletionRecord& record, FaultKind kind) {
             break;
         case CompletionOutcome::kMemoryError:
             category = "param_error";
+            break;
+        case CompletionOutcome::kLocalAccessError:
+            category = "path_fault";
             break;
         case CompletionOutcome::kLocalDeviceError:
             category = "context_failure";
@@ -2499,12 +2558,6 @@ void UbWorkers::onFault(CompletionRecord& record, FaultKind kind) {
         << (business->endpoint && business->endpoint->context()
                 ? business->endpoint->context()->incarnation()
                 : 0);
-    if (kind == FaultKind::kTimeout) {
-        // Deadline evidence without a placeable completion. A late completion
-        // resolves the same one-shot, so the rail sees exactly one timeout.
-        rail_monitor_->recordTimeout(business->path, now);
-        return;
-    }
     switch (record.terminal.outcome) {
         case CompletionOutcome::kLocalDeviceError:
             if (business->endpoint && business->endpoint->context()) {
@@ -2528,6 +2581,17 @@ void UbWorkers::onFault(CompletionRecord& record, FaultKind kind) {
         case CompletionOutcome::kEndpointError:
             if (probe_manager_ != nullptr) {
                 report_error(BusinessErrorKind::kLaneError);
+            }
+            rail_monitor_->recordError(business->path, now);
+            if (endpoint_retirer_) endpoint_retirer_(business->endpoint);
+            return;
+        case CompletionOutcome::kLocalAccessError:
+            // A link-down can surface as a local access error. Treat it like a
+            // remote path fault: isolate the path and let the slice retry on
+            // another one. A genuine token/permission error exhausts the
+            // bounded retry budget instead of failing on the first attempt.
+            if (probe_manager_ != nullptr) {
+                report_error(BusinessErrorKind::kPathFault);
             }
             rail_monitor_->recordError(business->path, now);
             if (endpoint_retirer_) endpoint_retirer_(business->endpoint);

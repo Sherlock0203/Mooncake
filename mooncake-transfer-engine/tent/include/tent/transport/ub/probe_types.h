@@ -472,6 +472,8 @@ struct ProbeStats {
     uint64_t probe_success{0};
     uint64_t probe_failure_path{0};
     uint64_t probe_failure_lane{0};
+    uint64_t probe_lane_retire{0};
+    uint64_t probe_lane_rebuild{0};
     uint64_t probe_timeout_unknown{0};
     uint64_t probe_stale{0};
     uint64_t probe_unknown_token{0};

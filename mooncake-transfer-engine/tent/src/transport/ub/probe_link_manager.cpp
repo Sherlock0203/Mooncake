@@ -88,6 +88,7 @@ EntryState mapCampaignOutcome(CompletionCategory category) {
         case CompletionCategory::SUCCESS:
             return EntryState::kOk;
         case CompletionCategory::REMOTE_PATH_ERROR:
+        case CompletionCategory::LOCAL_ACCESS_ERROR:
         case CompletionCategory::TIMEOUT:
             return EntryState::kFail;
         case CompletionCategory::LOCAL_DEVICE_ERROR:
@@ -979,6 +980,45 @@ void ProbeLinkManager::applyLocked(const Completion& completion,
             }
             return;
         }
+        case CompletionCategory::LOCAL_ACCESS_ERROR: {
+            // A link-down surfaces as a local access error. Treat it as a path
+            // fault for health and backoff, but retire the lane only once:
+            // rebuilding on every failure rotates the probe area and produces
+            // a rebuild storm while the peer publication cannot reach us. With
+            // a stable lane the first successful probe after link-up recovers
+            // the path.
+            ++stats_.probe_failure_path;
+            if (test_probe) ++stats_.probe_test_fail;
+            if (runtime.health != LinkHealth::kIsolated) {
+                ++runtime.fault_epoch;
+                setHealthLocked(version, runtime, LinkHealth::kIsolated,
+                                "probe_failure", effects);
+            }
+            if (!test_probe) {
+                ++runtime.consecutive_failures;
+                // Cap the backoff well below the path-fault maximum: the area
+                // is stable, so a probe every few seconds is enough to notice
+                // link-up without rebuilding on every completion.
+                runtime.backoff_ns =
+                    std::min(backoffDelayLocked(runtime.consecutive_failures),
+                             4 * params_.intervalNs());
+                runtime.next_probe_ns = now_ns + runtime.backoff_ns;
+            }
+            LOG_EVERY_N(WARNING, 100)
+                << "UB probe path local access error: " << pathText(version)
+                << " failures=" << runtime.consecutive_failures
+                << " backoff_ns=" << runtime.backoff_ns;
+            if (!test_mode) {
+                if (runtime.consecutive_failures == 1) {
+                    laneRetireLocked(
+                        port, now_ns, version,
+                        Status::RdmaError("probe local access error"), effects);
+                }
+            } else {
+                runtime.next_probe_ns = now_ns + params_.intervalNs();
+            }
+            return;
+        }
         case CompletionCategory::MEMORY_ERROR:
             // Probe area/token mismatch is a lane/configuration problem, never
             // evidence that the path is bad (design §9.3 / L-3).
@@ -997,13 +1037,42 @@ void ProbeLinkManager::applyLocked(const Completion& completion,
                 runtime.next_probe_ns = now_ns + params_.intervalNs();
                 return;
             }
+            // A link-down can surface as a local access error (MEMORY_ERROR).
+            // Retiring the lane on every such completion rotates the probe
+            // area, bumps the publication and produces a rebuild storm; the
+            // peer publication needed to refresh the area cannot reach us
+            // while the link is down, so the path never stabilizes. Retire
+            // once (the design's lane/config response), then keep the lane
+            // stable and back off like a path fault: the first successful
+            // probe after link-up recovers the path.
+            ++runtime.consecutive_failures;
+            // Cap the lane/config backoff well below the path-fault maximum:
+            // the area is stable now, so a probe every few seconds is enough
+            // to notice link-up without rebuilding on every completion.
+            runtime.backoff_ns =
+                std::min(backoffDelayLocked(runtime.consecutive_failures),
+                         4 * params_.intervalNs());
+            runtime.next_probe_ns = now_ns + runtime.backoff_ns;
+            if (runtime.health != LinkHealth::kIsolated) {
+                // HEALTHY paths are not probed periodically, so a lane that
+                // was just rebuilt would never be verified. Mark the path
+                // isolated to keep it on the probe schedule until it recovers.
+                ++runtime.fault_epoch;
+                setHealthLocked(version, runtime, LinkHealth::kIsolated,
+                                "probe_failure", effects);
+            }
             LOG_EVERY_N(WARNING, 100)
                 << "UB probe area configuration error: " << pathText(version)
-                << " jetty_gen=" << port.generation;
-            laneRetireLocked(port, now_ns, version,
-                             Status::InternalError("probe area config error"),
-                             effects);
-            markPortPendingLocked(port, PendingReason::kLaneRetired, now_ns);
+                << " jetty_gen=" << port.generation
+                << " failures=" << runtime.consecutive_failures
+                << " backoff_ns=" << runtime.backoff_ns;
+            if (runtime.consecutive_failures == 1) {
+                laneRetireLocked(
+                    port, now_ns, version,
+                    Status::InternalError("probe area config error"), effects);
+                markPortPendingLocked(port, PendingReason::kLaneRetired,
+                                      now_ns);
+            }
             return;
         case CompletionCategory::LOCAL_DEVICE_ERROR:
         case CompletionCategory::ENDPOINT_ERROR:
@@ -1572,10 +1641,12 @@ void ProbeLinkManager::laneRetireLocked(PortRuntime& port, uint64_t now_ns,
         effects.error_epoch = ++lane_error_epoch_;
         effects.path = path;
         effects.reason = reason;
+        ++stats_.probe_lane_retire;
         LOG_EVERY_N(WARNING, 100)
             << "UB probe lane retired: local_nic=" << port.supply.local_nic
             << " jetty_gen=" << port.generation
             << " error_epoch=" << effects.error_epoch
+            << " retire_total=" << stats_.probe_lane_retire
             << " reason=" << reason.ToString();
     }
     markPortPendingLocked(port, PendingReason::kLaneRetired, now_ns);
@@ -1747,6 +1818,12 @@ Status ProbeLinkManager::applyEventLocked(const ProbeEvent& event,
                 }
             }
 
+            // Count only a replacement of a retired lane, not the initial
+            // handle publication (the port starts handle_valid=true).
+            if (!port->handle_valid &&
+                event.port->jetty_generation != port->generation) {
+                ++stats_.probe_lane_rebuild;
+            }
             port->supply = *event.port;
             port->generation = event.port->jetty_generation;
             port->slot_token = 0;

@@ -144,6 +144,8 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
     // resources exist; ports without a Jetty/area are omitted.
     [[nodiscard]] ProbeLocalPublication publication() const;
     [[nodiscard]] uint64_t publicationEpoch() const;
+    // Steady-clock timestamp of the latest publication bump (0 if never).
+    [[nodiscard]] uint64_t publicationBumpNs() const;
 
     // Creates JFC/Jetty/source page/local area page without building the graph.
     // Used by the two-node selftest to publish the local identity before the
@@ -305,6 +307,7 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
     uint64_t publication_node_incarnation_{1};
     uint64_t publication_topology_epoch_{1};
     uint64_t publication_epoch_{1};
+    uint64_t publication_bump_ns_{0};
     std::vector<ProbeHandoff> quarantine_;
     std::vector<RetiredPage> retired_pages_;
     ProbeAvailabilitySink* availability_sink_{nullptr};
