@@ -22,9 +22,9 @@
 //   * one page-aligned probe source page per port and generation.
 //
 // Remote probe areas and remote probe Jetty identities come through
-// ProbePeerDirectory. P1 ships this seam with a test/stub implementation; the
-// peer handshake (bootstrap extension) lands in P2. Lane retire/rebuild and
-// quarantine transfer are recorded here and become native in P4.
+// ProbePeerDirectory. Production builds it from the ProbeBootstrapUb handshake
+// and ProbePeerRegistry; tests inject a stub. Lane retire/rebuild performs a
+// native Jetty rebuild and emits kProbeHandleReplaced.
 //
 // Design: docs/analyze/tent-ub-probe-standalone-supply.md.
 
@@ -62,9 +62,25 @@ struct ProbeLocalPortConfig {
     uint64_t generation{1};
 };
 
+// One declared probe port supplied by ProbeTopology. In declared mode the
+// provider never discovers devices: the binding comes from configuration and
+// the context is the business context (never closed by the provider).
+struct ProbePortSpec {
+    std::string port_id;
+    Topology::NicID local_nic{-1};
+    // Probe-owned context target. The provider opens (and owns) its own
+    // Context for a declared port; business contexts are a different type and
+    // must not be shared with the probe JFC/Jetty.
+    DeviceInfo device;
+    std::string topology_name;
+    std::string native_device_name;
+    std::string eid;
+    uint64_t generation{1};
+};
+
 // Supplies the remote half of the probe graph: per-edge probe area descriptor
-// and remote probe Jetty identity. P2 replaces the stub with the bootstrap
-// handshake; the provider itself does not parse peer metadata. The directory
+// and remote probe Jetty identity. Production uses the bootstrap handshake
+// publication; the provider itself does not parse peer metadata. The directory
 // must outlive the provider and must not call back into it.
 class ProbePeerDirectory {
    public:
@@ -103,6 +119,33 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
     // Discovers the probe physical ports (bond devices are filtered out) and
     // opens one probe Context per port. Idempotent.
     Status discover();
+
+    // Declared mode (design §6.2): installs exactly the configured ports.
+    // Must be called before snapshot()/prepareLocal() and replaces discovery.
+    // A duplicate id or NIC is a configuration error.
+    Status bindPorts(const std::vector<ProbePortSpec>& specs);
+
+    // Recomputes the peer edge set and emits the incremental graph events
+    // (kEdgeAdded / kAreaReplaced / kTargetEpochChanged / kEdgeRemoved) under
+    // one graph epoch. Runs on the coordinator thread, never on a poller.
+    Status refreshPeerEdges();
+
+    // Node identity published in ProbeBootstrapUb. Supplied by the transport;
+    // defaults keep selftest/unit builds usable.
+    void setNodeIdentity(std::string segment, uint64_t node_incarnation,
+                         uint64_t topology_epoch);
+
+    // Invoked after a local probe Jetty rebuild bumps publication_epoch, so
+    // the coordinator can push the new publication immediately instead of
+    // waiting for its periodic refresh.
+    void setPublicationChangedCallback(std::function<void(uint64_t)> callback);
+
+    // Responder snapshot (design §6.3/§7.2). Available once the local
+    // resources exist; ports without a Jetty/area are omitted.
+    [[nodiscard]] ProbeLocalPublication publication() const;
+    [[nodiscard]] uint64_t publicationEpoch() const;
+    // Steady-clock timestamp of the latest publication bump (0 if never).
+    [[nodiscard]] uint64_t publicationBumpNs() const;
 
     // Creates JFC/Jetty/source page/local area page without building the graph.
     // Used by the two-node selftest to publish the local identity before the
@@ -185,8 +228,12 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
    private:
     struct PortState {
         ProbeLocalPortConfig config;
+        std::string port_id;
+        std::string eid;
         std::string topology_name;
         std::string native_device_name;
+        DeviceInfo pending_device;
+        bool has_pending_device{false};
         bool available{true};
         JfcPtr probe_jfc;
         bool owns_jfc{false};
@@ -227,6 +274,8 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
     Status createPortLocked(PortState& port);
     Status destroyPortLocked(PortState& port);
     void rollbackPortsLocked();
+    void bumpPublicationEpochLocked();
+    Status ensureBoundContextsLocked();
     void releaseQuarantineLocked();
     void releaseRetiredPagesLocked();
     Status buildGraphLocked(ProbeGraph& graph);
@@ -234,6 +283,8 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
     Status rebuildPortLocked(PortState& port, uint64_t error_epoch,
                              std::vector<Completion>& completions);
     Status emitHandleReplacedLocked(const ProbePortSupply& supply);
+    Status applyEdgeDiffLocked(
+        const std::map<PathVersion, ProbeEdgeSupply>& next);
 
     mutable std::mutex mutex_;
     std::thread maintenance_;
@@ -250,12 +301,21 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
     const TopologyIdResolver topology_resolver_;
     bool owns_contexts_{false};
     bool auto_discover_{false};
+    bool declared_mode_{false};
+    bool ports_bound_{false};
+    std::string publication_segment_;
+    uint64_t publication_node_incarnation_{1};
+    uint64_t publication_topology_epoch_{1};
+    uint64_t publication_epoch_{1};
+    uint64_t publication_bump_ns_{0};
     std::vector<ProbeHandoff> quarantine_;
     std::vector<RetiredPage> retired_pages_;
     ProbeAvailabilitySink* availability_sink_{nullptr};
+    std::function<void(uint64_t)> publication_changed_;
     ProbeCompletionSink completion_sink_;
     uint64_t graph_epoch_{0};
     uint64_t event_seq_{0};
+    std::map<PathVersion, ProbeEdgeSupply> current_edges_;
     std::atomic<uint64_t> retire_calls_{0};
     uint64_t next_graph_epoch_{1};
     bool resources_ready_{false};

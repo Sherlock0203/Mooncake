@@ -30,7 +30,7 @@
 #include "tent/transport/ub/native_budget.h"
 #include "tent/transport/ub/quota.h"
 #include "tent/transport/ub/rail_monitor.h"
-#include "tent/transport/ub/send_jetty_pool.h"
+#include "tent/transport/ub/business_jetty_pool.h"
 #include "tent/transport/ub/topology_attrs.h"
 #include "tent/transport/ub/workers.h"
 #include "ub_fake_topology.h"
@@ -161,8 +161,8 @@ class PooledDataPath {
         params.runtime_profile =
             rm_mode_ ? UbRuntimeProfile::kRmPool : UbRuntimeProfile::kRcLegacy;
         params.task_max_inflight_attempts = task_k_;
-        params.business_queue_budget = queue_budget_;
-        params.send_pool.desired_per_context =
+        params.queue_budget = queue_budget_;
+        params.jetty_pool.business_desired_serving =
             static_cast<uint32_t>(desired_serving_);
 
         EndpointResolver resolver = [this](

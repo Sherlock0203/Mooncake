@@ -13,7 +13,6 @@
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -21,20 +20,22 @@
 #include "tent/common/status.h"
 #include "tent/runtime/segment_manager.h"
 #include "tent/runtime/topology.h"
-#include "tent/transport/ub/admission.h"
-#include "tent/transport/ub/attempt_gate.h"
 #include "tent/transport/ub/buffers.h"
 #include "tent/transport/ub/completion_record.h"
 #include "tent/transport/ub/context.h"
+#include "tent/transport/ub/edge_invalid_tracker.h"
 #include "tent/transport/ub/entity_event.h"
+#include "tent/transport/ub/jetty_drain_controller.h"
 #include "tent/transport/ub/params.h"
 #include "tent/transport/ub/path_load_ledger.h"
 #include "tent/transport/ub/post_scheduler.h"
+#include "tent/transport/ub/probe_topology.h"
 #include "tent/transport/ub/probe_link_manager.h"
 #include "tent/transport/ub/quota.h"
 #include "tent/transport/ub/rail_monitor.h"
-#include "tent/transport/ub/send_jetty_pool.h"
+#include "tent/transport/ub/business_jetty_pool.h"
 #include "tent/transport/ub/slice.h"
+#include "tent/transport/ub/tombstone.h"
 #include "tent/transport/ub/urma_adapter.h"
 
 namespace mooncake::tent::ub {
@@ -158,7 +159,21 @@ struct UbBusinessStatsSnapshot {
     uint64_t pool_lease_misses{0};
     uint64_t pool_stop_rejections{0};
     uint64_t pool_hard_errors{0};
+    uint64_t business_param_error_invalid_edge{0};
+    uint64_t business_deadline_timeouts{0};
+    uint64_t declared_candidates_total{0};
+    uint64_t declared_candidates_denied{0};
+    // W3g claim (R-1): rejections by pool-authority reason, the pre-W3g
+    // rollback path (claim/enabled=false) and the surviving PLM epoch check.
+    uint64_t claim_rejected_stopping{0};
+    uint64_t claim_rejected_member{0};
+    uint64_t claim_rejected_generation{0};
+    uint64_t claim_rejected_error_epoch{0};
+    uint64_t claim_disabled{0};
     uint64_t claim_after_isolation{0};
+    // Unknown-token completions attributed to a tombstoned (retired) native
+    // entity. `unknown_token` still counts every unattributed token.
+    uint64_t unknown_token_tombstoned{0};
     uint64_t post_on_isolated_path{0};
     uint64_t pooled_return{0};
     uint64_t pooled_retire{0};
@@ -194,8 +209,8 @@ class UbWorkers final : public gate::Sink {
               LocalDeviceFailureHandler local_device_failure_handler = {},
               ProbeLinkManager* probe_manager = nullptr,
               std::vector<ProbeJfcSlot> probe_jfcs = {},
-              std::shared_ptr<TaskPermitLedger> task_permits = nullptr,
-              std::shared_ptr<AttemptGate> attempt_gate = nullptr);
+              std::shared_ptr<TombstoneTable> tombstones = nullptr,
+              const ProbeTopology* probe_topology = nullptr);
     ~UbWorkers();
 
     UbWorkers(const UbWorkers&) = delete;
@@ -218,7 +233,7 @@ class UbWorkers final : public gate::Sink {
     // W3 admission/defer/pool counters (design §13).
     [[nodiscard]] UbBusinessStatsSnapshot businessStats() const;
     [[nodiscard]] uint64_t queueBudget() const noexcept {
-        return params_.business_queue_budget;
+        return params_.queue_budget;
     }
     // Completion gate counters (design §9).
     [[nodiscard]] CompletionStatsSnapshot completionStats() const {
@@ -226,6 +241,26 @@ class UbWorkers final : public gate::Sink {
     }
     [[nodiscard]] const CountingEntityEventSink& entityEvents() const {
         return entity_events_;
+    }
+
+    // Asynchronous drain chain entry points (design §4.3/§6.3). Both run on
+    // the control executor, never on a poller.
+    //
+    // settleDrainedWr(): a WR recovered by the software flush settles exactly
+    // once through the normal completion path. Returns true when this call
+    // settled it, false when the token was already claimed and disposed.
+    bool settleDrainedWr(const Completion& completion, uint64_t jfc_index);
+    // True once no registered record still holds the lane's lease, i.e. the
+    // completion gate claimed and disposed of every owner. This is the
+    // evidence DELETE_READY condition ⑤ asks for, derived from the existing
+    // record table (no counter on PoolMember).
+    [[nodiscard]] bool pooledLaneConverged(const PoolLaneKey& lane) const;
+
+    // Business path-error hint used by the probe coordinator to refresh the
+    // affected peer early. Called outside the PLM lock; nullptr disables it.
+    void setProbeRefreshHint(std::function<void(uint64_t)> hint) {
+        std::lock_guard<std::mutex> lock(probe_hint_mutex_);
+        probe_refresh_hint_ = std::move(hint);
     }
 
    private:
@@ -300,10 +335,12 @@ class UbWorkers final : public gate::Sink {
     void processPendingPooled(
         const PendingSlice& pending, size_t worker_index, const Route& route,
         const std::shared_ptr<UbEndpoint>& endpoint, const UbPostPath& path,
-        const QuotaReservation& reservation, const LocalSegmentRef& local,
-        const ImportedSegmentRef& remote, const UbAttemptToken& attempt);
+        const ProbePathKey& probe_key, const QuotaReservation& reservation,
+        const LocalSegmentRef& local, const ImportedSegmentRef& remote,
+        const UbAttemptToken& attempt);
     // W2 tail of processPending, kept byte-for-byte for pool == nullptr.
     void postLegacy(const PendingSlice& pending, size_t worker_index,
+                    const ProbePathKey& probe_key,
                     const std::shared_ptr<UbEndpoint>& endpoint,
                     const UbPostPath& path, const QuotaReservation& reservation,
                     const LocalSegmentRef& local,
@@ -312,14 +349,33 @@ class UbWorkers final : public gate::Sink {
     std::shared_ptr<BusinessRecord> makeRecord(
         const PendingSlice& pending,
         const std::shared_ptr<UbEndpoint>& endpoint, const UbPostPath& path,
-        const QuotaReservation& reservation, const LocalSegmentRef& local,
-        const ImportedSegmentRef& remote, const UbAttemptToken& attempt);
-    // The W3 claim review (design §8.2, R-1 transition shape): pool stop plus
-    // the fault-epoch snapshot comparison. Deliberately lock-free and
-    // allocation-free: it runs immediately before the native post (W3-IN-8).
-    [[nodiscard]] bool claimPost(const std::shared_ptr<SendJettyPool>& pool,
-                                 const UbPostPath& path,
-                                 uint64_t fault_epoch_snapshot);
+        const ProbePathKey& probe_key, const QuotaReservation& reservation,
+        const LocalSegmentRef& local, const ImportedSegmentRef& remote,
+        const UbAttemptToken& attempt);
+    // Maps a business path to the synthetic probe identity when its peer is
+    // declared. An invalid key means "not modelled by the probe graph".
+    [[nodiscard]] ProbePathKey probeKeyFor(const Route& route,
+                                           const UbPostPath& path) const;
+    // W3g-a claim decision. `closed` is the pool authority's verdict (R-1);
+    // `path_epoch_changed` is the pre-W3g PLM scalar check, which stays a
+    // separate input (design D-2: sampling is kept, authority moves).
+    struct ClaimDecision {
+        ClaimClosed closed{ClaimClosed::kNone};
+        bool path_epoch_changed{false};
+
+        [[nodiscard]] bool claimed() const noexcept {
+            return closed == ClaimClosed::kNone && !path_epoch_changed;
+        }
+    };
+
+    // The W3g claim (design §8.2/R-1): the pool's synchronized verdict plus the
+    // surviving fault-epoch comparison. Runs immediately before the native
+    // post, never blocks and never calls a provider (W3-IN-8, W3g IN-1).
+    [[nodiscard]] ClaimDecision claimPost(
+        const std::shared_ptr<SendJettyPool>& pool, const PoolKey& pool_key,
+        const AttemptKey& attempt, const LeaseWithCredit& leased,
+        const UbPostPath& path, const ProbePathKey& probe_key,
+        uint64_t fault_epoch_snapshot);
     [[nodiscard]] static PoolKey poolKeyFor(
         const std::shared_ptr<UbEndpoint>& endpoint);
     [[nodiscard]] DeferEpochs readDeferEpochs() const;
@@ -368,25 +424,6 @@ class UbWorkers final : public gate::Sink {
     void onFault(CompletionRecord& record, FaultKind kind) override;
     void onBlocked(CompletionRecord& record, BlockReason reason) override;
     void onDuplicate(CompletionRecord& record) override;
-    void releaseInflight(const std::shared_ptr<Inflight>& inflight);
-    void resolveInflight(const std::shared_ptr<Inflight>& inflight,
-                         TransferStatusEnum outcome, size_t bytes,
-                         bool retryable);
-    // rm_pool data path: how a pooled attempt reached its terminal point.
-    enum class PooledSettleKind : uint8_t {
-        kRealSuccess,  // exactly one real SUCCESS completion
-        kRealError,    // a real error completion attributed to the member
-        kZeroAccept,   // definitive zero acceptance rollback (INV07)
-        kFence,        // timeout/shutdown fence proved no more DMA
-    };
-    // Settles the pooled attempt exactly once through the attempt gate,
-    // returns or retires the leased member, and releases the JFC credit.
-    // Idempotent across completion/timeout/shutdown racers.
-    void settlePooledAttempt(const std::shared_ptr<Inflight>& inflight,
-                             PooledSettleKind kind, uint64_t completed_length,
-                             const std::string& reason);
-    void recordTimeoutOnce(const std::shared_ptr<Inflight>& inflight,
-                           uint64_t now_ns);
     void rememberEndpointDrain(const std::shared_ptr<UbEndpoint>& endpoint);
     void forgetEndpointDrain(const std::shared_ptr<UbEndpoint>& endpoint);
     void failUnposted(const PendingSlice& pending,
@@ -409,11 +446,6 @@ class UbWorkers final : public gate::Sink {
     EndpointResolver endpoint_resolver_;
     EndpointRetirer endpoint_retirer_;
     LocalDeviceFailureHandler local_device_failure_handler_;
-    // rm_pool admission and completion-gate components. Null on legacy
-    // installs; the pooled data path is only entered through a context with
-    // an attached SendJettyPool, which legacy installs never create.
-    std::shared_ptr<TaskPermitLedger> task_permits_;
-    std::shared_ptr<AttemptGate> attempt_gate_;
     // Serializes endpoint-store retirement progress across JFC pollers. The
     // handler temporarily moves quarantined endpoints out of the store while
     // retrying cleanup, so a second poller must not observe a false empty
@@ -439,6 +471,10 @@ class UbWorkers final : public gate::Sink {
     // Keyed by completion token. Renamed from `inflight_` because W5 adds a
     // second, deadline-ordered index next to it.
     std::unordered_map<uint64_t, std::shared_ptr<BusinessRecord>> records_;
+    // Live records per pooled lane generation. Maintained under records_mutex_
+    // so the drain controller can ask "is this lane fully claimed?" in O(1)
+    // instead of scanning every in-flight business record on each tick.
+    std::unordered_map<uint64_t, size_t> pooled_lane_refs_;
     // Endpoints whose ERROR transition has not yet reached its native flush
     // fence remain owned here even if every logical token completes naturally.
     std::unordered_map<uint64_t, std::shared_ptr<UbEndpoint>>
@@ -447,6 +483,9 @@ class UbWorkers final : public gate::Sink {
     struct BusinessSlot {
         std::shared_ptr<UbJfc> jfc;
         UbContextPtr context;
+        // Drain controller of the slot's context (design §4.3). Kept per slot
+        // so a marker never has to look it up on the poll path.
+        std::shared_ptr<JettyDrainController> drain;
     };
     struct ProbeSlot {
         JfcPtr jfc;
@@ -455,6 +494,19 @@ class UbWorkers final : public gate::Sink {
     std::vector<BusinessSlot> business_slots_;
     std::vector<ProbeSlot> probe_slots_;
     ProbeLinkManager* probe_manager_{nullptr};
+    mutable std::mutex probe_hint_mutex_;
+    std::function<void(uint64_t)> probe_refresh_hint_;
+    // Read-only adjacency policy; nullptr when no topology was declared.
+    const ProbeTopology* probe_topology_{nullptr};
+    // Declared-edge kParamError invalidation (closed-loop design §5.6.3).
+    ParamErrorEdgeTracker param_error_edges_;
+    std::atomic<uint64_t> business_deadline_timeouts_{0};
+    std::atomic<uint64_t> last_rail_log_ns_{0};
+    std::atomic<uint64_t> declared_candidates_total_{0};
+    std::atomic<uint64_t> declared_candidates_denied_{0};
+    // Bounded record of unproven destructions, used to attribute a completion
+    // whose token no longer maps to a live record (design §7.1/§7.2).
+    std::shared_ptr<TombstoneTable> tombstones_;
     // W3 per-path in-flight ledger (scoring only, D-11).
     PathLoadLedger path_load_;
 
@@ -472,7 +524,13 @@ class UbWorkers final : public gate::Sink {
     std::atomic<uint64_t> pool_lease_misses_{0};
     std::atomic<uint64_t> pool_stop_rejections_{0};
     std::atomic<uint64_t> pool_hard_errors_{0};
+    std::atomic<uint64_t> claim_rejected_stopping_{0};
+    std::atomic<uint64_t> claim_rejected_member_{0};
+    std::atomic<uint64_t> claim_rejected_generation_{0};
+    std::atomic<uint64_t> claim_rejected_error_epoch_{0};
+    std::atomic<uint64_t> claim_disabled_{0};
     std::atomic<uint64_t> claim_after_isolation_{0};
+    std::atomic<uint64_t> unknown_token_tombstoned_{0};
     std::atomic<uint64_t> post_on_isolated_path_{0};
     std::atomic<uint64_t> pooled_return_{0};
     std::atomic<uint64_t> pooled_retire_{0};

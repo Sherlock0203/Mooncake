@@ -300,8 +300,9 @@ struct JfcOptions {
     // Experimental send-only mode; not used by the probe path because UMDK
     // currently validates JFS/JFR mode through the shared JFR.
     bool send_only = false;
-    // RM Legacy: drives the native JFR transport mode. Defaults to RC so the
-    // RC legacy baseline is byte-for-byte unchanged.
+    // RM Legacy: one of the two RM spellings normalized by
+    // isReliableMessage(). Never read directly to build the JFR. Defaults to
+    // RC so the RC legacy baseline is byte-for-byte unchanged.
     uint16_t trans_mode = kUrmaTransportModeRc;
 };
 
@@ -312,13 +313,49 @@ struct JettyOptions {
     uint8_t rnr_retry = 7;
     uint8_t error_timeout = 17;
     JettyTransportMode transport_mode{JettyTransportMode::kRc};
-    // RM Legacy: drives the native JFS transport mode and the CTP bind mask.
-    // Both are derived from the trusted LocalSendProfile at install time and
-    // are never taken from peer-supplied bootstrap fields. Defaults keep the
-    // RC legacy creation path unchanged.
+    // RM Legacy: selects reliable-message semantics through
+    // isReliableMessage() and drives the CTP bind mask. Both are derived from
+    // the trusted LocalSendProfile at install time and are never taken from
+    // peer-supplied bootstrap fields. Defaults keep the RC legacy creation path
+    // unchanged.
     uint16_t trans_mode = kUrmaTransportModeRc;
     uint32_t bind_tp_type_mask = 0;
 };
+
+// The options above carry the same "is this RM?" concept in two spellings.
+// transport_mode is the adapter-level spelling used by the probe path and by
+// rm_pool; trans_mode is the native URMA value used by RM Legacy. A caller is
+// allowed to set only one of them, so every native decision (JFR/JFS mode,
+// min_rnr_timer, post gate) must be derived from this single predicate instead
+// of reading either field directly.
+[[nodiscard]] inline bool isReliableMessage(
+    const JfcOptions& options) noexcept {
+    return options.transport_mode == JettyTransportMode::kRm ||
+           options.trans_mode == kUrmaTransportModeRm;
+}
+
+[[nodiscard]] inline bool isReliableMessage(
+    const JettyOptions& options) noexcept {
+    return options.transport_mode == JettyTransportMode::kRm ||
+           options.trans_mode == kUrmaTransportModeRm;
+}
+
+// Native URMA transport mode selected by the normalized predicate. The
+// adapter-neutral constants are pinned to the UMDK enum by static_asserts in
+// urma_adapter.cpp.
+[[nodiscard]] inline uint16_t nativeTransportMode(
+    bool reliable_message) noexcept {
+    return reliable_message ? kUrmaTransportModeRm : kUrmaTransportModeRc;
+}
+
+// A native RM Jetty carries an explicit imported target on every WR, so a
+// freshly created Jetty is postable without a bind. A native RC Jetty must
+// complete a bind first. A Jetty in ERROR/RESET is never postable. Kept here
+// so the post gate and its unit tests share one definition.
+[[nodiscard]] inline bool isJettyPostable(bool reliable_message, bool created,
+                                          bool bound) noexcept {
+    return reliable_message ? (created || bound) : bound;
+}
 
 struct RemoteJettyInfo {
     std::string eid;
@@ -387,9 +424,34 @@ enum class CompletionCategory : uint8_t {
     REMOTE_PATH_ERROR,
     ENDPOINT_ERROR,
     MEMORY_ERROR,
+    // A link-down can surface as a local access error. Kept separate from
+    // MEMORY_ERROR so the business path treats it as retryable.
+    LOCAL_ACCESS_ERROR,
     TIMEOUT,
     UNKNOWN_ERROR,
 };
+
+inline const char* completionCategoryName(CompletionCategory category) {
+    switch (category) {
+        case CompletionCategory::SUCCESS:
+            return "SUCCESS";
+        case CompletionCategory::LOCAL_DEVICE_ERROR:
+            return "LOCAL_DEVICE_ERROR";
+        case CompletionCategory::REMOTE_PATH_ERROR:
+            return "REMOTE_PATH_ERROR";
+        case CompletionCategory::ENDPOINT_ERROR:
+            return "ENDPOINT_ERROR";
+        case CompletionCategory::MEMORY_ERROR:
+            return "MEMORY_ERROR";
+        case CompletionCategory::LOCAL_ACCESS_ERROR:
+            return "LOCAL_ACCESS_ERROR";
+        case CompletionCategory::TIMEOUT:
+            return "TIMEOUT";
+        case CompletionCategory::UNKNOWN_ERROR:
+            return "UNKNOWN_ERROR";
+    }
+    return "UNKNOWN_ERROR";
+}
 
 struct Completion {
     CompletionCategory category = CompletionCategory::UNKNOWN_ERROR;
@@ -400,6 +462,53 @@ struct Completion {
     // for entity-level flush markers whose token is deliberately zero.
     uint32_t local_jetty_id = 0;
 };
+
+// Classification of a provider entity marker (design §4.1/§6.1). A marker is a
+// completion record that carries no work-request identity (the adapter forces
+// token 0); only these shapes may reach the asynchronous drain chain, and only
+// a flush-done marker for the current ERROR epoch may advance a drain.
+enum class EntityMarkerKind : uint8_t {
+    kNone = 0,
+    kFlushDone = 1,    // URMA_CR_WR_FLUSH_ERR_DONE
+    kSuspendDone = 2,  // URMA_CR_WR_SUSPEND_DONE
+};
+
+inline const char* entityMarkerKindName(EntityMarkerKind kind) noexcept {
+    switch (kind) {
+        case EntityMarkerKind::kNone:
+            return "none";
+        case EntityMarkerKind::kFlushDone:
+            return "flush_done";
+        case EntityMarkerKind::kSuspendDone:
+            return "suspend_done";
+    }
+    return "none";
+}
+
+// Three-way native delete result (design §8.1). Only kConsumed proves that the
+// provider reclaimed the handle, so only kConsumed may release budget and erase
+// the tombstone.
+struct DeleteOutcome {
+    enum class Kind : uint8_t {
+        kConsumed = 0,  // handle reclaimed (or provably already gone)
+        kRetained = 1,  // provider says the handle is still valid: retry
+        kUnknown = 2,   // undecidable: keep every owner, never re-dereference
+    };
+    Kind kind = Kind::kUnknown;
+    Status status;
+};
+
+inline const char* deleteOutcomeKindName(DeleteOutcome::Kind kind) noexcept {
+    switch (kind) {
+        case DeleteOutcome::Kind::kConsumed:
+            return "consumed";
+        case DeleteOutcome::Kind::kRetained:
+            return "retained";
+        case DeleteOutcome::Kind::kUnknown:
+            return "unknown";
+    }
+    return "unknown";
+}
 
 // Pure, injectable URMA boundary. It deliberately does not know about TENT
 // Request, SubBatch, UbTask, UbSlice, scheduling, retry, or rail health.
@@ -498,8 +607,76 @@ class UrmaAdapter {
     // through their normal completion path before resetting or deleting the
     // Jetty. On failure no drain guarantee is made and native resources must
     // remain alive.
+    //
+    // This blocking form is the *legacy* fallback. The pooled error hot path
+    // must not use it (source design §1.4): it holds the JFC poll lock across a
+    // provider wait and freezes every other completion on the same JFC. It
+    // stays for shutdown, Context-fatal recovery and probe-Jetty teardown,
+    // which are the only branches the design permits.
     virtual Status quiesceJetty(const JettyPtr& jetty, uint32_t timeout_ms,
                                 std::vector<Completion>& completions) = 0;
+
+    // --- Asynchronous drain primitives (design §4.1) -----------------------
+    // These are the fine-grained steps of quiesceJetty(), exposed so the pooled
+    // retirement chain can drive them from its control executor instead of one
+    // blocking call on the fault path. Every default implementation is
+    // fail-closed: an adapter that does not override them makes the controller
+    // quarantine the member rather than delete on unproven evidence.
+
+    // Moves the Jetty into ERROR. Idempotent: an already-ERROR Jetty returns
+    // OK. Entering a new epoch discards the stale flush-done record for this
+    // native id. The implementation takes the Jetty's own mutex, which is also
+    // held by post(), so a successful return proves that no post is in flight.
+    virtual Status modifyJettyError(const JettyPtr& jetty,
+                                    uint64_t error_epoch) {
+        (void)jetty;
+        (void)error_epoch;
+        return Status::NotImplemented(
+            "asynchronous Jetty drain is not supported by this adapter");
+    }
+
+    // Classifies a token==0 completion as a provider entity marker. kNone means
+    // "not a marker" (an async event or an unknown record); the poller must
+    // keep routing it through its legacy unknown-token path.
+    virtual EntityMarkerKind classifyEntityMarker(
+        const Completion& completion) const {
+        (void)completion;
+        return EntityMarkerKind::kNone;
+    }
+
+    // Runs one bounded round of urma_flush_jetty(): returns the WR completions
+    // that were accepted by the provider but never completed. OK with an empty
+    // `out` means the software SQ is empty (the only proof of that condition).
+    // A token==0 entity marker in the returned batch is an internal error, the
+    // same judgment quiesceJetty makes.
+    virtual Status flushJettyOnce(const JettyPtr& jetty,
+                                  std::vector<Completion>& out) {
+        (void)jetty;
+        out.clear();
+        return Status::NotImplemented(
+            "asynchronous Jetty drain is not supported by this adapter");
+    }
+
+    // Drain teardown: clears the flush-done record, releases every segment
+    // retained for this Jetty and marks the Jetty flush-fenced. Called once,
+    // after the software SQ is proven empty.
+    virtual Status finishDrain(const JettyPtr& jetty) {
+        (void)jetty;
+        return Status::NotImplemented(
+            "asynchronous Jetty drain is not supported by this adapter");
+    }
+
+    // Classified native delete (design §8.1). The default derives the
+    // classification from the legacy delete contract: any error leaves the
+    // owner in place and is reported as Unknown (fail-closed). Adapters that
+    // can prove "handle already gone" or "provider says busy" override this.
+    virtual DeleteOutcome deleteJettyWithOutcome(JettyPtr& jetty) {
+        DeleteOutcome outcome;
+        outcome.status = deleteJetty(jetty);
+        outcome.kind = outcome.status.ok() ? DeleteOutcome::Kind::kConsumed
+                                           : DeleteOutcome::Kind::kUnknown;
+        return outcome;
+    }
 
     // On a native post error, posted_count is the number of leading requests
     // accepted before the provider's bad WR. Requests counted as posted must

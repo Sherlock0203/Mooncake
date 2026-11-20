@@ -4,17 +4,22 @@
 #ifndef TENT_TRANSPORT_UB_UB_TRANSPORT_H_
 #define TENT_TRANSPORT_UB_UB_TRANSPORT_H_
 
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <vector>
 
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/transport.h"
 #include "tent/transport/ub/probe_resources.h"
+#include "tent/transport/ub/probe_stats.h"
 
 namespace mooncake::tent {
 
 namespace ub {
 class UrmaAdapter;
+class ProbePeerCoordinator;
+class ProbeTopology;
 struct UbTask;
 }  // namespace ub
 
@@ -77,6 +82,29 @@ class UbTransport final : public Transport {
     double getEstimatedBandwidth() const override;
     Status getNicLoadStats(std::vector<NicLoadStats>& stats) const override;
     bool supportNotification() const override { return false; }
+
+    // ---- observation (design §12.1) --------------------------------------
+    // Number of probe path rows: legal adjacency edges, not healthy rows.
+    [[nodiscard]] size_t probeLinkCount() const;
+    // Campaigns with at least one unresolved entry.
+    [[nodiscard]] size_t probeCampaignCount() const;
+    // True once the probe manager stopped accepting new probes.
+    [[nodiscard]] bool probeStopped() const;
+    // Current probe graph generation, for log correlation.
+    [[nodiscard]] uint64_t probeGeneration() const;
+    // Declared adjacency counters (design §11). Zeroed when no declaration
+    // was installed or after uninstall.
+    [[nodiscard]] ub::ProbeTopologyStats probeTopologyStats() const;
+    // Probe handshake/publication counters.
+    [[nodiscard]] ub::ProbeCoordinatorStats probeCoordinatorStats() const;
+    // Responder-side identity failures (topology_name/EID/kind mismatch).
+    [[nodiscard]] uint64_t probePublicationIdentityFailures() const;
+    // ProbeLinkManager counters (probe test/post/health/campaign). Intended
+    // for machine-readable verification exporters.
+    [[nodiscard]] ub::ProbeStats probeLinkStats() const;
+    // Largest installed Context incarnation. Pool members are keyed by it, so
+    // a summary that prints it can be correlated with a pool generation.
+    [[nodiscard]] uint64_t poolGeneration() const;
 
    private:
     struct Impl;

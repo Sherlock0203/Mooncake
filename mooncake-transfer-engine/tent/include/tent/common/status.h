@@ -102,6 +102,11 @@ class Status final {
         kInvalidEntry = 5,
         kInvalidMetadataType = 6,
         kNeedsRefreshCache = 7,
+        // The peer presented a bootstrap that cannot be merged with the
+        // incumbent: either the same incarnation published different content,
+        // or a newer generation arrived. The caller should retire the
+        // incumbent and retry once with a fresh endpoint.
+        kAlreadyExists = 8,
 
         kRdmaError = 100,
         kCudaError = 101,
@@ -158,6 +163,7 @@ class Status final {
     TYPE_CHECK(InvalidEntry);
     TYPE_CHECK(InvalidMetadataType);
     TYPE_CHECK(NeedsRefreshCache);
+    TYPE_CHECK(AlreadyExists);
 
     TYPE_CHECK(RdmaError);
     TYPE_CHECK(CudaError);

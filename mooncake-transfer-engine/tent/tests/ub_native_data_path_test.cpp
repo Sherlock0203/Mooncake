@@ -385,6 +385,61 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         quiesce_calls_.fetch_add(1, std::memory_order_relaxed);
         return Status::OK();
     }
+    // Asynchronous drain primitives (design tent-ub-async-drain-design §4.1).
+    // The pooled error path runs the chain on the control executor, so the fake
+    // provider emits the flush-done marker the way a real one does: because the
+    // Jetty entered ERROR. The marker travels through the JFC poller, which is
+    // exactly the path this integration test covers.
+    static constexpr int kFlushDoneStatus = 0x21;
+
+    Status modifyJettyError(const JettyPtr& jetty, uint64_t) override {
+        auto fake = std::dynamic_pointer_cast<FakeJetty>(jetty);
+        if (!fake || !fake->valid()) {
+            return Status::InvalidArgument("bad Jetty modify");
+        }
+        modify_error_calls_.fetch_add(1, std::memory_order_relaxed);
+        if (auto jfc = fake->jfc()) {
+            jfc->push(Completion{CompletionCategory::ENDPOINT_ERROR,
+                                 kFlushDoneStatus, 0, 0, fake->id()});
+        }
+        return Status::OK();
+    }
+
+    EntityMarkerKind classifyEntityMarker(
+        const Completion& completion) const override {
+        return completion.native_status == kFlushDoneStatus
+                   ? EntityMarkerKind::kFlushDone
+                   : EntityMarkerKind::kNone;
+    }
+
+    Status flushJettyOnce(const JettyPtr& jetty,
+                          std::vector<Completion>& out) override {
+        out.clear();
+        auto fake = std::dynamic_pointer_cast<FakeJetty>(jetty);
+        if (!fake || !fake->valid()) {
+            return Status::InvalidArgument("bad Jetty flush");
+        }
+        flush_jetty_calls_.fetch_add(1, std::memory_order_relaxed);
+        return Status::OK();
+    }
+
+    Status finishDrain(const JettyPtr& jetty) override {
+        auto fake = std::dynamic_pointer_cast<FakeJetty>(jetty);
+        if (!fake || !fake->valid()) {
+            return Status::InvalidArgument("bad Jetty finish");
+        }
+        finish_drain_calls_.fetch_add(1, std::memory_order_relaxed);
+        return Status::OK();
+    }
+
+    DeleteOutcome deleteJettyWithOutcome(JettyPtr& jetty) override {
+        DeleteOutcome outcome;
+        outcome.status = deleteJetty(jetty);
+        outcome.kind = outcome.status.ok() ? DeleteOutcome::Kind::kConsumed
+                                           : DeleteOutcome::Kind::kUnknown;
+        return outcome;
+    }
+
     Status post(const JettyPtr& jetty, const std::vector<WorkRequest>& requests,
                 size_t& posted_count) override {
         posted_count = 0;
@@ -511,6 +566,15 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     uint64_t quiesceCalls() const {
         return quiesce_calls_.load(std::memory_order_relaxed);
     }
+    uint64_t modifyErrorCalls() const {
+        return modify_error_calls_.load(std::memory_order_relaxed);
+    }
+    uint64_t flushJettyCalls() const {
+        return flush_jetty_calls_.load(std::memory_order_relaxed);
+    }
+    uint64_t finishDrainCalls() const {
+        return finish_drain_calls_.load(std::memory_order_relaxed);
+    }
     uint64_t openContextCalls() const {
         return open_context_calls_.load(std::memory_order_relaxed);
     }
@@ -566,6 +630,9 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     std::vector<Pending> pending_;
     std::vector<uint32_t> imported_ids_;
     std::atomic<uint64_t> quiesce_calls_{0};
+    std::atomic<uint64_t> modify_error_calls_{0};
+    std::atomic<uint64_t> flush_jetty_calls_{0};
+    std::atomic<uint64_t> finish_drain_calls_{0};
     std::atomic<uint64_t> open_context_calls_{0};
     std::atomic<uint64_t> create_jetty_calls_{0};
     std::atomic<uint64_t> delete_jetty_calls_{0};
@@ -1668,7 +1735,9 @@ TEST(UbRmLegacyTest, EndpointProducesV2AndImportsPeerTargets) {
     EXPECT_EQ(local.protocol_version, 2U);
     ASSERT_TRUE(local.rm.has_value());
     EXPECT_TRUE(validateUbBootstrap(local).ok());
-    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::RM, local).ok());
+    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::RM,
+                                       UbBootstrapProtocol::kAuto, local)
+                    .ok());
     EXPECT_EQ(local.rm->targets.size(), 1U);
     EXPECT_EQ(local.rm->targets[0].id, endpoint->jetty(0)->id());
     EXPECT_EQ(local.rm->targets[0].target_epoch, local.endpoint_generation);
@@ -1691,13 +1760,14 @@ TEST(UbRmLegacyTest, EndpointProducesV2AndImportsPeerTargets) {
     // not import the peer targets a second time.
     EXPECT_TRUE(endpoint->bindRm(peer, expected).ok());
     EXPECT_EQ(adapter->importCalls(), 1U);
-    // A different peer generation is rejected without disturbing the
-    // established incarnation.
+    // A different peer generation is not merged into the established
+    // incarnation; it is reported as AlreadyExists so the target handler can
+    // retire the incumbent and retry once.
     auto other_generation = peer;
     other_generation.endpoint_generation = peer.endpoint_generation + 1;
     EXPECT_TRUE(
         endpoint->bindRm(other_generation, expectedForRmPeer(other_generation))
-            .IsInvalidArgument());
+            .IsAlreadyExists());
     EXPECT_EQ(endpoint->importedTargetCount(), 1U);
 
     // RC bind is rejected on an RM endpoint.
@@ -1786,6 +1856,60 @@ TEST(UbRmLegacyTest, BindRmRejectsBadDescriptorsAndRollsBackImports) {
     EXPECT_TRUE(adapter->shutdown().ok());
 }
 
+// A remote RM target is a node-wide resource shared by every endpoint on one
+// Context: the registry imports it once and reference-counts each user, so a
+// second endpoint incarnation must not create a second native import (design
+// §5.1).
+TEST(UbRmLegacyTest, SharedPeerTargetIsImportedOncePerContext) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(rmCapableDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+    auto context = std::make_shared<UbContext>(0, rmCapableDevice(), adapter);
+    ASSERT_TRUE(context->initialize(1, JfcOptions{}).ok());
+
+    auto make_endpoint = [&](uint64_t peer_segment_id) {
+        return std::make_shared<UbEndpoint>(
+            UbEndpointKey{0, peer_segment_id, 9, "peer/ub:fake0:eid0"}, context,
+            adapter, 2, rmJettyOptions());
+    };
+    auto make_peer = [](const std::shared_ptr<UbEndpoint>& endpoint,
+                        UbBootstrapDesc& peer) {
+        UbBootstrapDesc local;
+        EXPECT_TRUE(endpoint
+                        ->makeBootstrapDescV2("seg-a", "seg-a/ub:fake0:eid0",
+                                              "seg-b/ub:fake0:eid0", 5, 1, 1,
+                                              local)
+                        .ok());
+        peer = local;
+        peer.segment_name = "seg-b";
+        peer.local_nic_path = "seg-b/ub:fake0:eid0";
+        peer.peer_nic_path = "seg-a/ub:fake0:eid0";
+    };
+
+    auto first = make_endpoint(123);
+    auto second = make_endpoint(456);
+    ASSERT_TRUE(first->prepare().ok());
+    ASSERT_TRUE(second->prepare().ok());
+    UbBootstrapDesc peer;
+    make_peer(first, peer);
+    ASSERT_TRUE(first->bindRm(peer, expectedForRmPeer(peer)).ok());
+    // Both local endpoints reference the same peer descriptor, so the target
+    // identities (and epochs) are identical.
+    ASSERT_TRUE(second->bindRm(peer, expectedForRmPeer(peer)).ok());
+    // One peer device, two targets: the second endpoint only adds references.
+    EXPECT_EQ(adapter->importCalls(), 2U)
+        << "a shared peer target must be imported once per Context";
+    EXPECT_EQ(adapter->unimportCalls(), 0U);
+
+    // Releasing one endpoint keeps the target alive for the other.
+    ASSERT_TRUE(first->retire().ok());
+    EXPECT_EQ(adapter->unimportCalls(), 0U);
+    ASSERT_TRUE(second->retire().ok());
+    EXPECT_EQ(adapter->unimportCalls(), 2U);
+
+    EXPECT_TRUE(context->shutdown().ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
 TEST(UbRmLegacyTest, RetireRetainsTargetWhenUnimportFailsAndRetries) {
     auto adapter = std::make_shared<FakeUrmaAdapter>(rmCapableDevice());
     ASSERT_TRUE(adapter->initialize().ok());
@@ -1814,7 +1938,9 @@ TEST(UbRmLegacyTest, RetireRetainsTargetWhenUnimportFailsAndRetries) {
     adapter->failNextUnimports(1);
     EXPECT_TRUE(endpoint->retire().IsRdmaError());
     EXPECT_NE(endpoint->state(), UbEndpoint::State::kDestroyed);
-    EXPECT_EQ(endpoint->importedTargetCount(), 1U)
+    EXPECT_EQ(endpoint->importedTargetCount(), 0U);
+    ASSERT_NE(context->targetRegistry(), nullptr);
+    EXPECT_EQ(context->targetRegistry()->retainedCount(), 1U)
         << "the failed unimport must retain its target handle";
     EXPECT_EQ(adapter->unimportCalls(), 2U)
         << "the successful sibling unimport still completes";
@@ -1899,7 +2025,9 @@ TEST(UbRmLegacyTest, BindRmRollbackRetainsTargetWhenUnimportFails) {
     EXPECT_EQ(endpoint->state(), UbEndpoint::State::kFailed);
     EXPECT_EQ(adapter->importCalls(), 2U);
     EXPECT_EQ(adapter->unimportCalls(), 1U);
-    EXPECT_EQ(endpoint->importedTargetCount(), 1U)
+    EXPECT_EQ(endpoint->importedTargetCount(), 0U);
+    ASSERT_NE(context->targetRegistry(), nullptr);
+    EXPECT_EQ(context->targetRegistry()->retainedCount(), 1U)
         << "the failed rollback unimport retains its target handle";
 
     // A retry completes the release: no target survives kDestroyed.
@@ -1942,7 +2070,7 @@ TEST(UbRmLegacyTest, BindRmClassifiesRepeatedBootstrapAgainstIncumbent) {
     auto conflict = peer;
     conflict.rm->targets[0].id = peer.rm->targets[0].id + 100;
     EXPECT_TRUE(endpoint->bindRm(conflict, expectedForRmPeer(conflict))
-                    .IsInvalidArgument());
+                    .IsAlreadyExists());
     EXPECT_TRUE(endpoint->ready());
     EXPECT_EQ(endpoint->importedTargetCount(), 1U);
 
@@ -1961,7 +2089,7 @@ TEST(UbRmLegacyTest, BindRmClassifiesRepeatedBootstrapAgainstIncumbent) {
     newer.endpoint_generation = peer.endpoint_generation + 1;
     newer.rm->targets[0].target_epoch = newer.endpoint_generation;
     EXPECT_TRUE(
-        endpoint->bindRm(newer, expectedForRmPeer(newer)).IsInvalidArgument());
+        endpoint->bindRm(newer, expectedForRmPeer(newer)).IsAlreadyExists());
     EXPECT_TRUE(endpoint->ready());
     EXPECT_EQ(endpoint->importedTargetCount(), 1U);
 
@@ -2731,11 +2859,10 @@ TEST(UbRmPoolTest, TransportRunsSelfReadWriteThroughPooledSendPool) {
     // with the default desired_per_context=6 an in-flight lease triggers a
     // legal deficit creation,making the createJettyCalls assertion depend on
     // poller timing.
-    config->set("transports/ub/send_pool/desired_per_context", 2);
+    config->set("transports/ub/jetty_pool/business_desired_serving", 2);
     // This test pins exact createJettyCalls counters; keep the pool
     // demand-driven so the background refill cannot top up asynchronously.
     config->set("transports/ub/send_pool/background_refill", false);
-    config->set("transports/ub/probe/enabled", true);
     setPhysicalOnlyIdentity(*config, device);
 
     UbTransport transport(adapter);
@@ -2893,8 +3020,7 @@ TEST(UbRmPoolTest, PooledMemberRetiresAfterCqeError) {
     config->set("transports/ub/slice_timeout_ms", 1000);
     config->set("transports/ub/endpoint_cooldown_ms", 100);
     config->set("transports/ub/jetty_pool/enable", true);
-    config->set("transports/ub/send_pool/desired_per_context", 1);
-    config->set("transports/ub/probe/enabled", true);
+    config->set("transports/ub/jetty_pool/business_desired_serving", 1);
     setPhysicalOnlyIdentity(*config, device);
 
     UbTransport transport(adapter);
@@ -2952,9 +3078,19 @@ TEST(UbRmPoolTest, PooledMemberRetiresAfterCqeError) {
     EXPECT_EQ(transfer.s, COMPLETED);
     EXPECT_EQ(source, target);
 
-    EXPECT_GE(adapter->quiesceCalls(), 1U)
-        << "an errored pooled member must be moved to ERROR and flush-fenced "
-           "before it is retired";
+    // Asynchronous drain chain (design §4.4/§5.2): the error completion closes
+    // the post gate and hands the member to the control executor, which runs
+    // modify ERROR and the software flush. The blocking quiesce must not run on
+    // this path any more.
+    EXPECT_GE(adapter->modifyErrorCalls(), 1U)
+        << "an errored pooled member must be moved to ERROR before it is "
+           "retired";
+    EXPECT_GE(adapter->flushJettyCalls(), 1U)
+        << "the drain chain must flush the software SQ before DELETE_READY";
+    EXPECT_GE(adapter->finishDrainCalls(), 1U)
+        << "the drain chain must finish (clear marker / release segments)";
+    EXPECT_EQ(adapter->quiesceCalls(), 0U)
+        << "the pooled error hot path must never block on quiesceJetty";
     // Retirement hands the native reset+delete to the background delete
     // executor, so wait (bounded) instead of sampling synchronously.
     const auto delete_deadline =
@@ -3014,11 +3150,10 @@ TEST(UbRmPoolTest, BackgroundRefillTopsUpKnownPoolKey) {
     config->set("transports/ub/slice_timeout_ms", 1000);
     config->set("transports/ub/endpoint_cooldown_ms", 100);
     config->set("transports/ub/jetty_pool/enable", true);
-    config->set("transports/ub/send_pool/desired_per_context", 2);
+    config->set("transports/ub/jetty_pool/business_desired_serving", 2);
     config->set("transports/ub/send_pool/background_refill", true);
     config->set("transports/ub/send_pool/background_delete", true);
-    config->set("transports/ub/send_pool/refill_interval_ms", 5);
-    config->set("transports/ub/probe/enabled", true);
+    config->set("transports/ub/jetty_pool/refill_interval_ms", 5);
     setPhysicalOnlyIdentity(*config, device);
 
     UbTransport transport(adapter);

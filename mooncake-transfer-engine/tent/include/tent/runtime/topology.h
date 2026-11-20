@@ -28,6 +28,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "tent/common/config.h"
 #include "tent/common/status.h"
@@ -69,6 +70,15 @@ class Topology {
         std::unordered_map<std::string, std::string> device_attrs{};
     };
 
+    // Trusted UB device kind to publish into the segment topology. Kept
+    // transport-neutral (strings) so the runtime header does not depend on
+    // the UB adapter headers.
+    struct UbNicKindOverride {
+        std::string topology_name;
+        std::string kind;
+        std::string kind_source;
+    };
+
     using MemID = int;
     struct MemEntry {
         std::string name;
@@ -91,6 +101,12 @@ class Topology {
                     const Config* conf = nullptr);
 
     Status parse(const std::string& json_content);
+
+    // Overrides ub.device_kind / ub.device_kind_source for UB NICs whose name
+    // matches an entry. Unknown names are ignored; non-UB NICs are never
+    // touched. This is how install publishes the trusted kind instead of the
+    // raw discovery kind (G-1).
+    Status applyUbDeviceKinds(const std::vector<UbNicKindOverride>& overrides);
 
     // Parse classic TE NIC priority matrix:
     // {"cpu:0": [["mlx5_0"], ["mlx5_1"]], ...}

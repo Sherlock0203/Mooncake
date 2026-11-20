@@ -66,9 +66,9 @@ struct ProbePeerDescriptor {
     uint64_t endpoint_generation{0};
 };
 
-// Peer descriptor supply. P5 fills this from the bootstrap/control channel;
-// P2 tests use a stub. Must outlive the directory and must not call back into
-// it.
+// Peer descriptor supply. Production uses BootstrapProbePeerSource
+// (topology + peer publication registry); tests use a stub. Must outlive the
+// directory and must not call back into it.
 class ProbePeerDescriptorSource {
    public:
     virtual ~ProbePeerDescriptorSource() = default;
@@ -94,6 +94,9 @@ class HandshakeProbePeerDirectory final : public ProbePeerDirectory {
     Status shutdown();
 
     [[nodiscard]] size_t unsupportedPeerCount() const;
+    [[nodiscard]] size_t malformedDescriptorCount() const;
+    [[nodiscard]] size_t duplicateDescriptorCount() const;
+    [[nodiscard]] size_t unknownLocalPortCount() const;
     [[nodiscard]] size_t importFailureCount() const;
     [[nodiscard]] size_t importCount() const;
     [[nodiscard]] size_t cachedEdgeCount() const;
@@ -127,6 +130,9 @@ class HandshakeProbePeerDirectory final : public ProbePeerDirectory {
     ProbePeerDescriptorSource* const source_;
     std::map<EdgeKey, CachedEdge> cache_;
     size_t unsupported_peer_count_{0};
+    size_t malformed_descriptor_count_{0};
+    size_t duplicate_descriptor_count_{0};
+    size_t unknown_local_port_count_{0};
     size_t import_failure_count_{0};
     size_t import_count_{0};
     bool shut_down_{false};

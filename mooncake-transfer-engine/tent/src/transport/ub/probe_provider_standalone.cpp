@@ -15,9 +15,11 @@
 #include "tent/transport/ub/probe_provider_standalone.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <set>
+#include <unordered_set>
 #include <utility>
 
 #include <glog/logging.h>
@@ -50,7 +52,8 @@ StandaloneProbeResourceProvider::StandaloneProbeResourceProvider(
       directory_(nullptr),
       topology_resolver_(std::move(topology_resolver)),
       owns_contexts_(true),
-      auto_discover_(true) {
+      auto_discover_(true),
+      declared_mode_(!params_.local_ports.empty()) {
     maintenance_ = std::thread([this] { maintenanceLoop(); });
 }
 
@@ -79,6 +82,157 @@ Status StandaloneProbeResourceProvider::discover() {
     return discoverLocked();
 }
 
+Status StandaloneProbeResourceProvider::bindPorts(
+    const std::vector<ProbePortSpec>& specs) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (shut_down_) {
+        return Status::InvalidArgument(
+            "standalone probe provider is shut down");
+    }
+    if (initialized_ || resources_ready_) {
+        return Status::InvalidArgument(
+            "probe ports must be bound before local resources are created");
+    }
+    if (ports_bound_ || !ports_.empty()) {
+        return Status::InvalidArgument("probe ports are already bound");
+    }
+    if (specs.empty()) {
+        return Status::InvalidArgument("no declared probe port was supplied");
+    }
+    std::unordered_set<std::string> port_ids;
+    std::unordered_set<Topology::NicID> local_nics;
+    for (const auto& spec : specs) {
+        if (spec.port_id.empty()) {
+            return Status::InvalidArgument("declared probe port has no id");
+        }
+        if (spec.local_nic < 0 || spec.device.topology_name.empty()) {
+            return Status::InvalidArgument("declared probe port '" +
+                                           spec.port_id +
+                                           "' has no resolved device identity");
+        }
+        if (!port_ids.insert(spec.port_id).second) {
+            return Status::InvalidArgument("declared probe port '" +
+                                           spec.port_id + "' is duplicated");
+        }
+        if (!local_nics.insert(spec.local_nic).second) {
+            return Status::InvalidArgument(
+                "two declared probe ports bind the same local NIC " +
+                std::to_string(spec.local_nic));
+        }
+        PortState port;
+        port.config.local_nic = spec.local_nic;
+        port.config.generation = spec.generation == 0 ? 1 : spec.generation;
+        port.port_id = spec.port_id;
+        port.eid = spec.eid;
+        port.topology_name = spec.topology_name;
+        port.native_device_name = spec.native_device_name;
+        port.pending_device = spec.device;
+        port.has_pending_device = true;
+        port.source_generation = port.config.generation;
+        ports_.push_back(std::move(port));
+    }
+    declared_mode_ = true;
+    ports_bound_ = true;
+    owns_contexts_ = true;
+    LOG(INFO) << "UB probe: bound " << ports_.size()
+              << " declared probe port(s)";
+    return Status::OK();
+}
+
+Status StandaloneProbeResourceProvider::ensureBoundContextsLocked() {
+    for (auto& port : ports_) {
+        if (port.config.context && port.config.context->valid()) continue;
+        if (!port.has_pending_device) continue;
+        ContextPtr context;
+        auto status = adapter_->openContext(port.pending_device, context);
+        if (!status.ok() || !context || !context->valid()) {
+            return Status::DeviceNotFound(
+                "declared probe port '" + port.port_id +
+                "' cannot open a probe context: " + status.ToString());
+        }
+        port.config.context = std::move(context);
+        LOG(INFO) << "UB probe: opened declared probe context for port "
+                  << port.port_id << " device "
+                  << port.pending_device.native_device_name;
+    }
+    return Status::OK();
+}
+
+void StandaloneProbeResourceProvider::setPublicationChangedCallback(
+    std::function<void(uint64_t)> callback) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    publication_changed_ = std::move(callback);
+}
+
+void StandaloneProbeResourceProvider::setNodeIdentity(std::string segment,
+                                                      uint64_t node_incarnation,
+                                                      uint64_t topology_epoch) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    publication_segment_ = std::move(segment);
+    if (node_incarnation != 0) {
+        publication_node_incarnation_ = node_incarnation;
+    }
+    if (topology_epoch != 0) publication_topology_epoch_ = topology_epoch;
+}
+
+ProbeLocalPublication StandaloneProbeResourceProvider::publication() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ProbeLocalPublication result;
+    result.segment = publication_segment_;
+    result.node_incarnation = publication_node_incarnation_;
+    result.topology_epoch = publication_topology_epoch_;
+    result.publication_epoch = publication_epoch_;
+    for (const auto& port : ports_) {
+        if (!port.available || !port.probe_jetty || !port.area_segment) {
+            continue;
+        }
+        ProbeLocalPortPublication published;
+        published.port_id = port.port_id;
+        published.topology_name = port.topology_name;
+        published.eid = port.eid;
+        if (published.eid.empty() && port.config.context) {
+            published.eid = port.config.context->deviceInfo().eid;
+        }
+        published.target_epoch = port.config.generation;
+        published.jetty.eid = published.eid;
+        published.jetty.uasid = port.probe_jetty->uasid();
+        published.jetty.id = port.probe_jetty->id();
+        published.jetty.token = kProbeAreaToken;
+        published.area_descriptor = port.area_segment->descriptor();
+        published.area_length = port.area_size;
+        published.area_epoch = port.area_epoch;
+        published.area_token = kProbeAreaToken;
+        published.node_gate_ok = !shut_down_;
+        published.port_gate_ok = true;
+        const auto& device = port.config.context->deviceInfo();
+        const uint16_t modes = device.capabilities.transport_modes;
+        published.profile_gate_ok =
+            device.kind == DeviceKind::PHYSICAL &&
+            (modes == 0 || (modes & kUrmaTransportModeRm) != 0);
+        result.ports.push_back(std::move(published));
+    }
+    return result;
+}
+
+uint64_t StandaloneProbeResourceProvider::publicationEpoch() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return publication_epoch_;
+}
+
+void StandaloneProbeResourceProvider::bumpPublicationEpochLocked() {
+    ++publication_epoch_;
+    publication_bump_ns_ = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    LOG(INFO) << "UB probe publication bumped to epoch " << publication_epoch_;
+}
+
+uint64_t StandaloneProbeResourceProvider::publicationBumpNs() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return publication_bump_ns_;
+}
+
 namespace {
 
 std::string shortEidName(const DeviceInfo& device) {
@@ -105,6 +259,10 @@ Status StandaloneProbeResourceProvider::discoverLocked() {
             "standalone probe provider is shut down");
     }
     if (!ports_.empty()) return Status::OK();
+    if (declared_mode_) {
+        return Status::InvalidArgument(
+            "declared probe topology requires bindPorts() before discovery");
+    }
     if (!params_.valid()) {
         return Status::InvalidArgument("invalid probe parameters");
     }
@@ -561,6 +719,7 @@ Status StandaloneProbeResourceProvider::prepareLocal() {
 }
 
 Status StandaloneProbeResourceProvider::createLocalResourcesLocked() {
+    CHECK_STATUS(ensureBoundContextsLocked());
     auto page_status = validatePageSizeLocked();
     if (!page_status.ok()) return page_status;
 
@@ -634,10 +793,168 @@ Status StandaloneProbeResourceProvider::snapshot(ProbeGraph& graph) {
     ++next_graph_epoch_;
     graph_epoch_ = built.graph_epoch;
     event_seq_ = 0;
+    current_edges_.clear();
+    for (const auto& edge : built.edges) {
+        current_edges_.emplace(edge.version, edge);
+    }
     initialized_ = true;
     graph = std::move(built);
     LOG(INFO) << "UB standalone probe provider created " << available
               << " probe port(s)";
+    return Status::OK();
+}
+
+Status StandaloneProbeResourceProvider::refreshPeerEdges() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (shut_down_) return Status::OK();
+    if (!initialized_ || graph_epoch_ == 0) {
+        return Status::InvalidArgument("probe graph is not initialized");
+    }
+    if (directory_ == nullptr || availability_sink_ == nullptr) {
+        return Status::OK();
+    }
+    std::vector<ProbeEdgeSupply> edges;
+    auto status = directory_->snapshotEdges(edges);
+    if (!status.ok()) return status;
+    std::map<PathVersion, ProbeEdgeSupply> next;
+    for (auto& edge : edges) {
+        if (!edge.version.valid()) continue;
+        next.emplace(edge.version, std::move(edge));
+    }
+    return applyEdgeDiffLocked(next);
+}
+
+Status StandaloneProbeResourceProvider::applyEdgeDiffLocked(
+    const std::map<PathVersion, ProbeEdgeSupply>& next) {
+    auto emit = [&](ProbeEventKind kind, const ProbeEdgeSupply& edge,
+                    const std::optional<PathVersion>& version) -> Status {
+        ProbeEvent event;
+        event.kind = kind;
+        event.local_nic = edge.version.path.local_nic;
+        event.graph_epoch = graph_epoch_;
+        event.event_seq = event_seq_ + 1;
+        event.version = version;
+        event.edge = edge;
+        auto status = availability_sink_->onPoolAvailabilityChange(event);
+        if (status.ok()) {
+            ++event_seq_;
+            LOG(INFO) << "UB probe graph event: kind="
+                      << probeEventKindName(kind)
+                      << " peer=" << edge.peer.segment_id
+                      << " local_nic=" << edge.version.path.local_nic
+                      << " remote_nic=" << edge.version.path.remote_nic
+                      << " topology_epoch=" << edge.version.topology_epoch
+                      << " target_epoch=" << edge.version.target_epoch
+                      << " area_epoch=" << edge.area_epoch
+                      << " event_seq=" << event_seq_;
+        }
+        return status;
+    };
+    const auto same_volatile = [](const ProbeEdgeSupply& lhs,
+                                  const ProbeEdgeSupply& rhs) {
+        return lhs.area_epoch == rhs.area_epoch &&
+               lhs.area_address == rhs.area_address &&
+               lhs.area_length == rhs.area_length &&
+               lhs.remote_jetty.id == rhs.remote_jetty.id &&
+               lhs.remote_jetty.uasid == rhs.remote_jetty.uasid &&
+               lhs.remote_jetty.token == rhs.remote_jetty.token &&
+               lhs.node_gate_ok == rhs.node_gate_ok &&
+               lhs.port_gate_ok == rhs.port_gate_ok &&
+               lhs.profile_gate_ok == rhs.profile_gate_ok &&
+               lhs.endpoint_generation == rhs.endpoint_generation;
+    };
+    const auto same_path = [](const PathVersion& lhs, const PathVersion& rhs) {
+        return lhs.path == rhs.path;
+    };
+    auto applied = current_edges_;
+
+    // 1. New adjacency edges.
+    for (const auto& [version, edge] : next) {
+        if (applied.count(version) != 0) continue;
+        bool replaces_version = false;
+        for (const auto& [old_version, old_edge] : applied) {
+            (void)old_edge;
+            if (same_path(old_version, version)) {
+                replaces_version = true;
+                break;
+            }
+        }
+        if (replaces_version) continue;
+        auto status = emit(ProbeEventKind::kEdgeAdded, edge, std::nullopt);
+        if (!status.ok()) {
+            current_edges_ = std::move(applied);
+            return status;
+        }
+        applied.emplace(version, edge);
+    }
+
+    // 2. Same PathVersion, refreshed volatile handles/gates.
+    for (const auto& [version, edge] : next) {
+        auto existing = applied.find(version);
+        if (existing == applied.end()) continue;
+        if (same_volatile(existing->second, edge)) continue;
+        auto status = emit(ProbeEventKind::kAreaReplaced, edge, std::nullopt);
+        if (!status.ok()) {
+            current_edges_ = std::move(applied);
+            return status;
+        }
+        existing->second = edge;
+    }
+
+    // 3. Same adjacency path, new topology/target epoch: replace atomically.
+    for (const auto& [version, edge] : next) {
+        if (applied.count(version) != 0) continue;
+        std::vector<PathVersion> replaced;
+        for (const auto& [old_version, old_edge] : applied) {
+            (void)old_edge;
+            if (same_path(old_version, version))
+                replaced.push_back(old_version);
+        }
+        if (replaced.empty()) continue;
+        auto status =
+            emit(ProbeEventKind::kTargetEpochChanged, edge, std::nullopt);
+        if (!status.ok()) {
+            current_edges_ = std::move(applied);
+            return status;
+        }
+        for (const auto& old_version : replaced) applied.erase(old_version);
+        applied.emplace(version, edge);
+    }
+
+    // 4. Edges that disappeared (and were not replaced by a newer version).
+    for (auto it = applied.begin(); it != applied.end();) {
+        if (next.count(it->first) != 0) {
+            ++it;
+            continue;
+        }
+        bool replaced = false;
+        for (const auto& [version, edge] : next) {
+            (void)edge;
+            if (same_path(version, it->first)) {
+                replaced = true;
+                break;
+            }
+        }
+        if (replaced) {
+            ++it;
+            continue;
+        }
+        ProbeEvent event;
+        event.kind = ProbeEventKind::kEdgeRemoved;
+        event.local_nic = it->first.path.local_nic;
+        event.graph_epoch = graph_epoch_;
+        event.event_seq = event_seq_ + 1;
+        event.version = it->first;
+        auto status = availability_sink_->onPoolAvailabilityChange(event);
+        if (!status.ok()) {
+            current_edges_ = std::move(applied);
+            return status;
+        }
+        ++event_seq_;
+        it = applied.erase(it);
+    }
+
+    current_edges_ = std::move(applied);
     return Status::OK();
 }
 
@@ -689,6 +1006,8 @@ void StandaloneProbeResourceProvider::processRetire(
     const RetireRequest& request) {
     std::vector<Completion> completions;
     Status rebuild_status = Status::OK();
+    uint64_t publication_epoch = 0;
+    std::function<void(uint64_t)> publication_changed;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!initialized_ || shut_down_) return;
@@ -727,6 +1046,8 @@ void StandaloneProbeResourceProvider::processRetire(
         rebuild_status =
             rebuildPortLocked(*port, request.error_epoch, completions);
         if (rebuild_status.ok()) {
+            publication_epoch = publication_epoch_;
+            publication_changed = publication_changed_;
             LOG(INFO) << "UB standalone probe provider: rebuilt probe lane "
                       << request.path.path.local_nic << "/"
                       << request.path.path.segment_id << "/"
@@ -734,6 +1055,9 @@ void StandaloneProbeResourceProvider::processRetire(
                       << request.generation << " -> "
                       << port->config.generation;
         }
+    }
+    if (publication_epoch != 0 && publication_changed) {
+        publication_changed(publication_epoch);
     }
 
     // Dispatch quiesced completions outside the provider lock: the sink may
@@ -907,6 +1231,9 @@ Status StandaloneProbeResourceProvider::rebuildPortLocked(
     port.source_size = page;
     port.config.generation = next_generation;
     port.source_generation = next_generation;
+    // A probe Jetty rebuild changes target_epoch: peers must refresh quickly
+    // instead of waiting for the periodic handshake (design §6.6).
+    bumpPublicationEpochLocked();
     auto delete_status = adapter_->deleteJetty(old_jetty);
     if (!delete_status.ok()) {
         LOG(WARNING) << "UB probe: old Jetty deletion deferred: "

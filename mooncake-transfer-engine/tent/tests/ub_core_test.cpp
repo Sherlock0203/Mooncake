@@ -26,6 +26,7 @@
 #include "tent/transport/ub/params.h"
 #include "tent/transport/ub/rail_monitor.h"
 #include "tent/transport/ub/slice.h"
+#include "tent/transport/ub/urma_adapter.h"
 #include "tent/transport/ub/workers.h"
 
 namespace mooncake::tent::ub {
@@ -66,35 +67,36 @@ TEST(UbParamsTest, RuntimeDefaultsSelectRcLegacyWithPoolAndProbeOff) {
 
 TEST(UbParamsTest, ParsesDormantPoolAndProbeKeysWithoutStartingResources) {
     Config config;
-    config.set("transports/ub/runtime_profile", "RM_POOL");
+    config.set("transports/ub/runtime_profile", "rm_pool");
     config.set("transports/ub/trans_mode", "rm");
     config.set("transports/ub/jetty_pool/enable", true);
-    config.set("transports/ub/jetty_pool/force_disable", true);
     config.set("transports/ub/probe/enabled", true);
-    config.set("transports/ub/probe/interval", 100);
-    config.set("transports/ub/probe/timeout", 200);
-    config.set("transports/ub/probe/backoff_max", 300);
+    config.set("transports/ub/probe/interval_ms", 300);
+    config.set("transports/ub/probe/timeout_ms", 200);
+    config.set("transports/ub/probe/backoff_max_ms", 400);
     config.set("transports/ub/probe/peer_budget", 2);
-    config.set("transports/ub/probe/recover_success_threshold", 2);
+    config.set("transports/ub/probe/recover_success_threshold", 1);
     config.set("transports/ub/probe/failure_threshold", 4);
     config.set("transports/ub/probe/stop_on_recovery", true);
 
     UbParams params;
-    ASSERT_TRUE(UbParams::FromConfig(config, params).ok());
+    const Status parsed = UbParams::FromConfig(config, params);
+    ASSERT_TRUE(parsed.ok()) << parsed.ToString();
     EXPECT_EQ(params.runtime_profile, UbRuntimeProfile::kRmPool);
     EXPECT_EQ(params.trans_mode, UbTransportMode::kRm);
     EXPECT_TRUE(params.jetty_pool.enable);
-    EXPECT_TRUE(params.jetty_pool.force_disable);
+    EXPECT_FALSE(params.jetty_pool.force_disable);
     EXPECT_TRUE(params.probe.enabled);
-    EXPECT_EQ(params.probe.interval, 100U);
-    EXPECT_EQ(params.probe.timeout, 200U);
-    EXPECT_EQ(params.probe.backoff_max, 300U);
+    EXPECT_EQ(params.probe.interval_ms, 300U);
+    EXPECT_EQ(params.probe.timeout_ms, 200U);
+    EXPECT_EQ(params.probe.backoff_max_ms, 400U);
     EXPECT_EQ(params.probe.peer_budget, 2U);
-    EXPECT_EQ(params.probe.recover_success_threshold, 2U);
+    EXPECT_EQ(params.probe.recover_success_threshold, 1U);
     EXPECT_EQ(params.probe.failure_threshold, 4U);
 
-    // The schema is accepted, but force_disable is the runtime brake: the
-    // pooled selection fails closed instead of overriding the operator.
+    // The schema is accepted; force_disable is the runtime brake and the
+    // selection fails closed instead of overriding the operator.
+    params.jetty_pool.force_disable = true;
     UbRuntimeMode mode = UbRuntimeMode::kRcLegacy;
     EXPECT_TRUE(resolveUbRuntimeMode(params, mode).IsInvalidArgument());
 }
@@ -118,9 +120,11 @@ TEST(UbParamsTest, RuntimeMatrixRejectsInconsistentOrUnsupportedModes) {
     EXPECT_TRUE(evaluate(UbRuntimeProfile::kRcLegacy, UbTransportMode::kRc,
                          true, false, false)
                     .IsInvalidArgument());
+    // Probing is an independent decision: it does not select the runtime
+    // mode and is valid on the RC baseline (v1.7 standalone probing).
     EXPECT_TRUE(evaluate(UbRuntimeProfile::kRcLegacy, UbTransportMode::kRc,
                          false, true, false)
-                    .IsInvalidArgument());
+                    .ok());
 
     EXPECT_TRUE(evaluate(UbRuntimeProfile::kRmLegacy, UbTransportMode::kRc,
                          false, false, true)
@@ -133,9 +137,10 @@ TEST(UbParamsTest, RuntimeMatrixRejectsInconsistentOrUnsupportedModes) {
     EXPECT_TRUE(evaluate(UbRuntimeProfile::kRmLegacy, UbTransportMode::kRm,
                          true, false, true)
                     .IsInvalidArgument());
+    // Probing stays independent of the RM profile as well.
     EXPECT_TRUE(evaluate(UbRuntimeProfile::kRmLegacy, UbTransportMode::kRm,
                          false, true, true)
-                    .IsInvalidArgument());
+                    .ok());
     // RM Legacy is physical-only: no bonding device may be selected.
     EXPECT_TRUE(evaluate(UbRuntimeProfile::kRmLegacy, UbTransportMode::kRm,
                          false, false, false)
@@ -144,9 +149,11 @@ TEST(UbParamsTest, RuntimeMatrixRejectsInconsistentOrUnsupportedModes) {
     EXPECT_TRUE(evaluate(UbRuntimeProfile::kRmPool, UbTransportMode::kRm, false,
                          true, true)
                     .IsInvalidArgument());
+    // rm_pool does not require probing to be enabled (M-3): the pooled data
+    // path only needs the pool switch and the RM transport.
     EXPECT_TRUE(evaluate(UbRuntimeProfile::kRmPool, UbTransportMode::kRm, true,
                          false, true)
-                    .IsInvalidArgument());
+                    .ok());
     // A well-formed pooled configuration passes the config gate; install-time
     // capability/budget gates still fail closed before native resources.
     EXPECT_TRUE(evaluate(UbRuntimeProfile::kRmPool, UbTransportMode::kRm, true,
@@ -208,8 +215,10 @@ TEST(UbAdapterContractTest, ClassifiesPostAcceptanceFromNativeResult) {
     EXPECT_EQ(classifyPostAcceptance(Status::InvalidArgument("rejected"), 0, 1),
               PostAcceptance::kNotAccepted);
     // Accepted-prefix error: the WR may have crossed, so Unknown.
+    // A fully accepted count stays Accepted even when the call reports an
+    // error afterwards: the WR already crossed, so it is not a rollback case.
     EXPECT_EQ(classifyPostAcceptance(Status::RdmaError("late"), 1, 1),
-              PostAcceptance::kUnknown);
+              PostAcceptance::kAccepted);
     // Success with a short count is contradictory: Unknown.
     EXPECT_EQ(classifyPostAcceptance(Status::OK(), 0, 1),
               PostAcceptance::kUnknown);
@@ -289,19 +298,91 @@ UbBootstrapDesc makeValidRmBootstrap() {
 TEST(UbBootstrapTest, GatesVersionAndModeWithoutClaimingRmRuntimeSupport) {
     UbBootstrapDesc legacy;
     legacy.protocol_version = 1;
-    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::RC, legacy).ok());
-    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::RM, legacy)
+    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::RC,
+                                       UbBootstrapProtocol::kAuto, legacy)
+                    .ok());
+    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::RM,
+                                       UbBootstrapProtocol::kAuto, legacy)
                     .IsInvalidArgument());
 
     const auto rm = makeValidRmBootstrap();
     EXPECT_TRUE(validateUbBootstrap(rm).ok());
-    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::RM, rm).ok());
-    EXPECT_TRUE(
-        gateUbBootstrapForMode(UbBootstrapMode::RC, rm).IsNotImplemented());
+    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::RM,
+                                       UbBootstrapProtocol::kAuto, rm)
+                    .ok());
+    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::RC,
+                                       UbBootstrapProtocol::kAuto, rm)
+                    .IsNotImplemented());
     auto response_envelope = rm;
     response_envelope.reply_msg = "response is not a request";
-    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::RM, response_envelope)
+    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::RM,
+                                       UbBootstrapProtocol::kAuto,
+                                       response_envelope)
                     .IsInvalidArgument());
+}
+
+TEST(UbBootstrapTest, ExplicitProtocolSelectorForcesOneVersion) {
+    UbBootstrapDesc legacy;
+    legacy.protocol_version = 1;
+    const auto rm = makeValidRmBootstrap();
+
+    // Forced v1: a v1 peer is accepted by the RC runtime and rejected by RM,
+    // while a v2 peer is rejected outright.
+    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::RC,
+                                       UbBootstrapProtocol::kV1, legacy)
+                    .ok());
+    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::RM,
+                                       UbBootstrapProtocol::kV1, legacy)
+                    .IsNotImplemented());
+    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::RC,
+                                       UbBootstrapProtocol::kV1, rm)
+                    .IsInvalidArgument());
+
+    // Forced v2: a v1 peer is rejected even on the RC runtime, and an RM peer
+    // passes.
+    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::RC,
+                                       UbBootstrapProtocol::kV2, legacy)
+                    .IsInvalidArgument());
+    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::RM,
+                                       UbBootstrapProtocol::kV2, rm)
+                    .ok());
+}
+
+TEST(UbBootstrapTest, V1PeerIgnoresAndFlagsAV2Payload) {
+    auto desc = makeValidRmBootstrap();
+    nlohmann::json wire = desc;
+    // Simulate a peer that claims v1 but still sends a v2 block.
+    wire["protocol_version"] = 1;
+    const auto decoded = wire.get<UbBootstrapDesc>();
+    EXPECT_EQ(decoded.protocol_version, 1U);
+    // The block is dropped, never interpreted.
+    EXPECT_FALSE(decoded.rm.has_value());
+    EXPECT_TRUE(decoded.ignored_v2_payload);
+
+    // A plain v1 envelope is not flagged.
+    nlohmann::json plain = {{"protocol_version", 1}};
+    const auto clean = plain.get<UbBootstrapDesc>();
+    EXPECT_FALSE(clean.ignored_v2_payload);
+}
+
+TEST(UbBootstrapTest, UnknownTopLevelKeysAreIgnoredButBadTypesFailClosed) {
+    auto desc = makeValidRmBootstrap();
+    nlohmann::json wire = desc;
+    // An unknown top-level key is forward-compatible: it is ignored and the
+    // descriptor still validates.
+    wire["future_extension"] = {{"anything", 1}};
+    const auto decoded = wire.get<UbBootstrapDesc>();
+    EXPECT_TRUE(validateUbBootstrap(decoded).ok());
+
+    // A known key with the wrong type is a wire error, never a default.
+    nlohmann::json bad_generation = wire;
+    bad_generation["endpoint_generation"] = "not-a-number";
+    EXPECT_THROW(bad_generation.get<UbBootstrapDesc>(), std::invalid_argument);
+
+    nlohmann::json bad_targets = wire;
+    bad_targets["rm"]["targets"] = 7;
+    EXPECT_THROW(bad_targets.get<UbBootstrapDesc>(),
+                 nlohmann::json::type_error);
 }
 
 TEST(UbBootstrapTest, RmWireFormatParsesStrictlyAndRejectsUnknownFields) {
@@ -492,7 +573,28 @@ TEST(UbBootstrapTest, ComparesGenerationsWithoutOverwritingNewerSnapshots) {
     candidate.rm->targets[0].target_epoch--;
     candidate.endpoint_generation++;
     ASSERT_TRUE(compareUbBootstrapV2(candidate, current, comparison).ok());
-    EXPECT_EQ(comparison, UbBootstrapGenerationComparison::kConflict);
+    // Leaf generation is compared before the target set: a newer endpoint
+    // generation wins even when one incumbent target appears older.
+    EXPECT_EQ(comparison, UbBootstrapGenerationComparison::kNewer);
+
+    // D1 regression: a re-created endpoint has a new endpoint_generation and
+    // a completely new Jetty id range. The old order looked up the new target
+    // identities first and returned kConflict before reading the leaf.
+    candidate = current;
+    candidate.endpoint_generation++;
+    candidate.rm->probe_target_map.clear();
+    for (auto& target : candidate.rm->targets) {
+        target.id += 100;
+        target.target_identity += "-new";
+        target.target_epoch = candidate.endpoint_generation;
+    }
+    ASSERT_TRUE(compareUbBootstrapV2(candidate, current, comparison).ok());
+    EXPECT_EQ(comparison, UbBootstrapGenerationComparison::kNewer);
+
+    candidate = current;
+    candidate.rm->physical_device_identity = "different-device";
+    ASSERT_TRUE(compareUbBootstrapV2(candidate, current, comparison).ok());
+    EXPECT_EQ(comparison, UbBootstrapGenerationComparison::kNewer);
 
     candidate = current;
     candidate.rm->targets[0].eid = "0002:0000:0000:0000:0000:0000:0000:0000";
@@ -1150,6 +1252,94 @@ TEST(UbRailSelectionTest, AttemptOrderVisitsEveryRailExactlyOnce) {
     for (size_t index = 0; index < ids.size(); ++index) {
         EXPECT_EQ(std::count(order.begin(), order.end(), index), 1);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Transport mode normalization.
+//
+// The adapter options carry the same "is this RM?" concept twice:
+// transport_mode (probe path, rm_pool) and trans_mode (RM Legacy). A caller
+// may set only one of them, so JFC creation, JFS creation and the post gate
+// must all derive the native mode from isReliableMessage(). These tests pin
+// the four production profiles and the native invariants they depend on.
+// ---------------------------------------------------------------------------
+
+TEST(UbTransportModeNormalizationTest, AllProfilesResolveConsistently) {
+    struct Case {
+        const char* name;
+        JettyTransportMode transport_mode;
+        uint16_t trans_mode;
+        bool reliable_message;
+    };
+    const Case cases[] = {
+        // Probe: only the adapter-level spelling is set. Before the fix this
+        // combination created an RC JFR and an RC JFS.
+        {"probe", JettyTransportMode::kRm, kUrmaTransportModeRc, true},
+        // RM Legacy: only the native spelling is set.
+        {"rm_legacy", JettyTransportMode::kRc, kUrmaTransportModeRm, true},
+        // rm_pool: both spellings are set.
+        {"rm_pool", JettyTransportMode::kRm, kUrmaTransportModeRm, true},
+        // RC Legacy: neither spelling selects RM.
+        {"rc_legacy", JettyTransportMode::kRc, kUrmaTransportModeRc, false},
+    };
+    for (const Case& test_case : cases) {
+        SCOPED_TRACE(test_case.name);
+        JfcOptions jfc_options;
+        jfc_options.transport_mode = test_case.transport_mode;
+        jfc_options.trans_mode = test_case.trans_mode;
+        JettyOptions jetty_options;
+        jetty_options.transport_mode = test_case.transport_mode;
+        jetty_options.trans_mode = test_case.trans_mode;
+
+        EXPECT_EQ(isReliableMessage(jfc_options), test_case.reliable_message);
+        EXPECT_EQ(isReliableMessage(jetty_options), test_case.reliable_message);
+
+        const uint16_t expected_native = test_case.reliable_message
+                                             ? kUrmaTransportModeRm
+                                             : kUrmaTransportModeRc;
+        // INV-1: the JFR mode comes from the same predicate as the shared-JFC
+        // decision (shared_jfc_ is true exactly when the predicate is true).
+        EXPECT_EQ(nativeTransportMode(isReliableMessage(jfc_options)),
+                  expected_native);
+        // INV-2: the JFS mode and reliableMessage() agree.
+        EXPECT_EQ(nativeTransportMode(isReliableMessage(jetty_options)),
+                  expected_native);
+        // INV-3: JFS.trans_mode == shared JFR.trans_mode.
+        EXPECT_EQ(nativeTransportMode(isReliableMessage(jfc_options)),
+                  nativeTransportMode(isReliableMessage(jetty_options)));
+    }
+}
+
+TEST(UbTransportModeNormalizationTest, ProbeRmIsPostableBeforeBind) {
+    JettyOptions options;
+    options.transport_mode = JettyTransportMode::kRm;
+    // trans_mode keeps its RC default: this is the single-flag probe caller.
+    ASSERT_EQ(options.trans_mode, kUrmaTransportModeRc);
+    ASSERT_TRUE(isReliableMessage(options));
+
+    // INV-4: a native RM Jetty posts per-WR targets and needs no bind.
+    EXPECT_TRUE(isJettyPostable(true, /*created=*/true, /*bound=*/false));
+    EXPECT_TRUE(isJettyPostable(true, /*created=*/false, /*bound=*/true));
+    // An ERROR or RESET RM Jetty is still not postable.
+    EXPECT_FALSE(isJettyPostable(true, /*created=*/false, /*bound=*/false));
+}
+
+TEST(UbTransportModeNormalizationTest, RcLegacyStillRequiresBind) {
+    JettyOptions options;
+    ASSERT_FALSE(isReliableMessage(options));
+
+    EXPECT_FALSE(isJettyPostable(false, /*created=*/true, /*bound=*/false));
+    EXPECT_TRUE(isJettyPostable(false, /*created=*/false, /*bound=*/true));
+    EXPECT_FALSE(isJettyPostable(false, /*created=*/false, /*bound=*/false));
+}
+
+TEST(UbTransportModeNormalizationTest, NativeValuesMatchUrmaConstants) {
+    // The adapter-neutral constants are static_asserted against UMDK in
+    // urma_adapter.cpp; this pins the normalized result the probe log reports.
+    EXPECT_EQ(kUrmaTransportModeRm, 0x1);
+    EXPECT_EQ(kUrmaTransportModeRc, 0x2);
+    EXPECT_EQ(nativeTransportMode(true), kUrmaTransportModeRm);
+    EXPECT_EQ(nativeTransportMode(false), kUrmaTransportModeRc);
 }
 
 }  // namespace

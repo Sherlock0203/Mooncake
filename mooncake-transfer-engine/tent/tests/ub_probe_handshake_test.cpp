@@ -122,6 +122,44 @@ TEST(UbProbeHandshakeTest, ImportsAndCachesPeerProbeArea) {
     EXPECT_TRUE(adapter->shutdown().ok());
 }
 
+TEST(UbProbeHandshakeTest, OneBadDescriptorDoesNotDropTheSnapshot) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+    ContextPtr context;
+    ASSERT_TRUE(adapter->openContext(fakeDevice(), context).ok());
+
+    auto malformed = makePeer(0, 43, 1);
+    malformed.area_length = 0;
+    auto unknown_local = makePeer(9, 44, 0);
+    StubPeerSource source(
+        {makePeer(0, 42, 0), malformed, unknown_local, makePeer(0, 42, 0)});
+    HandshakeProbePeerDirectory directory(adapter, {{0, context}}, &source);
+
+    std::vector<ProbeEdgeSupply> edges;
+    ASSERT_TRUE(directory.snapshotEdges(edges).ok());
+    ASSERT_EQ(edges.size(), 1U);
+    EXPECT_EQ(edges[0].version.path.segment_id, 42U);
+    EXPECT_EQ(directory.malformedDescriptorCount(), 1U);
+    EXPECT_EQ(directory.unknownLocalPortCount(), 1U);
+    EXPECT_EQ(directory.duplicateDescriptorCount(), 1U);
+    EXPECT_EQ(directory.importCount(), 1U);
+
+    // A malformed descriptor for an already imported edge keeps its previous
+    // cache entry instead of tearing the edge down.
+    auto broken = makePeer(0, 42, 0);
+    broken.area_descriptor.hex.clear();
+    source.set({broken});
+    edges.clear();
+    ASSERT_TRUE(directory.snapshotEdges(edges).ok());
+    ASSERT_EQ(edges.size(), 1U);
+    EXPECT_EQ(edges[0].version.path.segment_id, 42U);
+    EXPECT_EQ(directory.malformedDescriptorCount(), 2U);
+
+    ASSERT_TRUE(directory.shutdown().ok());
+    EXPECT_TRUE(adapter->closeContext(context).ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
 TEST(UbProbeHandshakeTest, SkipsUnsupportedPeerSchema) {
     auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
     ASSERT_TRUE(adapter->initialize().ok());
@@ -196,7 +234,7 @@ TEST(UbProbeHandshakeTest, ChangedAreaIsReimportedAndOldSegmentReleased) {
     EXPECT_TRUE(adapter->shutdown().ok());
 }
 
-TEST(UbProbeHandshakeTest, UnknownLocalPortIsRejected) {
+TEST(UbProbeHandshakeTest, UnknownLocalPortIsSkipped) {
     auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
     ASSERT_TRUE(adapter->initialize().ok());
     ContextPtr context;
@@ -204,8 +242,12 @@ TEST(UbProbeHandshakeTest, UnknownLocalPortIsRejected) {
 
     StubPeerSource source({makePeer(7, 42, 0)});
     HandshakeProbePeerDirectory directory(adapter, {{0, context}}, &source);
+    // One unknown local port must not terminate the whole peer refresh; it is
+    // dropped and counted, and the remaining descriptors still apply.
     std::vector<ProbeEdgeSupply> edges;
-    EXPECT_TRUE(directory.snapshotEdges(edges).IsInvalidArgument());
+    EXPECT_TRUE(directory.snapshotEdges(edges).ok());
+    EXPECT_TRUE(edges.empty());
+    EXPECT_EQ(directory.unknownLocalPortCount(), 1U);
 
     ASSERT_TRUE(directory.shutdown().ok());
     EXPECT_TRUE(adapter->closeContext(context).ok());

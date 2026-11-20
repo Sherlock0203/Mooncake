@@ -49,8 +49,20 @@ class StubPeerDirectory final : public ProbePeerDirectory {
         return Status::OK();
     }
 
+    void set(std::vector<ProbeEdgeSupply> edges) { edges_ = std::move(edges); }
+
    private:
     std::vector<ProbeEdgeSupply> edges_;
+};
+
+class RecordingAvailabilitySink final : public ProbeAvailabilitySink {
+   public:
+    Status onPoolAvailabilityChange(const ProbeEvent& event) override {
+        events.push_back(event);
+        return Status::OK();
+    }
+
+    std::vector<ProbeEvent> events;
 };
 
 ProbeEdgeSupply makeEdge(Topology::NicID local_nic, SegmentID peer_id,
@@ -276,6 +288,168 @@ TEST(UbProbeStandaloneProviderTest, RecordsRetireAndHandoffUntilShutdown) {
     EXPECT_EQ(adapter->liveLocalSegmentCount(), 0U);
 
     EXPECT_TRUE(adapter->closeContext(context).ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
+TEST(UbProbeStandaloneProviderTest, RefreshEmitsIncrementalGraphEvents) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+    ContextPtr context;
+    ASSERT_TRUE(adapter->openContext(fakeDevice(), context).ok());
+
+    StubPeerDirectory directory({makeEdge(0, 42, 0), makeEdge(0, 42, 1)});
+    auto params = makeProbeParams();
+    params.dynamic_edges = true;
+    StandaloneProbeResourceProvider provider(
+        adapter, params, {ProbeLocalPortConfig{0, context, nullptr, 1}},
+        &directory);
+    ProbeGraph graph;
+    ASSERT_TRUE(provider.snapshot(graph).ok());
+    ASSERT_EQ(graph.edges.size(), 2U);
+
+    RecordingAvailabilitySink sink;
+    provider.setAvailabilitySink(&sink);
+
+    // Add a new edge and remove both old ones. Additions are emitted before
+    // removals so the graph never loses an unrelated edge first.
+    directory.set({makeEdge(0, 43, 0)});
+    ASSERT_TRUE(provider.refreshPeerEdges().ok());
+    ASSERT_EQ(sink.events.size(), 3U);
+    std::vector<ProbeEventKind> kinds;
+    for (const auto& event : sink.events) kinds.push_back(event.kind);
+    EXPECT_EQ(
+        std::count(kinds.begin(), kinds.end(), ProbeEventKind::kEdgeAdded), 1);
+    EXPECT_EQ(
+        std::count(kinds.begin(), kinds.end(), ProbeEventKind::kEdgeRemoved),
+        2);
+    EXPECT_EQ(sink.events[0].event_seq, 1U);
+    EXPECT_EQ(sink.events[1].event_seq, 2U);
+    EXPECT_EQ(sink.events[2].event_seq, 3U);
+
+    // Same PathVersion with a new area epoch: in-place replacement.
+    sink.events.clear();
+    auto refreshed = makeEdge(0, 43, 0);
+    refreshed.area_epoch = 2;
+    directory.set({refreshed});
+    ASSERT_TRUE(provider.refreshPeerEdges().ok());
+    ASSERT_EQ(sink.events.size(), 1U);
+    EXPECT_EQ(sink.events[0].kind, ProbeEventKind::kAreaReplaced);
+    EXPECT_EQ(sink.events[0].event_seq, 4U);
+
+    // Same adjacency path with a new target epoch: one atomic replacement.
+    sink.events.clear();
+    auto changed = makeEdge(0, 43, 0);
+    changed.version.target_epoch = 2;
+    directory.set({changed});
+    ASSERT_TRUE(provider.refreshPeerEdges().ok());
+    ASSERT_EQ(sink.events.size(), 1U);
+    EXPECT_EQ(sink.events[0].kind, ProbeEventKind::kTargetEpochChanged);
+    ASSERT_TRUE(sink.events[0].edge.has_value());
+    EXPECT_EQ(sink.events[0].edge->version.target_epoch, 2U);
+
+    // No diff produces no event.
+    sink.events.clear();
+    ASSERT_TRUE(provider.refreshPeerEdges().ok());
+    EXPECT_TRUE(sink.events.empty());
+
+    ASSERT_TRUE(provider.shutdown().ok());
+    EXPECT_TRUE(adapter->closeContext(context).ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
+TEST(UbProbeStandaloneProviderTest, RebuildPushesTheNewPublicationEpoch) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+    ContextPtr context;
+    ASSERT_TRUE(adapter->openContext(fakeDevice(), context).ok());
+
+    StubPeerDirectory directory({makeEdge(0, 42, 0)});
+    StandaloneProbeResourceProvider provider(
+        adapter, makeProbeParams(),
+        {ProbeLocalPortConfig{0, context, nullptr, 1}}, &directory);
+    ProbeGraph graph;
+    ASSERT_TRUE(provider.snapshot(graph).ok());
+    RecordingAvailabilitySink sink;
+    provider.setAvailabilitySink(&sink);
+    provider.setCompletionSink([](const Completion&) { return Status::OK(); });
+    uint64_t pushed_epoch = 0;
+    provider.setPublicationChangedCallback(
+        [&](uint64_t epoch) { pushed_epoch = epoch; });
+
+    const uint32_t jetty_id = graph.ports[0].probe_jetty->id();
+    const PathVersion version{ProbePathKey{0, 42, 0}, 1, 1};
+    provider.retireProbeLane(LaneKey{0, jetty_id, 1}, 1, 7, version,
+                             Status::InternalError("injected retire"));
+    ASSERT_TRUE(provider.waitForRebuilds(2000));
+    EXPECT_GT(provider.publicationEpoch(), 1U);
+    EXPECT_EQ(pushed_epoch, provider.publicationEpoch());
+
+    ASSERT_TRUE(provider.shutdown().ok());
+    EXPECT_TRUE(adapter->closeContext(context).ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
+TEST(UbProbeStandaloneProviderTest, DeclaredPortsPublishNodeIdentityAndArea) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+
+    ProbeParams params = makeProbeParams();
+    StandaloneProbeResourceProvider provider(adapter, params);
+    provider.setNodeIdentity("node-a", 11, 22);
+
+    auto device = fakeDevice();
+    device.kind = DeviceKind::PHYSICAL;
+    device.capabilities.transport_modes = 3;
+    ProbePortSpec spec;
+    spec.port_id = "P0";
+    spec.local_nic = 0;
+    spec.device = device;
+    spec.topology_name = device.topology_name;
+    spec.native_device_name = device.native_device_name;
+    spec.eid = device.eid;
+    spec.generation = 1;
+    ASSERT_TRUE(provider.bindPorts({spec}).ok());
+    // Ports may only be bound once, before resources exist.
+    EXPECT_TRUE(provider.bindPorts({spec}).IsInvalidArgument());
+    ASSERT_TRUE(provider.prepareLocal().ok());
+
+    const auto publication = provider.publication();
+    EXPECT_EQ(publication.segment, "node-a");
+    EXPECT_EQ(publication.node_incarnation, 11U);
+    EXPECT_EQ(publication.topology_epoch, 22U);
+    EXPECT_EQ(publication.publication_epoch, 1U);
+    ASSERT_EQ(publication.ports.size(), 1U);
+    const auto& port = publication.ports[0];
+    EXPECT_EQ(port.port_id, "P0");
+    EXPECT_EQ(port.topology_name, device.topology_name);
+    EXPECT_EQ(port.eid, device.eid);
+    EXPECT_EQ(port.target_epoch, 1U);
+    EXPECT_NE(port.jetty.id, 0U);
+    EXPECT_EQ(port.jetty.eid, device.eid);
+    EXPECT_EQ(port.jetty.token, 0xACFEU);
+    EXPECT_EQ(port.area_length % static_cast<uint64_t>(::getpagesize()), 0U);
+    EXPECT_EQ(port.area_epoch, 1U);
+    EXPECT_EQ(port.area_token, 0xACFEU);
+    EXPECT_FALSE(port.area_descriptor.hex.empty());
+    EXPECT_TRUE(port.node_gate_ok);
+    EXPECT_TRUE(port.port_gate_ok);
+    EXPECT_TRUE(port.profile_gate_ok);
+    EXPECT_EQ(provider.publicationEpoch(), 1U);
+
+    EXPECT_TRUE(provider.shutdown().ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
+TEST(UbProbeStandaloneProviderTest, DeclaredModeRequiresBindPorts) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+
+    ProbeParams params = makeProbeParams();
+    params.local_ports.push_back(ProbeLocalPortDecl{"P0", "ub:fake0:eid0", ""});
+    StandaloneProbeResourceProvider provider(adapter, params);
+    EXPECT_TRUE(provider.discover().IsInvalidArgument());
+
+    EXPECT_TRUE(provider.shutdown().ok());
     EXPECT_TRUE(adapter->shutdown().ok());
 }
 

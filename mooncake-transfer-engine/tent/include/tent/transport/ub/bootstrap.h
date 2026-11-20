@@ -17,6 +17,29 @@ enum class UbBootstrapMode : uint8_t {
     RM,
 };
 
+// Explicit bootstrap protocol selector (design §4.2). `kAuto` derives the
+// required version from the runtime mode, which is the historical behavior.
+// `kV1`/`kV2` force one version and reject the other instead of silently
+// switching: an RM/RC or RM/UM peer mismatch must be a visible error, never a
+// quiet fallback to v1.
+enum class UbBootstrapProtocol : uint8_t {
+    kAuto = 0,
+    kV2,
+    kV1,
+};
+
+inline const char* ubBootstrapProtocolName(UbBootstrapProtocol protocol) {
+    switch (protocol) {
+        case UbBootstrapProtocol::kAuto:
+            return "auto";
+        case UbBootstrapProtocol::kV2:
+            return "v2";
+        case UbBootstrapProtocol::kV1:
+            return "v1";
+    }
+    return "unknown";
+}
+
 enum class UbBootstrapGenerationComparison : uint8_t {
     kDuplicate,
     kStale,
@@ -50,7 +73,11 @@ Status validateUbBootstrap(const UbBootstrapDesc& desc);
 
 // Checks only the version/mode contract. A successful RM v2 gate does not
 // claim that the current runtime or provider implements the RM data plane.
+// `requested` is the explicit selector: kAuto keeps the historical mode-derived
+// behavior, kV2 rejects a v1 peer and kV1 rejects a v2 peer. A v1 peer is only
+// served by the RC legacy runtime; RM (legacy or pooled) requires v2.
 Status gateUbBootstrapForMode(UbBootstrapMode expected,
+                              UbBootstrapProtocol requested,
                               const UbBootstrapDesc& desc);
 
 Status validateUbBootstrapV2PeerIdentity(

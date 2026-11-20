@@ -561,24 +561,122 @@ if(USE_UB)
   add_executable(
     tent_ub_core_test
     ub_core_test.cpp ../src/transport/ub/bootstrap.cpp
-    ../src/transport/ub/quota.cpp ../src/transport/ub/rail_monitor.cpp)
+    ../src/transport/ub/completion_record.cpp ../src/transport/ub/quota.cpp
+    ../src/transport/ub/rail_monitor.cpp)
   target_link_libraries(tent_ub_core_test PRIVATE tent_common gtest gtest_main)
   target_include_directories(tent_ub_core_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_ub_core_test COMMAND tent_ub_core_test)
 
+  # Completion gate unit tests (W2a). Links only completion_record.cpp, so the
+  # retryability table can be checked without the workers or the adapter.
+  add_executable(tent_ub_completion_gate_test
+                 ub_completion_gate_test.cpp
+                 ../src/transport/ub/completion_record.cpp)
+  target_link_libraries(tent_ub_completion_gate_test
+                        PRIVATE tent_common gtest gtest_main)
+  target_include_directories(tent_ub_completion_gate_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_completion_gate_test
+           COMMAND tent_ub_completion_gate_test)
+
+  # Declared probe topology (design §4–§5): config resolution, binding
+  # uniqueness and the per-slice adjacency view. Software-only.
+  add_executable(tent_ub_probe_topology_test ub_probe_topology_test.cpp)
+  target_link_libraries(tent_ub_probe_topology_test
+                        PRIVATE tent_link_group gtest gtest_main)
+  target_include_directories(tent_ub_probe_topology_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_probe_topology_test
+           COMMAND tent_ub_probe_topology_test)
+
+  # ProbeBootstrapUb wire codec/validation (design §7.2/§7.3).
+  add_executable(tent_ub_probe_publication_test
+                 ub_probe_publication_test.cpp)
+  target_link_libraries(tent_ub_probe_publication_test
+                        PRIVATE tent_link_group gtest gtest_main)
+  target_include_directories(tent_ub_probe_publication_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_probe_publication_test
+           COMMAND tent_ub_probe_publication_test)
+
+  # Peer publication registry withdrawal semantics and the descriptor source
+  # join (design §6.3/§7.6).
+  add_executable(tent_ub_probe_peer_registry_test
+                 ub_probe_peer_registry_test.cpp)
+  target_link_libraries(tent_ub_probe_peer_registry_test
+                        PRIVATE tent_link_group gtest gtest_main)
+  target_include_directories(tent_ub_probe_peer_registry_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_probe_peer_registry_test
+           COMMAND tent_ub_probe_peer_registry_test)
+
+  # Declared-edge kParamError invalidation (closed-loop design §5.6.3).
+  add_executable(tent_ub_edge_invalid_tracker_test
+                 ub_edge_invalid_tracker_test.cpp)
+  target_link_libraries(tent_ub_edge_invalid_tracker_test
+                        PRIVATE tent_common gtest gtest_main)
+  target_include_directories(tent_ub_edge_invalid_tracker_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_edge_invalid_tracker_test
+           COMMAND tent_ub_edge_invalid_tracker_test)
+
+  # Handshake scheduling/apply and the publication -> registry -> source ->
+  # provider diff path (design §7).
+  add_executable(tent_ub_probe_peer_coordinator_test
+                 ub_probe_peer_coordinator_test.cpp)
+  target_link_libraries(tent_ub_probe_peer_coordinator_test
+                        PRIVATE tent_link_group gtest gtest_main)
+  target_include_directories(tent_ub_probe_peer_coordinator_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_probe_peer_coordinator_test
+           COMMAND tent_ub_probe_peer_coordinator_test)
+
   # Pooled rm_pool core components (C05/C06/C07): budget ledger, admission
   # tickets, per-attempt send pool and completion gate. Software-only: the
   # fake adapter needs no provider or NIC.
+  # Tombstone table and recovery budgets (design §7.2): unproven destruction
+  # is recorded, never TTL-evicted, and gates the native budget release.
+  add_executable(
+    tent_ub_tombstone_test
+    ub_tombstone_test.cpp ../src/transport/ub/native_budget.cpp
+    ../src/transport/ub/admission.cpp ../src/transport/ub/business_jetty_pool.cpp ../src/transport/ub/jetty_retire_worker.cpp ../src/transport/ub/jetty_refill_worker.cpp ../src/transport/ub/jetty_drain_controller.cpp ../src/transport/ub/control_executor.cpp
+    ../src/transport/ub/tombstone.cpp ../src/transport/ub/jfc.cpp)
+  target_link_libraries(tent_ub_tombstone_test PRIVATE tent_common gtest
+                                                       gtest_main)
+  target_include_directories(tent_ub_tombstone_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_tombstone_test COMMAND tent_ub_tombstone_test)
+
+  # W3e/W3g claim/return unit tests: the pool's claim authority, the epoch
+  # snapshot and the mutually exclusive claim verdicts. The PLM is linked only
+  # for the fault-epoch anchor test.
+  add_executable(
+    tent_ub_post_claim_test ub_post_claim_test.cpp
+                               ../src/transport/ub/native_budget.cpp
+                               ../src/transport/ub/admission.cpp
+                               ../src/transport/ub/business_jetty_pool.cpp ../src/transport/ub/jetty_retire_worker.cpp ../src/transport/ub/jetty_refill_worker.cpp ../src/transport/ub/jetty_drain_controller.cpp ../src/transport/ub/control_executor.cpp
+                               ../src/transport/ub/tombstone.cpp
+                               ../src/transport/ub/jfc.cpp
+                               ../src/transport/ub/probe_link_manager.cpp)
+  target_link_libraries(tent_ub_post_claim_test PRIVATE tent_common gtest
+                                                            gtest_main)
+  target_include_directories(tent_ub_post_claim_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_post_claim_test COMMAND tent_ub_post_claim_test)
+
   add_executable(
     tent_ub_pooled_core_test
     ub_pooled_core_test.cpp
     ../src/transport/ub/native_budget.cpp
     ../src/transport/ub/admission.cpp
-    ../src/transport/ub/send_jetty_pool.cpp
+    ../src/transport/ub/business_jetty_pool.cpp ../src/transport/ub/jetty_retire_worker.cpp ../src/transport/ub/jetty_refill_worker.cpp ../src/transport/ub/jetty_drain_controller.cpp ../src/transport/ub/control_executor.cpp
+    ../src/transport/ub/tombstone.cpp
     ../src/transport/ub/attempt_gate.cpp
     ../src/transport/ub/jfc.cpp
     ../src/transport/ub/context.cpp
+    ../src/transport/ub/bootstrap.cpp
+    ../src/transport/ub/target_registry.cpp
     ../src/transport/ub/jetty_pool.cpp)
   target_link_libraries(tent_ub_pooled_core_test PRIVATE tent_common gtest
                                                          gtest_main)
@@ -586,6 +684,30 @@ if(USE_UB)
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_ub_pooled_core_test COMMAND tent_ub_pooled_core_test)
   set_tests_properties(tent_ub_pooled_core_test PROPERTIES TIMEOUT 300)
+
+  # Asynchronous pooled-Jetty drain chain (design tent-ub-async-drain-design
+  # §11.1): the controller state machine, marker attribution, software flush /
+  # settlement, timeout, delete outcomes and the sync fallback. Deterministic
+  # fake adapter + manual control executor + fake clock.
+  add_executable(
+    tent_ub_drain_controller_test
+    ub_drain_controller_test.cpp
+    ../src/transport/ub/native_budget.cpp
+    ../src/transport/ub/admission.cpp
+    ../src/transport/ub/business_jetty_pool.cpp
+    ../src/transport/ub/jetty_retire_worker.cpp
+    ../src/transport/ub/jetty_refill_worker.cpp
+    ../src/transport/ub/jetty_drain_controller.cpp
+    ../src/transport/ub/control_executor.cpp
+    ../src/transport/ub/tombstone.cpp
+    ../src/transport/ub/jfc.cpp)
+  target_link_libraries(tent_ub_drain_controller_test
+                        PRIVATE tent_common gtest gtest_main)
+  target_include_directories(tent_ub_drain_controller_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_drain_controller_test
+           COMMAND tent_ub_drain_controller_test)
+  set_tests_properties(tent_ub_drain_controller_test PROPERTIES TIMEOUT 300)
 
   add_executable(
     tent_ub_teardown_test
@@ -599,7 +721,9 @@ if(USE_UB)
     ../src/transport/ub/jfc.cpp
     ../src/transport/ub/native_budget.cpp
     ../src/transport/ub/admission.cpp
-    ../src/transport/ub/send_jetty_pool.cpp)
+    ../src/transport/ub/business_jetty_pool.cpp ../src/transport/ub/jetty_retire_worker.cpp ../src/transport/ub/jetty_refill_worker.cpp ../src/transport/ub/jetty_drain_controller.cpp ../src/transport/ub/control_executor.cpp
+    ../src/transport/ub/tombstone.cpp
+    ../src/transport/ub/target_registry.cpp)
   target_link_libraries(tent_ub_teardown_test PRIVATE tent_common gtest
                                                       gtest_main)
   target_include_directories(tent_ub_teardown_test

@@ -1,19 +1,26 @@
 // Copyright 2026 KVCache.AI
 // SPDX-License-Identifier: Apache-2.0
 
+#include "tent/transport/ub/probe_bootstrap.h"
 #include "tent/transport/ub/probe_link_manager.h"
+#include "tent/transport/ub/probe_peer_coordinator.h"
+#include "tent/transport/ub/probe_peer_registry.h"
+#include "tent/transport/ub/probe_peer_source.h"
 #include "tent/transport/ub/probe_peer_handshake.h"
 #include "tent/transport/ub/probe_poster_urma.h"
 #include "tent/transport/ub/probe_provider_standalone.h"
+#include "tent/transport/ub/probe_topology.h"
 #include "tent/transport/ub/probe_scheduler.h"
 #include "tent/transport/ub/ub_transport.h"
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <condition_variable>
 #include <mutex>
 #include <new>
 #include <sstream>
@@ -32,16 +39,18 @@
 #include "tent/transport/ub/bootstrap.h"
 #include "tent/transport/ub/buffers.h"
 #include "tent/transport/ub/context.h"
+#include "tent/transport/ub/topology_attrs.h"
 
 #include "jetty_pool.h"
-#include "tent/transport/ub/attempt_gate.h"
 #include "tent/transport/ub/device_selection.h"
 #include "tent/transport/ub/endpoint.h"
 #include "tent/transport/ub/endpoint_store.h"
 #include "tent/transport/ub/identity_import.h"
 #include "tent/transport/ub/native_budget.h"
 #include "tent/transport/ub/params.h"
-#include "tent/transport/ub/send_jetty_pool.h"
+#include "tent/transport/ub/business_jetty_pool.h"
+#include "tent/transport/ub/target_registry.h"
+#include "tent/transport/ub/tombstone.h"
 #include "tent/transport/ub/quota.h"
 #include "tent/transport/ub/rail_monitor.h"
 #include "tent/transport/ub/slice.h"
@@ -153,6 +162,40 @@ struct UbTransport::Impl {
         }
     }
 
+    Status createBusinessContext(
+        Topology::NicID local_nic, const ub::DeviceInfo& device,
+        std::unordered_map<Topology::NicID, uint32_t>& jfc_depth_by_device,
+        ub::UbContextPtr& created) {
+        ub::JfcOptions jfc_options;
+        const bool rm_runtime = runtime_mode == ub::UbRuntimeMode::kRmLegacy ||
+                                runtime_mode == ub::UbRuntimeMode::kPooledRm;
+        if (params.runtime_profile == ub::UbRuntimeProfile::kRmPool) {
+            jfc_options.transport_mode = ub::JettyTransportMode::kRm;
+        }
+        if (rm_runtime) jfc_options.trans_mode = ub::kUrmaTransportModeRm;
+        const auto& device_caps = device.capabilities;
+        if (device_caps.max_jfc_depth != 0) {
+            jfc_options.depth =
+                std::min(jfc_options.depth, device_caps.max_jfc_depth);
+            jfc_options.receiver_depth =
+                std::min(jfc_options.receiver_depth, device_caps.max_jfc_depth);
+        }
+        if (device_caps.max_jfr_depth != 0) {
+            jfc_options.receiver_depth =
+                std::min(jfc_options.receiver_depth, device_caps.max_jfr_depth);
+        }
+        auto context =
+            std::make_shared<ub::UbContext>(local_nic, device, adapter);
+        auto status = context->initialize(params.jfc_per_context, jfc_options);
+        created = context;
+        if (!status.ok()) return status;
+        context_by_topology_id.emplace(local_nic, context);
+        context_by_topology_name.emplace(device.topology_name, context);
+        jfc_depth_by_device.emplace(local_nic, jfc_options.depth);
+        contexts.push_back(std::move(context));
+        return Status::OK();
+    }
+
     Status install(const std::string& segment_name,
                    std::shared_ptr<ControlService> control,
                    std::shared_ptr<Topology> topology,
@@ -177,6 +220,13 @@ struct UbTransport::Impl {
                 "A real or injected URMA adapter is unavailable" LOC_MARK);
         }
         if (!config) config = std::make_shared<Config>();
+        {
+            uint64_t next_epoch = generationSeed();
+            while (next_epoch == topology_epoch) {
+                next_epoch = generationSeed();
+            }
+            topology_epoch = next_epoch;
+        }
 
         // RM auto-import pre-pass: when physical-only selection is requested
         // without explicit identities, collect them from the provider and
@@ -214,16 +264,11 @@ struct UbTransport::Impl {
                 "UB notifications are not supported by protocol version "
                 "1" LOC_MARK));
         }
-        if (parsed.runtime_profile == ub::UbRuntimeProfile::kRmLegacy) {
-            // W3 wires exactly two profiles: the untouched RC legacy baseline
-            // and the pooled rm_pool path (D-2). RM legacy depends on the
-            // pooling side's bootstrap-v2 target import, which this baseline
-            // does not carry yet (M-4), so it fails closed instead of silently
-            // running RC under an RM label.
-            return Status::NotImplemented(
-                "runtime_profile=rm_legacy is not wired in W3; use rc_legacy "
-                "or rm_pool" LOC_MARK);
-        }
+        // RM legacy is a first-class runtime profile: the merged baseline
+        // carries bootstrap-v2 target import (bindRm/importRemoteTarget) and
+        // the RM endpoint data path, so it no longer fails closed here. Its
+        // provider/capability gates still run during install and reject an
+        // inconsistent device before any native resource is created.
         ub::UbRuntimeMode selected_mode = ub::UbRuntimeMode::kRcLegacy;
         auto mode_status = ub::resolveUbRuntimeMode(parsed, selected_mode);
         if (!mode_status.ok()) return abort_after_auto_import(mode_status);
@@ -266,6 +311,29 @@ struct UbTransport::Impl {
                                                  discovered);
         if (!status.ok()) return failInstall(status);
 
+        // Publish the trusted kind, not the raw discovery kind: the peer's
+        // ProbeBootstrapUb identity check requires physical UB NICs.
+        std::vector<Topology::UbNicKindOverride> kind_overrides;
+        kind_overrides.reserve(discovered.size());
+        for (const auto& device : discovered) {
+            kind_overrides.push_back(Topology::UbNicKindOverride{
+                device.topology_name,
+                std::string(ub::deviceKindName(device.kind)),
+                std::string(ub::deviceKindSourceName(device.kind_source))});
+        }
+        status = local_topology->applyUbDeviceKinds(kind_overrides);
+        if (!status.ok()) return failInstall(status);
+
+        // Declared topology is resolved once, against the same discovery
+        // snapshot that selects the business devices. A declared binding that
+        // matches zero or multiple physical EIDs fails the install (design
+        // §4.3 rule 9); it is never skipped or guessed.
+        probe_topology = std::make_shared<ub::ProbeTopology>();
+        status = ub::ProbeTopology::resolve(
+            params.probe, discovered, *local_topology, *probe_topology,
+            params.observability.topology_dump_limit);
+        if (!status.ok()) return failInstall(status);
+
         const bool explicit_filter = !params.device_filter.empty();
         const auto preferred_devices = params.physical_only
                                            ? ub::physicalDevices(discovered)
@@ -287,6 +355,15 @@ struct UbTransport::Impl {
         std::unordered_map<Topology::NicID, uint32_t> jfc_depth_by_device;
         for (auto& device : discovered) {
             by_topology_name.emplace(device.topology_name, std::move(device));
+        }
+        // INV-1: in declared mode the bindings are the only business device
+        // source. Restricting the RM-capability gate here also prevents an
+        // undeclared device from blocking or joining the install.
+        if (probe_topology->declared()) {
+            preferred_topology_names.clear();
+            for (const auto& binding : probe_topology->ports()) {
+                preferred_topology_names.insert(binding.topology_name);
+            }
         }
 
         // RM capability gate (legacy and pooled): every selectable device
@@ -331,71 +408,66 @@ struct UbTransport::Impl {
         std::vector<std::string> preferred_names;
         std::vector<std::string> skipped_names;
 
-        for (size_t id = 0; id < local_topology->getNicCount(); ++id) {
-            const auto* nic = local_topology->getNicEntry(static_cast<int>(id));
-            if (!nic || nic->type != Topology::NIC_UB) continue;
-            auto found = by_topology_name.find(nic->name);
-            if (found == by_topology_name.end() || !found->second.active) {
-                continue;
-            }
-            if (!filterAllows(params.device_filter, found->second)) continue;
-            if (preferred_topology_names.find(found->second.topology_name) ==
-                preferred_topology_names.end()) {
-                skipped_names.push_back(found->second.native_device_name);
-                continue;
-            }
-
-            ub::JfcOptions jfc_options;
-            // W3 B2: UMDK requires JFS.trans_mode == shared JFR.trans_mode
-            // (urma_adapter.cpp RealJetty::initialize). The business JFC of an
-            // rm_pool context therefore has to create an RM JFR, otherwise
-            // every createJetty for a pooled member is rejected by the provider
-            // and tryLease can never succeed.
-            if (params.runtime_profile == ub::UbRuntimeProfile::kRmPool) {
-                jfc_options.transport_mode = ub::JettyTransportMode::kRm;
-            }
-            const auto& device_caps = found->second.capabilities;
-            if (rm_runtime) {
-                // RM creates an RM receive-side JFR; it never falls
-                // back to RC.
-                jfc_options.trans_mode = ub::kUrmaTransportModeRm;
-            }
-            if (device_caps.max_jfc_depth != 0) {
-                jfc_options.depth =
-                    std::min(jfc_options.depth, device_caps.max_jfc_depth);
-                jfc_options.receiver_depth = std::min(
-                    jfc_options.receiver_depth, device_caps.max_jfc_depth);
-            }
-            if (device_caps.max_jfr_depth != 0) {
-                jfc_options.receiver_depth = std::min(
-                    jfc_options.receiver_depth, device_caps.max_jfr_depth);
-            }
-            auto context = std::make_shared<ub::UbContext>(
-                static_cast<Topology::NicID>(id), found->second, adapter);
-            status = context->initialize(params.jfc_per_context, jfc_options);
-            if (!status.ok()) {
-                if (context->state() == ub::UbContext::State::kDraining) {
-                    // Initialization produced a native handle whose cleanup
-                    // also failed. Adopt it into the transport graph and abort
-                    // installation so uninstall can retry without a leak.
-                    contexts.push_back(std::move(context));
+        if (probe_topology->declared()) {
+            for (const auto& binding : probe_topology->ports()) {
+                auto found = by_topology_name.find(binding.topology_name);
+                if (found == by_topology_name.end() || !found->second.active) {
+                    return failInstall(Status::DeviceNotFound(
+                        "declared probe port '" + binding.id +
+                        "' resolved device is not active" LOC_MARK));
+                }
+                ub::UbContextPtr context;
+                status = createBusinessContext(binding.local_nic, found->second,
+                                               jfc_depth_by_device, context);
+                if (!status.ok()) {
+                    if (context &&
+                        context->state() == ub::UbContext::State::kDraining) {
+                        contexts.push_back(std::move(context));
+                    }
                     return failInstall(status);
                 }
-                LOG(WARNING) << "Disable UB device " << nic->name << ": "
-                             << status.ToString();
-                continue;
+                preferred_names.push_back(found->second.native_device_name);
             }
-            preferred_names.push_back(found->second.native_device_name);
-            context_by_topology_id.emplace(static_cast<int>(id), context);
-            context_by_topology_name.emplace(nic->name, context);
-            jfc_depth_by_device.emplace(static_cast<Topology::NicID>(id),
-                                        jfc_options.depth);
-            contexts.push_back(std::move(context));
+        } else {
+            for (size_t id = 0; id < local_topology->getNicCount(); ++id) {
+                const auto* nic =
+                    local_topology->getNicEntry(static_cast<int>(id));
+                if (!nic || nic->type != Topology::NIC_UB) continue;
+                auto found = by_topology_name.find(nic->name);
+                if (found == by_topology_name.end() || !found->second.active) {
+                    continue;
+                }
+                if (!filterAllows(params.device_filter, found->second))
+                    continue;
+                if (preferred_topology_names.find(
+                        found->second.topology_name) ==
+                    preferred_topology_names.end()) {
+                    skipped_names.push_back(found->second.native_device_name);
+                    continue;
+                }
+                ub::UbContextPtr context;
+                status = createBusinessContext(static_cast<Topology::NicID>(id),
+                                               found->second,
+                                               jfc_depth_by_device, context);
+                if (!status.ok()) {
+                    if (context &&
+                        context->state() == ub::UbContext::State::kDraining) {
+                        contexts.push_back(std::move(context));
+                        return failInstall(status);
+                    }
+                    LOG(WARNING) << "Disable UB device " << nic->name << ": "
+                                 << status.ToString();
+                    continue;
+                }
+                preferred_names.push_back(found->second.native_device_name);
+            }
         }
 
         {
             std::ostringstream selection_log;
-            if (params.physical_only) {
+            if (probe_topology->declared()) {
+                selection_log << "UB device selection: mode=declared-topology";
+            } else if (params.physical_only) {
                 selection_log << "UB device selection: mode=physical-only";
                 if (explicit_filter) selection_log << "+explicit-filter";
             } else if (explicit_filter) {
@@ -527,11 +599,27 @@ struct UbTransport::Impl {
                 }
             }
             native_budget = std::make_shared<ub::NativeBudget>();
+            // One bounded tombstone table per install: it records unproven
+            // destructions and is what authorizes a final budget release.
+            tombstones =
+                std::make_shared<ub::TombstoneTable>(params.tombstone_budget);
+            if (params.jetty_pool.async_drain) {
+                // Every drain step runs here, never on a JFC poller and never
+                // on the error-return path. A refused thread degrades to the
+                // synchronous fence instead of terminating the process.
+                drain_executor = std::make_unique<ub::ThreadedControlExecutor>(
+                    "ub-jetty-drain");
+                if (!drain_executor->start()) {
+                    LOG(WARNING)
+                        << "UB cannot start the Jetty drain control executor; "
+                           "falling back to the synchronous retirement fence";
+                    drain_executor.reset();
+                }
+            }
             std::unordered_set<std::string> configured_devices;
             for (const auto& context : contexts) {
                 const auto& device = context->deviceInfo();
-                const std::string device_key = ub::makePhysicalDeviceIdentity(
-                    device.native_device_path, device.eid);
+                const std::string device_key = ub::physicalDeviceKey(device);
                 if (!configured_devices.insert(device_key).second) continue;
                 const uint64_t verified = device.capabilities.max_jetty;
                 uint64_t configured = params.native_budget.max_jetty_per_device;
@@ -555,9 +643,6 @@ struct UbTransport::Impl {
                                                   configured, reserve);
                 if (!status.ok()) return failInstall(status);
             }
-            task_permits = std::make_shared<ub::TaskPermitLedger>(
-                params.send_pool.task_max_inflight_attempts);
-            attempt_gate = std::make_shared<ub::AttemptGate>();
             for (auto& context : contexts) {
                 const auto& device = context->deviceInfo();
                 const uint32_t depth =
@@ -581,7 +666,7 @@ struct UbTransport::Impl {
                 }
                 ub::SendJettyPoolOptions pool_options;
                 pool_options.desired_serving =
-                    params.send_pool.desired_per_context;
+                    params.jetty_pool.business_desired_serving;
                 pool_options.max_creating =
                     params.send_pool.max_creating_per_key;
                 pool_options.background_refill =
@@ -589,15 +674,83 @@ struct UbTransport::Impl {
                 pool_options.background_delete =
                     params.send_pool.background_delete;
                 pool_options.refill_interval_ms =
-                    params.send_pool.refill_interval_ms;
+                    params.jetty_pool.refill_interval_ms;
+                pool_options.retire_timeout_ms =
+                    params.jetty_pool.retire_timeout_ms;
+                pool_options.cooldown_ms = params.jetty_pool.cooldown_ms;
+                pool_options.quarantine_budget = params.quarantine_budget;
+                pool_options.tombstones = tombstones;
                 pool_options.jetty_options = jetty_options;
-                context->attachPooledSendPool(
-                    std::make_shared<ub::SendJettyPool>(
-                        adapter, context->handle(), context->jfcs(),
-                        native_budget,
-                        ub::makePhysicalDeviceIdentity(
-                            device.native_device_path, device.eid),
-                        credits, pool_options));
+                pool_options.verbose_events =
+                    params.observability.verbose_events;
+                pool_options.sample_every =
+                    params.observability.leaseSampleEvery();
+                // Asynchronous drain (design §4.4). The chain is only armed
+                // when a control executor exists; otherwise the pool keeps the
+                // synchronous fence and says so once at install.
+                pool_options.async_drain =
+                    params.jetty_pool.async_drain && drain_executor != nullptr;
+                pool_options.drain_flush_batch =
+                    params.jetty_pool.drain_flush_batch;
+                pool_options.drain_quarantine_threshold =
+                    params.jetty_pool.drain_quarantine_threshold;
+                auto pool = std::make_shared<ub::SendJettyPool>(
+                    adapter, context->handle(), context->jfcs(), native_budget,
+                    ub::physicalDeviceKey(device), credits, pool_options);
+                context->attachPooledSendPool(pool);
+                if (pool_options.async_drain) {
+                    // The pool owns the verdicts; the workers own the two
+                    // settlement queries. Both are resolved lazily at call time
+                    // so the controller can be built before the workers exist.
+                    std::weak_ptr<ub::SendJettyPool> weak_pool = pool;
+                    ub::DrainCallbacks callbacks;
+                    callbacks.resolveJetty =
+                        [weak_pool](
+                            const ub::PoolLaneKey& lane) -> ub::JettyPtr {
+                        auto pool = weak_pool.lock();
+                        return pool ? pool->drainJettyFor(lane) : nullptr;
+                    };
+                    callbacks.markDeleteReady = [weak_pool](
+                                                    const ub::PoolLaneKey& lane,
+                                                    uint64_t error_epoch) {
+                        auto pool = weak_pool.lock();
+                        if (pool) {
+                            (void)pool->markDrainDeleteReady(lane, error_epoch);
+                        }
+                    };
+                    callbacks.quarantine = [weak_pool](
+                                               const ub::PoolLaneKey& lane,
+                                               const std::string& reason) {
+                        auto pool = weak_pool.lock();
+                        if (pool) (void)pool->quarantineDrain(lane, reason);
+                    };
+                    callbacks.settleDrainedWr =
+                        [this](const ub::Completion& completion,
+                               uint64_t jfc_index) {
+                            return workers != nullptr &&
+                                   workers->settleDrainedWr(completion,
+                                                            jfc_index);
+                        };
+                    callbacks.responsibilityConverged =
+                        [this](const ub::PoolLaneKey& lane) {
+                            // No workers means no record book: fail closed.
+                            return workers != nullptr &&
+                                   workers->pooledLaneConverged(lane);
+                        };
+                    ub::DrainOptions drain_options;
+                    drain_options.retire_timeout_ms =
+                        params.jetty_pool.retire_timeout_ms;
+                    drain_options.flush_batch =
+                        params.jetty_pool.drain_flush_batch;
+                    drain_options.quarantine_threshold =
+                        params.jetty_pool.drain_quarantine_threshold;
+                    auto controller =
+                        std::make_shared<ub::JettyDrainController>(
+                            adapter, tombstones.get(), drain_executor.get(),
+                            std::move(callbacks), drain_options);
+                    context->attachDrainController(controller);
+                    pool->attachDrainController(std::move(controller));
+                }
             }
         }
         ub::RailMonitorConfig rail_config;
@@ -647,24 +800,87 @@ struct UbTransport::Impl {
                         "installed; inject one or set "
                         "transports/ub/probe/provider=standalone" LOC_MARK));
                 }
-                if (probe_peer_source == nullptr) {
+                // Production declared mode builds its own registry/source;
+                // the injected source remains the test/legacy seam.
+                if (probe_peer_source == nullptr &&
+                    !probe_topology->declared()) {
                     return failInstall(Status::InvalidArgument(
-                        "UB probe provider=standalone requires a peer "
-                        "descriptor source" LOC_MARK));
+                        "UB probe provider=standalone requires declared "
+                        "adjacency or an injected peer descriptor "
+                        "source" LOC_MARK));
                 }
                 auto standalone =
                     std::make_shared<ub::StandaloneProbeResourceProvider>(
-                        adapter, params.probe,
-                        [topology =
-                             local_topology](const std::string& topology_name) {
-                            return topology ? topology->getNicId(topology_name)
-                                            : static_cast<Topology::NicID>(-1);
-                        });
-                auto discover = standalone->discover();
-                if (!discover.ok()) return failInstall(discover);
+                        adapter, params.probe);
+                standalone->setNodeIdentity(local_segment_name,
+                                            node_incarnation, topology_epoch);
+                if (probe_topology->declared()) {
+                    // Declared mode: the configured bindings decide which
+                    // ports exist. A missing business context is an install
+                    // error, never a silent skip (design §6.2).
+                    std::vector<ub::ProbePortSpec> specs;
+                    specs.reserve(probe_topology->ports().size());
+                    for (const auto& binding : probe_topology->ports()) {
+                        auto device =
+                            by_topology_name.find(binding.topology_name);
+                        if (device == by_topology_name.end()) {
+                            return failInstall(Status::InvalidArgument(
+                                "declared probe port '" + binding.id +
+                                "' has no discovered device" LOC_MARK));
+                        }
+                        ub::ProbePortSpec spec;
+                        spec.port_id = binding.id;
+                        spec.local_nic = binding.local_nic;
+                        spec.device = device->second;
+                        spec.topology_name = binding.topology_name;
+                        spec.native_device_name = binding.native_device_name;
+                        spec.eid = binding.eid;
+                        spec.generation = 1;
+                        specs.push_back(std::move(spec));
+                    }
+                    auto bind = standalone->bindPorts(specs);
+                    if (!bind.ok()) return failInstall(bind);
+                    auto prepared = standalone->prepareLocal();
+                    if (!prepared.ok()) return failInstall(prepared);
+                } else {
+                    auto discover = standalone->discover();
+                    if (!discover.ok()) return failInstall(discover);
+                }
+                if (probe_peer_source == nullptr) {
+                    std::map<std::string,
+                             std::vector<ub::ProbeDeclaredPeerPort>>
+                        declared;
+                    for (const auto& [peer, decl] :
+                         probe_topology->peerDecls()) {
+                        auto& ports = declared[peer];
+                        for (const auto& port : decl.ports) {
+                            ports.push_back(
+                                ub::ProbeDeclaredPeerPort{port.id, port.eid});
+                        }
+                    }
+                    std::map<std::string, uint64_t> peer_ids;
+                    for (const auto& [peer, decl] :
+                         probe_topology->peerDecls()) {
+                        (void)decl;
+                        auto id = probe_topology->probePeerId(peer);
+                        if (id.has_value()) peer_ids.emplace(peer, *id);
+                    }
+                    probe_registry = std::make_unique<ub::ProbePeerRegistry>(
+                        declared, params.probe.handshake.withdraw_grace,
+                        peer_ids);
+                    probe_source =
+                        std::make_unique<ub::BootstrapProbePeerSource>(
+                            probe_topology.get(), probe_registry.get());
+                    probe_topology->setPeerRegistry(probe_registry.get());
+                }
+                auto* directory_source =
+                    probe_peer_source != nullptr
+                        ? probe_peer_source
+                        : static_cast<ub::ProbePeerDescriptorSource*>(
+                              probe_source.get());
                 probe_directory =
                     std::make_shared<ub::HandshakeProbePeerDirectory>(
-                        adapter, standalone->contexts(), probe_peer_source);
+                        adapter, standalone->contexts(), directory_source);
                 standalone->setRemoteDirectory(probe_directory.get());
                 probe_provider = standalone;
                 probe_poster = std::make_shared<ub::UrmaProbePoster>(adapter);
@@ -674,6 +890,8 @@ struct UbTransport::Impl {
             if (!status.ok()) return failInstall(status);
             probe_manager =
                 std::make_unique<ub::ProbeLinkManager>(params.probe);
+            probe_manager->setVerboseEvents(
+                params.observability.verbose_events);
             probe_manager->setReportSink(probe_provider.get());
             status = probe_manager->initialize(graph);
             if (!status.ok()) return failInstall(status);
@@ -698,6 +916,15 @@ struct UbTransport::Impl {
                     }
                     return Status::OK();
                 });
+            // Responder side of ProbeBootstrapUb. The callback is installed
+            // only while the probe resources exist and is cleared before they
+            // are released.
+            metadata->setProbeBootstrapCallback(
+                [this](const ub::ProbeBootstrapRequest& request,
+                       ub::ProbeBootstrapResponse& response) {
+                    return onProbeBootstrap(request, response);
+                });
+            probe_bootstrap_callback_installed = true;
             for (const auto& supply : graph.ports) {
                 if (context_by_topology_id.find(supply.local_nic) ==
                     context_by_topology_id.end()) {
@@ -710,6 +937,52 @@ struct UbTransport::Impl {
                 if (!supply.probe_jfc) continue;
                 probe_jfcs.push_back(
                     ub::ProbeJfcSlot{supply.local_nic, supply.probe_jfc});
+            }
+            if (probe_registry && probe_source) {
+                auto* standalone =
+                    dynamic_cast<ub::StandaloneProbeResourceProvider*>(
+                        probe_provider.get());
+                if (standalone == nullptr) {
+                    return failInstall(Status::InvalidArgument(
+                        "declared probe topology requires the standalone "
+                        "probe provider" LOC_MARK));
+                }
+                ub::ProbePeerCoordinator::Dependencies dependencies;
+                dependencies.segment_manager = &metadata->segmentManager();
+                dependencies.registry = probe_registry.get();
+                dependencies.provider = standalone;
+                dependencies.topology = probe_topology.get();
+                dependencies.rpc = [](const std::string& server_addr,
+                                      const ub::ProbeBootstrapRequest& request,
+                                      ub::ProbeBootstrapResponse& response) {
+                    return ControlClient::probeBootstrapUb(server_addr, request,
+                                                           response);
+                };
+                probe_coordinator = std::make_unique<ub::ProbePeerCoordinator>(
+                    params.probe, std::move(dependencies));
+                // The provider bumps the publication epoch after a lane
+                // rebuild. Without this callback the coordinator only notices
+                // it on the next handshake refresh tick (30s by default), so a
+                // recovered link can stay unused for that whole window. The
+                // callback only wakes the coordinator; it never reads provider
+                // state, so it cannot deadlock against the provider mutex.
+                if (probe_provider) {
+                    auto* standalone =
+                        dynamic_cast<ub::StandaloneProbeResourceProvider*>(
+                            probe_provider.get());
+                    if (standalone != nullptr) {
+                        standalone->setPublicationChangedCallback(
+                            [coordinator = probe_coordinator.get()](
+                                uint64_t publication_epoch) {
+                                if (coordinator != nullptr) {
+                                    coordinator->onLocalPublicationChanged(
+                                        publication_epoch);
+                                }
+                            });
+                    }
+                }
+                status = probe_coordinator->start();
+                if (!status.ok()) return failInstall(status);
             }
         }
 
@@ -731,8 +1004,15 @@ struct UbTransport::Impl {
                 }
                 return endpoints->retireLocalDevice(local_topology_id);
             },
-            probe_manager.get(), std::move(probe_jfcs), task_permits,
-            attempt_gate);
+            probe_manager.get(), std::move(probe_jfcs), tombstones,
+            probe_topology.get());
+        if (probe_coordinator) {
+            workers->setProbeRefreshHint([this](uint64_t peer_id) {
+                if (probe_coordinator) {
+                    probe_coordinator->noteBusinessPathError(peer_id);
+                }
+            });
+        }
         status = workers->start();
         if (!status.ok()) return failInstall(status);
 
@@ -751,6 +1031,14 @@ struct UbTransport::Impl {
         }
 
         installed.store(true, std::memory_order_release);
+        LOG(INFO) << "UB installed: probe_links="
+                  << (probe_manager ? probe_manager->pathCount() : 0)
+                  << " probe_generation="
+                  << (probe_manager ? probe_manager->probeGeneration() : 0)
+                  << " pool_generation="
+                  << (contexts.empty() || !contexts.front()
+                          ? 0
+                          : contexts.front()->incarnation());
         return Status::OK();
     }
 
@@ -778,12 +1066,51 @@ struct UbTransport::Impl {
         installed.store(false, std::memory_order_release);
         shutting_down.store(true, std::memory_order_release);
 
+        // Wake every single-flight follower. Copy the flights under the map
+        // lock and signal them after releasing it: the leader takes the flight
+        // lock before the map lock, so the reverse order here would deadlock.
+        std::vector<std::shared_ptr<ResolveFlight>> pending_flights;
+        {
+            std::lock_guard<std::mutex> lock(resolve_flights_mutex);
+            pending_flights.reserve(resolve_flights.size());
+            for (const auto& [key, flight] : resolve_flights) {
+                (void)key;
+                if (flight) pending_flights.push_back(flight);
+            }
+        }
+        for (const auto& flight : pending_flights) {
+            {
+                std::lock_guard<std::mutex> lock(flight->mutex);
+                if (flight->done) continue;
+                flight->done = true;
+                flight->status = Status::InvalidArgument(
+                    "UB transport is shutting down" LOC_MARK);
+                flight->endpoint.reset();
+            }
+            flight->cv.notify_all();
+        }
+        resolve_flights.clear();
+
         // Callback replacement waits for a currently executing UB bootstrap
         // handler, fencing all control-plane access before resources retire.
         if (callback_installed && metadata) {
             metadata->setBootstrapUbCallback({});
             callback_installed = false;
         }
+        if (probe_bootstrap_callback_installed && metadata) {
+            metadata->setProbeBootstrapCallback({});
+            probe_bootstrap_callback_installed = false;
+        }
+        if (probe_provider) {
+            auto* standalone =
+                dynamic_cast<ub::StandaloneProbeResourceProvider*>(
+                    probe_provider.get());
+            if (standalone != nullptr) {
+                standalone->setPublicationChangedCallback({});
+            }
+        }
+        // Fence the control plane before any probe resource is released.
+        if (probe_coordinator) probe_coordinator->stop();
         // Stop interface-7 rebuilds before draining workers: a retire during
         // teardown must stay a record, not create resources that are about to
         // be destroyed.
@@ -808,18 +1135,30 @@ struct UbTransport::Impl {
                 }
                 return status;
             }
+            // drainIdle() already degraded every in-flight drain to the
+            // synchronous fence, so no callback may still need the workers.
+            // Stopping the executor here bounds the thread's lifetime to the
+            // ownership graph that references it.
+            if (drain_executor) {
+                drain_executor->stop();
+                drain_executor.reset();
+            }
             workers.reset();
         }
         // Workers joined the scheduler through drainBeforePollStop(); destroy
         // the PLM only after the workers that reference it are gone.
         probe_scheduler.reset();
         probe_manager.reset();
+        probe_coordinator.reset();
         probe_poster.reset();
         // Unimport remote probe areas while the probe Contexts are still
         // alive; the self-owned provider closes them in its shutdown.
         if (probe_directory) (void)probe_directory->shutdown();
         probe_provider.reset();
         probe_directory.reset();
+        probe_source.reset();
+        probe_registry.reset();
+        probe_topology.reset();
         // W3 pooled teardown safety net (design §11.2). workers->stop() already
         // drained the pools, but an install that failed before the workers
         // existed can leave a pool attached to its context. beginStop() and
@@ -861,8 +1200,7 @@ struct UbTransport::Impl {
         // contexts just drained their pools; the admission components can be
         // released now.
         native_budget.reset();
-        task_permits.reset();
-        attempt_gate.reset();
+        tombstones.reset();
         rails.reset();
         quota.reset();
         if (adapter_initialized && adapter) {
@@ -881,6 +1219,12 @@ struct UbTransport::Impl {
         local_segment_name.clear();
         auto_import_snapshot.clear();
         auto_import_snapshot_valid = false;
+        // Failed installs may never have created the workers; the drain
+        // executor still must not outlive this ownership graph.
+        if (drain_executor) {
+            drain_executor->stop();
+            drain_executor.reset();
+        }
         shutting_down.store(false, std::memory_order_release);
         return Status::OK();
     }
@@ -894,6 +1238,11 @@ struct UbTransport::Impl {
                         "Local segment is not memory-backed" LOC_MARK);
                 }
                 auto& detail = std::get<MemorySegmentDesc>(segment.detail);
+                // setupLocalSegment() copied topology_ before install ran, so
+                // the published snapshot still carries the raw discovery kind
+                // (unknown). Refresh it from the install-time topology that
+                // applyUbDeviceKinds() has already patched.
+                if (local_topology) detail.topology = *local_topology;
                 detail.transport_attrs[TransportType::UB] = nlohmann::json{
                     {"schema_version", 1},
                     {"protocol", "urma"},
@@ -938,6 +1287,74 @@ struct UbTransport::Impl {
 
     Status resolveEndpoint(const ub::EndpointResolveRequest& request,
                            std::shared_ptr<ub::UbEndpoint>& endpoint) {
+        // The single-flight key is exactly the EndpointStore key the leader
+        // will use. Invalid routes bypass the flight and let the leader return
+        // the precise error.
+        if (shutting_down.load(std::memory_order_acquire) ||
+            !request.local_context || !request.remote_segment) {
+            return resolveEndpointLeader(request, endpoint);
+        }
+        const auto* remote_nic =
+            request.remote_segment->getMemory().topology.getNicEntry(
+                request.remote_topology_id);
+        if (!remote_nic || remote_nic->type != Topology::NIC_UB) {
+            return resolveEndpointLeader(request, endpoint);
+        }
+        const ub::UbEndpointKey key{
+            request.local_context->topologyId(), request.remote_segment_id,
+            request.remote_topology_id,
+            MakeNicPath(request.remote_segment->name, remote_nic->name)};
+        std::shared_ptr<ResolveFlight> flight;
+        bool leader = false;
+        {
+            std::lock_guard<std::mutex> lock(resolve_flights_mutex);
+            auto [it, inserted] = resolve_flights.try_emplace(key, nullptr);
+            if (inserted || !it->second) {
+                it->second = std::make_shared<ResolveFlight>();
+                flight = it->second;
+                leader = true;
+            } else {
+                flight = it->second;
+            }
+        }
+        if (!leader) {
+            std::unique_lock<std::mutex> lock(flight->mutex);
+            constexpr auto kResolveFlightWait = std::chrono::milliseconds(5000);
+            if (!flight->cv.wait_for(lock, kResolveFlightWait,
+                                     [&] { return flight->done; })) {
+                return Status::TooManyRequests(
+                    "UB endpoint resolution is still in flight" LOC_MARK);
+            }
+            if (!flight->status.ok()) return flight->status;
+            if (!flight->endpoint || !flight->endpoint->ready()) {
+                return Status::TooManyRequests(
+                    "UB endpoint resolution finished without a ready "
+                    "endpoint" LOC_MARK);
+            }
+            endpoint = flight->endpoint;
+            return Status::OK();
+        }
+
+        Status status = resolveEndpointLeader(request, endpoint);
+        {
+            std::lock_guard<std::mutex> lock(flight->mutex);
+            flight->status = status;
+            flight->endpoint = status.ok() ? endpoint : nullptr;
+            flight->done = true;
+        }
+        flight->cv.notify_all();
+        {
+            std::lock_guard<std::mutex> lock(resolve_flights_mutex);
+            auto it = resolve_flights.find(key);
+            if (it != resolve_flights.end() && it->second == flight) {
+                resolve_flights.erase(it);
+            }
+        }
+        return status;
+    }
+
+    Status resolveEndpointLeader(const ub::EndpointResolveRequest& request,
+                                 std::shared_ptr<ub::UbEndpoint>& endpoint) {
         endpoint.reset();
         if (shutting_down.load(std::memory_order_acquire) || !endpoints ||
             !request.local_context || !request.remote_segment) {
@@ -959,7 +1376,29 @@ struct UbTransport::Impl {
                               request.remote_topology_id, peer_path};
         CHECK_STATUS(
             endpoints->getOrCreate(key, request.local_context, endpoint));
+        const uint64_t resolve_total =
+            endpoint_resolve_total.fetch_add(1, std::memory_order_relaxed) + 1;
+        auto log_resolve_summary = [&]() {
+            const uint64_t bootstraps =
+                endpoint_resolve_bootstrap.load(std::memory_order_relaxed);
+            LOG(INFO)
+                << "UB endpoint resolve summary: total=" << resolve_total
+                << " cache_hit="
+                << endpoint_resolve_cache_hit.load(std::memory_order_relaxed)
+                << " bootstrap=" << bootstraps << " bootstrap_fail="
+                << endpoint_resolve_bootstrap_fail.load(
+                       std::memory_order_relaxed)
+                << " rpc_us_avg="
+                << (bootstraps == 0 ? 0
+                                    : endpoint_resolve_rpc_us_sum.load(
+                                          std::memory_order_relaxed) /
+                                          bootstraps)
+                << " rpc_us_max="
+                << endpoint_resolve_rpc_us_max.load(std::memory_order_relaxed);
+        };
         if (endpoint->ready()) {
+            endpoint_resolve_cache_hit.fetch_add(1, std::memory_order_relaxed);
+            if (resolve_total % 5000 == 0) log_resolve_summary();
             recordReadyEndpoint(endpoint);
             return Status::OK();
         }
@@ -988,8 +1427,31 @@ struct UbTransport::Impl {
             return status;
         }
         UbBootstrapDesc response;
+        const auto rpc_begin = std::chrono::steady_clock::now();
         status = ControlClient::bootstrapUb(
             request.remote_segment->rpc_server_addr, bootstrap, response);
+        const uint64_t rpc_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - rpc_begin)
+                .count());
+        endpoint_resolve_bootstrap.fetch_add(1, std::memory_order_relaxed);
+        endpoint_resolve_rpc_us_sum.fetch_add(rpc_us,
+                                              std::memory_order_relaxed);
+        uint64_t prev_max =
+            endpoint_resolve_rpc_us_max.load(std::memory_order_relaxed);
+        while (rpc_us > prev_max &&
+               !endpoint_resolve_rpc_us_max.compare_exchange_weak(
+                   prev_max, rpc_us, std::memory_order_relaxed)) {
+        }
+        if (!status.ok()) {
+            endpoint_resolve_bootstrap_fail.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        LOG_EVERY_N(INFO, 50) << "UB endpoint resolve: local_nic="
+                              << request.local_context->topologyId()
+                              << " remote_nic=" << request.remote_topology_id
+                              << " cache_hit=0 rpc_us=" << rpc_us
+                              << " status=" << status.ToString();
         if (status.ok()) {
             if (rm_endpoint_runtime) {
                 // Trusted anchor for the peer identity: the device metadata
@@ -1010,12 +1472,156 @@ struct UbTransport::Impl {
             }
         }
         if (!status.ok()) {
+            endpoint_bind_fail.fetch_add(1, std::memory_order_relaxed);
+            LOG_EVERY_N(WARNING, 20)
+                << "UB endpoint bind failed: local_nic="
+                << request.local_context->topologyId()
+                << " remote_nic=" << request.remote_topology_id << " state="
+                << (endpoint ? static_cast<int>(endpoint->state()) : -1)
+                << " status=" << status.ToString();
             (void)endpoints->retire(endpoint);
             endpoint.reset();
             return status;
         }
         recordReadyEndpoint(endpoint);
         return Status::OK();
+    }
+
+    int onProbeBootstrap(const ub::ProbeBootstrapRequest& request,
+                         ub::ProbeBootstrapResponse& response) {
+        response.responder_segment = local_segment_name;
+        response.node_incarnation = node_incarnation;
+        response.topology_epoch = topology_epoch;
+        response.transport_mode = ub::kProbeBootstrapTransportMode;
+        response.device_kind = ub::kProbeBootstrapDeviceKind;
+        if (shutting_down.load(std::memory_order_acquire) || !probe_provider) {
+            response.reply_msg = "probe not ready";
+            return -1;
+        }
+        auto standalone =
+            std::dynamic_pointer_cast<ub::StandaloneProbeResourceProvider>(
+                probe_provider);
+        if (!standalone) {
+            response.reply_msg = "probe provider does not publish resources";
+            return -1;
+        }
+        auto status = ub::validateProbeBootstrapRequest(request);
+        if (!status.ok()) {
+            response.reply_msg = status.ToString();
+            return -1;
+        }
+
+        // The registered segment metadata is the only trusted anchor for the
+        // requester's ports. Never accept a self-asserted EID (design §7.7).
+        SegmentDescRef requester_segment;
+        if (request.requester_segment == local_segment_name) {
+            requester_segment = metadata->segmentManager().getLocal();
+        } else {
+            auto fetch = std::async(
+                std::launch::async, [this, name = request.requester_segment]() {
+                    SegmentDescRef segment;
+                    auto fetch_status =
+                        metadata->segmentManager().getRemote(segment, name);
+                    return std::make_pair(fetch_status, std::move(segment));
+                });
+            auto fetched = fetch.get();
+            if (!fetched.first.ok() || !fetched.second) {
+                response.reply_msg = "requester segment is not registered";
+                return -1;
+            }
+            requester_segment = std::move(fetched.second);
+        }
+        if (!requester_segment) {
+            response.reply_msg = "requester segment is not registered";
+            return -1;
+        }
+
+        auto lower = [](std::string value) {
+            std::transform(value.begin(), value.end(), value.begin(),
+                           [](unsigned char c) {
+                               return static_cast<char>(std::tolower(c));
+                           });
+            return value;
+        };
+        const auto& topology = requester_segment->getMemory().topology;
+        for (const auto& port : request.ports) {
+            size_t matches = 0;
+            bool physical = true;
+            for (size_t id = 0; id < topology.getNicCount(); ++id) {
+                const auto* nic =
+                    topology.getNicEntry(static_cast<Topology::NicID>(id));
+                if (!nic || nic->type != Topology::NIC_UB) continue;
+                auto eid =
+                    nic->device_attrs.find(std::string(ub::kTopologyEidAttr));
+                if (eid == nic->device_attrs.end()) continue;
+                if (nic->name != port.topology_name) continue;
+                if (lower(eid->second) != lower(port.eid)) continue;
+                auto kind = nic->device_attrs.find(
+                    std::string(ub::kTopologyDeviceKindAttr));
+                if (kind != nic->device_attrs.end() &&
+                    kind->second !=
+                        ub::deviceKindName(ub::DeviceKind::PHYSICAL)) {
+                    physical = false;
+                }
+                ++matches;
+            }
+            if (matches != 1 || !physical) {
+                probe_publication_identity_fail.fetch_add(
+                    1, std::memory_order_relaxed);
+                LOG_EVERY_N(WARNING, 100)
+                    << "UB probe publication identity mismatch: port="
+                    << port.port_id << " topology=" << port.topology_name
+                    << " eid=" << port.eid << " matches=" << matches
+                    << " physical=" << (physical ? 1 : 0);
+                response.reply_msg =
+                    "probe publication identity mismatch for port '" +
+                    port.port_id + "'";
+                return -1;
+            }
+        }
+
+        // declared_peers is diagnostic only: a mismatch between both sides'
+        // declarations is logged, never used to create resources.
+        if (request.declared_peers.size() != params.probe.peers.size()) {
+            LOG_EVERY_N(INFO, 100)
+                << "UB probe handshake: requester " << request.requester_segment
+                << " declares " << request.declared_peers.size()
+                << " peer(s), local declares " << params.probe.peers.size();
+        }
+
+        // The request carries the requester's publication. Hand it to the
+        // coordinator, which applies it on a control executor (never on this
+        // RPC thread) and refreshes the graph. If this side did not declare
+        // the requester, the coordinator drops it.
+        if (probe_coordinator) {
+            ub::ProbeBootstrapResponse requester_publication;
+            requester_publication.responder_segment = request.requester_segment;
+            requester_publication.node_incarnation =
+                request.requester_node_incarnation;
+            requester_publication.topology_epoch =
+                request.requester_topology_epoch;
+            requester_publication.publication_epoch =
+                request.requester_publication_epoch;
+            requester_publication.transport_mode =
+                ub::kProbeBootstrapTransportMode;
+            requester_publication.device_kind = ub::kProbeBootstrapDeviceKind;
+            requester_publication.ports = request.ports;
+            (void)probe_coordinator->ingestPeerPublication(
+                request.requester_segment, requester_segment,
+                std::move(requester_publication));
+        }
+
+        auto publication = standalone->publication();
+        if (publication.ports.empty()) {
+            response.reply_msg = "probe not ready";
+            return -1;
+        }
+        response.publication_epoch = publication.publication_epoch;
+        response.ports.reserve(publication.ports.size());
+        for (const auto& port : publication.ports) {
+            response.ports.push_back(ub::toProbeBootstrapPort(port));
+        }
+        return 0;
     }
 
     int onBootstrap(const UbBootstrapDesc& request, UbBootstrapDesc& response) {
@@ -1030,7 +1636,16 @@ struct UbTransport::Impl {
                                 runtime_mode == ub::UbRuntimeMode::kPooledRm;
         auto gate_status = ub::gateUbBootstrapForMode(
             rm_runtime ? ub::UbBootstrapMode::RM : ub::UbBootstrapMode::RC,
-            request);
+            params.bootstrap_protocol, request);
+        if (request.ignored_v2_payload) {
+            // A v1 peer sent a v2 block. It was sanitized away during
+            // deserialization and never reached an endpoint; count it so a
+            // protocol mismatch is observable instead of silent.
+            bootstrap_v2_ignored.fetch_add(1, std::memory_order_relaxed);
+            LOG_EVERY_N(WARNING, 100)
+                << "UB bootstrap v1 peer carried a v2 payload; the block was "
+                   "ignored";
+        }
         if (!gate_status.ok()) {
             response = request;
             response.reply_msg = gate_status.ToString();
@@ -1130,6 +1745,30 @@ struct UbTransport::Impl {
         std::shared_ptr<ub::UbEndpoint> endpoint;
         auto status = endpoints->getOrCreate(key, context, endpoint);
         if (status.ok()) status = endpoint->bindRm(request, expected);
+        if (!status.ok() && status.IsAlreadyExists()) {
+            // The incumbent cannot be merged with this bootstrap (same
+            // incarnation/different content, or a newer generation). Retire it
+            // and retry once in the same RPC: the requester has already paid
+            // the round trip, and leaving the stale incumbent in place makes
+            // the requester loop forever. A stale request never reaches this
+            // branch (kStale stays InvalidArgument), so a late request cannot
+            // evict a newer incumbent.
+            endpoint_bind_conflict.fetch_add(1, std::memory_order_relaxed);
+            endpoint_bind_replace_retry.fetch_add(1, std::memory_order_relaxed);
+            LOG_EVERY_N(WARNING, 100)
+                << "UB RM bootstrap replacing incumbent: local_nic="
+                << context->topologyId()
+                << " remote_device=" << request.local_device_id
+                << " reason=" << status.ToString();
+            if (endpoint) (void)endpoints->retire(endpoint);
+            endpoint.reset();
+            status = endpoints->getOrCreate(key, context, endpoint);
+            if (status.ok()) status = endpoint->bindRm(request, expected);
+            if (status.ok()) {
+                endpoint_bind_replace_ok.fetch_add(1,
+                                                   std::memory_order_relaxed);
+            }
+        }
         if (status.ok()) {
             status = endpoint->makeBootstrapDescV2(
                 local_segment_name, request.peer_nic_path,
@@ -1140,6 +1779,7 @@ struct UbTransport::Impl {
             recordReadyEndpoint(endpoint);
         }
         if (!status.ok()) {
+            endpoint_bind_fail.fetch_add(1, std::memory_order_relaxed);
             if (endpoint) (void)endpoints->retire(endpoint);
             response = UbBootstrapDesc{};
             response.protocol_version = 2;
@@ -1173,7 +1813,10 @@ struct UbTransport::Impl {
     // v2 descriptors; both are transport-lifetime stable in the P1 baseline.
     ub::UbRuntimeMode runtime_mode{ub::UbRuntimeMode::kRcLegacy};
     const uint64_t node_incarnation{generationSeed()};
-    const uint64_t topology_epoch{generationSeed()};
+    // topology_epoch identifies one transport install. It must change on
+    // every install (including uninstall/reinstall of the same object), since
+    // the provider publication epoch restarts at 1.
+    uint64_t topology_epoch{generationSeed()};
     std::string local_segment_name;
     std::shared_ptr<ControlService> metadata;
     std::shared_ptr<Topology> local_topology;
@@ -1190,19 +1833,57 @@ struct UbTransport::Impl {
     // manager -> provider/poster (the workers hold a raw manager pointer).
     // probe_directory is declared before probe_provider so it is destroyed
     // after the provider that borrows it.
+    // Asynchronous Jetty drain chain (design §4.2). Declared before the probe
+    // block/workers/contexts so they are destroyed after both: destruction of a
+    // controller never invokes a callback, and the pools (owned by the
+    // contexts) are expected to be gone by then.
+    std::unique_ptr<ub::ThreadedControlExecutor> drain_executor;
     ub::ProbePeerDescriptorSource* probe_peer_source{nullptr};
+    std::unique_ptr<ub::ProbePeerRegistry> probe_registry;
+    std::unique_ptr<ub::BootstrapProbePeerSource> probe_source;
     std::shared_ptr<ub::HandshakeProbePeerDirectory> probe_directory;
+    std::unique_ptr<ub::ProbePeerCoordinator> probe_coordinator;
     std::shared_ptr<ub::ProbeResourceProvider> probe_provider;
     std::shared_ptr<ub::ProbePoster> probe_poster;
+    // Declared adjacency policy for the business routing gate. Destroyed
+    // after the workers that borrow it.
+    std::shared_ptr<ub::ProbeTopology> probe_topology;
     std::unique_ptr<ub::ProbeLinkManager> probe_manager;
     std::unique_ptr<ub::ProbeScheduler> probe_scheduler;
     std::unique_ptr<ub::UbWorkers> workers;
-    // rm_pool admission and completion-gate components, owned by the install
-    // generation and shared with the workers. Reset during shutdown after the
-    // workers stop and the contexts (pool owners) are released.
+    // rm_pool admission components, owned by the install generation and
+    // shared with the workers. Reset during shutdown after the workers stop
+    // and the contexts (pool owners) are released.
     std::shared_ptr<ub::NativeBudget> native_budget;
-    std::shared_ptr<ub::TaskPermitLedger> task_permits;
-    std::shared_ptr<ub::AttemptGate> attempt_gate;
+    // Bounded tombstones for unproven native destruction (design §7.2). One
+    // table per install generation, shared by the pools and the workers.
+    std::shared_ptr<ub::TombstoneTable> tombstones;
+    // v1 peers that carried a v2 block (sanitized ignore, design §6.4).
+    std::atomic<uint64_t> bootstrap_v2_ignored{0};
+    std::atomic<uint64_t> probe_publication_identity_fail{0};
+    std::atomic<uint64_t> endpoint_resolve_total{0};
+    std::atomic<uint64_t> endpoint_resolve_cache_hit{0};
+    std::atomic<uint64_t> endpoint_resolve_bootstrap{0};
+    std::atomic<uint64_t> endpoint_resolve_bootstrap_fail{0};
+    std::atomic<uint64_t> endpoint_resolve_rpc_us_sum{0};
+    std::atomic<uint64_t> endpoint_resolve_rpc_us_max{0};
+    std::atomic<uint64_t> endpoint_bind_fail{0};
+    std::atomic<uint64_t> endpoint_bind_conflict{0};
+    std::atomic<uint64_t> endpoint_bind_replace_retry{0};
+    std::atomic<uint64_t> endpoint_bind_replace_ok{0};
+
+    struct ResolveFlight {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool done{false};
+        Status status;
+        std::shared_ptr<ub::UbEndpoint> endpoint;
+    };
+    std::mutex resolve_flights_mutex;
+    std::unordered_map<ub::UbEndpointKey, std::shared_ptr<ResolveFlight>,
+                       ub::UbEndpointKeyHash>
+        resolve_flights;
+    bool probe_bootstrap_callback_installed{false};
 };
 
 UbTransport::UbTransport(
@@ -1435,6 +2116,60 @@ bool UbTransport::warmupMemory(void* addr, size_t length) {
         length, options, segment);
     if (!status.ok()) return false;
     return impl_->adapter->unregisterLocalSegment(segment).ok();
+}
+
+size_t UbTransport::probeLinkCount() const {
+    std::lock_guard<std::mutex> lock(impl_->lifecycle_mutex);
+    return impl_->probe_manager ? impl_->probe_manager->pathCount() : 0;
+}
+
+size_t UbTransport::probeCampaignCount() const {
+    std::lock_guard<std::mutex> lock(impl_->lifecycle_mutex);
+    return impl_->probe_manager ? impl_->probe_manager->campaignCount() : 0;
+}
+
+bool UbTransport::probeStopped() const {
+    std::lock_guard<std::mutex> lock(impl_->lifecycle_mutex);
+    return impl_->probe_manager != nullptr &&
+           impl_->probe_manager->postingStopped();
+}
+
+uint64_t UbTransport::probeGeneration() const {
+    std::lock_guard<std::mutex> lock(impl_->lifecycle_mutex);
+    return impl_->probe_manager ? impl_->probe_manager->probeGeneration() : 0;
+}
+
+ub::ProbeTopologyStats UbTransport::probeTopologyStats() const {
+    std::lock_guard<std::mutex> lock(impl_->lifecycle_mutex);
+    if (!impl_->probe_topology) return ub::ProbeTopologyStats{};
+    return impl_->probe_topology->stats();
+}
+
+ub::ProbeCoordinatorStats UbTransport::probeCoordinatorStats() const {
+    std::lock_guard<std::mutex> lock(impl_->lifecycle_mutex);
+    if (!impl_->probe_coordinator) return ub::ProbeCoordinatorStats{};
+    return impl_->probe_coordinator->stats();
+}
+
+uint64_t UbTransport::probePublicationIdentityFailures() const {
+    std::lock_guard<std::mutex> lock(impl_->lifecycle_mutex);
+    return impl_->probe_publication_identity_fail.load(
+        std::memory_order_relaxed);
+}
+
+ub::ProbeStats UbTransport::probeLinkStats() const {
+    std::lock_guard<std::mutex> lock(impl_->lifecycle_mutex);
+    if (!impl_->probe_manager) return ub::ProbeStats{};
+    return impl_->probe_manager->stats();
+}
+
+uint64_t UbTransport::poolGeneration() const {
+    std::lock_guard<std::mutex> lock(impl_->lifecycle_mutex);
+    uint64_t generation = 0;
+    for (const auto& context : impl_->contexts) {
+        if (context) generation = std::max(generation, context->incarnation());
+    }
+    return generation;
 }
 
 double UbTransport::getEstimatedBandwidth() const {

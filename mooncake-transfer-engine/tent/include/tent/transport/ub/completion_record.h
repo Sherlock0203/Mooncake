@@ -82,6 +82,10 @@ enum class CompletionOutcome : uint8_t {
     kEndpointError = 4,
     kMemoryError = 5,
     kUnknownError = 6,
+    // Local access error. Usually a link-down surfacing on the local side, so
+    // it is retryable and reported as a path fault; genuine token/permission
+    // errors exhaust the bounded retry budget instead of killing the slice.
+    kLocalAccessError = 7,
 };
 
 // Logical result of the attempt (three-layer semantics, total design §8).

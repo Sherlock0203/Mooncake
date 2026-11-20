@@ -43,6 +43,29 @@ Topology::~Topology() {}
 
 bool Topology::empty() const { return nic_list_.empty() && mem_list_.empty(); }
 
+Status Topology::applyUbDeviceKinds(
+    const std::vector<UbNicKindOverride>& overrides) {
+    std::unordered_map<std::string, const UbNicKindOverride*> by_name;
+    by_name.reserve(overrides.size());
+    for (const auto& entry : overrides) {
+        if (entry.topology_name.empty()) continue;
+        by_name[entry.topology_name] = &entry;
+    }
+    for (auto& nic : nic_list_) {
+        if (nic.type != NIC_UB) continue;
+        auto found = by_name.find(nic.name);
+        if (found == by_name.end()) continue;
+        if (!found->second->kind.empty()) {
+            nic.device_attrs["ub.device_kind"] = found->second->kind;
+        }
+        if (!found->second->kind_source.empty()) {
+            nic.device_attrs["ub.device_kind_source"] =
+                found->second->kind_source;
+        }
+    }
+    return Status::OK();
+}
+
 void Topology::clear() {
     nic_list_.clear();
     mem_list_.clear();

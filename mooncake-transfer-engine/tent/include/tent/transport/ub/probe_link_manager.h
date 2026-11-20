@@ -182,6 +182,8 @@ class ProbeLinkManager final : public ProbeAvailabilitySink {
     // same object that supplies resources, or a narrower sink. The hook mutex
     // makes the setter safe against concurrent emitEffects().
     void setReportSink(ProbeReportSink* sink);
+    void setVerboseEvents(bool verbose) { verbose_events_ = verbose; }
+    [[nodiscard]] bool verboseEvents() const { return verbose_events_; }
     // Invoked outside the PLM mutex whenever scheduling state changed.
     void setWakeCallback(WakeCallback callback);
 
@@ -270,6 +272,16 @@ class ProbeLinkManager final : public ProbeAvailabilitySink {
     [[nodiscard]] bool businessPathUsable(const UbPostPath& path);
     [[nodiscard]] uint64_t businessFaultEpoch(const UbPostPath& path);
 
+    // Synthetic probe identity (design §5.4). Configured peers use these
+    // entries so business open/closeRemote churn cannot move a probe path.
+    // An invalid key (segment_id == LOCAL_SEGMENT_ID) is a no-op: the path is
+    // not modelled by the probe graph.
+    [[nodiscard]] bool businessPathUsable(const ProbePathKey& key);
+    [[nodiscard]] uint64_t businessFaultEpoch(const ProbePathKey& key);
+    void onBusinessPathSuccess(const ProbePathKey& key, uint64_t now_ns = 0);
+    void onBusinessPathError(const ProbePathKey& key, BusinessErrorKind kind,
+                             uint64_t now_ns = 0);
+
     // ---- interface 7 (design §12.3) --------------------------------------
     // Synchronous, bounded update. A repeated (graph_epoch, event_seq) is
     // acknowledged without being applied. A gap or a malformed payload is
@@ -284,6 +296,17 @@ class ProbeLinkManager final : public ProbeAvailabilitySink {
     [[nodiscard]] size_t inflightCount() const;
     [[nodiscard]] size_t orphanCount() const;
     [[nodiscard]] uint64_t graphEpoch() const;
+    // Number of path rows in the health table (one row per legal adjacency
+    // edge), not the number of healthy rows. This is the `probe_link_count`
+    // metric of design §12.1.
+    [[nodiscard]] size_t pathCount() const;
+    // Campaigns that still have an unresolved entry.
+    [[nodiscard]] size_t campaignCount() const;
+    // True after stopPosting(): no new probe can be claimed.
+    [[nodiscard]] bool postingStopped() const;
+    // Monotonic identity of the current probe graph generation; logs carry it
+    // so evidence from different topology epochs cannot be confused.
+    [[nodiscard]] uint64_t probeGeneration() const;
     [[nodiscard]] const ProbeParams& params() const { return params_; }
 
    private:
@@ -345,6 +368,16 @@ class ProbeLinkManager final : public ProbeAvailabilitySink {
         PathVersion path;
         Status reason;
         bool bump{false};
+        struct HealthTransition {
+            PathVersion version;
+            LinkHealth from{LinkHealth::kEligibleUnverified};
+            LinkHealth to{LinkHealth::kEligibleUnverified};
+            const char* reason{"state_change"};
+            uint64_t fault_epoch{0};
+            uint64_t consecutive_failures{0};
+            uint64_t backoff_ns{0};
+        };
+        std::vector<HealthTransition> health_transitions;
     };
 
     enum class StaleReason : uint8_t {
@@ -369,9 +402,11 @@ class ProbeLinkManager final : public ProbeAvailabilitySink {
 
     // State helpers. setHealthLocked() owns the path_state counters and the
     // availability bump.
-    void setHealthLocked(PathRuntime& runtime, LinkHealth health,
+    void setHealthLocked(const PathVersion& version, PathRuntime& runtime,
+                         LinkHealth health, const char* reason,
                          Effects& effects);
-    void publishHealthyLocked(PathRuntime& runtime, Effects& effects);
+    void publishHealthyLocked(const PathVersion& version, PathRuntime& runtime,
+                              const char* reason, Effects& effects);
     static bool externalGateOk(const ProbeEdgeSupply& edge);
     uint64_t backoffDelayLocked(uint64_t consecutive_failures) const;
 
@@ -428,6 +463,15 @@ class ProbeLinkManager final : public ProbeAvailabilitySink {
     // because they must not promote a path they do not belong to.
     std::optional<PathVersion> resolveVersionLocked(
         const UbPostPath& evidence, bool require_matching_generation);
+    std::optional<PathVersion> resolveVersionLocked(
+        const ProbePathKey& key, uint64_t endpoint_generation,
+        bool require_matching_generation);
+    void onBusinessPathSuccessResolved(const ProbePathKey& key,
+                                       uint64_t endpoint_generation,
+                                       uint64_t now_ns);
+    void onBusinessPathErrorResolved(const ProbePathKey& key,
+                                     uint64_t endpoint_generation,
+                                     BusinessErrorKind kind, uint64_t now_ns);
 
     mutable std::mutex mutex_;
     // Guards the externally installed hooks (report sink, wake callback and
@@ -467,6 +511,7 @@ class ProbeLinkManager final : public ProbeAvailabilitySink {
     uint64_t lane_error_epoch_{0};
 
     ProbeStats stats_;
+    bool verbose_events_{false};
 };
 
 }  // namespace ub

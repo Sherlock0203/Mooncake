@@ -3,6 +3,8 @@
 
 #include "tent/transport/ub/context.h"
 
+#include "tent/transport/ub/jetty_drain_controller.h"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -10,7 +12,7 @@
 #include <utility>
 
 #include "jetty_pool.h"
-#include "tent/transport/ub/send_jetty_pool.h"
+#include "tent/transport/ub/business_jetty_pool.h"
 
 namespace mooncake::tent::ub {
 namespace {
@@ -91,6 +93,11 @@ Status UbContext::initialize(uint32_t jfc_count, const JfcOptions& options) {
         return status;
     }
 
+    // One registry per Context: an imported target is a node-wide resource
+    // shared by every endpoint/probe on this Context, not endpoint state.
+    target_registry_ =
+        std::make_shared<ImportedTargetRegistry>(adapter_, handle_);
+
     jfcs_.reserve(jfc_count);
     for (uint32_t i = 0; i < jfc_count; ++i) {
         JfcPtr native_jfc;
@@ -134,6 +141,12 @@ void UbContext::attachPooledSendPool(std::shared_ptr<SendJettyPool> pool) {
     pooled_send_pool_ = std::move(pool);
 }
 
+void UbContext::attachDrainController(
+    std::shared_ptr<JettyDrainController> controller) {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    drain_controller_ = std::move(controller);
+}
+
 Status UbContext::shutdownLocked() {
     auto current = state_.load(std::memory_order_relaxed);
     if (current == State::kClosed) return Status::OK();
@@ -159,6 +172,13 @@ Status UbContext::shutdownLocked() {
         auto status = pooled_send_pool_->drainIdle();
         if (!status.ok() && first_error.ok()) first_error = std::move(status);
         status = pooled_send_pool_->drainQuarantined();
+        if (!status.ok() && first_error.ok()) first_error = std::move(status);
+    }
+    // Every endpoint released its references during endpoint-store teardown;
+    // this is the last chance to prove destruction of a target whose unimport
+    // previously failed. A remaining failure keeps the context reviewable.
+    if (target_registry_) {
+        auto status = target_registry_->drainRetained();
         if (!status.ok() && first_error.ok()) first_error = std::move(status);
     }
     for (size_t index = jfcs_.size(); index > 0;) {

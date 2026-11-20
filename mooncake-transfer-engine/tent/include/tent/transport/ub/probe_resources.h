@@ -93,6 +93,32 @@ struct ProbeEdgeSupply {
     uint64_t endpoint_generation{0};
 };
 
+// Runtime handles for one declared local probe port. This is the responder
+// half of ProbeBootstrapUb: identity + epochs + area descriptor + probe Jetty.
+// It never contains a route the configuration did not declare.
+struct ProbeLocalPortPublication {
+    std::string port_id;
+    std::string topology_name;
+    std::string eid;
+    uint64_t target_epoch{0};
+    RemoteJettyRef jetty;
+    SegmentDescriptor area_descriptor;
+    uint64_t area_length{0};
+    uint64_t area_epoch{0};
+    uint32_t area_token{0};
+    bool node_gate_ok{false};
+    bool port_gate_ok{false};
+    bool profile_gate_ok{false};
+};
+
+struct ProbeLocalPublication {
+    std::string segment;
+    uint64_t node_incarnation{0};
+    uint64_t topology_epoch{0};
+    uint64_t publication_epoch{0};
+    std::vector<ProbeLocalPortPublication> ports;
+};
+
 struct ProbeGraph {
     // Interface 4 is a full snapshot; this epoch starts the interface-7
     // (graph_epoch, event_seq) idempotency domain.

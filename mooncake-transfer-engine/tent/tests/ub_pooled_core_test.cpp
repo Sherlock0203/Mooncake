@@ -3,7 +3,7 @@
 //
 // Software-only acceptance tests for the pooled rm_pool core components:
 //   - NativeBudget (C05): device-level full-role budget ledger
-//   - JfcCreditLedger / TaskPermitLedger (C05/C06): admission tickets
+//   - JfcCreditLedger (C05/C06): admission tickets
 //   - SendJettyPool (C06): per-attempt exclusive LIFO pool with JFC credit
 //     matching, stop interleaving, fault retirement and leak defence
 //   - AttemptGate (C07/D04): completion gate with single settlement
@@ -32,7 +32,7 @@
 #include "tent/transport/ub/jfc.h"
 #include "tent/transport/ub/native_budget.h"
 #include "tent/transport/ub/params.h"
-#include "tent/transport/ub/send_jetty_pool.h"
+#include "tent/transport/ub/business_jetty_pool.h"
 #include "tent/transport/ub/urma_adapter.h"
 
 using mooncake::tent::Config;
@@ -404,7 +404,8 @@ TEST(UbNativeBudgetTest, LeakedReservationCounted) {
 }
 
 // ---------------------------------------------------------------------------
-// JfcCreditLedger / TaskPermitLedger (T-10 admission tickets)
+// JfcCreditLedger (T-10 admission tickets). Task-level K lives on
+// UbTask and is covered by ub_admission_test.cpp (D-6/R-3).
 // ---------------------------------------------------------------------------
 
 TEST(UbAdmissionTest, JfcCreditRoundTrip) {
@@ -436,32 +437,6 @@ TEST(UbAdmissionTest, JfcCreditRejectsOversizedReservation) {
     ASSERT_TRUE(credits.install(0, 2).ok());
     EXPECT_FALSE(credits.tryReserve(0, 3).has_value());
     EXPECT_FALSE(credits.tryReserve(9, 1).has_value());  // unknown JFC
-}
-
-TEST(UbAdmissionTest, TaskPermitEnforcesK) {
-    TaskPermitLedger permits(2);
-    auto first = permits.tryAcquire();
-    auto second = permits.tryAcquire();
-    ASSERT_TRUE(first.valid());
-    ASSERT_TRUE(second.valid());
-    // K exhausted: the attempt defers, never faults.
-    EXPECT_FALSE(permits.tryAcquire().valid());
-    EXPECT_EQ(permits.rejectedAcquisitions(), 1u);
-    EXPECT_EQ(permits.outstanding(), 2u);
-
-    first.release();
-    EXPECT_EQ(permits.outstanding(), 1u);
-    auto third = permits.tryAcquire();
-    EXPECT_TRUE(third.valid());
-
-    // Move ownership: exactly one holder releases.
-    TaskPermitTicket moved = std::move(third);
-    EXPECT_FALSE(third.valid());
-    EXPECT_TRUE(moved.valid());
-    moved.release();
-    EXPECT_EQ(permits.outstanding(), 1u);
-    second.release();
-    EXPECT_EQ(permits.outstanding(), 0u);
 }
 
 // ---------------------------------------------------------------------------
@@ -855,7 +830,7 @@ TEST(UbSendJettyPoolTest, DistinctPoolKeysNeverShareMembers) {
 TEST(UbAttemptGateTest, NormalSuccessReturnsToPool) {
     AttemptGate gate;
     const auto token =
-        gate.registerAttempt(makeAttemptKey(1, 1, 1), LaneKey{7, 1}, 4096);
+        gate.registerAttempt(makeAttemptKey(1, 1, 1), PoolLaneKey{7, 1}, 4096);
     gate.onPostReturn(token, Status::OK(), PostAcceptance::kAccepted);
     gate.onRealCompletion(token, /*success=*/true, /*length=*/4096);
 
@@ -878,7 +853,7 @@ TEST(UbAttemptGateTest, NormalSuccessReturnsToPool) {
 TEST(UbAttemptGateTest, EarlyCompletionWaitsForPostReturn) {
     AttemptGate gate;
     const auto token =
-        gate.registerAttempt(makeAttemptKey(1, 1, 1), LaneKey{7, 1}, 64);
+        gate.registerAttempt(makeAttemptKey(1, 1, 1), PoolLaneKey{7, 1}, 64);
     // The completion arrives before the post call returns.
     gate.onRealCompletion(token, true, 64);
 
@@ -894,7 +869,7 @@ TEST(UbAttemptGateTest, EarlyCompletionWaitsForPostReturn) {
 TEST(UbAttemptGateTest, PostNotReturnedWaits) {
     AttemptGate gate;
     const auto token =
-        gate.registerAttempt(makeAttemptKey(1, 1, 1), LaneKey{7, 1}, 64);
+        gate.registerAttempt(makeAttemptKey(1, 1, 1), PoolLaneKey{7, 1}, 64);
     AttemptGate::Settlement settlement;
     EXPECT_FALSE(gate.tryFinalize(token, true, settlement));
     EXPECT_TRUE(settlement.wait);
@@ -903,7 +878,7 @@ TEST(UbAttemptGateTest, PostNotReturnedWaits) {
 TEST(UbAttemptGateTest, DuplicateCompletionIsContradiction) {
     AttemptGate gate;
     const auto token =
-        gate.registerAttempt(makeAttemptKey(1, 1, 1), LaneKey{7, 1}, 64);
+        gate.registerAttempt(makeAttemptKey(1, 1, 1), PoolLaneKey{7, 1}, 64);
     gate.onPostReturn(token, Status::OK(), PostAcceptance::kAccepted);
     gate.onRealCompletion(token, true, 64);
     gate.onRealCompletion(token, true, 64);  // duplicate real CQE
@@ -918,7 +893,7 @@ TEST(UbAttemptGateTest, DuplicateCompletionIsContradiction) {
 TEST(UbAttemptGateTest, InvalidLengthIsContradiction) {
     AttemptGate gate;
     const auto token =
-        gate.registerAttempt(makeAttemptKey(1, 1, 1), LaneKey{7, 1}, 64);
+        gate.registerAttempt(makeAttemptKey(1, 1, 1), PoolLaneKey{7, 1}, 64);
     gate.onPostReturn(token, Status::OK(), PostAcceptance::kAccepted);
     gate.onRealCompletion(token, true, /*length=*/32);
 
@@ -931,7 +906,7 @@ TEST(UbAttemptGateTest, InvalidLengthIsContradiction) {
 TEST(UbAttemptGateTest, FailedCompletionRetires) {
     AttemptGate gate;
     const auto token =
-        gate.registerAttempt(makeAttemptKey(1, 1, 1), LaneKey{7, 1}, 64);
+        gate.registerAttempt(makeAttemptKey(1, 1, 1), PoolLaneKey{7, 1}, 64);
     gate.onPostReturn(token, Status::OK(), PostAcceptance::kAccepted);
     gate.onRealCompletion(token, /*success=*/false, 0);
 
@@ -944,7 +919,7 @@ TEST(UbAttemptGateTest, FailedCompletionRetires) {
 TEST(UbAttemptGateTest, DefinitiveZeroAcceptRollsBack) {
     AttemptGate gate;
     const auto token =
-        gate.registerAttempt(makeAttemptKey(1, 1, 1), LaneKey{7, 1}, 64);
+        gate.registerAttempt(makeAttemptKey(1, 1, 1), PoolLaneKey{7, 1}, 64);
     gate.onPostReturn(token, Status::TooManyRequests("provider queue full"),
                       PostAcceptance::kNotAccepted);
 
@@ -959,7 +934,7 @@ TEST(UbAttemptGateTest, DefinitiveZeroAcceptRollsBack) {
 TEST(UbAttemptGateTest, NotAcceptedWithCqeKeepsResponsibility) {
     AttemptGate gate;
     const auto token =
-        gate.registerAttempt(makeAttemptKey(1, 1, 1), LaneKey{7, 1}, 64);
+        gate.registerAttempt(makeAttemptKey(1, 1, 1), PoolLaneKey{7, 1}, 64);
     gate.onPostReturn(token, Status::InternalError("provider ambiguous"),
                       PostAcceptance::kNotAccepted);
     gate.onRealCompletion(token, true, 64);  // contradiction
@@ -974,7 +949,7 @@ TEST(UbAttemptGateTest, NotAcceptedWithCqeKeepsResponsibility) {
 TEST(UbAttemptGateTest, UnknownAcceptanceHoldsResponsibility) {
     AttemptGate gate;
     const auto token =
-        gate.registerAttempt(makeAttemptKey(1, 1, 1), LaneKey{7, 1}, 64);
+        gate.registerAttempt(makeAttemptKey(1, 1, 1), PoolLaneKey{7, 1}, 64);
     gate.onPostReturn(token, Status::InternalError("timeout"),
                       PostAcceptance::kUnknown);
 
@@ -988,7 +963,7 @@ TEST(UbAttemptGateTest, UnknownAcceptanceHoldsResponsibility) {
 TEST(UbAttemptGateTest, HandlerReferencesBlockSettlement) {
     AttemptGate gate;
     const auto token =
-        gate.registerAttempt(makeAttemptKey(1, 1, 1), LaneKey{7, 1}, 64);
+        gate.registerAttempt(makeAttemptKey(1, 1, 1), PoolLaneKey{7, 1}, 64);
     gate.onPostReturn(token, Status::OK(), PostAcceptance::kAccepted);
     gate.onRealCompletion(token, true, 64);
     gate.onHandlerEnter(token);
@@ -1005,7 +980,7 @@ TEST(UbAttemptGateTest, HandlerReferencesBlockSettlement) {
 TEST(UbAttemptGateTest, ClosedPoolRetiresSuccessfulAttempt) {
     AttemptGate gate;
     const auto token =
-        gate.registerAttempt(makeAttemptKey(1, 1, 1), LaneKey{7, 1}, 64);
+        gate.registerAttempt(makeAttemptKey(1, 1, 1), PoolLaneKey{7, 1}, 64);
     gate.onPostReturn(token, Status::OK(), PostAcceptance::kAccepted);
     gate.onRealCompletion(token, true, 64);
 
@@ -1019,7 +994,7 @@ TEST(UbAttemptGateTest, ClosedPoolRetiresSuccessfulAttempt) {
 TEST(UbAttemptGateTest, FaultRetiresRegardlessOfCompletions) {
     AttemptGate gate;
     const auto token =
-        gate.registerAttempt(makeAttemptKey(1, 1, 1), LaneKey{7, 1}, 64);
+        gate.registerAttempt(makeAttemptKey(1, 1, 1), PoolLaneKey{7, 1}, 64);
     gate.onPostReturn(token, Status::OK(), PostAcceptance::kAccepted);
     gate.reportFault(token, "jetty async event");
 
@@ -1228,6 +1203,13 @@ TEST(UbSendJettyPoolConcurrencyTest, HammerWithStopDrainsSafely) {
     for (int thread = 0; thread < kThreads; ++thread) {
         threads.emplace_back([&, thread] {
             for (int round = 0; round < kRounds; ++round) {
+                // Trigger the stop from the top of the iteration: doing it
+                // after a successful lease made the signal racy, because a
+                // deferred (TooManyRequests) round skipped the trigger and the
+                // stopper thread then waited forever.
+                if (round == kRounds / 2 && thread == 0) {
+                    stop_requested.store(true);
+                }
                 LeaseWithCredit grant;
                 const auto attempt =
                     makeAttemptKey(static_cast<uint64_t>(thread + 1),
@@ -1245,9 +1227,6 @@ TEST(UbSendJettyPoolConcurrencyTest, HammerWithStopDrainsSafely) {
                 ASSERT_TRUE(
                     harness.pool->returnOnce(std::move(grant.lease), true)
                         .ok());
-                if (round == kRounds / 2 && thread == 0) {
-                    stop_requested.store(true);
-                }
             }
         });
     }
@@ -1293,21 +1272,262 @@ Status parseUbParams(const std::string& json_text, UbParams& params) {
 TEST(UbParamsPooledTest, DefaultsAreLegacySafe) {
     UbParams params;
     ASSERT_TRUE(parseUbParams("{}", params).ok());
-    EXPECT_EQ(params.send_pool.desired_per_context, 6u);
-    EXPECT_EQ(params.send_pool.task_max_inflight_attempts, 4u);
+    EXPECT_EQ(params.jetty_pool.business_desired_serving, 6u);
+    EXPECT_EQ(params.task_max_inflight_attempts, 4u);
     EXPECT_EQ(params.send_pool.max_creating_per_key, 2u);
     EXPECT_EQ(params.send_pool.jfc_credit_reserve, 16u);
     EXPECT_EQ(params.native_budget.max_jetty_per_device, 0u);
     EXPECT_EQ(params.native_budget.replacement_reserve, 2u);
 }
 
+TEST(UbParamsPooledTest, RejectsConflictingRenamedAndLegacyKeys) {
+    UbParams params;
+    // New and deprecated names both present with different values: fail
+    // closed instead of silently preferring one.
+    const Status conflict = parseUbParams(R"({
+        "transports": {
+            "ub": {
+                "jetty_pool": {"business_desired_serving": 8},
+                "send_pool": {"desired_per_context": 6}
+            }
+        }
+    })",
+                                          params);
+    EXPECT_TRUE(conflict.IsInvalidArgument());
+
+    // The deprecated name alone is still accepted (migration window).
+    ASSERT_TRUE(parseUbParams(R"({
+        "transports": {
+            "ub": {
+                "send_pool": {"desired_per_context": 9}
+            }
+        }
+    })",
+                              params)
+                    .ok());
+    EXPECT_EQ(params.jetty_pool.business_desired_serving, 9u);
+
+    // business_min_size is the compatibility mapping of the legacy
+    // jetty_per_endpoint; a conflicting pair is an operator error.
+    EXPECT_TRUE(parseUbParams(R"({
+        "transports": {
+            "ub": {
+                "jetty_per_endpoint": 6,
+                "jetty_pool": {"business_min_size": 3}
+            }
+        }
+    })",
+                              params)
+                    .IsInvalidArgument());
+    // Both present and equal is accepted.
+    ASSERT_TRUE(parseUbParams(R"({
+        "transports": {
+            "ub": {
+                "jetty_per_endpoint": 6,
+                "jetty_pool": {
+                    "business_desired_serving": 6,
+                    "business_min_size": 6,
+                    "business_max_size": 6,
+                    "business_initial_size": 6
+                }
+            }
+        }
+    })",
+                              params)
+                    .ok());
+    EXPECT_EQ(params.jetty_pool.business_min_size, 6u);
+}
+
+TEST(UbParamsPooledTest, ParsesDeclaredProbeTopologyAndRejectsBadEdges) {
+    UbParams params;
+    ASSERT_TRUE(parseUbParams(R"({
+        "transports": {
+            "ub": {
+                "runtime_profile": "rm_legacy",
+                "trans_mode": "rm",
+                "probe": {
+                    "enabled": true,
+                    "provider": "standalone",
+                    "local_ports": [
+                        {"id": "P0", "bind": "ub:udma0:eid0"},
+                        {"id": "P1", "bind": "ub:udma1:eid0"}
+                    ],
+                    "peers": {
+                        "node-b": {
+                            "ports": [
+                                {"id": "R0", "eid": "0000:0000:0000:0000:0000:0000:0000:0021"},
+                                {"id": "R1", "eid": "0000:0000:0000:0000:0000:0000:0000:0022"}
+                            ]
+                        }
+                    },
+                    "adjacency": {
+                        "node-b": {"P0": ["R0", "R1"], "P1": ["R0"]}
+                    }
+                }
+            }
+        }
+    })",
+                              params)
+                    .ok());
+    ASSERT_EQ(params.probe.local_ports.size(), 2u);
+    EXPECT_EQ(params.probe.local_ports[0].id, "P0");
+    EXPECT_EQ(params.probe.local_ports[0].bind, "ub:udma0:eid0");
+    ASSERT_EQ(params.probe.peers.count("node-b"), 1u);
+    ASSERT_EQ(params.probe.peers.at("node-b").ports.size(), 2u);
+    ASSERT_EQ(params.probe.adjacency.at("node-b").at("P0").size(), 2u);
+    EXPECT_TRUE(params.probe.dynamic_edges);
+    EXPECT_TRUE(params.probe.enforcesAdjacency());
+
+    // Bare-string local port: id == bind.
+    ASSERT_TRUE(parseUbParams(R"({
+        "transports": {"ub": {
+            "runtime_profile": "rm_legacy", "trans_mode": "rm",
+            "probe": {
+                "enabled": true, "provider": "standalone",
+                "local_ports": ["P0"],
+                "peers": {"node-b": {"ports": [
+                    {"id": "R0", "eid": "0000:0000:0000:0000:0000:0000:0000:0021"}
+                ]}},
+                "adjacency": {"node-b": {"P0": ["R0"]}}
+            }
+        }}
+    })",
+                              params)
+                    .ok());
+    EXPECT_EQ(params.probe.local_ports[0].bind, "P0");
+
+    // The removed shape ({local: [peer...]}) is rejected, not reinterpreted.
+    EXPECT_TRUE(parseUbParams(R"({
+        "transports": {"ub": {
+            "runtime_profile": "rm_legacy", "trans_mode": "rm",
+            "probe": {
+                "enabled": true, "provider": "standalone",
+                "local_ports": ["P0"],
+                "peers": {"peer-a": {"ports": [
+                    {"id": "R0", "eid": "0000:0000:0000:0000:0000:0000:0000:0021"}
+                ]}},
+                "adjacency": {"P0": ["peer-a"]}
+            }
+        }}
+    })",
+                              params)
+                    .IsInvalidArgument());
+
+    // target_map was removed in favour of peers[].ports[].eid.
+    EXPECT_TRUE(parseUbParams(R"({
+        "transports": {"ub": {"probe": {"target_map": {"P0": ["t0"]}}}}
+    })",
+                              params)
+                    .IsInvalidArgument());
+
+    // An edge to an undeclared local port is fail-closed.
+    EXPECT_TRUE(parseUbParams(R"({
+        "transports": {"ub": {
+            "runtime_profile": "rm_legacy", "trans_mode": "rm",
+            "probe": {
+                "enabled": true, "provider": "standalone",
+                "local_ports": ["P0"],
+                "peers": {"peer-a": {"ports": [
+                    {"id": "R0", "eid": "0000:0000:0000:0000:0000:0000:0000:0021"}
+                ]}},
+                "adjacency": {"peer-a": {"P9": ["R0"]}}
+            }
+        }}
+    })",
+                              params)
+                    .IsInvalidArgument());
+
+    // Duplicate remote id in one local list is rejected.
+    EXPECT_TRUE(parseUbParams(R"({
+        "transports": {"ub": {
+            "runtime_profile": "rm_legacy", "trans_mode": "rm",
+            "probe": {
+                "enabled": true, "provider": "standalone",
+                "local_ports": ["P0"],
+                "peers": {"peer-a": {"ports": [
+                    {"id": "R0", "eid": "0000:0000:0000:0000:0000:0000:0000:0021"}
+                ]}},
+                "adjacency": {"peer-a": {"P0": ["R0", "R0"]}}
+            }
+        }}
+    })",
+                              params)
+                    .IsInvalidArgument());
+
+    // A declaration without probe enabled, or with the injected pool
+    // provider, cannot form a mapping and is rejected.
+    EXPECT_TRUE(parseUbParams(R"({
+        "transports": {"ub": {
+            "runtime_profile": "rm_legacy", "trans_mode": "rm",
+            "probe": {
+                "local_ports": ["P0"],
+                "peers": {"peer-a": {"ports": [
+                    {"id": "R0", "eid": "0000:0000:0000:0000:0000:0000:0000:0021"}
+                ]}},
+                "adjacency": {"peer-a": {"P0": ["R0"]}}
+            }
+        }}
+    })",
+                              params)
+                    .IsInvalidArgument());
+    EXPECT_TRUE(parseUbParams(R"({
+        "transports": {"ub": {
+            "runtime_profile": "rm_legacy", "trans_mode": "rm",
+            "probe": {
+                "enabled": true, "provider": "pool",
+                "local_ports": ["P0"],
+                "peers": {"peer-a": {"ports": [
+                    {"id": "R0", "eid": "0000:0000:0000:0000:0000:0000:0000:0021"}
+                ]}},
+                "adjacency": {"peer-a": {"P0": ["R0"]}}
+            }
+        }}
+    })",
+                              params)
+                    .IsInvalidArgument());
+}
+
+TEST(UbParamsPooledTest, ParsesObservabilitySwitches) {
+    UbParams params;
+    ASSERT_TRUE(parseUbParams(R"({
+        "transports": {"ub": {"observability": {
+            "verbose_events": true,
+            "sample_every": 256,
+            "topology_dump_limit": 128
+        }}}
+    })",
+                              params)
+                    .ok());
+    EXPECT_TRUE(params.observability.verbose_events);
+    EXPECT_EQ(params.observability.sample_every, 256U);
+    EXPECT_EQ(params.observability.topology_dump_limit, 128U);
+    EXPECT_EQ(params.observability.leaseSampleEvery(), 256U);
+    EXPECT_EQ(params.observability.probeSampleEvery(), 256U);
+
+    ASSERT_TRUE(parseUbParams("{}", params).ok());
+    EXPECT_FALSE(params.observability.verbose_events);
+    EXPECT_EQ(params.observability.leaseSampleEvery(), 1024U);
+    EXPECT_EQ(params.observability.probeSampleEvery(), 100U);
+
+    EXPECT_TRUE(parseUbParams(R"({
+        "transports": {"ub": {"observability": {"sample_every": -1}}}
+    })",
+                              params)
+                    .IsInvalidArgument());
+}
+
 TEST(UbParamsPooledTest, ParsesExplicitPoolKeys) {
     const std::string config_json = R"({
         "transports": {
             "ub": {
+                "jetty_pool": {
+                    "business_desired_serving": 8,
+                    "business_initial_size": 8,
+                    "business_min_size": 8,
+                    "business_max_size": 8
+                },
+                "task_max_inflight_attempts": 2,
                 "send_pool": {
-                    "desired_per_context": 8,
-                    "task_max_inflight_attempts": 2,
                     "max_creating_per_key": 1,
                     "jfc_credit_reserve": 4
                 },
@@ -1320,8 +1540,8 @@ TEST(UbParamsPooledTest, ParsesExplicitPoolKeys) {
     })";
     UbParams params;
     ASSERT_TRUE(parseUbParams(config_json, params).ok());
-    EXPECT_EQ(params.send_pool.desired_per_context, 8u);
-    EXPECT_EQ(params.send_pool.task_max_inflight_attempts, 2u);
+    EXPECT_EQ(params.jetty_pool.business_desired_serving, 8u);
+    EXPECT_EQ(params.task_max_inflight_attempts, 2u);
     EXPECT_EQ(params.send_pool.max_creating_per_key, 1u);
     EXPECT_EQ(params.send_pool.jfc_credit_reserve, 4u);
     EXPECT_EQ(params.native_budget.max_jetty_per_device, 12u);
@@ -1334,7 +1554,9 @@ TEST(UbParamsPooledTest, RejectsInvalidPoolKeys) {
     ASSERT_FALSE(parseUbParams(R"({
                          "transports": {
                              "ub": {
-                                 "send_pool": {"desired_per_context": -1}
+                                 "jetty_pool": {
+                                     "business_desired_serving": -1
+                                 }
                              }
                          }
                      })",
@@ -1344,9 +1566,7 @@ TEST(UbParamsPooledTest, RejectsInvalidPoolKeys) {
     ASSERT_FALSE(parseUbParams(R"({
                          "transports": {
                              "ub": {
-                                 "send_pool": {
-                                     "task_max_inflight_attempts": 0
-                                 }
+                                 "task_max_inflight_attempts": 0
                              }
                          }
                      })",

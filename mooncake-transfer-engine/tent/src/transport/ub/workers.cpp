@@ -41,7 +41,12 @@ RecordPath makeBusinessRecordPath(const UbPostPath& path) {
 // excludes the endpoint generation (see UbRailKey). These read-only probes
 // therefore only need a generation that satisfies UbPostPath::valid(); real
 // endpoint generations are monotonic and never below this value.
-constexpr uint64_t kRailProbeEndpointGeneration = 1;
+// W3g-c: pre-resolution health queries are path-level, not generation-level.
+// Zero means "no generation claim" to the PLM, so a bootstrap-published edge
+// with a real endpoint-generation anchor does not report every candidate as
+// `probe_evidence_unmapped`. The claim-time check still uses the real
+// generation and remains strict.
+constexpr uint64_t kRailProbeEndpointGeneration = 0;
 
 // Number of candidates always taken in pre-score order, regardless of which
 // local device they belong to. Two is the floor that keeps tryAcquireFirst from
@@ -63,6 +68,10 @@ struct UbWorkers::Route {
     BufferDesc* remote_buffer{nullptr};
     UbBufferMetadata metadata;
     std::vector<Topology::NicID> remote_devices;
+    // Declaration gate for this peer, computed once per route.
+    AdjacencyView adjacency;
+    // Synthetic peer id for the probe graph; 0 when the peer is not declared.
+    uint64_t probe_peer_id{LOCAL_SEGMENT_ID};
 };
 
 // Owner-side half of a completion record (design §5.3). The shared kernel
@@ -75,27 +84,34 @@ struct UbWorkers::BusinessRecord {
     // attempt_key is only an observability/claiming scalar.
     UbAttemptToken attempt;
     UbPostPath path;
+    ProbePathKey probe_key;
     std::shared_ptr<UbEndpoint> endpoint;
     LocalSegmentPtr local_segment;
     RemoteSegmentPtr remote_segment;
     QuotaReservation quota;
     uint64_t posted_ns{0};
     uint64_t deadline_ns{0};
-    std::atomic<bool> timed_out{false};
-    std::atomic<bool> timeout_recorded{false};
-    std::atomic<bool> resources_released{false};
-    // rm_pool data-path owners. pooled_pool is null on legacy paths; the
-    // lease/permit/gate/credit fields are only meaningful when it is set.
-    // The lease is settled exactly once through settlePooledAttempt(); a
-    // dropped lease would be counted as a leak by the pool, so every exit
-    // path must route through the settlement helper.
-    std::shared_ptr<SendJettyPool> pooled_pool;
-    SliceJettyLease pooled_lease;
-    TaskPermitTicket pooled_permit;
-    uint64_t gate_token{0};
-    uint64_t jfc_credit_token{0};
-    size_t pooled_jfc_index{0};
-    std::atomic<bool> pooled_settled{false};
+
+    // ---- W3 pooled ownership (design §5.1) --------------------------------
+    // nullptr means the W2 legacy path: nothing below is touched, and the
+    // member-return code never runs (D-2 mode gate).
+    std::shared_ptr<SendJettyPool> pool;
+    // Handed over exactly once to returnOnce()/retireFaulted() from
+    // onOwners(). A lease still valid at destruction is a responsibility leak
+    // and the pool quarantines the member (diagnostic, not a release path).
+    SliceJettyLease lease;
+    // Identity of the leased member for the lane-scoped drain query. The lease
+    // itself is handed over on the finalize path, so the lane is snapshotted
+    // here while the lease is still valid.
+    PoolLaneKey pooled_lane{};
+    size_t credit_jfc_index{0};
+    uint64_t credit_token{0};
+    // The claim anchor: snapshotted before the lease, compared after it, and
+    // written into core.fault_epoch so business evidence is generation-mapped
+    // (design §5.1/§10.4).
+    uint64_t fault_epoch_snapshot{0};
+    // True while this record owns one task-level K slot (D-6).
+    bool attempt_slot_held{false};
 };
 
 UbWorkers::UbWorkers(std::shared_ptr<UrmaAdapter> adapter,
@@ -108,8 +124,8 @@ UbWorkers::UbWorkers(std::shared_ptr<UrmaAdapter> adapter,
                      LocalDeviceFailureHandler local_device_failure_handler,
                      ProbeLinkManager* probe_manager,
                      std::vector<ProbeJfcSlot> probe_jfcs,
-                     std::shared_ptr<TaskPermitLedger> task_permits,
-                     std::shared_ptr<AttemptGate> attempt_gate)
+                     std::shared_ptr<TombstoneTable> tombstones,
+                     const ProbeTopology* probe_topology)
     : adapter_(std::move(adapter)),
       contexts_(std::move(contexts)),
       local_topology_(std::move(local_topology)),
@@ -121,14 +137,19 @@ UbWorkers::UbWorkers(std::shared_ptr<UrmaAdapter> adapter,
       endpoint_resolver_(std::move(endpoint_resolver)),
       endpoint_retirer_(std::move(endpoint_retirer)),
       local_device_failure_handler_(std::move(local_device_failure_handler)),
-      task_permits_(std::move(task_permits)),
-      attempt_gate_(std::move(attempt_gate)),
-      probe_manager_(probe_manager) {
+      probe_manager_(probe_manager),
+      probe_topology_(probe_topology),
+      param_error_edges_(
+          params_.probe.adjacency_policy.param_error_invalidate_threshold),
+      tombstones_(std::move(tombstones)) {
     for (const auto& context : contexts_) {
         if (!context) continue;
         context_by_topology_id_[context->topologyId()] = context;
+        auto drain = context->drainController();
         for (const auto& jfc : context->jfcs()) {
-            if (jfc) business_slots_.push_back(BusinessSlot{jfc, context});
+            if (jfc) {
+                business_slots_.push_back(BusinessSlot{jfc, context, drain});
+            }
         }
     }
     for (auto& slot : probe_jfcs) {
@@ -256,20 +277,26 @@ Status UbWorkers::stop() {
     // safely; fixed sleeps are never treated as proof that DMA stopped.
     std::vector<std::shared_ptr<BusinessRecord>> still_inflight;
     std::vector<std::shared_ptr<UbEndpoint>> endpoints_to_fence;
-    std::vector<std::shared_ptr<Inflight>> pooled_to_fence;
+    // W3 D-14/W3-IN-10: a pooled record's WR rode a leased member, so its
+    // fence target is that member's Jetty. Fencing the endpoint instead would
+    // prove nothing about the WR that is actually outstanding.
+    std::vector<std::pair<JettyPtr, int>> pooled_jetties_to_fence;
     {
-        std::lock_guard<std::mutex> lock(inflight_mutex_);
-        still_inflight.reserve(inflight_.size());
-        for (const auto& [_, inflight] : inflight_) {
-            still_inflight.push_back(inflight);
-            if (!inflight) continue;
-            if (inflight->pooled_pool && inflight->pooled_lease.valid() &&
-                inflight->pooled_lease.member()) {
-                // The WR rode a pooled member; the fence must quiesce the
-                // member's Jetty, not the endpoint's Jetty set.
-                pooled_to_fence.push_back(inflight);
-            } else if (inflight->endpoint) {
-                endpoints_to_fence.push_back(inflight->endpoint);
+        std::lock_guard<std::mutex> lock(records_mutex_);
+        still_inflight.reserve(records_.size());
+        for (const auto& [_, record] : records_) {
+            still_inflight.push_back(record);
+            if (!record) continue;
+            if (record->pool && record->lease.valid()) {
+                const auto member = record->lease.member();
+                if (member && member->jetty) {
+                    pooled_jetties_to_fence.emplace_back(
+                        member->jetty, record->core.path.local_nic);
+                }
+                continue;
+            }
+            if (record->endpoint) {
+                endpoints_to_fence.push_back(record->endpoint);
             }
         }
         for (const auto& [_, endpoint] : draining_endpoints_) {
@@ -300,23 +327,6 @@ Status UbWorkers::stop() {
         }
         forgetEndpointDrain(endpoint);
         if (endpoint_retirer_) endpoint_retirer_(endpoint);
-    }
-    for (const auto& inflight : pooled_to_fence) {
-        // The shutdown fence proves no more DMA from the pooled member before
-        // context teardown destroys native resources.
-        std::vector<Completion> drained;
-        auto status =
-            adapter_->quiesceJetty(inflight->pooled_lease.member()->jetty,
-                                   params_.slice_timeout_ms, drained);
-        for (const auto& completion : drained) {
-            if (completion.token != 0) handleCompletion(completion);
-        }
-        if (!status.ok()) {
-            if (fence_error.ok()) fence_error = status;
-            continue;
-        }
-        settlePooledAttempt(inflight, PooledSettleKind::kFence, 0,
-                            "shutdown fence");
     }
     if (!fence_error.ok()) {
         return fence_error;
@@ -387,16 +397,18 @@ Status UbWorkers::stop() {
         for (auto& [_, record] : records_) {
             still_inflight.push_back(std::move(record));
         }
-        inflight_.clear();
+        records_.clear();
+        pooled_lane_refs_.clear();
     }
-    for (const auto& inflight : still_inflight) {
-        // Idempotent: a fence-drained completion may have settled the pooled
-        // attempt already; this only covers still-unsettled leases.
-        settlePooledAttempt(inflight, PooledSettleKind::kFence, 0,
-                            "provider-lost token");
-        releaseInflight(inflight);
-        (void)inflight->pending.slice->resolveAttempt(inflight->attempt, FAILED,
-                                                      0, false);
+    for (const auto& record : still_inflight) {
+        // The bottom-out shares every claim bit with the CQE and timeout exits:
+        // if any of them already disposed of the record, this call only
+        // supplies the missing settlement, so a double release is impossible
+        // (design §6.9). In pooled mode this also settles the lease: an
+        // unposted record finalizes, retires its member and releases its
+        // credit exactly once.
+        gate::onUnposted(record->core, RecordDropReason::kShutdown, *this,
+                         gate_ctx_);
     }
     inflight_cv_.notify_all();
 
@@ -458,8 +470,7 @@ Status UbWorkers::submit(const UbTask::Ptr& task, uint64_t device_mask) {
             // Parked slices count against the same budget: a slice waiting for
             // a lease is just as much queued work as one waiting for a lane.
             if (!businessQueueAdmits(
-                    params_.business_queue_budget,
-                    static_cast<uint64_t>(queued_),
+                    params_.queue_budget, static_cast<uint64_t>(queued_),
                     static_cast<uint64_t>(defer_.parkedTotal()),
                     static_cast<uint64_t>(need))) {
                 budget_exhausted = true;
@@ -548,8 +559,26 @@ UbBusinessStatsSnapshot UbWorkers::businessStats() const {
     out.pool_stop_rejections =
         pool_stop_rejections_.load(std::memory_order_relaxed);
     out.pool_hard_errors = pool_hard_errors_.load(std::memory_order_relaxed);
+    out.business_param_error_invalid_edge = param_error_edges_.invalidations();
+    out.business_deadline_timeouts =
+        business_deadline_timeouts_.load(std::memory_order_relaxed);
+    out.declared_candidates_total =
+        declared_candidates_total_.load(std::memory_order_relaxed);
+    out.declared_candidates_denied =
+        declared_candidates_denied_.load(std::memory_order_relaxed);
+    out.claim_rejected_stopping =
+        claim_rejected_stopping_.load(std::memory_order_relaxed);
+    out.claim_rejected_member =
+        claim_rejected_member_.load(std::memory_order_relaxed);
+    out.claim_rejected_generation =
+        claim_rejected_generation_.load(std::memory_order_relaxed);
+    out.claim_rejected_error_epoch =
+        claim_rejected_error_epoch_.load(std::memory_order_relaxed);
+    out.claim_disabled = claim_disabled_.load(std::memory_order_relaxed);
     out.claim_after_isolation =
         claim_after_isolation_.load(std::memory_order_relaxed);
+    out.unknown_token_tombstoned =
+        unknown_token_tombstoned_.load(std::memory_order_relaxed);
     out.post_on_isolated_path =
         post_on_isolated_path_.load(std::memory_order_relaxed);
     out.pooled_return = pooled_return_.load(std::memory_order_relaxed);
@@ -707,10 +736,89 @@ void UbWorkers::logBusinessSummary(uint64_t now_ns) {
         return;
     }
     const auto stats = businessStats();
+    // Drain-chain summary (design §10.2). The controller owns the stage
+    // counters; this is the periodic outlet that makes them observable without
+    // a per-WR log line.
+    DrainStats drain{};
+    for (const auto& context : contexts_) {
+        if (!context) continue;
+        auto controller = context->drainController();
+        if (!controller) continue;
+        const DrainStats one = controller->stats();
+        drain.drain_begin += one.drain_begin;
+        drain.drain_begin_failed += one.drain_begin_failed;
+        drain.drain_delete_ready += one.drain_delete_ready;
+        drain.drain_timeout += one.drain_timeout;
+        drain.drain_quarantined += one.drain_quarantined;
+        drain.modify_error_ok += one.modify_error_ok;
+        drain.modify_error_fail += one.modify_error_fail;
+        drain.marker_flush_done += one.marker_flush_done;
+        drain.marker_suspend_done += one.marker_suspend_done;
+        drain.marker_dup += one.marker_dup;
+        drain.marker_stale += one.marker_stale;
+        drain.marker_before_error += one.marker_before_error;
+        drain.entity_event_on_drain += one.entity_event_on_drain;
+        drain.software_flush_calls += one.software_flush_calls;
+        drain.software_flush_wrs += one.software_flush_wrs;
+        drain.software_flush_unhandled += one.software_flush_unhandled;
+        drain.drained_after_settle += one.drained_after_settle;
+        drain.drain_pending += one.drain_pending;
+        drain.drain_oldest_age_ms =
+            std::max(drain.drain_oldest_age_ms, one.drain_oldest_age_ms);
+        drain.async_drain_supported =
+            drain.async_drain_supported && one.async_drain_supported;
+        drain.async_drain_disabled += one.async_drain_disabled;
+    }
+    for (const auto& context : contexts_) {
+        if (!context) continue;
+        const auto pool = context->pooledSendPool();
+        if (!pool) continue;
+        const auto budget = pool->budgetSnapshot();
+        if (!budget || budget->total_jetties == 0) continue;
+        LOG(INFO) << "UB native budget: device_key=" << budget->device_key
+                  << " configured=" << budget->configured_budget_jetties
+                  << " reserve=" << budget->replacement_reserve_jetties
+                  << " verified_limit=" << budget->verified_device_limit_jetties
+                  << " total=" << budget->total_jetties
+                  << " active=" << budget->active_jetties
+                  << " creating=" << budget->creating_jetties
+                  << " retiring=" << budget->retiring_jetties
+                  << " quarantined=" << budget->quarantined_jetties
+                  << " rejected=" << budget->rejected_reservations
+                  << " leaked=" << budget->leaked_reservations;
+    }
     if (stats.queue_depth == 0 && stats.parked_depth == 0 &&
-        stats.pool_lease_attempts == 0) {
+        stats.pool_lease_attempts == 0 && drain.drain_begin == 0) {
         return;
     }
+    uint64_t last_rail = last_rail_log_ns_.load(std::memory_order_acquire);
+    if (now_ns - last_rail >= 30'000'000'000ULL &&
+        last_rail_log_ns_.compare_exchange_strong(last_rail, now_ns,
+                                                  std::memory_order_acq_rel) &&
+        rail_monitor_ != nullptr) {
+        for (const auto& rail : rail_monitor_->allStats(now_ns)) {
+            LOG(INFO) << "UB rail business: local_topology_id="
+                      << rail.key.local_topology_id
+                      << " remote_device_id=" << rail.key.remote_device_id
+                      << " remote_segment_id=" << rail.key.remote_segment_id
+                      << " paused=" << (rail.paused ? 1 : 0)
+                      << " ok=" << rail.successful_completions
+                      << " err=" << rail.completion_errors
+                      << " timeout=" << rail.timeouts
+                      << " recoveries=" << rail.recoveries
+                      << " rebuilds=" << rail.endpoint_rebuilds
+                      << " pauses=" << rail.pauses << " ewma_lat_us="
+                      << (rail.ewma_latency_ns < 0
+                              ? -1.0
+                              : rail.ewma_latency_ns / 1000.0)
+                      << " ewma_bw_mbps="
+                      << (rail.ewma_bandwidth_bytes_per_second < 0
+                              ? -1.0
+                              : rail.ewma_bandwidth_bytes_per_second * 8.0 /
+                                    1e6);
+        }
+    }
+    const auto gate = completionStats();
     LOG(INFO) << "UB business: queued=" << stats.queue_depth
               << " parked=" << stats.parked_depth
               << " submit_rejected=" << stats.submit_backpressure
@@ -728,12 +836,69 @@ void UbWorkers::logBusinessSummary(uint64_t now_ns) {
               << ",miss=" << stats.pool_lease_misses
               << ",stopped=" << stats.pool_stop_rejections
               << ",hard=" << stats.pool_hard_errors
-              << "} claim_isolated=" << stats.claim_after_isolation
+              << "} claim{stopping=" << stats.claim_rejected_stopping
+              << ",member=" << stats.claim_rejected_member
+              << ",gen=" << stats.claim_rejected_generation
+              << ",epoch=" << stats.claim_rejected_error_epoch
+              << ",disabled=" << stats.claim_disabled
+              << ",isolated=" << stats.claim_after_isolation << "}"
               << " post_isolated=" << stats.post_on_isolated_path
+              << " param_invalid_edge="
+              << stats.business_param_error_invalid_edge
+              << " declared_candidates=" << stats.declared_candidates_total
+              << "/" << stats.declared_candidates_denied
               << " retire=" << stats.pooled_retire
+              << " deadline_timeout=" << stats.business_deadline_timeouts
               << " path_peak=" << stats.path_inflight_peak
               << " imbalance=" << stats.path_load_imbalance
-              << " double_return=" << stats.pool_return_double;
+              << " double_return=" << stats.pool_return_double
+              << " unknown_tombstoned=" << stats.unknown_token_tombstoned
+              << " drain{begin=" << drain.drain_begin
+              << ",begin_failed=" << drain.drain_begin_failed
+              << ",ready=" << drain.drain_delete_ready
+              << ",pending=" << drain.drain_pending
+              << ",oldest_ms=" << drain.drain_oldest_age_ms
+              << ",timeout=" << drain.drain_timeout
+              << ",quarantine=" << drain.drain_quarantined
+              << ",modify_ok=" << drain.modify_error_ok
+              << ",modify_fail=" << drain.modify_error_fail
+              << ",marker=" << drain.marker_flush_done
+              << ",marker_stale=" << drain.marker_stale
+              << ",marker_dup=" << drain.marker_dup
+              << ",marker_early=" << drain.marker_before_error
+              << ",event_on_drain=" << drain.entity_event_on_drain
+              << ",flush=" << drain.software_flush_calls
+              << ",flush_wrs=" << drain.software_flush_wrs
+              << ",flush_marker=" << drain.software_flush_unhandled
+              << ",settled_late=" << drain.drained_after_settle
+              << ",supported=" << (drain.async_drain_supported ? 1 : 0)
+              << ",disabled=" << drain.async_drain_disabled << "}"
+              << " gate{post_return=" << gate.gate_blocked_by_post_return
+              << ",cqe=" << gate.gate_blocked_by_cqe
+              << ",responsibility=" << gate.gate_blocked_by_responsibility
+              << ",refs=" << gate.gate_blocked_by_handler_refs
+              << ",fault=" << gate.gate_blocked_by_fault
+              << ",not_accepted=" << gate.gate_blocked_by_not_accepted
+              << ",acceptance=" << gate.gate_blocked_by_acceptance << "}";
+    if (probe_topology_ != nullptr) {
+        const auto probe = probe_topology_->stats();
+        LOG(INFO) << "UB probe topology: ports=" << probe.ports
+                  << " edges=" << probe.edges
+                  << " adjacency_allowed=" << probe.adjacency_allowed
+                  << " adjacency_undeclared_peer="
+                  << probe.adjacency_undeclared_peer
+                  << " adjacency_undeclared_local="
+                  << probe.adjacency_undeclared_local
+                  << " adjacency_undeclared_remote="
+                  << probe.adjacency_undeclared_remote
+                  << " adjacency_peer_eid_unmatched="
+                  << probe.adjacency_peer_eid_unmatched
+                  << " adjacency_port_missing=" << probe.adjacency_port_missing
+                  << " adjacency_peer_gate_blocked="
+                  << probe.adjacency_peer_gate_blocked
+                  << " adjacency_unverified_peer="
+                  << probe.adjacency_unverified_peer;
+    }
 }
 
 bool UbWorkers::pollBusinessSlot(size_t slot_index) {
@@ -796,13 +961,46 @@ bool UbWorkers::dispatchCompletion(const Completion& completion, int local_nic,
     // P0-B supplies, so the W4 classification hangs off this single call site
     // (IN-9: token 0 never reaches the business registry).
     if (completion.token == 0) {
+        // W4 classification (design tent-ub-async-drain-design §4.3): a
+        // token==0 record may be a provider entity marker owned by an
+        // in-flight pooled drain. The controller claims it first; only an
+        // unowned record falls through to the legacy accounting. The poller
+        // performs one hash lookup and flag writes, never a provider call.
+        const BusinessSlot* slot = nullptr;
+        for (const auto& candidate : business_slots_) {
+            if (candidate.jfc && candidate.jfc->index() == jfc_index &&
+                candidate.context &&
+                candidate.context->topologyId() == local_nic) {
+                slot = &candidate;
+                break;
+            }
+        }
+        if (slot != nullptr && slot->drain != nullptr &&
+            slot->drain->onEntityEvent(completion, jfc_index)) {
+            return true;
+        }
+        // Classification is observation only here: a marker with no drain
+        // owner still goes through the unknown-token path below (the controller
+        // already counted an owned-but-unusable marker).
+        EntityEventKind kind = EntityEventKind::kUnclassified;
+        switch (adapter_ ? adapter_->classifyEntityMarker(completion)
+                         : EntityMarkerKind::kNone) {
+            case EntityMarkerKind::kFlushDone:
+                kind = EntityEventKind::kMarkerFlushDone;
+                break;
+            case EntityMarkerKind::kSuspendDone:
+                kind = EntityEventKind::kMarkerSuspendDone;
+                break;
+            case EntityMarkerKind::kNone:
+                break;
+        }
         EntityEvidence evidence;
         evidence.token = completion.token;
         evidence.jetty_id = completion.local_jetty_id;
         evidence.native_status = completion.native_status;
         evidence.completed_bytes = completion.completed_bytes;
         entity_events_.onEntityEvent(local_nic, EntityType::kJfc, jfc_index,
-                                     EntityEventKind::kUnclassified, evidence);
+                                     kind, evidence);
         return false;
     }
     // Step 2: namespace first (probe design §11.2). A probe completion may
@@ -834,6 +1032,16 @@ bool UbWorkers::dispatchCompletion(const Completion& completion, int local_nic,
     // Step 4: unknown / late / already disposed. Count it, report it, and keep
     // polling: one stray token never affects any other responsibility (IN-8).
     gate_ctx_.stats.unknown_token.fetch_add(1, std::memory_order_relaxed);
+    // Attribute the token to a retired native entity when the tombstone table
+    // still owns it. The entry proves the Jetty left service, so this is a
+    // late completion of an unproven retirement, not a topology-wide fault.
+    if (tombstones_ != nullptr && completion.local_jetty_id != 0) {
+        const auto stone =
+            tombstones_->lookup(EntityKind::kJetty, completion.local_jetty_id);
+        if (stone.has_value()) {
+            unknown_token_tombstoned_.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     EntityEvidence evidence;
     evidence.token = completion.token;
     evidence.jetty_id = completion.local_jetty_id;
@@ -846,7 +1054,7 @@ bool UbWorkers::dispatchCompletion(const Completion& completion, int local_nic,
 
 void UbWorkers::enqueueRetry(const PendingSlice& pending) {
     if (!pending.slice) return;
-    // Deliberately NOT subject to business_queue_budget: a retry is already
+    // Deliberately NOT subject to queue_budget: a retry is already
     // bounded by the slice's own bounded retry budget, and rejecting it here
     // would turn "the queue is momentarily full" into a transfer failure. The
     // budget exists for submit() backpressure (review minor).
@@ -955,7 +1163,16 @@ Status UbWorkers::buildRoute(const PendingSlice& pending, Route& route) {
             route.remote_buffer = buffer;
             route.metadata = std::move(metadata);
             route.remote_devices = orderedRemoteDevices(*segment, *buffer);
-            if (route.remote_devices.empty()) {
+            if (probe_topology_ != nullptr) {
+                route.adjacency =
+                    probe_topology_->viewFor(segment->name, *segment);
+                route.probe_peer_id =
+                    probe_topology_->probePeerId(segment->name)
+                        .value_or(LOCAL_SEGMENT_ID);
+            }
+            if (route.remote_devices.empty() &&
+                !(route.adjacency.enforced &&
+                  route.adjacency.peer_eid_unmatched)) {
                 return Status::DeviceNotFound(
                     "UB target has no active advertised device" LOC_MARK);
             }
@@ -1088,8 +1305,41 @@ Status UbWorkers::chooseAndResolveEndpoint(
         QuotaAvailability capacity;
     };
 
-    const auto local_devices = orderedLocalDevices(pending);
-    if (route.remote_devices.empty()) {
+    auto local_devices = orderedLocalDevices(pending);
+    auto remote_devices = route.remote_devices;
+    // INV-1/INV-2: in declared mode the candidate set is exactly the resolved
+    // bindings x declared adjacency, not the full local x remote discovery
+    // product. Unpublished/withdrawn/gated remote ports stay in the view so
+    // the gate can classify them as transient.
+    if (route.adjacency.enforced) {
+        if (route.adjacency.peer_eid_unmatched || remote_devices.empty()) {
+            if (plan != nullptr) {
+                plan->reason = DeferReason::kPathUnavailable;
+                plan->expire_ns = deadlineAfter(steadyNowNs(), kTimedDeferNs);
+            }
+            return Status::TooManyRequests(
+                "Declared peer has no reachable probe port yet" LOC_MARK);
+        }
+        std::unordered_set<Topology::NicID> declared_locals(
+            route.adjacency.local_nics.begin(),
+            route.adjacency.local_nics.end());
+        local_devices.erase(
+            std::remove_if(local_devices.begin(), local_devices.end(),
+                           [&](const LocalDeviceCandidate& candidate) {
+                               return declared_locals.count(candidate.id) == 0;
+                           }),
+            local_devices.end());
+        remote_devices = route.adjacency.remote_nics;
+        if (remote_devices.empty()) {
+            if (plan != nullptr) {
+                plan->reason = DeferReason::kPathUnavailable;
+                plan->expire_ns = deadlineAfter(steadyNowNs(), kTimedDeferNs);
+            }
+            return Status::TooManyRequests(
+                "Declared peer has no mapped remote port" LOC_MARK);
+        }
+    }
+    if (remote_devices.empty()) {
         return Status::DeviceNotFound("No usable UB posting path" LOC_MARK);
     }
     const auto snapshot = pending.slice->snapshot();
@@ -1131,8 +1381,41 @@ Status UbWorkers::chooseAndResolveEndpoint(
         return Status::DeviceNotFound(
             "All local UB devices remained unavailable" LOC_MARK);
     }
+    struct DeclaredPair {
+        LocalDeviceCandidate local;
+        Topology::NicID remote_id;
+    };
+    std::vector<DeclaredPair> declared_pairs;
+    if (route.adjacency.enforced) {
+        for (const auto& local : local_devices) {
+            const auto local_it =
+                std::find(route.adjacency.local_nics.begin(),
+                          route.adjacency.local_nics.end(), local.id);
+            if (local_it == route.adjacency.local_nics.end()) continue;
+            const size_t local_slot = static_cast<size_t>(
+                std::distance(route.adjacency.local_nics.begin(), local_it));
+            for (size_t remote_slot = 0;
+                 remote_slot < route.adjacency.remote_nics.size();
+                 ++remote_slot) {
+                const size_t index =
+                    local_slot * route.adjacency.remote_nics.size() +
+                    remote_slot;
+                if (index >= route.adjacency.allowed.size() ||
+                    route.adjacency.allowed[index] == 0) {
+                    continue;
+                }
+                declared_pairs.push_back(DeclaredPair{
+                    local, route.adjacency.remote_nics[remote_slot]});
+            }
+        }
+        if (declared_pairs.empty()) {
+            return Status::InvalidArgument(
+                "declared adjacency has no usable local/remote pair" LOC_MARK);
+        }
+    }
     const size_t combinations =
-        local_devices.size() * route.remote_devices.size();
+        route.adjacency.enforced ? declared_pairs.size()
+                                 : local_devices.size() * remote_devices.size();
     const size_t start =
         combinations == 0 ? 0 : snapshot.retry_count % combinations;
     Status first_error = Status::DeviceNotFound(
@@ -1159,10 +1442,67 @@ Status UbWorkers::chooseAndResolveEndpoint(
     std::vector<RailCandidate> rails;
     rails.reserve(combinations);
     bool health_screened_out = false;
+    // Declared adjacency is a static configuration fence and runs before any
+    // health/load judgement (design §5.1 step 2). The first denial is kept for
+    // a precise error when no candidate survives.
+    bool adjacency_screened_out = false;
+    size_t adjacency_denied = 0;
+    size_t adjacency_hard_denied = 0;
+    size_t adjacency_transient_denied = 0;
+    size_t invalid_edge_denied = 0;
+    AdjacencyDecision first_adjacency_denial = AdjacencyDecision::kAllowed;
+    Topology::NicID first_denied_local = -1;
+    Topology::NicID first_denied_remote = -1;
+    if (route.adjacency.enforced) {
+        declared_candidates_total_.fetch_add(combinations,
+                                             std::memory_order_relaxed);
+    }
     for (size_t flat = 0; flat < combinations; ++flat) {
-        const auto& local = local_devices[flat / route.remote_devices.size()];
-        const auto remote_id =
-            route.remote_devices[flat % route.remote_devices.size()];
+        LocalDeviceCandidate local;
+        Topology::NicID remote_id = -1;
+        if (route.adjacency.enforced) {
+            local = declared_pairs[flat].local;
+            remote_id = declared_pairs[flat].remote_id;
+            const ProbePathKey candidate_key{
+                local.id, static_cast<SegmentID>(route.probe_peer_id),
+                remote_id};
+            if (param_error_edges_.invalid(candidate_key)) {
+                ++invalid_edge_denied;
+                continue;
+            }
+        } else {
+            local = local_devices[flat / remote_devices.size()];
+            remote_id = remote_devices[flat % remote_devices.size()];
+        }
+        if (route.adjacency.enforced) {
+            bool local_declared = false;
+            const auto decision =
+                route.adjacency.check(local.id, remote_id, &local_declared);
+            if (probe_topology_ != nullptr) {
+                probe_topology_->recordAdjacency(
+                    decision, decision == AdjacencyDecision::kAllowed &&
+                                  !route.adjacency.publication_seen);
+            }
+            if (decision != AdjacencyDecision::kAllowed) {
+                const bool hard =
+                    decision == AdjacencyDecision::kUndeclaredPeer ||
+                    decision == AdjacencyDecision::kUndeclaredLocal ||
+                    decision == AdjacencyDecision::kUndeclaredRemote;
+                if (!adjacency_screened_out || hard) {
+                    first_adjacency_denial = decision;
+                    first_denied_local = local.id;
+                    first_denied_remote = remote_id;
+                }
+                ++adjacency_denied;
+                if (hard) {
+                    ++adjacency_hard_denied;
+                } else {
+                    ++adjacency_transient_denied;
+                }
+                adjacency_screened_out = true;
+                continue;
+            }
+        }
         const UbPostPath probe_path{local.id, pending.target_id, remote_id,
                                     kRailProbeEndpointGeneration};
         // W3 health gate (design §7.1 rule 1 / D-10). Health is a pure
@@ -1174,10 +1514,17 @@ Status UbWorkers::chooseAndResolveEndpoint(
         // Rail pause is GONE here (design §7.2): the pause state was a local
         // substitute for isolation, and keeping both would double-penalize a
         // path that PLM already excludes.
-        if (probe_manager_ != nullptr &&
-            !probe_manager_->businessPathUsable(probe_path)) {
-            health_screened_out = true;
-            continue;
+        if (probe_manager_ != nullptr) {
+            const bool usable =
+                route.probe_peer_id != LOCAL_SEGMENT_ID
+                    ? probe_manager_->businessPathUsable(ProbePathKey{
+                          local.id, static_cast<SegmentID>(route.probe_peer_id),
+                          remote_id})
+                    : probe_manager_->businessPathUsable(probe_path);
+            if (!usable) {
+                health_screened_out = true;
+                continue;
+            }
         }
         // A non-inserting lookup: an unknown rail scores as "no health history
         // yet" without being added to the map, so probing every local x remote
@@ -1189,6 +1536,65 @@ Status UbWorkers::chooseAndResolveEndpoint(
             (flat + combinations - start) % combinations, probe_path,
             std::move(rail_stats),
             quota_->availability(probe_path, pending.slice->spec().length)});
+    }
+    const size_t counted_denied = adjacency_denied + invalid_edge_denied;
+    const size_t health_denied =
+        combinations > counted_denied + rails.size()
+            ? combinations - counted_denied - rails.size()
+            : 0;
+    if (route.adjacency.enforced) {
+        declared_candidates_denied_.fetch_add(counted_denied,
+                                              std::memory_order_relaxed);
+    }
+    if (rails.empty() && invalid_edge_denied == combinations) {
+        LOG_EVERY_N(WARNING, params_.observability.leaseSampleEvery())
+            << "UB endpoint select denied: task="
+            << reinterpret_cast<uint64_t>(pending.task.get())
+            << " slice=" << pending.slice->snapshot().id
+            << " policy=" << (route.adjacency.enforced ? "declared" : "legacy")
+            << " candidates=" << combinations << " healthy=" << rails.size()
+            << " health_denied=" << health_denied
+            << " denied{adjacency=" << adjacency_denied
+            << ",invalid_edge=" << invalid_edge_denied << ",quota=0}";
+        return Status::InvalidArgument(
+            "Every declared edge was invalidated after repeated "
+            "parameter/memory errors" LOC_MARK);
+    }
+    if (rails.empty() && adjacency_screened_out &&
+        adjacency_denied == combinations) {
+        if (adjacency_hard_denied > 0) {
+            LOG_EVERY_N(WARNING, params_.observability.leaseSampleEvery())
+                << "UB endpoint select denied: task="
+                << reinterpret_cast<uint64_t>(pending.task.get())
+                << " slice=" << pending.slice->snapshot().id
+                << " candidates=" << combinations
+                << " denied{adjacency=" << adjacency_denied
+                << ",invalid_edge=" << invalid_edge_denied << ",quota=0}"
+                << " first=" << adjacencyDecisionName(first_adjacency_denial)
+                << " local=" << first_denied_local
+                << " remote=" << first_denied_remote;
+            return Status::InvalidArgument(
+                "UB adjacency rejects every posting candidate: peer=" +
+                (route.pin ? route.pin->name : std::string("<unknown>")) +
+                " local_nic=" + std::to_string(first_denied_local) +
+                " remote_nic=" + std::to_string(first_denied_remote) +
+                " reason=" + adjacencyDecisionName(first_adjacency_denial) +
+                LOC_MARK);
+        }
+        if (adjacency_transient_denied > 0) {
+            // A peer EID that is not in the current metadata, a port inside
+            // its withdraw grace, or a peer gate that is temporarily closed
+            // are all recoverable: defer instead of failing the slice.
+            if (plan != nullptr) {
+                plan->reason = DeferReason::kPathUnavailable;
+                plan->expire_ns = deadlineAfter(steadyNowNs(), kTimedDeferNs);
+            }
+            return Status::TooManyRequests(
+                "Every UB posting path is transiently unavailable (adjacency) "
+                "reason=" +
+                std::string(adjacencyDecisionName(first_adjacency_denial)) +
+                LOC_MARK);
+        }
     }
     std::stable_sort(rails.begin(), rails.end(),
                      [&](const RailCandidate& lhs, const RailCandidate& rhs) {
@@ -1329,6 +1735,68 @@ Status UbWorkers::chooseAndResolveEndpoint(
     endpoint = selected->endpoint;
     path = selected->path;
     reservation = *acquired;
+    {
+        const auto slice = pending.slice->snapshot();
+        const uint64_t task_id = reinterpret_cast<uint64_t>(pending.task.get());
+        const bool declared = route.adjacency.enforced;
+        auto healthy_text = [&]() {
+            std::string out;
+            const size_t limit = std::min<size_t>(rails.size(), 8);
+            for (size_t i = 0; i < limit; ++i) {
+                if (i != 0) out += ",";
+                out += std::to_string(rails[i].local_id);
+                out += ":";
+                out += std::to_string(rails[i].remote_id);
+            }
+            if (rails.size() > limit) out += ",...";
+            return out;
+        };
+        if (params_.observability.verbose_events) {
+            LOG(INFO) << "UB endpoint select: task=" << task_id
+                      << " slice=" << slice.id << " attempt=" << slice.attempt
+                      << " policy=" << (declared ? "declared" : "legacy")
+                      << " candidates=" << combinations << " start=" << start
+                      << " chosen=" << selected->score.local_topology_id << ":"
+                      << selected->score.remote_device_id
+                      << " rank=" << selected->score.topology_rank
+                      << " probe_path=" << (route.probe_peer_id != 0 ? 1 : 0)
+                      << " denied{adjacency=" << adjacency_denied
+                      << ",invalid_edge=" << invalid_edge_denied << ",quota=0}"
+                      << " healthy=" << rails.size()
+                      << " resolved=" << candidates.size()
+                      << " health_denied=" << health_denied
+                      << " healthy_paths=[" << healthy_text() << "]";
+        } else if (VLOG_IS_ON(1)) {
+            VLOG(1) << "UB endpoint select: task=" << task_id
+                    << " slice=" << slice.id << " attempt=" << slice.attempt
+                    << " policy=" << (declared ? "declared" : "legacy")
+                    << " candidates=" << combinations << " start=" << start
+                    << " chosen=" << selected->score.local_topology_id << ":"
+                    << selected->score.remote_device_id
+                    << " rank=" << selected->score.topology_rank
+                    << " probe_path=" << (route.probe_peer_id != 0 ? 1 : 0)
+                    << " denied{adjacency=" << adjacency_denied
+                    << ",invalid_edge=" << invalid_edge_denied << ",quota=0}"
+                    << " healthy=" << rails.size()
+                    << " resolved=" << candidates.size()
+                    << " health_denied=" << health_denied << " healthy_paths=["
+                    << healthy_text() << "]";
+        } else {
+            LOG_EVERY_N(INFO, params_.observability.leaseSampleEvery())
+                << "UB endpoint select: task=" << task_id
+                << " slice=" << slice.id << " attempt=" << slice.attempt
+                << " policy=" << (declared ? "declared" : "legacy")
+                << " candidates=" << combinations << " healthy=" << rails.size()
+                << " resolved=" << candidates.size()
+                << " health_denied=" << health_denied << " start=" << start
+                << " chosen=" << selected->score.local_topology_id << ":"
+                << selected->score.remote_device_id
+                << " rank=" << selected->score.topology_rank
+                << " probe_path=" << (route.probe_peer_id != 0 ? 1 : 0)
+                << " denied{adjacency=" << adjacency_denied
+                << ",invalid_edge=" << invalid_edge_denied << ",quota=0}";
+        }
+    }
     return Status::OK();
 }
 
@@ -1361,7 +1829,8 @@ bool UbWorkers::poolCandidateUsable(
     // would reject every candidate and business traffic could never start,
     // which is why the literal `servingCount() > 0` pre-screen of design §7.1
     // is relaxed here; tryLease remains the authority.
-    return pool->servingCount(key) < params_.send_pool.desired_per_context;
+    return pool->servingCount(key) <
+           params_.jetty_pool.business_desired_serving;
 }
 
 PoolKey UbWorkers::poolKeyFor(const std::shared_ptr<UbEndpoint>& endpoint) {
@@ -1382,24 +1851,45 @@ PoolKey UbWorkers::poolKeyFor(const std::shared_ptr<UbEndpoint>& endpoint) {
     return key;
 }
 
-bool UbWorkers::claimPost(const std::shared_ptr<SendJettyPool>& pool,
-                          const UbPostPath& path,
-                          uint64_t fault_epoch_snapshot) {
-    // W3 claim review (design §8.2, the R-1 transition shape). Two scalar reads
-    // and no lock held across them: this runs between the last rollback point
-    // and the native post, so it must stay non-blocking (W3-IN-8).
-    //
-    // The window that remains is "review -> tryCommitPost -> publish -> post",
-    // which is a handful of non-blocking instructions. A path isolated inside
-    // that window can leak at most one post per posting thread, and PLM is
-    // idempotent for repeated errors on an already isolated path, so the leak
-    // cannot amplify into a storm (design §8.2, RK1).
-    if (pool && pool->stopping()) return false;
-    if (probe_manager_ != nullptr &&
-        probe_manager_->businessFaultEpoch(path) != fault_epoch_snapshot) {
-        return false;
+UbWorkers::ClaimDecision UbWorkers::claimPost(
+    const std::shared_ptr<SendJettyPool>& pool, const PoolKey& pool_key,
+    const AttemptKey& attempt, const LeaseWithCredit& leased,
+    const UbPostPath& path, const ProbePathKey& probe_key,
+    uint64_t fault_epoch_snapshot) {
+    // W3g R-1. Two independent inputs decide whether the WR may be posted:
+    //   1. the pool's synchronized verdict (stopping / member / generation /
+    //      error epoch), authoritative for the leased resource;
+    //   2. the PLM fault-epoch scalar compared against the pre-lease sample,
+    //      which stays a separate read because the pool must not call the PLM
+    //      while holding its lock (W3g D-4).
+    // Both are lock-free from this thread's perspective and allocation-free;
+    // this runs between the last rollback point and the native post.
+    ClaimDecision decision;
+    if (probe_manager_ != nullptr) {
+        const uint64_t current =
+            probe_key.valid() ? probe_manager_->businessFaultEpoch(probe_key)
+                              : probe_manager_->businessFaultEpoch(path);
+        if (current != fault_epoch_snapshot) {
+            decision.path_epoch_changed = true;
+        }
     }
-    return true;
+    if (!params_.claim.enabled) {
+        // D-9 rollback lever: the pre-W3g recheck only. Counted so a config
+        // accidentally left off is visible in the periodic summary.
+        claim_disabled_.fetch_add(1, std::memory_order_relaxed);
+        if (pool && pool->stopping()) {
+            decision.closed = ClaimClosed::kPoolStopping;
+        }
+        return decision;
+    }
+    if (!pool) return decision;
+    ClaimRequest request;
+    request.attempt = attempt;
+    request.lane_generation = leased.lease.lane().lane_generation;
+    request.error_epoch_snapshot = leased.error_epoch;
+    request.member = leased.lease.member().get();
+    decision.closed = pool->tryClaimPost(pool_key, attempt, request).closed;
+    return decision;
 }
 
 WorkRequest UbWorkers::makeWorkRequest(const PendingSlice& pending,
@@ -1419,11 +1909,21 @@ WorkRequest UbWorkers::makeWorkRequest(const PendingSlice& pending,
     return work;
 }
 
+ProbePathKey UbWorkers::probeKeyFor(const Route& route,
+                                    const UbPostPath& path) const {
+    ProbePathKey key;
+    if (route.probe_peer_id == LOCAL_SEGMENT_ID) return key;
+    key.local_nic = path.local_topology_id;
+    key.segment_id = static_cast<SegmentID>(route.probe_peer_id);
+    key.remote_nic = path.remote_device_id;
+    return key;
+}
+
 std::shared_ptr<UbWorkers::BusinessRecord> UbWorkers::makeRecord(
     const PendingSlice& pending, const std::shared_ptr<UbEndpoint>& endpoint,
-    const UbPostPath& path, const QuotaReservation& reservation,
-    const LocalSegmentRef& local, const ImportedSegmentRef& remote,
-    const UbAttemptToken& attempt) {
+    const UbPostPath& path, const ProbePathKey& probe_key,
+    const QuotaReservation& reservation, const LocalSegmentRef& local,
+    const ImportedSegmentRef& remote, const UbAttemptToken& attempt) {
     const uint64_t completion_token = nextCompletionToken();
     auto record = std::make_shared<BusinessRecord>();
     record->core.token = completion_token;
@@ -1436,6 +1936,7 @@ std::shared_ptr<UbWorkers::BusinessRecord> UbWorkers::makeRecord(
     record->pending = pending;
     record->attempt = attempt;
     record->path = path;
+    record->probe_key = probe_key;
     record->endpoint = endpoint;
     record->local_segment = local.segment;
     record->remote_segment = remote.segment;
@@ -1537,245 +2038,229 @@ void UbWorkers::processPending(const PendingSlice& pending,
         return;
     }
 
-    // rm_pool data path (C06): admission runs before any inflight state is
-    // published. A permit/lease miss is capacity pressure - the attempt is
-    // deferred without charging retry budget and every owner acquired so far
-    // is released. A hard lease error fails the attempt through the normal
-    // retryable resolution instead.
-    std::shared_ptr<SendJettyPool> pooled_pool =
-        endpoint->context() ? endpoint->context()->pooledSendPool() : nullptr;
-    TaskPermitTicket pooled_permit;
-    LeaseWithCredit pooled_lease;
-    uint64_t gate_token = 0;
-    if (pooled_pool) {
-        auto defer_pooled_attempt = [&] {
-            (void)pending.slice->deferAttempt(*attempt);
-            endpoint->releaseOutstanding(pending.slice->spec().length);
-            (void)quota_->release(reservation);
-            deferPending(pending);
-        };
-        if (task_permits_) {
-            pooled_permit = task_permits_->tryAcquire();
-            if (!pooled_permit.valid()) {
-                defer_pooled_attempt();
-                return;
-            }
-        }
-        const JettyOptions profile = endpoint->jettyOptions();
-        const PoolKey pool_key{
-            endpoint->context()->incarnation(), profile.trans_mode,
-            static_cast<uint8_t>(profile.priority), profile.bind_tp_type_mask};
-        const AttemptKey attempt_key{
-            reinterpret_cast<uint64_t>(pending.task.get()), attempt->slice_id,
-            attempt->attempt};
-        const auto lease_status =
-            pooled_pool->tryLease(pool_key, attempt_key, pooled_lease);
-        if (lease_status.IsTooManyRequests()) {
-            defer_pooled_attempt();
-            return;
-        }
-        if (!lease_status.ok()) {
-            endpoint->releaseOutstanding(pending.slice->spec().length);
-            (void)quota_->release(reservation);
-            const auto resolution = pending.slice->resolveAttempt(
-                *attempt, FAILED, 0, retryableStatus(lease_status));
-            if (resolution == UbAttemptResolution::kRetryScheduled) {
-                enqueueRetry(pending);
-            }
-            return;
-        }
-        if (attempt_gate_) {
-            gate_token = attempt_gate_->registerAttempt(
-                attempt_key, pooled_lease.lease.lane(),
-                pending.slice->spec().length);
-        }
+    // ---- D-2 mode gate ----------------------------------------------------
+    // `pooledSendPool() != nullptr` selects the W3 pool-aware admission below;
+    // otherwise the W2 path runs byte for byte, touching no lease, credit or K
+    // slot (RK10).
+    const ProbePathKey probe_key = probeKeyFor(route, path);
+    if (pooledPoolFor(endpoint)) {
+        processPendingPooled(pending, worker_index, route, endpoint, path,
+                             probe_key, reservation, local, remote, *attempt);
+        return;
     }
+    postLegacy(pending, worker_index, probe_key, endpoint, path, reservation,
+               local, remote, *attempt);
+}
 
-    const uint64_t completion_token = nextCompletionToken();
-    auto inflight = std::make_shared<Inflight>();
-    inflight->completion_token = completion_token;
-    inflight->pending = pending;
-    inflight->attempt = *attempt;
-    inflight->path = path;
-    inflight->endpoint = endpoint;
-    inflight->local_segment = local.segment;
-    inflight->remote_segment = remote.segment;
-    inflight->quota = reservation;
-    inflight->posted_ns = steadyNowNs();
-    inflight->deadline_ns = deadlineAfter(
-        inflight->posted_ns,
-        static_cast<uint64_t>(params_.slice_timeout_ms) * 1'000'000ULL);
-    inflight->pooled_pool = pooled_pool;
-    inflight->pooled_permit = std::move(pooled_permit);
-    inflight->gate_token = gate_token;
+void UbWorkers::postLegacy(const PendingSlice& pending, size_t worker_index,
+                           const ProbePathKey& probe_key,
+                           const std::shared_ptr<UbEndpoint>& endpoint,
+                           const UbPostPath& path,
+                           const QuotaReservation& reservation,
+                           const LocalSegmentRef& local,
+                           const ImportedSegmentRef& remote,
+                           const UbAttemptToken& attempt) {
+    auto record = makeRecord(pending, endpoint, path, probe_key, reservation,
+                             local, remote, attempt);
+    const size_t length = pending.slice->spec().length;
 
-    void UbWorkers::postLegacy(
-        const PendingSlice& pending, size_t worker_index,
-        const std::shared_ptr<UbEndpoint>& endpoint, const UbPostPath& path,
-        const QuotaReservation& reservation, const LocalSegmentRef& local,
-        const ImportedSegmentRef& remote, const UbAttemptToken& attempt) {
-        auto record = makeRecord(pending, endpoint, path, reservation, local,
-                                 remote, attempt);
-        const size_t length = pending.slice->spec().length;
-
-        if (!pending.slice->tryCommitPost(attempt, record->posted_ns)) {
-            endpoint->releaseOutstanding(length);
-            (void)quota_->release(reservation);
-            if (pooled_pool) {
-                // Cancellation won before the native boundary: no WR crossed,
-                // so the member is clean and returns to the pool. The gate
-                // record never saw a post and is dropped; the credit is
-                // released here because the pool never releases caller credits.
-                if (attempt_gate_ && gate_token != 0) {
-                    attempt_gate_->discard(gate_token);
-                }
-                if (auto credits = pooled_pool->creditLedger()) {
-                    credits->release(pooled_lease.jfc_index,
-                                     pooled_lease.jfc_credit_token);
-                }
-                (void)pooled_pool->returnOnce(std::move(pooled_lease.lease),
-                                              true);
-            }
-            return;
-        }
-        if (pooled_pool) {
-            inflight->pooled_jfc_index = pooled_lease.jfc_index;
-            inflight->jfc_credit_token = pooled_lease.jfc_credit_token;
-            inflight->pooled_lease = std::move(pooled_lease.lease);
-        }
-        {
-            // The post-stack reference spans the blocking native call, and it
-            // is taken *before* the record becomes visible to the timeout scan:
-            // a published record with zero references would let a scan fence a
-            // post that has not even started (D-7). The guard releases the
-            // reference on every exit path; when it is the last one the gate
-            // advances with both facts available.
-            gate::HandlerRef post_handler(record->core, *this, gate_ctx_);
-            {
-                std::lock_guard<std::mutex> lock(records_mutex_);
-                records_.emplace(record->core.token, record);
-            }
-            gate_ctx_.stats.record_published.fetch_add(
-                1, std::memory_order_relaxed);
-            path_load_.onPublish(path, length);
-            auto jetty = endpoint->jetty(worker_index);
-            size_t posted_count = 0;
-            PostAcceptance acceptance = PostAcceptance::kNotAccepted;
-            Status status =
-                jetty ? adapter_->post(jetty, {work}, posted_count, acceptance)
-                      : Status::InternalError(
-                            "UB endpoint has no Jetty" LOC_MARK);
-            if (posted_count > 1) {
-                // One WR can only produce one record, so more than one accepted
-                // WR is a contradictory adapter result. It is counted, and it
-                // must never be used as a reason to roll back (D-12).
-                LOG_EVERY_N(WARNING, 100)
-                    << "UB adapter reported an impossible posted_count "
-                    << posted_count << " for one WR; token "
-                    << record->core.token
-                    << " drains until a fence proves responsibility";
-            }
-            if (acceptance == PostAcceptance::kUnknown) {
-                // Nothing is released on a guess: the record drains until the
-                // timeout fence proves the old DMA stopped (upstream §1.2.4).
-                LOG_EVERY_N(WARNING, 100) << "UB post acceptance is unknown; "
-                                             "retaining WR owners until a "
-                                             "CQE or fence settles token "
-                                          << record->core.token;
-            }
-            if (acceptance == PostAcceptance::kAccepted) {
-                rail_monitor_->registerPath(path);
-                if (!status.ok()) {
-                    LOG_EVERY_N(WARNING, 1000)
-                        << "UB post returned an error after accepting the WR: "
-                        << status.ToString();
-                }
-            }
-            gate::onPostReturn(
-                record->core,
-                PostReturn{acceptance,
-                           acceptance == PostAcceptance::kAccepted ? length : 0,
-                           retryableStatus(status)},
-                gate_ctx_);
-            // A rejected post needs no extra work here: the reject disposition
-            // performs the legacy rollback exactly once when the guard above
-            // releases the last reference.
-        }
+    if (!pending.slice->tryCommitPost(attempt, record->posted_ns)) {
+        endpoint->releaseOutstanding(length);
+        (void)quota_->release(reservation);
+        return;
     }
+    // §5.1 status bit, not a gate: it records that this side took the attempt's
+    // single post right, so a future local double post stays detectable.
+    record->core.post_claimed.store(true, std::memory_order_release);
 
-    WorkRequest work;
-    work.operation =
-        pending.opcode == Request::READ ? Operation::READ : Operation::WRITE;
-    work.local_address =
-        reinterpret_cast<uint64_t>(pending.slice->spec().local_address);
-    work.remote_address = pending.slice->spec().remote_address;
-    work.length = pending.slice->spec().length;
-    work.token = completion_token;
-    work.local_segment = local.segment;
-    work.remote_segment = remote.segment;
+    WorkRequest work =
+        makeWorkRequest(pending, record->core.token, local, remote);
     // RM Legacy: one slice attempt is one native WR that must reference the
     // imported target positional with this Jetty; the target is never
     // substituted by a bound remote Jetty.
     const bool rm_endpoint = endpoint->rmMode();
-    if (rm_endpoint) work.target = endpoint->rmTarget(worker_index);
-    JettyPtr jetty;
-    if (inflight->pooled_pool) {
-        // rm_pool data path: the WR rides the leased pool member, never an
-        // endpoint-owned Jetty. The imported target still comes from the
-        // endpoint incarnation that owns the peer relationship.
-        const auto& member = inflight->pooled_lease.member();
-        jetty = member ? member->jetty : nullptr;
-    } else {
-        jetty = endpoint->jetty(worker_index);
+    if (rm_endpoint) {
+        work.target = endpoint->rmTarget(
+            worker_index % std::max<size_t>(1, endpoint->jettyCount()));
     }
-    size_t posted_count = 0;
-    PostAcceptance acceptance = PostAcceptance::kNotAccepted;
-    if (!jetty) {
-        status = Status::InternalError(
-            inflight->pooled_pool ? "Pooled send Jetty is unavailable" LOC_MARK
-                                  : "UB endpoint has no Jetty" LOC_MARK);
-    } else if (rm_endpoint && !work.target) {
-        status = Status::InternalError(
-            "RM endpoint has no imported target for this Jetty" LOC_MARK);
-    } else {
-        status = adapter_->post(jetty, {work}, posted_count, acceptance);
-    }
-    if (inflight->pooled_pool && attempt_gate_ && inflight->gate_token != 0) {
-        attempt_gate_->onPostReturn(inflight->gate_token, status, acceptance);
-    }
-    if (posted_count == 1) {
-        rail_monitor_->registerPath(path);
-        if (acceptance == PostAcceptance::kUnknown) {
-            // A contradictory native result cannot prove the WR was rejected:
-            // never roll back or replay; the CQE or the timeout fence settles
-            // the pre-registered owners.
-            LOG(WARNING)
-                << "UB post acceptance is unknown; retaining WR owners until "
-                   "a CQE or fence settles: "
-                << status.ToString();
-        } else if (!status.ok()) {
-            LOG_EVERY_N(WARNING, 1000)
-                << "UB post returned an error after accepting the WR: "
-                << status.ToString();
+    {
+        // The post-stack reference spans the blocking native call, and it is
+        // taken *before* the record becomes visible to the timeout scan: a
+        // published record with zero references would let a scan fence a post
+        // that has not even started (D-7). The guard releases the reference on
+        // every exit path; when it is the last one the gate advances with both
+        // facts available.
+        gate::HandlerRef post_handler(record->core, *this, gate_ctx_);
+        {
+            std::lock_guard<std::mutex> lock(records_mutex_);
+            records_.emplace(record->core.token, record);
+            if (record->pool && record->pooled_lane.lane_generation != 0) {
+                ++pooled_lane_refs_[record->pooled_lane.lane_generation];
+            }
         }
+        gate_ctx_.stats.record_published.fetch_add(1,
+                                                   std::memory_order_relaxed);
+        path_load_.onPublish(path, length);
+        auto jetty = endpoint->jetty(worker_index);
+        size_t posted_count = 0;
+        PostAcceptance acceptance = PostAcceptance::kNotAccepted;
+        Status status;
+        if (!jetty) {
+            status = Status::InternalError("UB endpoint has no Jetty" LOC_MARK);
+        } else if (rm_endpoint && !work.target) {
+            status = Status::InternalError(
+                "RM endpoint has no imported target for this Jetty" LOC_MARK);
+        } else {
+            status = adapter_->post(jetty, {work}, posted_count, acceptance);
+        }
+        if (posted_count > 1) {
+            // One WR can only produce one record, so more than one accepted WR
+            // is a contradictory adapter result. It is counted, and it must
+            // never be used as a reason to roll back (D-12).
+            LOG_EVERY_N(WARNING, 100)
+                << "UB adapter reported an impossible posted_count "
+                << posted_count << " for one WR; token " << record->core.token
+                << " drains until a fence proves responsibility";
+        }
+        if (acceptance == PostAcceptance::kUnknown) {
+            // Nothing is released on a guess: the record drains until the
+            // timeout fence proves the old DMA stopped (upstream §1.2.4).
+            LOG_EVERY_N(WARNING, 100)
+                << "UB post acceptance is unknown; retaining WR owners until a "
+                   "CQE or fence settles token "
+                << record->core.token;
+        }
+        if (acceptance == PostAcceptance::kAccepted) {
+            rail_monitor_->registerPath(path);
+            if (!status.ok()) {
+                LOG_EVERY_N(WARNING, 1000)
+                    << "UB post returned an error after accepting the WR: "
+                    << status.ToString();
+            }
+        }
+        gate::onPostReturn(
+            record->core,
+            PostReturn{acceptance,
+                       acceptance == PostAcceptance::kAccepted ? length : 0,
+                       retryableStatus(status)},
+            gate_ctx_);
+        // A rejected post needs no extra work here: the reject disposition
+        // performs the legacy rollback exactly once when the guard above
+        // releases the last reference.
+    }
+}
+
+void UbWorkers::processPendingPooled(
+    const PendingSlice& pending, size_t worker_index, const Route& route,
+    const std::shared_ptr<UbEndpoint>& endpoint, const UbPostPath& path,
+    const ProbePathKey& probe_key, const QuotaReservation& reservation,
+    const LocalSegmentRef& local, const ImportedSegmentRef& remote,
+    const UbAttemptToken& attempt) {
+    (void)route;
+    const size_t length = pending.slice->spec().length;
+    auto pool = pooledPoolFor(endpoint);
+    if (!pool) {
+        // The gate above only calls this with a pool; defensive rollback.
+        endpoint->releaseOutstanding(length);
+        (void)quota_->release(reservation);
         return;
     }
-    if (acceptance == PostAcceptance::kUnknown) {
-        // Zero-count but contradictory: the WR may still have crossed. Keep
-        // the token, buffer, segment and endpoint owners; the timeout fence
-        // settles responsibility. Never replay here.
-        LOG(WARNING)
-            << "UB post acceptance is unknown with no posted WR; retaining "
-               "WR owners until a fence settles: "
-            << status.ToString();
-        rail_monitor_->registerPath(path);
+    const DeferEpochs epochs = readDeferEpochs();
+
+    // ④ K (D-6): the task-level concurrency ticket. K exhausted is capacity
+    // pressure, never a failure: no retry is consumed, no path fault is
+    // recorded and no slice is marked failed (W3-IN-3).
+    if (!pending.task->tryAcquireAttemptSlot()) {
+        task_K_wait_.fetch_add(1, std::memory_order_relaxed);
+        endpoint->releaseOutstanding(length);
+        (void)quota_->release(reservation);
+        (void)pending.slice->deferAttempt(attempt);
+        deferPending(pending, DeferReason::kTaskPermit, epochs.task_permit);
         return;
     }
 
-    // ⑦ Claim review. The member is exclusively leased, so only the pool's stop
-    // flag and the path health can have changed since selection.
-    if (!claimPost(pool, path, fault_epoch_snapshot)) {
-        claim_after_isolation_.fetch_add(1, std::memory_order_relaxed);
+    // ⑤ The claim anchor is sampled *before* the lease. Comparing it after the
+    // lease covers the longest window in the attempt (selection -> lease), see
+    // design §8.1 note 2.
+    const uint64_t fault_epoch_snapshot =
+        probe_manager_ == nullptr
+            ? 0
+            : (probe_key.valid() ? probe_manager_->businessFaultEpoch(probe_key)
+                                 : probe_manager_->businessFaultEpoch(path));
+
+    // ⑥ Lease (+ JFC credit). tryLease is non-blocking and already performs the
+    // LIFO scan, the credit reservation and the budget gate, so this side never
+    // keeps a second credit ledger.
+    const PoolKey pool_key = poolKeyFor(endpoint);
+    const AttemptKey attempt_key{reinterpret_cast<uint64_t>(pending.task.get()),
+                                 attempt.slice_id, attempt.attempt};
+    LeaseWithCredit leased;
+    pool_lease_attempts_.fetch_add(1, std::memory_order_relaxed);
+    const Status lease_status = pool->tryLease(pool_key, attempt_key, leased);
+    if (!lease_status.ok()) {
+        // Quota, endpoint counter and the K slot are already held: undo them in
+        // reverse order before deciding what the attempt becomes.
+        endpoint->releaseOutstanding(length);
+        (void)quota_->release(reservation);
+        pending.task->releaseAttemptSlot();
+        if (lease_status.IsTooManyRequests()) {
+            // D-5: the pooling side returns the same status for "stopping" and
+            // "no capacity", so the verdict is re-read here. A stopped pool
+            // must cancel instead of parking, otherwise the slice would wait
+            // for a wake-up that can never come (RK2).
+            if (pool->stopping()) {
+                pool_stop_rejections_.fetch_add(1, std::memory_order_relaxed);
+                pending.slice->requestCancellation();
+                return;
+            }
+            pool_lease_misses_.fetch_add(1, std::memory_order_relaxed);
+            (void)pending.slice->deferAttempt(attempt);
+            // A return/retire normally bumps this bucket, but a pool whose
+            // member creation keeps failing has no release site at all, so the
+            // wait is bounded as well.
+            deferPending(pending, DeferReason::kPoolIdle, epochs.pool_idle,
+                         deadlineAfter(steadyNowNs(), kTimedDeferNs));
+            return;
+        }
+        // A hard lease error is a real failure: it consumes retry budget like
+        // every other native error.
+        pool_hard_errors_.fetch_add(1, std::memory_order_relaxed);
+        const auto resolution = pending.slice->resolveAttempt(
+            attempt, FAILED, 0, retryableStatus(lease_status));
+        if (resolution == UbAttemptResolution::kRetryScheduled) {
+            enqueueRetry(pending);
+        }
+        return;
+    }
+
+    // ⑦ W3g claim (R-1). The pool synchronizes the verdict with retirement and
+    // stop; the PLM fault epoch remains a separate scalar input.
+    const ClaimDecision claim =
+        claimPost(pool, pool_key, attempt_key, leased, path, probe_key,
+                  fault_epoch_snapshot);
+    if (!claim.claimed()) {
+        switch (claim.closed) {
+            case ClaimClosed::kPoolStopping:
+                claim_rejected_stopping_.fetch_add(1,
+                                                   std::memory_order_relaxed);
+                break;
+            case ClaimClosed::kMemberRetired:
+                claim_rejected_member_.fetch_add(1, std::memory_order_relaxed);
+                break;
+            case ClaimClosed::kGenerationMoved:
+                claim_rejected_generation_.fetch_add(1,
+                                                     std::memory_order_relaxed);
+                break;
+            case ClaimClosed::kErrorEpochMoved:
+                claim_rejected_error_epoch_.fetch_add(
+                    1, std::memory_order_relaxed);
+                break;
+            case ClaimClosed::kNone:
+                break;
+        }
+        if (claim.path_epoch_changed) {
+            claim_after_isolation_.fetch_add(1, std::memory_order_relaxed);
+        }
         // Reverse order again: credit (bound to the member's JFC) after the
         // member, then quota, outstanding counter and the K slot. No WR was
         // posted, so the member is clean and goes straight back to the LIFO
@@ -1799,9 +2284,10 @@ void UbWorkers::processPending(const PendingSlice& pending,
     // ⑧ Record + commit. The record owns the lease and the credit token from
     // here on, so every exit below (including a late CQE, a timeout fence and
     // shutdown) releases them through onOwners() exactly once.
-    auto record = makeRecord(pending, endpoint, path, reservation, local,
-                             remote, attempt);
+    auto record = makeRecord(pending, endpoint, path, probe_key, reservation,
+                             local, remote, attempt);
     record->pool = pool;
+    record->pooled_lane = leased.lease.lane();
     record->lease = std::move(leased.lease);
     record->credit_jfc_index = leased.jfc_index;
     record->credit_token = leased.jfc_credit_token;
@@ -1825,22 +2311,86 @@ void UbWorkers::processPending(const PendingSlice& pending,
         pending.task->releaseAttemptSlot();
         return;
     }
-    inflight_cv_.notify_all();
-    releaseInflight(inflight);
-    rail_monitor_->recordError(path);
-    if (inflight->pooled_pool) {
-        // Definitive zero acceptance: the attempt gate decides whether the
-        // member returns to the pool (INV07 rollback) or retires on
-        // contradiction; the endpoint incarnation is not at fault.
-        settlePooledAttempt(inflight, PooledSettleKind::kZeroAccept, 0,
-                            "post rejected: " + status.ToString());
-    } else {
-        if (endpoint_retirer_) endpoint_retirer_(endpoint);
-    }
-    const auto resolution = pending.slice->resolveAttempt(
-        *attempt, FAILED, 0, retryableStatus(status));
-    if (resolution == UbAttemptResolution::kRetryScheduled) {
-        enqueueRetry(pending);
+    record->core.post_claimed.store(true, std::memory_order_release);
+
+    // ⑨ publish + ⑩ post. The record is visible before the native call because
+    // a completion may legally arrive first.
+    WorkRequest work =
+        makeWorkRequest(pending, record->core.token, local, remote);
+    {
+        gate::HandlerRef post_handler(record->core, *this, gate_ctx_);
+        {
+            std::lock_guard<std::mutex> lock(records_mutex_);
+            records_.emplace(record->core.token, record);
+            if (record->pool && record->pooled_lane.lane_generation != 0) {
+                ++pooled_lane_refs_[record->pooled_lane.lane_generation];
+            }
+        }
+        gate_ctx_.stats.record_published.fetch_add(1,
+                                                   std::memory_order_relaxed);
+        path_load_.onPublish(path, length);
+
+        const auto member = record->lease.member();
+        JettyPtr jetty = member ? member->jetty : nullptr;
+        size_t posted_count = 0;
+        PostAcceptance acceptance = PostAcceptance::kNotAccepted;
+        Status status;
+        if (!jetty) {
+            status = Status::InternalError(
+                "UB pooled send Jetty is unavailable" LOC_MARK);
+        } else if (endpoint->rmMode()) {
+            // RM: the WR carries the peer target explicitly; the leased member
+            // is never bound to a remote Jetty. The target slot follows the
+            // posting lane, not the member's JFC rotation index - the rotation
+            // index is a pool-internal detail unrelated to the peer's Jetty
+            // topology (review M6).
+            const size_t target_slot =
+                worker_index % std::max<size_t>(1, endpoint->jettyCount());
+            work.target = endpoint->rmTarget(target_slot);
+            if (!work.target) {
+                // Never post an RM WR without a valid target: the adapter would
+                // otherwise build a WR with no remote Jetty.
+                status = Status::InternalError(
+                    "UB RM endpoint has no imported target for this "
+                    "slot" LOC_MARK);
+            } else {
+                status =
+                    adapter_->post(jetty, {work}, posted_count, acceptance);
+            }
+        } else {
+            status = adapter_->post(jetty, {work}, posted_count, acceptance);
+        }
+        if (posted_count > 1) {
+            LOG_EVERY_N(WARNING, 100)
+                << "UB adapter reported an impossible posted_count "
+                << posted_count << " for one WR; token " << record->core.token
+                << " drains until a fence proves responsibility";
+        }
+        if (acceptance == PostAcceptance::kAccepted) {
+            rail_monitor_->registerPath(path);
+            if (!status.ok()) {
+                LOG_EVERY_N(WARNING, 1000)
+                    << "UB post returned an error after accepting the WR: "
+                    << status.ToString();
+            }
+        }
+        // Observation only: how often the claim window actually leaked a post
+        // onto a path that had just been isolated (design §8.2, RK1 urgency).
+        if (probe_manager_ != nullptr) {
+            const uint64_t current =
+                probe_key.valid()
+                    ? probe_manager_->businessFaultEpoch(probe_key)
+                    : probe_manager_->businessFaultEpoch(path);
+            if (current != fault_epoch_snapshot) {
+                post_on_isolated_path_.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        gate::onPostReturn(
+            record->core,
+            PostReturn{acceptance,
+                       acceptance == PostAcceptance::kAccepted ? length : 0,
+                       retryableStatus(status)},
+            gate_ctx_);
     }
 }
 
@@ -1892,59 +2442,28 @@ WrFacts UbWorkers::makeWrFacts(const Completion& completion) {
     facts.completed_bytes = completion.completed_bytes;
     switch (completion.category) {
         case CompletionCategory::SUCCESS:
-            rail_monitor_->recordSuccess(inflight->path,
-                                         inflight->pending.slice->spec().length,
-                                         latency, now);
-            settlePooledAttempt(inflight, PooledSettleKind::kRealSuccess,
-                                inflight->pending.slice->spec().length, "");
-            resolveInflight(inflight, COMPLETED,
-                            inflight->pending.slice->spec().length, false);
+            facts.outcome = CompletionOutcome::kSuccess;
             break;
         case CompletionCategory::TIMEOUT:
-            rail_monitor_->recordTimeout(inflight->path, now);
-            settlePooledAttempt(inflight, PooledSettleKind::kRealError, 0,
-                                "native completion timeout");
-            if (!inflight->pooled_pool && endpoint_retirer_) {
-                endpoint_retirer_(inflight->endpoint);
-            }
-            resolveInflight(inflight, TIMEOUT, 0, true);
+            facts.outcome = CompletionOutcome::kTimeout;
             break;
         case CompletionCategory::LOCAL_DEVICE_ERROR:
-            if (inflight->endpoint && inflight->endpoint->context()) {
-                handleLocalDeviceFailure(inflight->endpoint->context());
-            }
-            rail_monitor_->recordError(inflight->path, now);
-            settlePooledAttempt(inflight, PooledSettleKind::kRealError, 0,
-                                "local device completion error");
-            if (endpoint_retirer_) endpoint_retirer_(inflight->endpoint);
-            resolveInflight(inflight, FAILED, 0, true);
+            facts.outcome = CompletionOutcome::kLocalDeviceError;
             break;
         case CompletionCategory::REMOTE_PATH_ERROR:
             facts.outcome = CompletionOutcome::kRemotePathError;
             break;
         case CompletionCategory::ENDPOINT_ERROR:
             facts.outcome = CompletionOutcome::kEndpointError;
-            rail_monitor_->recordError(inflight->path, now);
-            settlePooledAttempt(
-                inflight, PooledSettleKind::kRealError, 0,
-                completion.category == CompletionCategory::ENDPOINT_ERROR
-                    ? "endpoint completion error"
-                    : "remote path completion error");
-            if (endpoint_retirer_) endpoint_retirer_(inflight->endpoint);
-            resolveInflight(inflight, FAILED, 0, true);
             break;
         case CompletionCategory::MEMORY_ERROR:
             facts.outcome = CompletionOutcome::kMemoryError;
             break;
+        case CompletionCategory::LOCAL_ACCESS_ERROR:
+            facts.outcome = CompletionOutcome::kLocalAccessError;
+            break;
         case CompletionCategory::UNKNOWN_ERROR:
             facts.outcome = CompletionOutcome::kUnknownError;
-            rail_monitor_->recordError(inflight->path, now);
-            settlePooledAttempt(
-                inflight, PooledSettleKind::kRealError, 0,
-                completion.category == CompletionCategory::MEMORY_ERROR
-                    ? "memory completion error"
-                    : "unknown completion error");
-            resolveInflight(inflight, FAILED, 0, false);
             break;
     }
     return facts;
@@ -1970,12 +2489,103 @@ void UbWorkers::onFault(CompletionRecord& record, FaultKind kind) {
     auto* business = static_cast<BusinessRecord*>(record.owner);
     if (business == nullptr) return;
     const uint64_t now = steadyNowNs();
+    const auto report_error = [&](BusinessErrorKind kind) {
+        if (business->probe_key.valid()) {
+            if (kind == BusinessErrorKind::kParamError) {
+                if (param_error_edges_.noteError(business->probe_key)) {
+                    LOG(WARNING)
+                        << "UB declared edge invalidated after repeated "
+                           "parameter/memory errors: peer="
+                        << business->probe_key.segment_id
+                        << " local_nic=" << business->probe_key.local_nic
+                        << " remote_nic=" << business->probe_key.remote_nic;
+                }
+            } else {
+                param_error_edges_.noteSuccess(business->probe_key);
+            }
+        }
+        if (probe_manager_ == nullptr) return;
+        if (business->probe_key.valid()) {
+            probe_manager_->onBusinessPathError(business->probe_key, kind, now);
+        } else {
+            probe_manager_->onBusinessPathError(business->path, kind, now);
+        }
+        if (kind == BusinessErrorKind::kPathFault &&
+            business->probe_key.valid()) {
+            std::function<void(uint64_t)> hint;
+            {
+                std::lock_guard<std::mutex> lock(probe_hint_mutex_);
+                hint = probe_refresh_hint_;
+            }
+            if (hint) hint(business->probe_key.segment_id);
+        }
+    };
     if (kind == FaultKind::kTimeout) {
         // Deadline evidence without a placeable completion. A late completion
         // resolves the same one-shot, so the rail sees exactly one timeout.
+        business_deadline_timeouts_.fetch_add(1, std::memory_order_relaxed);
         rail_monitor_->recordTimeout(business->path, now);
+        const uint64_t age_us = now > business->posted_ns
+                                    ? (now - business->posted_ns) / 1000ULL
+                                    : 0ULL;
+        LOG_EVERY_N(WARNING, 100)
+            << "UB business deadline timeout: token=" << record.token
+            << " task="
+            << reinterpret_cast<uint64_t>(business->pending.task.get())
+            << " slice=" << business->attempt.slice_id
+            << " attempt=" << business->attempt.attempt
+            << " local_nic=" << record.path.local_nic
+            << " remote_device=" << record.path.remote_nic
+            << " remote_segment=" << record.path.segment_id
+            << " jetty_gen=" << record.jetty_generation
+            << " lane_gen=" << business->pooled_lane.lane_generation
+            << " posted_age_us=" << age_us
+            << " deadline_us=" << params_.slice_timeout_ms * 1000ULL;
         return;
     }
+    const char* category = "unknown";
+    switch (record.terminal.outcome) {
+        case CompletionOutcome::kRemotePathError:
+            category = "path_fault";
+            break;
+        case CompletionOutcome::kTimeout:
+            category = "timeout";
+            break;
+        case CompletionOutcome::kMemoryError:
+            category = "param_error";
+            break;
+        case CompletionOutcome::kLocalAccessError:
+            category = "path_fault";
+            break;
+        case CompletionOutcome::kLocalDeviceError:
+            category = "context_failure";
+            break;
+        case CompletionOutcome::kEndpointError:
+            category = "lane_error";
+            break;
+        case CompletionOutcome::kUnknownError:
+            category = "unknown";
+            break;
+        case CompletionOutcome::kSuccess:
+            category = "success";
+            break;
+    }
+    LOG_EVERY_N(WARNING, 20)
+        << "UB business error: token=" << record.token
+        << " task=" << reinterpret_cast<uint64_t>(business->pending.task.get())
+        << " slice=" << business->attempt.slice_id
+        << " attempt=" << business->attempt.attempt
+        << " kind=" << recordKindName(record.kind)
+        << " local_nic=" << record.path.local_nic
+        << " remote_device=" << record.path.remote_nic
+        << " remote_segment=" << record.path.segment_id << " acceptance="
+        << postAcceptanceName(record.acceptance.load(std::memory_order_relaxed))
+        << " terminal=" << completionOutcomeName(record.terminal.outcome)
+        << " category=" << category << " jetty_gen=" << record.jetty_generation
+        << " lane_gen=" << business->pooled_lane.lane_generation << " pool_gen="
+        << (business->endpoint && business->endpoint->context()
+                ? business->endpoint->context()->incarnation()
+                : 0);
     switch (record.terminal.outcome) {
         case CompletionOutcome::kLocalDeviceError:
             if (business->endpoint && business->endpoint->context()) {
@@ -1984,47 +2594,52 @@ void UbWorkers::onFault(CompletionRecord& record, FaultKind kind) {
             if (probe_manager_ != nullptr) {
                 // kContextFailure disables every path on the port; the PLM fans
                 // it out to onContextUnavailable().
-                probe_manager_->onBusinessPathError(
-                    business->path, BusinessErrorKind::kContextFailure, now);
+                report_error(BusinessErrorKind::kContextFailure);
             }
             rail_monitor_->recordError(business->path, now);
             if (endpoint_retirer_) endpoint_retirer_(business->endpoint);
             return;
         case CompletionOutcome::kRemotePathError:
             if (probe_manager_ != nullptr) {
-                probe_manager_->onBusinessPathError(
-                    business->path, BusinessErrorKind::kPathFault, now);
+                report_error(BusinessErrorKind::kPathFault);
             }
             rail_monitor_->recordError(business->path, now);
             if (endpoint_retirer_) endpoint_retirer_(business->endpoint);
             return;
         case CompletionOutcome::kEndpointError:
             if (probe_manager_ != nullptr) {
-                probe_manager_->onBusinessPathError(
-                    business->path, BusinessErrorKind::kLaneError, now);
+                report_error(BusinessErrorKind::kLaneError);
+            }
+            rail_monitor_->recordError(business->path, now);
+            if (endpoint_retirer_) endpoint_retirer_(business->endpoint);
+            return;
+        case CompletionOutcome::kLocalAccessError:
+            // A link-down can surface as a local access error. Treat it like a
+            // remote path fault: isolate the path and let the slice retry on
+            // another one. A genuine token/permission error exhausts the
+            // bounded retry budget instead of failing on the first attempt.
+            if (probe_manager_ != nullptr) {
+                report_error(BusinessErrorKind::kPathFault);
             }
             rail_monitor_->recordError(business->path, now);
             if (endpoint_retirer_) endpoint_retirer_(business->endpoint);
             return;
         case CompletionOutcome::kMemoryError:
             if (probe_manager_ != nullptr) {
-                probe_manager_->onBusinessPathError(
-                    business->path, BusinessErrorKind::kParamError, now);
+                report_error(BusinessErrorKind::kParamError);
             }
             rail_monitor_->recordError(business->path, now);
             return;
         case CompletionOutcome::kUnknownError:
             if (probe_manager_ != nullptr) {
-                probe_manager_->onBusinessPathError(
-                    business->path, BusinessErrorKind::kUnknown, now);
+                report_error(BusinessErrorKind::kUnknown);
             }
             rail_monitor_->recordError(business->path, now);
             return;
         case CompletionOutcome::kTimeout:
             // Adapter-level TIMEOUT category (not the deadline scan).
             if (probe_manager_ != nullptr) {
-                probe_manager_->onBusinessPathError(
-                    business->path, BusinessErrorKind::kPathFault, now);
+                report_error(BusinessErrorKind::kPathFault);
             }
             rail_monitor_->recordTimeout(business->path, now);
             if (endpoint_retirer_) endpoint_retirer_(business->endpoint);
@@ -2072,9 +2687,55 @@ void UbWorkers::onOwners(CompletionRecord& record,
 
 void UbWorkers::onBlocked(CompletionRecord& record, BlockReason reason) {
     // Observational only: the gate already maintains gate_blocked_by_*.
-    // W3 hangs the defer/backpressure wake-up here, W4 the classified logging.
-    (void)record;
-    (void)reason;
+    if (params_.observability.verbose_events || VLOG_IS_ON(1)) {
+        if (params_.observability.verbose_events) {
+            LOG(INFO)
+                << "UB completion gate blocked: token=" << record.token
+                << " kind=" << recordKindName(record.kind)
+                << " path=" << recordPathText(record.path)
+                << " generation=" << record.jetty_generation << " acceptance="
+                << postAcceptanceName(
+                       record.acceptance.load(std::memory_order_relaxed))
+                << " blocked_by=" << blockReasonName(reason)
+                << " post_returned="
+                << (record.post_returned.load(std::memory_order_acquire) ? 1
+                                                                         : 0)
+                << " early_cqe="
+                << ((record.wr_terminal.load(std::memory_order_acquire) &&
+                     !record.post_returned.load(std::memory_order_acquire))
+                        ? 1
+                        : 0)
+                << " handler_refs="
+                << record.handler_refs.load(std::memory_order_relaxed)
+                << " fault="
+                << (record.fault_reported.load(std::memory_order_relaxed) ? 1
+                                                                          : 0);
+        } else {
+            VLOG(1) << "UB completion gate blocked: token=" << record.token
+                    << " kind=" << recordKindName(record.kind)
+                    << " path=" << recordPathText(record.path)
+                    << " generation=" << record.jetty_generation
+                    << " acceptance="
+                    << postAcceptanceName(
+                           record.acceptance.load(std::memory_order_relaxed))
+                    << " blocked_by=" << blockReasonName(reason)
+                    << " post_returned="
+                    << (record.post_returned.load(std::memory_order_acquire)
+                            ? 1
+                            : 0)
+                    << " early_cqe="
+                    << ((record.wr_terminal.load(std::memory_order_acquire) &&
+                         !record.post_returned.load(std::memory_order_acquire))
+                            ? 1
+                            : 0)
+                    << " handler_refs="
+                    << record.handler_refs.load(std::memory_order_relaxed)
+                    << " fault="
+                    << (record.fault_reported.load(std::memory_order_relaxed)
+                            ? 1
+                            : 0);
+        }
+    }
 }
 
 void UbWorkers::onDuplicate(CompletionRecord& record) {
@@ -2111,20 +2772,25 @@ void UbWorkers::scanTimeouts() {
         // evidence: a revoked timeout must not swallow the real fault (IN-11).
         if (!gate::onTimeout(record->core)) continue;
         std::vector<Completion> drained;
-        const bool pooled = inflight->pooled_pool &&
-                            inflight->pooled_lease.valid() &&
-                            inflight->pooled_lease.member();
         Status status;
-        if (pooled) {
-            // The WR rode a pooled member, not an endpoint Jetty: the fence
-            // must quiesce the member's Jetty to prove no more DMA.
-            status =
-                adapter_->quiesceJetty(inflight->pooled_lease.member()->jetty,
-                                       params_.slice_timeout_ms, drained);
+        JettyPtr pooled_jetty;
+        if (record->pool && record->lease.valid()) {
+            // D-14 / W3-IN-10: in pooled mode the fence target is the leased
+            // member's Jetty. `endpoint->jetty(worker_index)` belongs to
+            // another, unused Jetty set and fencing it would prove nothing.
+            const auto member = record->lease.member();
+            pooled_jetty = member ? member->jetty : nullptr;
+        }
+        if (pooled_jetty) {
+            status = adapter_->quiesceJetty(pooled_jetty,
+                                            params_.slice_timeout_ms, drained);
+        } else if (record->pool) {
+            status = Status::InvalidArgument(
+                "Timed-out pooled UB WR has no leased Jetty" LOC_MARK);
         } else {
-            status = inflight->endpoint
-                         ? inflight->endpoint->quiesce(params_.slice_timeout_ms,
-                                                       drained)
+            status = record->endpoint
+                         ? record->endpoint->quiesce(params_.slice_timeout_ms,
+                                                     drained)
                          : Status::InvalidArgument(
                                "Timed-out UB WR has no endpoint" LOC_MARK);
         }
@@ -2134,7 +2800,10 @@ void UbWorkers::scanTimeouts() {
             dispatchCompletion(completion, record->core.path.local_nic);
         }
         if (!status.ok()) {
-            if (!pooled) rememberEndpointDrain(inflight->endpoint);
+            // The pooled path keeps the endpoint alive: the member is the only
+            // resource that can be at fault, and the record stays registered so
+            // a later scan retries the fence.
+            if (!record->pool) rememberEndpointDrain(record->endpoint);
             LOG_EVERY_N(ERROR, 100)
                 << "Cannot establish UB timeout drain fence: "
                 << status.ToString();
@@ -2150,29 +2819,106 @@ void UbWorkers::scanTimeouts() {
             if (still_registered) gate::onFenceFailed(record->core);
             continue;
         }
-        if (pooled) {
-            // The fence proved no more DMA from the member. If a drained
-            // completion already settled the attempt this is a no-op;
-            // otherwise the unsettled attempt retires the member (INV07).
-            settlePooledAttempt(inflight, PooledSettleKind::kFence, 0,
-                                "slice timeout fence");
-        } else {
-            forgetEndpointDrain(inflight->endpoint);
-            if (endpoint_retirer_) endpoint_retirer_(inflight->endpoint);
+        if (!record->pool) {
+            forgetEndpointDrain(record->endpoint);
+            if (endpoint_retirer_) endpoint_retirer_(record->endpoint);
         }
-        recordTimeoutOnce(inflight, now);
-        // quiesce() is the proof that retry cannot overlap old DMA. Reclaim a
-        // provider-lost token here: the successful fence proves the old WR can
-        // no longer touch memory, so releasing outstanding/quota accounting is
-        // safe. releaseInflight() is idempotent against a racing completion.
-        bool erased = false;
-        {
-            std::lock_guard<std::mutex> lock(inflight_mutex_);
-            auto it = inflight_.find(inflight->completion_token);
-            if (it != inflight_.end() && it->second == inflight) {
-                inflight_.erase(it);
-                erased = true;
-            }
+        // The erase and the "is this record still mine?" check happen in one
+        // critical section: if a drained completion already claimed and
+        // disposed of the record, the scan must not release the owners again
+        // (IN-4).
+        eraseRecord(record->core.token, record.get());
+        // quiesce() is the proof that retry cannot overlap old DMA. The fence
+        // evidence then settles TIMEOUT and finalizes once (§6.7).
+        gate::onFenceProven(record->core, *this, gate_ctx_);
+    }
+}
+
+bool UbWorkers::settleDrainedWr(const Completion& completion,
+                                uint64_t jfc_index) {
+    (void)jfc_index;
+    if (completion.token == 0) return false;
+    // A software-flush WR is a WR the provider accepted but never completed. It
+    // settles through the same gate as a real CQE, exactly once. Looking the
+    // record up here and settling it directly keeps two properties that routing
+    // through dispatchCompletion() could not:
+    //   - a token that was already claimed and disposed is reported as "not
+    //     settled" instead of being counted as an unknown token (it is a
+    //     duplicate of a settled WR, not a topology fault);
+    //   - the one-shot gate claim (cr_claimed / finalize_claimed) is still the
+    //     exactly-once authority, so a concurrent disposal cannot double
+    //     release even if it happens after the lookup.
+    auto record = findRecord(completion.token);
+    if (!record) return false;
+    if (probe_manager_ != nullptr && isProbeToken(completion.token)) {
+        // Namespace first, exactly like dispatchCompletion().
+        (void)probe_manager_->onProbeCompletion(completion);
+        return true;
+    }
+    gate::HandlerRef handler(record->core, *this, gate_ctx_);
+    gate::onRealCr(record->core, makeWrFacts(completion), *this, gate_ctx_);
+    return true;
+}
+
+bool UbWorkers::pooledLaneConverged(const PoolLaneKey& lane) const {
+    if (lane.lane_generation == 0) return true;
+    std::lock_guard<std::mutex> lock(records_mutex_);
+    auto refs = pooled_lane_refs_.find(lane.lane_generation);
+    return refs == pooled_lane_refs_.end() || refs->second == 0;
+}
+
+std::shared_ptr<UbWorkers::BusinessRecord> UbWorkers::findRecord(
+    uint64_t token) const {
+    // The registry lock is only held to take a shared_ptr; every consumer works
+    // on the reference outside the lock (design §5.6 rule 2).
+    std::lock_guard<std::mutex> lock(records_mutex_);
+    auto it = records_.find(token);
+    return it == records_.end() ? nullptr : it->second;
+}
+
+void UbWorkers::releaseOwnerResources(BusinessRecord& record,
+                                      OwnerDisposition disposition) {
+    // Exactly one call per record: the gate's claim bit already guaranteed it
+    // (W3-IN-1). Order is fixed: endpoint accounting, quota, pool member,
+    // credit, K slot (design §10.1).
+    const size_t length =
+        record.pending.slice ? record.pending.slice->spec().length : 0;
+    if (record.endpoint) record.endpoint->releaseOutstanding(length);
+    if (record.quota.valid()) (void)quota_->release(record.quota);
+    bool pool_woken = false;
+    if (record.pool && record.lease.valid()) {
+        if (disposition == OwnerDisposition::kFinalize) {
+            // A first real error, a proven timeout or a shutdown bottom-out:
+            // the member is retired permanently and never re-enters the LIFO
+            // stack (INV07). The pool is the arbiter, so a pool that is already
+            // stopping also ends here.
+            const RecordDropReason drop =
+                record.core.orphan_reason.load(std::memory_order_acquire);
+            const std::string reason =
+                drop != RecordDropReason::kNone
+                    ? recordDropReasonName(drop)
+                    : completionOutcomeName(record.core.terminal.outcome);
+            // A real error completion must pass the hardware retirement fence
+            // (modify ERROR -> flush-done -> software flush) before the member
+            // may be reset and deleted (design §7.2 rule 5). A proven timeout
+            // fence and the shutdown bottom-out already fenced the member, so
+            // they must not pay for a second, blocking provider call.
+            const bool hardware_fault =
+                drop == RecordDropReason::kCompletionError ||
+                (drop == RecordDropReason::kNone &&
+                 record.core.terminal.outcome != CompletionOutcome::kSuccess &&
+                 record.core.terminal.outcome != CompletionOutcome::kTimeout);
+            (void)record.pool->retireFaulted(std::move(record.lease), reason,
+                                             hardware_fault);
+            pooled_retire_.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            // kReturn and kReject both hand the member back: a rejected post
+            // never crossed the native boundary, so the member is clean
+            // (W3-IN-2). The pool turns a return into a retirement by itself
+            // when it is stopping.
+            (void)record.pool->returnOnce(std::move(record.lease),
+                                          /*gate_passed=*/true);
+            pooled_return_.fetch_add(1, std::memory_order_relaxed);
         }
         // Credit is released after the member: the token is bound to the
         // member's JFC, so releasing it first would let the ledger admit a new
@@ -2211,6 +2957,17 @@ void UbWorkers::eraseRecord(uint64_t token, const BusinessRecord* record) {
         auto it = records_.find(token);
         if (it != records_.end() && it->second.get() == record) {
             records_.erase(it);
+            const uint64_t generation = record->pooled_lane.lane_generation;
+            if (generation != 0) {
+                auto refs = pooled_lane_refs_.find(generation);
+                if (refs != pooled_lane_refs_.end()) {
+                    if (refs->second <= 1) {
+                        pooled_lane_refs_.erase(refs);
+                    } else {
+                        --refs->second;
+                    }
+                }
+            }
             erased = true;
         }
     }
@@ -2258,8 +3015,15 @@ void UbWorkers::recordSuccessEvidence(BusinessRecord& record) {
     const uint64_t now = steadyNowNs();
     const uint64_t latency =
         now >= record.posted_ns ? now - record.posted_ns : 0;
+    if (record.probe_key.valid()) {
+        param_error_edges_.noteSuccess(record.probe_key);
+    }
     if (probe_manager_ != nullptr) {
-        probe_manager_->onBusinessPathSuccess(record.path, now);
+        if (record.probe_key.valid()) {
+            probe_manager_->onBusinessPathSuccess(record.probe_key, now);
+        } else {
+            probe_manager_->onBusinessPathSuccess(record.path, now);
+        }
     }
     rail_monitor_->recordSuccess(
         record.path, record.pending.slice->spec().length, latency, now);
@@ -2285,102 +3049,6 @@ void UbWorkers::forgetEndpointDrain(
 void UbWorkers::failUnposted(const PendingSlice& pending,
                              TransferStatusEnum outcome) {
     if (pending.slice) (void)pending.slice->tryResolveBeforePost(outcome);
-}
-
-void UbWorkers::settlePooledAttempt(const std::shared_ptr<Inflight>& inflight,
-                                    PooledSettleKind kind,
-                                    uint64_t completed_length,
-                                    const std::string& reason) {
-    if (!inflight || !inflight->pooled_pool ||
-        !inflight->pooled_lease.valid()) {
-        return;
-    }
-    bool expected = false;
-    if (!inflight->pooled_settled.compare_exchange_strong(
-            expected, true, std::memory_order_acq_rel)) {
-        return;
-    }
-    // Hardware retirement fence (C08): a real error completion, including the
-    // pinned provider's native status 9 class, takes the member out of
-    // hardware service before it is retired. quiesceJetty moves the Jetty to
-    // URMA_JETTY_STATE_ERROR (urma_modify_jetty), waits for that ERROR
-    // epoch's flush-done marker and drains the remaining WRs with
-    // urma_flush_jetty. Only then does the pool reset and delete the member.
-    // A failed fence leaves the member in ERROR without a trusted barrier, so
-    // the pool's reset is rejected and the handle stays quarantined instead
-    // of re-entering circulation.
-    if (kind == PooledSettleKind::kRealError) {
-        const auto& member = inflight->pooled_lease.member();
-        if (member && member->jetty) {
-            std::vector<Completion> drained;
-            const Status fence = adapter_->quiesceJetty(
-                member->jetty, params_.slice_timeout_ms, drained);
-            for (const auto& completion : drained) {
-                if (completion.token != 0) handleCompletion(completion);
-            }
-            if (!fence.ok()) {
-                LOG_EVERY_N(WARNING, 100) << "UB pooled member could not be "
-                                             "fenced before retirement; "
-                                             "it stays quarantined: "
-                                          << fence.ToString();
-            }
-        }
-    }
-    const auto& pool = inflight->pooled_pool;
-    AttemptGate::Settlement settlement;
-    bool settled = false;
-    if (attempt_gate_ && inflight->gate_token != 0) {
-        switch (kind) {
-            case PooledSettleKind::kRealSuccess:
-                attempt_gate_->onRealCompletion(inflight->gate_token, true,
-                                                completed_length);
-                break;
-            case PooledSettleKind::kRealError:
-                attempt_gate_->onRealCompletion(inflight->gate_token, false, 0);
-                attempt_gate_->reportFault(inflight->gate_token, reason);
-                break;
-            case PooledSettleKind::kZeroAccept:
-                // onPostReturn already recorded the definitive rejection; a
-                // rollback must not add a fault or the member would retire.
-                break;
-            case PooledSettleKind::kFence:
-                attempt_gate_->reportFault(inflight->gate_token, reason);
-                break;
-        }
-        settled = attempt_gate_->tryFinalize(inflight->gate_token,
-                                             !pool->stopping(), settlement);
-    }
-    if (settled && (settlement.return_to_pool || settlement.rollback_return)) {
-        (void)pool->returnOnce(std::move(inflight->pooled_lease), true);
-    } else {
-        const char* fallback = "pooled attempt unsettled";
-        switch (kind) {
-            case PooledSettleKind::kRealSuccess:
-                fallback = "pooled member retired before reuse";
-                break;
-            case PooledSettleKind::kRealError:
-                fallback = "pooled attempt completion error";
-                break;
-            case PooledSettleKind::kZeroAccept:
-                fallback = "pooled rollback rejected by gate";
-                break;
-            case PooledSettleKind::kFence:
-                fallback = "pooled attempt fenced";
-                break;
-        }
-        (void)pool->retireFaulted(
-            std::move(inflight->pooled_lease),
-            reason.empty() ? std::string(fallback) : reason);
-    }
-    if (attempt_gate_ && inflight->gate_token != 0) {
-        attempt_gate_->discard(inflight->gate_token);
-    }
-    // The pool never releases caller credits; the settlement path owns the
-    // exactly-once release.
-    if (auto credits = pool->creditLedger()) {
-        credits->release(inflight->pooled_jfc_index,
-                         inflight->jfc_credit_token);
-    }
 }
 
 uint64_t UbWorkers::nextCompletionToken() {

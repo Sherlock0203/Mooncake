@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "tent/transport/ub/endpoint.h"
+#include "tent/transport/ub/target_registry.h"
 
 #include "tent/transport/ub/bootstrap.h"
 
@@ -11,12 +12,19 @@
 #include <cassert>
 #include <chrono>
 #include <exception>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <utility>
 
 namespace mooncake::tent::ub {
 namespace {
+
+uint64_t descriptorHash(const UbBootstrapDesc& descriptor) {
+    UbBootstrapDesc content = descriptor;
+    content.reply_msg.clear();
+    return std::hash<std::string>{}(nlohmann::json(content).dump());
+}
 
 uint64_t generationSeed() {
     const auto wall = static_cast<uint64_t>(
@@ -130,25 +138,26 @@ Status UbEndpoint::resetAndUnbindLocked() {
     return first_error;
 }
 
-Status UbEndpoint::unimportTargetsLocked() {
+Status UbEndpoint::unimportTargetsLocked(bool retry_retained) {
     Status first_error = Status::OK();
-    if (imported_targets_.empty()) return first_error;
-    if (!adapter_) {
+    auto registry = context_ ? context_->targetRegistry() : nullptr;
+    if (!registry) {
         return Status::InternalError(
-            "UB endpoint cannot unimport RM targets without an "
-            "adapter" LOC_MARK);
+            "UB endpoint cannot unimport RM targets without a Context target "
+            "registry" LOC_MARK);
     }
-    std::vector<RemoteTargetPtr> retained;
-    for (size_t index = imported_targets_.size(); index > 0; --index) {
-        auto& target = imported_targets_[index - 1];
-        if (!target) continue;
-        auto status = adapter_->unimportRemoteTarget(target);
-        rememberFirstError(status, first_error);
-        // A failed unimport leaves the handle owned by this incarnation; it
-        // is never dereferenced blindly or retried without a budget.
-        if (!status.ok()) retained.push_back(std::move(target));
+    if (imported_targets_.empty()) {
+        // A previous retire already released this incarnation's references but
+        // a provider unimport failed. The handle lives in the registry's
+        // quarantine; a retire retry is the place that retries it.
+        return retry_retained ? registry->drainRetained() : Status::OK();
     }
-    imported_targets_ = std::move(retained);
+    // Release this incarnation's references. The registry unimports the native
+    // target on the last release and retains a failed unimport as quarantine,
+    // so this endpoint never drops a handle blindly.
+    const Status status = registry->releaseAll(imported_targets_);
+    rememberFirstError(status, first_error);
+    imported_targets_.clear();
     return first_error;
 }
 
@@ -229,7 +238,8 @@ Status UbEndpoint::failLocked(Status status) {
     rememberFirstError(resetAndUnbindLocked(), retire_status_);
     rememberFirstError(deleteJettysLocked(), retire_status_);
     if (jetties_.empty()) {
-        rememberFirstError(unimportTargetsLocked(), retire_status_);
+        rememberFirstError(unimportTargetsLocked(/*retry_retained=*/false),
+                           retire_status_);
     }
     return lifecycle_status_;
 }
@@ -413,21 +423,6 @@ Status UbEndpoint::bind(const UbBootstrapDesc& peer) {
     return Status::OK();
 }
 
-RemoteJettyInfo UbEndpoint::rmTarget(size_t jetty_index) const {
-    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
-    RemoteJettyInfo target;
-    if (!rmMode() || jetties_.empty() || peer_.local_eid.empty() ||
-        peer_.jetty_ids.empty()) {
-        return target;
-    }
-    const size_t index = jetty_index % peer_.jetty_ids.size();
-    target.eid = peer_.local_eid;
-    target.id = peer_.jetty_ids[index];
-    if (peer_.jetty_uasids.size() == peer_.jetty_ids.size()) {
-        target.uasid = peer_.jetty_uasids[index];
-    }
-    return target;
-}
 Status UbEndpoint::bindRm(const UbBootstrapDesc& peer,
                           const UbExpectedPeerIdentity& expected) {
     std::lock_guard<std::mutex> lock(lifecycle_mutex_);
@@ -453,6 +448,41 @@ Status UbEndpoint::bindRm(const UbBootstrapDesc& peer,
                 "Repeated RM bootstrap descriptor is structurally invalid: " +
                 compare_status.ToString() + LOC_MARK);
         }
+        if (VLOG_IS_ON(1) &&
+            comparison != UbBootstrapGenerationComparison::kDuplicate) {
+            auto target_ids = [](const UbBootstrapDesc& desc) {
+                std::string out;
+                if (!desc.rm.has_value()) return out;
+                for (const auto& target : desc.rm->targets) {
+                    out += std::to_string(target.id);
+                    out += "/";
+                    out += std::to_string(target.uasid);
+                    out += "/";
+                    out += std::to_string(target.target_epoch);
+                    out += ",";
+                }
+                return out;
+            };
+            VLOG(1)
+                << "UB RM bootstrap diff: comparison="
+                << static_cast<int>(comparison)
+                << " candidate{endpoint_gen=" << peer.endpoint_generation
+                << ",segment_gen=" << peer.segment_generation
+                << ",node_inc=" << (peer.rm ? peer.rm->node_incarnation : 0)
+                << ",ctx_inc=" << (peer.rm ? peer.rm->context_incarnation : 0)
+                << ",topo_epoch=" << (peer.rm ? peer.rm->topology_epoch : 0)
+                << ",device="
+                << (peer.rm ? peer.rm->physical_device_identity : "")
+                << ",targets=" << target_ids(peer) << "}"
+                << " incumbent{endpoint_gen=" << peer_.endpoint_generation
+                << ",segment_gen=" << peer_.segment_generation
+                << ",node_inc=" << (peer_.rm ? peer_.rm->node_incarnation : 0)
+                << ",ctx_inc=" << (peer_.rm ? peer_.rm->context_incarnation : 0)
+                << ",topo_epoch=" << (peer_.rm ? peer_.rm->topology_epoch : 0)
+                << ",device="
+                << (peer_.rm ? peer_.rm->physical_device_identity : "")
+                << ",targets=" << target_ids(peer_) << "}";
+        }
         switch (comparison) {
             case UbBootstrapGenerationComparison::kDuplicate:
                 return Status::OK();
@@ -461,13 +491,13 @@ Status UbEndpoint::bindRm(const UbBootstrapDesc& peer,
                     "RM bootstrap generation is stale; the incumbent endpoint "
                     "is preserved" LOC_MARK);
             case UbBootstrapGenerationComparison::kConflict:
-                return Status::InvalidArgument(
+                return Status::AlreadyExists(
                     "RM bootstrap conflicts with the incumbent generation: "
                     "the same incarnation published different "
                     "content" LOC_MARK);
             case UbBootstrapGenerationComparison::kNewer:
             default:
-                return Status::InvalidArgument(
+                return Status::AlreadyExists(
                     "RM peer generation advanced; the endpoint must be "
                     "re-created through a new incarnation" LOC_MARK);
         }
@@ -523,42 +553,32 @@ Status UbEndpoint::bindRm(const UbBootstrapDesc& peer,
         }
     }
 
-    // Import every peer target owned by this endpoint incarnation. A failed
-    // import publishes the partial import set to this incarnation so the
-    // retire cleanup owns every handle: failLocked() unimports them in
-    // reverse order, retains handles whose unimport fails, and the destructor
-    // quarantine takes over persistent failures. A provider may also return a
-    // partially allocated handle alongside the error (same contract as
-    // createJetty in prepare()); such handles are adopted, never dropped.
-    std::vector<RemoteTargetPtr> imported;
-    imported.reserve(rm.targets.size());
-    Status first_error = Status::OK();
-    for (const auto& target : rm.targets) {
-        RemoteTargetPtr handle;
-        auto status = adapter_->importRemoteTarget(
-            context_->handle(), target.eid, target.uasid, target.id,
-            target.profile.trans_mode, target.profile.target_type,
-            target.profile.tp_type, handle);
-        if (!status.ok()) {
-            if (handle) {
-                imported.push_back(std::move(handle));
-            }
-            if (first_error.ok()) {
-                first_error = std::move(status);
-            }
-            continue;
-        }
-        imported.push_back(std::move(handle));
+    // Import every peer target through the Context registry. A target is a
+    // node-wide resource shared by every endpoint/probe on this Context, so the
+    // registry deduplicates it and reference-counts this incarnation; the
+    // native import is released only when the last reference goes away. A
+    // failed import rolls the registry back to its previous state, and any
+    // partially allocated native handle is adopted and quarantined there (same
+    // provider contract as createJetty in prepare()).
+    auto registry = context_ ? context_->targetRegistry() : nullptr;
+    if (!registry) {
+        return failLocked(Status::InternalError(
+            "UB endpoint has no Context target registry" LOC_MARK));
     }
-    if (!first_error.ok()) {
-        imported_targets_ = std::move(imported);
-        return failLocked(std::move(first_error));
+    const std::string peer_scope =
+        peer.segment_name + "|" + rm.physical_device_identity;
+    std::vector<RemoteTargetPtr> imported;
+    const Status import_status =
+        registry->importAll(peer_scope, rm.targets, imported);
+    if (!import_status.ok()) {
+        return failLocked(import_status);
     }
 
     // Compare-and-commit: the incumbent state is only replaced after every
     // validation and import succeeded.
     imported_targets_ = std::move(imported);
     peer_ = peer;
+    bound_descriptor_hash_ = descriptorHash(peer_);
     peer_generation_.store(peer.endpoint_generation, std::memory_order_release);
     lifecycle_status_ = Status::OK();
     state_.store(State::kReady, std::memory_order_release);
@@ -631,6 +651,12 @@ Status UbEndpoint::makeBootstrapDescV2(const std::string& segment_name,
     if (current != State::kPrepared && current != State::kReady) {
         return Status::InvalidArgument(
             "UB endpoint must be prepared before bootstrap" LOC_MARK);
+    }
+    if (current == State::kReady && !descriptorMatchesBoundLocked()) {
+        LOG_EVERY_N(WARNING, 100)
+            << "UB endpoint descriptor drifted without a generation bump:"
+            << " local_nic=" << context_->topologyId()
+            << " endpoint_gen=" << generation_;
     }
 
     const auto& device = context_->deviceInfo();
@@ -743,7 +769,7 @@ Status UbEndpoint::finishRetireLocked() {
     // Imported RM targets are unimported only after every Jetty that could
     // reference them has been deleted; a failed unimport keeps the handle
     // owned and leaves the incarnation short of kDestroyed.
-    auto unimport_status = unimportTargetsLocked();
+    auto unimport_status = unimportTargetsLocked(/*retry_retained=*/true);
     if (!unimport_status.ok()) {
         retire_status_ = unimport_status;
         return unimport_status;
@@ -758,6 +784,11 @@ Status UbEndpoint::finishRetireLocked() {
     peer_generation_.store(0, std::memory_order_release);
     state_.store(State::kDestroyed, std::memory_order_release);
     return retire_status_;
+}
+
+bool UbEndpoint::descriptorMatchesBoundLocked() const {
+    return peer_.rm.has_value() &&
+           bound_descriptor_hash_ == descriptorHash(peer_);
 }
 
 Status UbEndpoint::retire() {

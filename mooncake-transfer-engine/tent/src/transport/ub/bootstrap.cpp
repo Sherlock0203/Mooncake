@@ -170,8 +170,32 @@ Status validateUbBootstrap(const UbBootstrapDesc& desc) {
 }
 
 Status gateUbBootstrapForMode(UbBootstrapMode expected,
+                              UbBootstrapProtocol requested,
                               const UbBootstrapDesc& desc) {
     CHECK_STATUS(validateUbBootstrap(desc));
+    switch (requested) {
+        case UbBootstrapProtocol::kV1:
+            if (desc.protocol_version != 1) {
+                return Status::InvalidArgument(
+                    "bootstrap/protocol=v1 rejects a non-v1 peer");
+            }
+            // v1 carries per-lane Jetty ids and no RM target; it can only be
+            // served by the RC legacy runtime. RM (legacy or pooled) is
+            // rejected explicitly instead of degrading to v1.
+            if (expected == UbBootstrapMode::RM) {
+                return Status::NotImplemented(
+                    "bootstrap/protocol=v1 cannot serve an RM runtime");
+            }
+            return Status::OK();
+        case UbBootstrapProtocol::kV2:
+            if (desc.protocol_version != 2) {
+                return Status::InvalidArgument(
+                    "bootstrap/protocol=v2 rejects a non-v2 peer");
+            }
+            break;
+        case UbBootstrapProtocol::kAuto:
+            break;
+    }
     if (expected == UbBootstrapMode::RC) {
         if (desc.protocol_version == 1) return Status::OK();
         return Status::NotImplemented(
@@ -218,12 +242,14 @@ Status compareUbBootstrapV2(const UbBootstrapDesc& candidate,
     const auto& next = *candidate.rm;
     const auto& incumbent = *current.rm;
     if (next.physical_device_identity != incumbent.physical_device_identity) {
+        // A different physical device is not a generation conflict: the
+        // incumbent belongs to another device identity and must not be
+        // compared field by field. Report it as a replacement.
+        comparison = UbBootstrapGenerationComparison::kNewer;
         return Status::OK();
     }
 
-    // A parent incarnation change creates a new comparison scope. Within one
-    // unchanged parent scope, no newer leaf may hide an older target or
-    // segment.
+    // 1) Parents: a parent change opens a new comparison scope.
     const uint64_t candidate_parents[] = {
         next.node_incarnation, next.context_incarnation, next.topology_epoch};
     const uint64_t current_parents[] = {incumbent.node_incarnation,
@@ -242,21 +268,14 @@ Status compareUbBootstrapV2(const UbBootstrapDesc& candidate,
         }
     }
 
-    std::map<std::string, const UbRmTargetDescriptor*> current_targets;
-    for (const auto& target : incumbent.targets) {
-        current_targets.emplace(target.target_identity, &target);
-    }
-    if (current_targets.size() != next.targets.size()) return Status::OK();
+    // 2) Leaf generations BEFORE the target set. A re-created endpoint
+    //    necessarily has a new Jetty id range, so target_identity can never be
+    //    matched against the incumbent. Comparing the target set first (the
+    //    old order) returned kConflict before the newer endpoint_generation
+    //    was ever looked at, which made every post-link-down re-bootstrap fail
+    //    forever.
     bool has_newer_generation = false;
     bool has_older_generation = false;
-    for (const auto& target : next.targets) {
-        const auto found = current_targets.find(target.target_identity);
-        if (found == current_targets.end()) return Status::OK();
-        const int order =
-            compareUint64(target.target_epoch, found->second->target_epoch);
-        has_newer_generation = has_newer_generation || order > 0;
-        has_older_generation = has_older_generation || order < 0;
-    }
     const uint64_t candidate_leaves[] = {candidate.segment_generation,
                                          candidate.endpoint_generation};
     const uint64_t current_leaves[] = {current.segment_generation,
@@ -266,7 +285,10 @@ Status compareUbBootstrapV2(const UbBootstrapDesc& candidate,
         has_newer_generation = has_newer_generation || order > 0;
         has_older_generation = has_older_generation || order < 0;
     }
-    if (has_newer_generation && has_older_generation) return Status::OK();
+    if (has_newer_generation && has_older_generation) {
+        comparison = UbBootstrapGenerationComparison::kConflict;
+        return Status::OK();
+    }
     if (has_older_generation) {
         comparison = UbBootstrapGenerationComparison::kStale;
         return Status::OK();
@@ -276,6 +298,41 @@ Status compareUbBootstrapV2(const UbBootstrapDesc& candidate,
         return Status::OK();
     }
 
+    // 3) All generations tie. Only now is the target set required to match;
+    //    a differing set at the same generation is a genuine content conflict.
+    std::map<std::string, const UbRmTargetDescriptor*> current_targets;
+    for (const auto& target : incumbent.targets) {
+        current_targets.emplace(target.target_identity, &target);
+    }
+    if (current_targets.size() != next.targets.size()) {
+        comparison = UbBootstrapGenerationComparison::kConflict;
+        return Status::OK();
+    }
+    for (const auto& target : next.targets) {
+        const auto found = current_targets.find(target.target_identity);
+        if (found == current_targets.end()) {
+            comparison = UbBootstrapGenerationComparison::kConflict;
+            return Status::OK();
+        }
+        const int order =
+            compareUint64(target.target_epoch, found->second->target_epoch);
+        has_newer_generation = has_newer_generation || order > 0;
+        has_older_generation = has_older_generation || order < 0;
+    }
+    if (has_newer_generation && has_older_generation) {
+        comparison = UbBootstrapGenerationComparison::kConflict;
+        return Status::OK();
+    }
+    if (has_older_generation) {
+        comparison = UbBootstrapGenerationComparison::kStale;
+        return Status::OK();
+    }
+    if (has_newer_generation) {
+        comparison = UbBootstrapGenerationComparison::kNewer;
+        return Status::OK();
+    }
+
+    // 4) Fully identical generation tuple: duplicate or genuine conflict.
     UbBootstrapDesc candidate_identity = candidate;
     UbBootstrapDesc current_identity = current;
     candidate_identity.reply_msg.clear();

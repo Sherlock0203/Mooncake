@@ -14,6 +14,7 @@
 
 #include "tent/transport/ub/probe_peer_handshake.h"
 
+#include <set>
 #include <utility>
 
 #include <glog/logging.h>
@@ -53,13 +54,28 @@ Status HandshakeProbePeerDirectory::snapshotEdges(
     }
 
     std::vector<ProbePeerDescriptor> descriptors;
+    // Only a whole-snapshot failure is fatal; per-descriptor problems are
+    // isolated below so one bad peer cannot stop every other refresh (G-4).
     auto status = source_->snapshot(descriptors);
     if (!status.ok()) return status;
 
-    // Validate the whole snapshot first: a malformed descriptor must not leave
-    // a half-imported cache behind.
-    std::vector<const ProbePeerDescriptor*> accepted;
-    std::vector<EdgeKey> keys;
+    std::map<EdgeKey, CachedEdge> next;
+    std::set<EdgeKey> seen;
+    std::vector<RemoteSegmentPtr> retired;
+    auto key_of = [](const ProbePeerDescriptor& descriptor,
+                     EdgeKey& key) -> bool {
+        if (descriptor.local_nic < 0 ||
+            descriptor.peer_segment_id == LOCAL_SEGMENT_ID ||
+            descriptor.remote_nic < 0 || descriptor.topology_epoch == 0 ||
+            descriptor.target_epoch == 0) {
+            return false;
+        }
+        key = EdgeKey{descriptor.local_nic, descriptor.peer_segment_id,
+                      descriptor.remote_nic, descriptor.topology_epoch,
+                      descriptor.target_epoch};
+        return true;
+    };
+
     for (const auto& descriptor : descriptors) {
         if (descriptor.schema_version != kProbePeerDescriptorSchemaVersion) {
             // A peer that does not support probing is not an error: skip its
@@ -67,38 +83,49 @@ Status HandshakeProbePeerDirectory::snapshotEdges(
             ++unsupported_peer_count_;
             continue;
         }
-        if (descriptor.local_nic < 0 ||
-            descriptor.peer_segment_id == LOCAL_SEGMENT_ID ||
-            descriptor.remote_nic < 0 || descriptor.topology_epoch == 0 ||
-            descriptor.target_epoch == 0 || descriptor.area_length == 0 ||
-            descriptor.area_epoch == 0 ||
-            descriptor.area_descriptor.hex.empty()) {
-            return Status::InvalidArgument("malformed probe peer descriptor");
+        EdgeKey key{};
+        const bool has_key = key_of(descriptor, key);
+        const bool valid = has_key && descriptor.area_length != 0 &&
+                           descriptor.area_epoch != 0 &&
+                           !descriptor.area_descriptor.hex.empty();
+        if (!valid) {
+            ++malformed_descriptor_count_;
+            LOG_EVERY_N(WARNING, 100)
+                << "UB probe peer descriptor rejected: local_nic="
+                << descriptor.local_nic
+                << " peer=" << descriptor.peer_segment_id
+                << " remote_nic=" << descriptor.remote_nic
+                << " topology_epoch=" << descriptor.topology_epoch
+                << " target_epoch=" << descriptor.target_epoch;
+            // Keep the last good edge for the same key if it can be named.
+            if (has_key) {
+                auto existing = cache_.find(key);
+                if (existing != cache_.end()) {
+                    next.emplace(key, existing->second);
+                }
+            }
+            continue;
         }
         if (contexts_.find(descriptor.local_nic) == contexts_.end() ||
             !contexts_.at(descriptor.local_nic)) {
-            return Status::InvalidArgument(
-                "probe peer descriptor references an unknown local port");
+            ++unknown_local_port_count_;
+            LOG_EVERY_N(WARNING, 100)
+                << "UB probe peer descriptor references an unknown local "
+                   "port "
+                << descriptor.local_nic;
+            continue;
         }
-        const EdgeKey key{descriptor.local_nic, descriptor.peer_segment_id,
-                          descriptor.remote_nic, descriptor.topology_epoch,
-                          descriptor.target_epoch};
-        for (const auto& seen : keys) {
-            if (seen < key || key < seen) continue;
-            return Status::InvalidArgument("duplicate probe peer descriptor");
+        if (!seen.insert(key).second) {
+            ++duplicate_descriptor_count_;
+            LOG_EVERY_N(WARNING, 100)
+                << "UB probe peer descriptor duplicated: local_nic="
+                << descriptor.local_nic
+                << " peer=" << descriptor.peer_segment_id
+                << " remote_nic=" << descriptor.remote_nic;
+            continue;
         }
-        keys.push_back(key);
-        accepted.push_back(&descriptor);
-    }
 
-    std::map<EdgeKey, CachedEdge> next;
-    std::vector<RemoteSegmentPtr> retired;
-    for (const ProbePeerDescriptor* descriptor_ptr : accepted) {
-        const auto& descriptor = *descriptor_ptr;
         const auto& context = contexts_.at(descriptor.local_nic);
-        const EdgeKey key{descriptor.local_nic, descriptor.peer_segment_id,
-                          descriptor.remote_nic, descriptor.topology_epoch,
-                          descriptor.target_epoch};
         auto existing = cache_.find(key);
         if (existing != cache_.end() &&
             existing->second.descriptor_hex == descriptor.area_descriptor.hex) {
@@ -124,9 +151,9 @@ Status HandshakeProbePeerDirectory::snapshotEdges(
         options.token = descriptor.area_token != 0 ? descriptor.area_token
                                                    : kDefaultProbeAreaToken;
         RemoteSegmentPtr segment;
-        auto status = adapter_->importRemoteSegment(
+        auto import_status = adapter_->importRemoteSegment(
             context, descriptor.area_descriptor, options, segment);
-        if (!status.ok() || !segment || segment->address() == 0 ||
+        if (!import_status.ok() || !segment || segment->address() == 0 ||
             segment->length() == 0) {
             ++import_failure_count_;
             LOG_EVERY_N(WARNING, 100)
@@ -134,7 +161,7 @@ Status HandshakeProbePeerDirectory::snapshotEdges(
                 << descriptor.local_nic
                 << " peer=" << descriptor.peer_segment_id
                 << " remote_nic=" << descriptor.remote_nic
-                << " status=" << status.ToString();
+                << " status=" << import_status.ToString();
             // Keep the previous edge (if any) instead of dropping coverage on
             // a transient import failure.
             if (segment) retired.push_back(std::move(segment));
@@ -214,6 +241,21 @@ Status HandshakeProbePeerDirectory::shutdown() {
 size_t HandshakeProbePeerDirectory::unsupportedPeerCount() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return unsupported_peer_count_;
+}
+
+size_t HandshakeProbePeerDirectory::malformedDescriptorCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return malformed_descriptor_count_;
+}
+
+size_t HandshakeProbePeerDirectory::duplicateDescriptorCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return duplicate_descriptor_count_;
+}
+
+size_t HandshakeProbePeerDirectory::unknownLocalPortCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return unknown_local_port_count_;
 }
 
 size_t HandshakeProbePeerDirectory::importFailureCount() const {
