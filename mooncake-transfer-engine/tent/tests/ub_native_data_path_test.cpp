@@ -1760,13 +1760,14 @@ TEST(UbRmLegacyTest, EndpointProducesV2AndImportsPeerTargets) {
     // not import the peer targets a second time.
     EXPECT_TRUE(endpoint->bindRm(peer, expected).ok());
     EXPECT_EQ(adapter->importCalls(), 1U);
-    // A different peer generation is rejected without disturbing the
-    // established incarnation.
+    // A different peer generation is not merged into the established
+    // incarnation; it is reported as AlreadyExists so the target handler can
+    // retire the incumbent and retry once.
     auto other_generation = peer;
     other_generation.endpoint_generation = peer.endpoint_generation + 1;
     EXPECT_TRUE(
         endpoint->bindRm(other_generation, expectedForRmPeer(other_generation))
-            .IsInvalidArgument());
+            .IsAlreadyExists());
     EXPECT_EQ(endpoint->importedTargetCount(), 1U);
 
     // RC bind is rejected on an RM endpoint.
@@ -2069,7 +2070,7 @@ TEST(UbRmLegacyTest, BindRmClassifiesRepeatedBootstrapAgainstIncumbent) {
     auto conflict = peer;
     conflict.rm->targets[0].id = peer.rm->targets[0].id + 100;
     EXPECT_TRUE(endpoint->bindRm(conflict, expectedForRmPeer(conflict))
-                    .IsInvalidArgument());
+                    .IsAlreadyExists());
     EXPECT_TRUE(endpoint->ready());
     EXPECT_EQ(endpoint->importedTargetCount(), 1U);
 
@@ -2088,7 +2089,7 @@ TEST(UbRmLegacyTest, BindRmClassifiesRepeatedBootstrapAgainstIncumbent) {
     newer.endpoint_generation = peer.endpoint_generation + 1;
     newer.rm->targets[0].target_epoch = newer.endpoint_generation;
     EXPECT_TRUE(
-        endpoint->bindRm(newer, expectedForRmPeer(newer)).IsInvalidArgument());
+        endpoint->bindRm(newer, expectedForRmPeer(newer)).IsAlreadyExists());
     EXPECT_TRUE(endpoint->ready());
     EXPECT_EQ(endpoint->importedTargetCount(), 1U);
 

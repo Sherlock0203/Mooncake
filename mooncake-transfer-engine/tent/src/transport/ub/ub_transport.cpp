@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <condition_variable>
 #include <mutex>
 #include <new>
 #include <sstream>
@@ -1065,6 +1066,31 @@ struct UbTransport::Impl {
         installed.store(false, std::memory_order_release);
         shutting_down.store(true, std::memory_order_release);
 
+        // Wake every single-flight follower. Copy the flights under the map
+        // lock and signal them after releasing it: the leader takes the flight
+        // lock before the map lock, so the reverse order here would deadlock.
+        std::vector<std::shared_ptr<ResolveFlight>> pending_flights;
+        {
+            std::lock_guard<std::mutex> lock(resolve_flights_mutex);
+            pending_flights.reserve(resolve_flights.size());
+            for (const auto& [key, flight] : resolve_flights) {
+                (void)key;
+                if (flight) pending_flights.push_back(flight);
+            }
+        }
+        for (const auto& flight : pending_flights) {
+            {
+                std::lock_guard<std::mutex> lock(flight->mutex);
+                if (flight->done) continue;
+                flight->done = true;
+                flight->status = Status::InvalidArgument(
+                    "UB transport is shutting down" LOC_MARK);
+                flight->endpoint.reset();
+            }
+            flight->cv.notify_all();
+        }
+        resolve_flights.clear();
+
         // Callback replacement waits for a currently executing UB bootstrap
         // handler, fencing all control-plane access before resources retire.
         if (callback_installed && metadata) {
@@ -1261,6 +1287,74 @@ struct UbTransport::Impl {
 
     Status resolveEndpoint(const ub::EndpointResolveRequest& request,
                            std::shared_ptr<ub::UbEndpoint>& endpoint) {
+        // The single-flight key is exactly the EndpointStore key the leader
+        // will use. Invalid routes bypass the flight and let the leader return
+        // the precise error.
+        if (shutting_down.load(std::memory_order_acquire) ||
+            !request.local_context || !request.remote_segment) {
+            return resolveEndpointLeader(request, endpoint);
+        }
+        const auto* remote_nic =
+            request.remote_segment->getMemory().topology.getNicEntry(
+                request.remote_topology_id);
+        if (!remote_nic || remote_nic->type != Topology::NIC_UB) {
+            return resolveEndpointLeader(request, endpoint);
+        }
+        const ub::UbEndpointKey key{
+            request.local_context->topologyId(), request.remote_segment_id,
+            request.remote_topology_id,
+            MakeNicPath(request.remote_segment->name, remote_nic->name)};
+        std::shared_ptr<ResolveFlight> flight;
+        bool leader = false;
+        {
+            std::lock_guard<std::mutex> lock(resolve_flights_mutex);
+            auto [it, inserted] = resolve_flights.try_emplace(key, nullptr);
+            if (inserted || !it->second) {
+                it->second = std::make_shared<ResolveFlight>();
+                flight = it->second;
+                leader = true;
+            } else {
+                flight = it->second;
+            }
+        }
+        if (!leader) {
+            std::unique_lock<std::mutex> lock(flight->mutex);
+            constexpr auto kResolveFlightWait = std::chrono::milliseconds(5000);
+            if (!flight->cv.wait_for(lock, kResolveFlightWait,
+                                     [&] { return flight->done; })) {
+                return Status::TooManyRequests(
+                    "UB endpoint resolution is still in flight" LOC_MARK);
+            }
+            if (!flight->status.ok()) return flight->status;
+            if (!flight->endpoint || !flight->endpoint->ready()) {
+                return Status::TooManyRequests(
+                    "UB endpoint resolution finished without a ready "
+                    "endpoint" LOC_MARK);
+            }
+            endpoint = flight->endpoint;
+            return Status::OK();
+        }
+
+        Status status = resolveEndpointLeader(request, endpoint);
+        {
+            std::lock_guard<std::mutex> lock(flight->mutex);
+            flight->status = status;
+            flight->endpoint = status.ok() ? endpoint : nullptr;
+            flight->done = true;
+        }
+        flight->cv.notify_all();
+        {
+            std::lock_guard<std::mutex> lock(resolve_flights_mutex);
+            auto it = resolve_flights.find(key);
+            if (it != resolve_flights.end() && it->second == flight) {
+                resolve_flights.erase(it);
+            }
+        }
+        return status;
+    }
+
+    Status resolveEndpointLeader(const ub::EndpointResolveRequest& request,
+                                 std::shared_ptr<ub::UbEndpoint>& endpoint) {
         endpoint.reset();
         if (shutting_down.load(std::memory_order_acquire) || !endpoints ||
             !request.local_context || !request.remote_segment) {
@@ -1378,6 +1472,13 @@ struct UbTransport::Impl {
             }
         }
         if (!status.ok()) {
+            endpoint_bind_fail.fetch_add(1, std::memory_order_relaxed);
+            LOG_EVERY_N(WARNING, 20)
+                << "UB endpoint bind failed: local_nic="
+                << request.local_context->topologyId()
+                << " remote_nic=" << request.remote_topology_id << " state="
+                << (endpoint ? static_cast<int>(endpoint->state()) : -1)
+                << " status=" << status.ToString();
             (void)endpoints->retire(endpoint);
             endpoint.reset();
             return status;
@@ -1644,6 +1745,30 @@ struct UbTransport::Impl {
         std::shared_ptr<ub::UbEndpoint> endpoint;
         auto status = endpoints->getOrCreate(key, context, endpoint);
         if (status.ok()) status = endpoint->bindRm(request, expected);
+        if (!status.ok() && status.IsAlreadyExists()) {
+            // The incumbent cannot be merged with this bootstrap (same
+            // incarnation/different content, or a newer generation). Retire it
+            // and retry once in the same RPC: the requester has already paid
+            // the round trip, and leaving the stale incumbent in place makes
+            // the requester loop forever. A stale request never reaches this
+            // branch (kStale stays InvalidArgument), so a late request cannot
+            // evict a newer incumbent.
+            endpoint_bind_conflict.fetch_add(1, std::memory_order_relaxed);
+            endpoint_bind_replace_retry.fetch_add(1, std::memory_order_relaxed);
+            LOG_EVERY_N(WARNING, 100)
+                << "UB RM bootstrap replacing incumbent: local_nic="
+                << context->topologyId()
+                << " remote_device=" << request.local_device_id
+                << " reason=" << status.ToString();
+            if (endpoint) (void)endpoints->retire(endpoint);
+            endpoint.reset();
+            status = endpoints->getOrCreate(key, context, endpoint);
+            if (status.ok()) status = endpoint->bindRm(request, expected);
+            if (status.ok()) {
+                endpoint_bind_replace_ok.fetch_add(1,
+                                                   std::memory_order_relaxed);
+            }
+        }
         if (status.ok()) {
             status = endpoint->makeBootstrapDescV2(
                 local_segment_name, request.peer_nic_path,
@@ -1654,6 +1779,7 @@ struct UbTransport::Impl {
             recordReadyEndpoint(endpoint);
         }
         if (!status.ok()) {
+            endpoint_bind_fail.fetch_add(1, std::memory_order_relaxed);
             if (endpoint) (void)endpoints->retire(endpoint);
             response = UbBootstrapDesc{};
             response.protocol_version = 2;
@@ -1741,6 +1867,22 @@ struct UbTransport::Impl {
     std::atomic<uint64_t> endpoint_resolve_bootstrap_fail{0};
     std::atomic<uint64_t> endpoint_resolve_rpc_us_sum{0};
     std::atomic<uint64_t> endpoint_resolve_rpc_us_max{0};
+    std::atomic<uint64_t> endpoint_bind_fail{0};
+    std::atomic<uint64_t> endpoint_bind_conflict{0};
+    std::atomic<uint64_t> endpoint_bind_replace_retry{0};
+    std::atomic<uint64_t> endpoint_bind_replace_ok{0};
+
+    struct ResolveFlight {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool done{false};
+        Status status;
+        std::shared_ptr<ub::UbEndpoint> endpoint;
+    };
+    std::mutex resolve_flights_mutex;
+    std::unordered_map<ub::UbEndpointKey, std::shared_ptr<ResolveFlight>,
+                       ub::UbEndpointKeyHash>
+        resolve_flights;
     bool probe_bootstrap_callback_installed{false};
 };
 

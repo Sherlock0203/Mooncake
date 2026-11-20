@@ -12,12 +12,19 @@
 #include <cassert>
 #include <chrono>
 #include <exception>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <utility>
 
 namespace mooncake::tent::ub {
 namespace {
+
+uint64_t descriptorHash(const UbBootstrapDesc& descriptor) {
+    UbBootstrapDesc content = descriptor;
+    content.reply_msg.clear();
+    return std::hash<std::string>{}(nlohmann::json(content).dump());
+}
 
 uint64_t generationSeed() {
     const auto wall = static_cast<uint64_t>(
@@ -441,6 +448,41 @@ Status UbEndpoint::bindRm(const UbBootstrapDesc& peer,
                 "Repeated RM bootstrap descriptor is structurally invalid: " +
                 compare_status.ToString() + LOC_MARK);
         }
+        if (VLOG_IS_ON(1) &&
+            comparison != UbBootstrapGenerationComparison::kDuplicate) {
+            auto target_ids = [](const UbBootstrapDesc& desc) {
+                std::string out;
+                if (!desc.rm.has_value()) return out;
+                for (const auto& target : desc.rm->targets) {
+                    out += std::to_string(target.id);
+                    out += "/";
+                    out += std::to_string(target.uasid);
+                    out += "/";
+                    out += std::to_string(target.target_epoch);
+                    out += ",";
+                }
+                return out;
+            };
+            VLOG(1)
+                << "UB RM bootstrap diff: comparison="
+                << static_cast<int>(comparison)
+                << " candidate{endpoint_gen=" << peer.endpoint_generation
+                << ",segment_gen=" << peer.segment_generation
+                << ",node_inc=" << (peer.rm ? peer.rm->node_incarnation : 0)
+                << ",ctx_inc=" << (peer.rm ? peer.rm->context_incarnation : 0)
+                << ",topo_epoch=" << (peer.rm ? peer.rm->topology_epoch : 0)
+                << ",device="
+                << (peer.rm ? peer.rm->physical_device_identity : "")
+                << ",targets=" << target_ids(peer) << "}"
+                << " incumbent{endpoint_gen=" << peer_.endpoint_generation
+                << ",segment_gen=" << peer_.segment_generation
+                << ",node_inc=" << (peer_.rm ? peer_.rm->node_incarnation : 0)
+                << ",ctx_inc=" << (peer_.rm ? peer_.rm->context_incarnation : 0)
+                << ",topo_epoch=" << (peer_.rm ? peer_.rm->topology_epoch : 0)
+                << ",device="
+                << (peer_.rm ? peer_.rm->physical_device_identity : "")
+                << ",targets=" << target_ids(peer_) << "}";
+        }
         switch (comparison) {
             case UbBootstrapGenerationComparison::kDuplicate:
                 return Status::OK();
@@ -449,13 +491,13 @@ Status UbEndpoint::bindRm(const UbBootstrapDesc& peer,
                     "RM bootstrap generation is stale; the incumbent endpoint "
                     "is preserved" LOC_MARK);
             case UbBootstrapGenerationComparison::kConflict:
-                return Status::InvalidArgument(
+                return Status::AlreadyExists(
                     "RM bootstrap conflicts with the incumbent generation: "
                     "the same incarnation published different "
                     "content" LOC_MARK);
             case UbBootstrapGenerationComparison::kNewer:
             default:
-                return Status::InvalidArgument(
+                return Status::AlreadyExists(
                     "RM peer generation advanced; the endpoint must be "
                     "re-created through a new incarnation" LOC_MARK);
         }
@@ -536,6 +578,7 @@ Status UbEndpoint::bindRm(const UbBootstrapDesc& peer,
     // validation and import succeeded.
     imported_targets_ = std::move(imported);
     peer_ = peer;
+    bound_descriptor_hash_ = descriptorHash(peer_);
     peer_generation_.store(peer.endpoint_generation, std::memory_order_release);
     lifecycle_status_ = Status::OK();
     state_.store(State::kReady, std::memory_order_release);
@@ -608,6 +651,12 @@ Status UbEndpoint::makeBootstrapDescV2(const std::string& segment_name,
     if (current != State::kPrepared && current != State::kReady) {
         return Status::InvalidArgument(
             "UB endpoint must be prepared before bootstrap" LOC_MARK);
+    }
+    if (current == State::kReady && !descriptorMatchesBoundLocked()) {
+        LOG_EVERY_N(WARNING, 100)
+            << "UB endpoint descriptor drifted without a generation bump:"
+            << " local_nic=" << context_->topologyId()
+            << " endpoint_gen=" << generation_;
     }
 
     const auto& device = context_->deviceInfo();
@@ -735,6 +784,11 @@ Status UbEndpoint::finishRetireLocked() {
     peer_generation_.store(0, std::memory_order_release);
     state_.store(State::kDestroyed, std::memory_order_release);
     return retire_status_;
+}
+
+bool UbEndpoint::descriptorMatchesBoundLocked() const {
+    return peer_.rm.has_value() &&
+           bound_descriptor_hash_ == descriptorHash(peer_);
 }
 
 Status UbEndpoint::retire() {

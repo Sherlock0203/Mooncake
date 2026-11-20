@@ -573,7 +573,28 @@ TEST(UbBootstrapTest, ComparesGenerationsWithoutOverwritingNewerSnapshots) {
     candidate.rm->targets[0].target_epoch--;
     candidate.endpoint_generation++;
     ASSERT_TRUE(compareUbBootstrapV2(candidate, current, comparison).ok());
-    EXPECT_EQ(comparison, UbBootstrapGenerationComparison::kConflict);
+    // Leaf generation is compared before the target set: a newer endpoint
+    // generation wins even when one incumbent target appears older.
+    EXPECT_EQ(comparison, UbBootstrapGenerationComparison::kNewer);
+
+    // D1 regression: a re-created endpoint has a new endpoint_generation and
+    // a completely new Jetty id range. The old order looked up the new target
+    // identities first and returned kConflict before reading the leaf.
+    candidate = current;
+    candidate.endpoint_generation++;
+    candidate.rm->probe_target_map.clear();
+    for (auto& target : candidate.rm->targets) {
+        target.id += 100;
+        target.target_identity += "-new";
+        target.target_epoch = candidate.endpoint_generation;
+    }
+    ASSERT_TRUE(compareUbBootstrapV2(candidate, current, comparison).ok());
+    EXPECT_EQ(comparison, UbBootstrapGenerationComparison::kNewer);
+
+    candidate = current;
+    candidate.rm->physical_device_identity = "different-device";
+    ASSERT_TRUE(compareUbBootstrapV2(candidate, current, comparison).ok());
+    EXPECT_EQ(comparison, UbBootstrapGenerationComparison::kNewer);
 
     candidate = current;
     candidate.rm->targets[0].eid = "0002:0000:0000:0000:0000:0000:0000:0000";

@@ -186,6 +186,9 @@ class UbEndpoint final : public std::enable_shared_from_this<UbEndpoint> {
     Status resetAndUnbindLocked();
     Status deleteJettysLocked();
     Status finishRetireLocked();
+    // Defense-in-depth for F2a: while kReady, the bound peer descriptor must
+    // not change without a new endpoint incarnation.
+    [[nodiscard]] bool descriptorMatchesBoundLocked() const;
     // Unimports every imported RM target in reverse import order. Only called
     // after the Jetty set is fenced and deleted, so no WR can still reference
     // a target. Failed handles stay owned for a later retry.
@@ -214,6 +217,7 @@ class UbEndpoint final : public std::enable_shared_from_this<UbEndpoint> {
     // has fenced and deleted every Jetty.
     std::vector<RemoteTargetPtr> imported_targets_;
     UbBootstrapDesc peer_;
+    uint64_t bound_descriptor_hash_{0};
     Status lifecycle_status_;
     Status retire_status_;
     bool native_quiesced_{false};
