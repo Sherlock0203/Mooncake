@@ -1537,9 +1537,14 @@ Status UbWorkers::chooseAndResolveEndpoint(
             std::move(rail_stats),
             quota_->availability(probe_path, pending.slice->spec().length)});
     }
+    const size_t counted_denied = adjacency_denied + invalid_edge_denied;
+    const size_t health_denied =
+        combinations > counted_denied + rails.size()
+            ? combinations - counted_denied - rails.size()
+            : 0;
     if (route.adjacency.enforced) {
-        declared_candidates_denied_.fetch_add(
-            adjacency_denied + invalid_edge_denied, std::memory_order_relaxed);
+        declared_candidates_denied_.fetch_add(counted_denied,
+                                              std::memory_order_relaxed);
     }
     if (rails.empty() && invalid_edge_denied == combinations) {
         LOG_EVERY_N(WARNING, params_.observability.leaseSampleEvery())
@@ -1547,7 +1552,8 @@ Status UbWorkers::chooseAndResolveEndpoint(
             << reinterpret_cast<uint64_t>(pending.task.get())
             << " slice=" << pending.slice->snapshot().id
             << " policy=" << (route.adjacency.enforced ? "declared" : "legacy")
-            << " candidates=" << combinations
+            << " candidates=" << combinations << " healthy=" << rails.size()
+            << " health_denied=" << health_denied
             << " denied{adjacency=" << adjacency_denied
             << ",invalid_edge=" << invalid_edge_denied << ",quota=0}";
         return Status::InvalidArgument(
@@ -1733,6 +1739,18 @@ Status UbWorkers::chooseAndResolveEndpoint(
         const auto slice = pending.slice->snapshot();
         const uint64_t task_id = reinterpret_cast<uint64_t>(pending.task.get());
         const bool declared = route.adjacency.enforced;
+        auto healthy_text = [&]() {
+            std::string out;
+            const size_t limit = std::min<size_t>(rails.size(), 8);
+            for (size_t i = 0; i < limit; ++i) {
+                if (i != 0) out += ",";
+                out += std::to_string(rails[i].local_id);
+                out += ":";
+                out += std::to_string(rails[i].remote_id);
+            }
+            if (rails.size() > limit) out += ",...";
+            return out;
+        };
         if (params_.observability.verbose_events) {
             LOG(INFO) << "UB endpoint select: task=" << task_id
                       << " slice=" << slice.id << " attempt=" << slice.attempt
@@ -1743,7 +1761,11 @@ Status UbWorkers::chooseAndResolveEndpoint(
                       << " rank=" << selected->score.topology_rank
                       << " probe_path=" << (route.probe_peer_id != 0 ? 1 : 0)
                       << " denied{adjacency=" << adjacency_denied
-                      << ",invalid_edge=" << invalid_edge_denied << ",quota=0}";
+                      << ",invalid_edge=" << invalid_edge_denied << ",quota=0}"
+                      << " healthy=" << rails.size()
+                      << " resolved=" << candidates.size()
+                      << " health_denied=" << health_denied
+                      << " healthy_paths=[" << healthy_text() << "]";
         } else if (VLOG_IS_ON(1)) {
             VLOG(1) << "UB endpoint select: task=" << task_id
                     << " slice=" << slice.id << " attempt=" << slice.attempt
@@ -1754,13 +1776,19 @@ Status UbWorkers::chooseAndResolveEndpoint(
                     << " rank=" << selected->score.topology_rank
                     << " probe_path=" << (route.probe_peer_id != 0 ? 1 : 0)
                     << " denied{adjacency=" << adjacency_denied
-                    << ",invalid_edge=" << invalid_edge_denied << ",quota=0}";
+                    << ",invalid_edge=" << invalid_edge_denied << ",quota=0}"
+                    << " healthy=" << rails.size()
+                    << " resolved=" << candidates.size()
+                    << " health_denied=" << health_denied << " healthy_paths=["
+                    << healthy_text() << "]";
         } else {
             LOG_EVERY_N(INFO, params_.observability.leaseSampleEvery())
                 << "UB endpoint select: task=" << task_id
                 << " slice=" << slice.id << " attempt=" << slice.attempt
                 << " policy=" << (declared ? "declared" : "legacy")
-                << " candidates=" << combinations << " start=" << start
+                << " candidates=" << combinations << " healthy=" << rails.size()
+                << " resolved=" << candidates.size()
+                << " health_denied=" << health_denied << " start=" << start
                 << " chosen=" << selected->score.local_topology_id << ":"
                 << selected->score.remote_device_id
                 << " rank=" << selected->score.topology_rank
