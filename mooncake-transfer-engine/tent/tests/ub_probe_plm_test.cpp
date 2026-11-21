@@ -754,6 +754,118 @@ TEST(UbProbeLinkManagerTest, HandleReplacedPreservesBackoff) {
     EXPECT_FALSE(plm.pendingActions(clock.now()).empty());
 }
 
+// F8: a retryable (capacity/not-ready) post rejection must keep the campaign's
+// verification obligation for that path. Cancelling the entry would leave a
+// HEALTHY sibling path with no reason to ever be verified again
+// (timeEligibleLocked never probes HEALTHY paths).
+TEST(UbProbeLinkManagerTest, RetryablePostRejectionKeepsTheVerificationTodo) {
+    TestClock clock;
+    ProbeLinkManager plm(defaultParams(), clock.clock());
+    auto graph = makeGraph({makePortSupply(0, 1)}, {makeEdgeSupply(0, 10, 0),
+                                                    makeEdgeSupply(0, 10, 1)});
+    ASSERT_TRUE(plm.initialize(graph).ok());
+    const PathVersion healthy{ProbePathKey{0, 10, 0}, 1, 1};
+    const PathVersion faulty{ProbePathKey{0, 10, 1}, 1, 1};
+
+    // The faulty sibling starts a campaign that verifies both paths: the
+    // healthy one is only probed because of this obligation.
+    plm.onBusinessPathError(makeEvidence(0, 10, 1),
+                            BusinessErrorKind::kPathFault, clock.now());
+    ASSERT_FALSE(plm.campaignView().empty());
+
+    uint64_t token_seq = 0;
+    auto posted = postNext(plm, token_seq, clock.now());
+    ASSERT_TRUE(posted.has_value());
+    ASSERT_EQ(posted->record->key.version, healthy);
+    // The provider rejected for a retryable reason.
+    plm.onPostResult(posted->record, ProbePostOutcome::kRejectedRetryable,
+                     clock.now());
+
+    EXPECT_EQ(plm.inflightCount(), 0U);
+    EXPECT_EQ(plm.stats().probe_post_rejected_retryable, 1U);
+    EXPECT_EQ(plm.stats().probe_post_rejected, 0U);
+    EXPECT_EQ(plm.stats().probe_verification_abandoned, 0U);
+    // The entry is still queued: the obligation was not dropped.
+    EXPECT_EQ(healthOf(plm, healthy).task, TaskState::kQueued);
+
+    // Once the backoff expires the same path is scheduled again.
+    const uint64_t retry_ns = plm.params().intervalNs() << 1;
+    clock.advance(retry_ns + 1);
+    // pendingActions() returns at most one probe per port, so drain the
+    // currently eligible sibling before checking that the retained path comes
+    // back. Every rejection is retryable, so this also proves the obligation
+    // survives more than one rejection.
+    bool scheduled = false;
+    for (int round = 0; round < 3 && !scheduled; ++round) {
+        auto next = postNext(plm, token_seq, clock.now());
+        if (!next.has_value()) break;
+        if (next->record->key.version == healthy) {
+            scheduled = true;
+            break;
+        }
+        plm.onPostResult(next->record, ProbePostOutcome::kRejectedRetryable,
+                         clock.now());
+        clock.advance(retry_ns + 1);
+    }
+    EXPECT_TRUE(scheduled);
+}
+
+// F8: a terminal rejection (revoked/superseded/invalid request) still cancels
+// the obligation, and that give-up is not counted as an abandoned retry.
+TEST(UbProbeLinkManagerTest, TerminalPostRejectionCancelsTheVerificationTodo) {
+    TestClock clock;
+    ProbeLinkManager plm(defaultParams(), clock.clock());
+    auto graph = makeGraph({makePortSupply(0, 1)}, {makeEdgeSupply(0, 10, 0),
+                                                    makeEdgeSupply(0, 10, 1)});
+    ASSERT_TRUE(plm.initialize(graph).ok());
+    const PathVersion healthy{ProbePathKey{0, 10, 0}, 1, 1};
+
+    plm.onBusinessPathError(makeEvidence(0, 10, 1),
+                            BusinessErrorKind::kPathFault, clock.now());
+    uint64_t token_seq = 0;
+    auto posted = postNext(plm, token_seq, clock.now());
+    ASSERT_TRUE(posted.has_value());
+    ASSERT_EQ(posted->record->key.version, healthy);
+    plm.onPostResult(posted->record, ProbePostOutcome::kRejected, clock.now());
+
+    EXPECT_EQ(plm.inflightCount(), 0U);
+    EXPECT_EQ(plm.stats().probe_post_rejected, 1U);
+    EXPECT_EQ(plm.stats().probe_post_rejected_retryable, 0U);
+    EXPECT_EQ(plm.stats().probe_verification_abandoned, 0U);
+    // This path's entry is closed rather than retried. The campaign may still
+    // be alive for the other (faulty) sibling, which is the point: only the
+    // terminal rejection's own obligation is dropped.
+    EXPECT_EQ(healthOf(plm, healthy).task, TaskState::kIdle);
+}
+
+// F8: persistent retryable rejections are bounded. After the cap the retry
+// obligation is abandoned explicitly and counted, so it no longer looks like a
+// silent drop.
+TEST(UbProbeLinkManagerTest, RetryableRejectionCapAbandonsAndCounts) {
+    TestClock clock;
+    auto params = defaultParams();
+    params.post_rejection_cap = 3;
+    ProbeLinkManager plm(params, clock.clock());
+    auto graph = makeGraph({makePortSupply(0, 1)}, {makeEdgeSupply(0, 10, 0)});
+    ASSERT_TRUE(plm.initialize(graph).ok());
+
+    plm.onBusinessPathError(makeEvidence(0, 10, 0),
+                            BusinessErrorKind::kPathFault, clock.now());
+    uint64_t token_seq = 0;
+    const uint32_t attempts = params.post_rejection_cap + 1;
+    for (uint32_t i = 0; i < attempts; ++i) {
+        clock.advance((plm.params().intervalNs() << 4) + 1);
+        auto posted = postNext(plm, token_seq, clock.now());
+        ASSERT_TRUE(posted.has_value()) << "attempt " << i;
+        plm.onPostResult(posted->record, ProbePostOutcome::kRejectedRetryable,
+                         clock.now());
+        EXPECT_EQ(plm.inflightCount(), 0U);
+    }
+    EXPECT_EQ(plm.stats().probe_post_rejected_retryable, attempts);
+    EXPECT_EQ(plm.stats().probe_verification_abandoned, 1U);
+    EXPECT_TRUE(plm.campaignView().empty());
+}
+
 }  // namespace
 }  // namespace ub
 }  // namespace tent

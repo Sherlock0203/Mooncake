@@ -332,6 +332,10 @@ class ProbeLinkManager final : public ProbeAvailabilitySink {
         uint64_t pending_since_ns{0};
         // Why this path is DISABLED. kNone for every other health state.
         DisableCause disable_cause{DisableCause::kNone};
+        // F8: consecutive retryable post rejections for this path. Lives on
+        // the runtime (not the record) because every attempt creates a new
+        // record; reset as soon as a post is accepted.
+        uint32_t post_rejections{0};
     };
 
     struct PortRuntime {

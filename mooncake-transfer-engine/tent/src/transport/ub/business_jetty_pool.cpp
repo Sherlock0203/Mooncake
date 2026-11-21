@@ -536,8 +536,9 @@ Status BusinessJettyPool::returnOnce(SliceJettyLease lease,
             LOG(ERROR) << "UB pool double return: device_key=" << device_key_
                        << " pool_gen=" << member->pool_key.context_incarnation
                        << " lane_gen=" << member->lane.lane_generation
-                       << " jetty=" << member->lane.jetty_id
-                       << " state=" << static_cast<int>(member->state);
+                       << " jetty=" << member->lane.jetty_id << " state="
+                       << static_cast<int>(
+                              member->state.load(std::memory_order_relaxed));
             return Status::InvalidArgument(
                 "UB send pool lease returned twice" LOC_MARK);
         }
@@ -650,8 +651,9 @@ Status BusinessJettyPool::retireFaulted(SliceJettyLease lease,
                  << " pool_gen=" << member->pool_key.context_incarnation
                  << " lane_gen=" << member->lane.lane_generation
                  << " jetty=" << member->lane.jetty_id
-                 << " reason=" << member->retire_reason
-                 << " state=" << static_cast<int>(member->state)
+                 << " reason=" << member->retire_reason << " state="
+                 << static_cast<int>(
+                        member->state.load(std::memory_order_relaxed))
                  << " epoch=" << member->error_epoch;
     if (controller != nullptr) {
         // Non-blocking hand-off: the chain continues on the control executor.
@@ -875,7 +877,6 @@ void BusinessJettyPool::finishDelete(const std::shared_ptr<PoolMember>& member,
                                      DeleteOutcome outcome) {
     switch (outcome.kind) {
         case DeleteOutcome::Kind::kConsumed: {
-            member->state = PoolMemberState::kDestroyed;
             ++delete_consumed_;
             // No release without evidence: the tombstone entry is erased only
             // now that the provider proved destruction.
@@ -886,7 +887,12 @@ void BusinessJettyPool::finishDelete(const std::shared_ptr<PoolMember>& member,
                 return;
             }
             {
+                // State transition and container mutation in one critical
+                // section: no observer may see "destroyed" while the member is
+                // still in a container (and vice versa).
                 std::lock_guard<std::mutex> lock(mutex_);
+                member->state.store(PoolMemberState::kDestroyed,
+                                    std::memory_order_release);
                 delete_retry_at_ns_.erase(member->lane.lane_generation);
                 retained_.erase(member->lane.lane_generation);
             }
@@ -915,8 +921,9 @@ void BusinessJettyPool::finishDelete(const std::shared_ptr<PoolMember>& member,
             delay_ms =
                 std::min<uint64_t>(delay_ms << capped,
                                    std::max<uint32_t>(1, options_.cooldown_ms));
-            member->state = PoolMemberState::kDeleteReady;
             std::lock_guard<std::mutex> lock(mutex_);
+            member->state.store(PoolMemberState::kDeleteReady,
+                                std::memory_order_release);
             delete_retry_at_ns_[member->lane.lane_generation] =
                 steadyNowNs() + delay_ms * 1'000'000ULL;
             retained_[member->lane.lane_generation] = member;
@@ -932,10 +939,11 @@ void BusinessJettyPool::finishDelete(const std::shared_ptr<PoolMember>& member,
             // Undecidable destruction: keep the handle owned by the member so
             // a later drain can retry, and keep the budget charged (INV09).
             ++delete_unknown_;
-            member->state = PoolMemberState::kQuarantined;
             (void)budget_->transition(member->budget,
                                       BudgetObjectState::kQuarantined);
             std::lock_guard<std::mutex> lock(mutex_);
+            member->state.store(PoolMemberState::kQuarantined,
+                                std::memory_order_release);
             delete_retry_at_ns_.erase(member->lane.lane_generation);
             retained_.erase(member->lane.lane_generation);
             quarantined_.push_back(member);
@@ -982,7 +990,8 @@ void BusinessJettyPool::onLeaseLeaked(
         std::lock_guard<std::mutex> lock(mutex_);
         ++leaked_leases_;
         if (member == nullptr) return;
-        if (member->state == PoolMemberState::kInUse) {
+        if (member->state.load(std::memory_order_acquire) ==
+            PoolMemberState::kInUse) {
             auto bucket = buckets_.find(member->pool_key);
             if (bucket != buckets_.end() && bucket->second.in_use > 0) {
                 --bucket->second.in_use;
@@ -1269,35 +1278,41 @@ SendJettyPoolStats BusinessJettyPool::stats() const {
     result.flushing_members = flushing_;
     result.draining_members = draining_.size();
     result.quarantined_members = quarantined_.size();
-    result.drain_begin = drain_begin_;
-    result.drain_delete_ready = drain_delete_ready_;
-    result.drain_quarantined = drain_quarantined_;
-    result.delete_consumed = delete_consumed_;
-    result.delete_retained = delete_retained_;
-    result.delete_unknown = delete_unknown_;
+    result.drain_begin = drain_begin_.load(std::memory_order_relaxed);
+    result.drain_delete_ready =
+        drain_delete_ready_.load(std::memory_order_relaxed);
+    result.drain_quarantined =
+        drain_quarantined_.load(std::memory_order_relaxed);
+    result.delete_consumed = delete_consumed_.load(std::memory_order_relaxed);
+    result.delete_retained = delete_retained_.load(std::memory_order_relaxed);
+    result.delete_unknown = delete_unknown_.load(std::memory_order_relaxed);
     for (const auto& entry : buckets_) {
         if (entry.second.backoff_attempts != 0 &&
             steadyNowNs() < entry.second.backoff_until_ns) {
             ++result.backoff_keys;
         }
     }
-    result.total_leases = total_leases_;
-    result.total_returns = total_returns_;
-    result.pool_misses = pool_misses_;
-    result.stop_rejections = stop_rejections_;
-    result.leaked_leases = leaked_leases_;
-    result.created_members = created_members_;
-    result.create_failures = create_failures_;
+    result.total_leases = total_leases_.load(std::memory_order_relaxed);
+    result.total_returns = total_returns_.load(std::memory_order_relaxed);
+    result.pool_misses = pool_misses_.load(std::memory_order_relaxed);
+    result.stop_rejections = stop_rejections_.load(std::memory_order_relaxed);
+    result.leaked_leases = leaked_leases_.load(std::memory_order_relaxed);
+    result.created_members = created_members_.load(std::memory_order_relaxed);
+    result.create_failures = create_failures_.load(std::memory_order_relaxed);
     result.create_failures_unproven =
         create_failures_unproven_.load(std::memory_order_relaxed);
     result.budget_release_anomalies =
         budget_release_anomalies_.load(std::memory_order_relaxed);
-    result.double_returns = double_returns_;
-    result.create_backoffs = create_backoffs_;
-    result.fence_drained_completions = fence_drained_completions_;
-    result.tombstone_insert_failures = tombstone_insert_failures_;
-    result.tombstone_erase_misses = tombstone_erase_misses_;
-    result.backpressure_rejections = backpressure_rejections_;
+    result.double_returns = double_returns_.load(std::memory_order_relaxed);
+    result.create_backoffs = create_backoffs_.load(std::memory_order_relaxed);
+    result.fence_drained_completions =
+        fence_drained_completions_.load(std::memory_order_relaxed);
+    result.tombstone_insert_failures =
+        tombstone_insert_failures_.load(std::memory_order_relaxed);
+    result.tombstone_erase_misses =
+        tombstone_erase_misses_.load(std::memory_order_relaxed);
+    result.backpressure_rejections =
+        backpressure_rejections_.load(std::memory_order_relaxed);
     result.tombstone_backpressure = tombstone_backpressure_;
     result.quarantine_backpressure = quarantine_backpressure_;
     result.drain_admission_stopped = drain_controller_ != nullptr &&
@@ -1314,7 +1329,7 @@ std::vector<PoolMemberState> BusinessJettyPool::memberStates() const {
     std::vector<PoolMemberState> states;
     for (const auto& entry : buckets_) {
         for (const auto& member : entry.second.idle) {
-            states.push_back(member->state);
+            states.push_back(member->state.load(std::memory_order_acquire));
         }
         states.insert(states.end(), entry.second.in_use,
                       PoolMemberState::kInUse);
@@ -1328,9 +1343,12 @@ std::vector<PoolMemberState> BusinessJettyPool::memberStates() const {
     }
     // Members owned by the asynchronous drain chain are not in a container that
     // memberStates() otherwise walks.
-    for (const auto& entry : draining_) states.push_back(entry.second->state);
-    for (const auto& entry : retained_) states.push_back(entry.second->state);
-    for (const auto& member : quarantined_) states.push_back(member->state);
+    for (const auto& entry : draining_)
+        states.push_back(entry.second->state.load(std::memory_order_acquire));
+    for (const auto& entry : retained_)
+        states.push_back(entry.second->state.load(std::memory_order_acquire));
+    for (const auto& member : quarantined_)
+        states.push_back(member->state.load(std::memory_order_acquire));
     return states;
 }
 

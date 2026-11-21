@@ -19,6 +19,16 @@
 namespace mooncake {
 namespace tent {
 namespace ub {
+namespace {
+
+// F8: capacity / not-ready / transient provider errors keep the verification
+// obligation; argument and identity errors are terminal.
+bool probeRejectionIsRetryable(const Status& status) {
+    return status.IsTooManyRequests() || status.IsDeviceNotFound() ||
+           status.IsRdmaError();
+}
+
+}  // namespace
 
 UrmaProbePoster::UrmaProbePoster(std::shared_ptr<UrmaAdapter> adapter)
     : adapter_(std::move(adapter)) {}
@@ -72,7 +82,9 @@ Status UrmaProbePoster::post(const ProbePostTarget& target,
             outcome = ProbePostOutcome::kAccepted;
             break;
         case PostAcceptance::kNotAccepted:
-            outcome = ProbePostOutcome::kRejected;
+            outcome = probeRejectionIsRetryable(native.status)
+                          ? ProbePostOutcome::kRejectedRetryable
+                          : ProbePostOutcome::kRejected;
             break;
         case PostAcceptance::kUnknown:
         default:

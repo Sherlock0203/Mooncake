@@ -110,7 +110,10 @@ struct PoolMember {
     JettyPtr jetty;
     size_t jfc_index = 0;
     BudgetReservation budget{};
-    PoolMemberState state = PoolMemberState::kCreating;
+    // Written by the retire/delete path, read by memberStates()/stats() and
+    // the return path. Atomic so a delete-thread transition cannot be a torn
+    // read on the pool side (INV-3 / F9.3).
+    std::atomic<PoolMemberState> state{PoolMemberState::kCreating};
     uint64_t error_epoch = 0;
     // True once a tombstone entry records this generation's unproven
     // destruction. Native budget may only be released after that entry is
@@ -597,28 +600,31 @@ class BusinessJettyPool final
     // Null means "not attached": every retirement uses the synchronous fence.
     std::shared_ptr<JettyDrainController> drain_controller_;
 
-    // Diagnostics counters (protected by mutex_).
-    uint64_t total_leases_ = 0;
-    uint64_t total_returns_ = 0;
-    uint64_t pool_misses_ = 0;
-    uint64_t stop_rejections_ = 0;
-    uint64_t leaked_leases_ = 0;
-    uint64_t created_members_ = 0;
-    uint64_t create_failures_ = 0;
+    // Diagnostics counters. Atomic rather than mutex-protected: finishDelete()
+    // increments several of them on the retire thread and must not take the
+    // pool lock for bookkeeping (nested-lock risk), while stats() may read them
+    // at any time.
+    std::atomic<uint64_t> total_leases_{0};
+    std::atomic<uint64_t> total_returns_{0};
+    std::atomic<uint64_t> pool_misses_{0};
+    std::atomic<uint64_t> stop_rejections_{0};
+    std::atomic<uint64_t> leaked_leases_{0};
+    std::atomic<uint64_t> created_members_{0};
+    std::atomic<uint64_t> create_failures_{0};
     std::atomic<uint64_t> create_failures_unproven_{0};
     std::atomic<uint64_t> budget_release_anomalies_{0};
-    uint64_t double_returns_ = 0;
-    uint64_t create_backoffs_ = 0;
-    uint64_t fence_drained_completions_ = 0;
-    uint64_t drain_begin_ = 0;
-    uint64_t drain_delete_ready_ = 0;
-    uint64_t drain_quarantined_ = 0;
-    uint64_t delete_consumed_ = 0;
-    uint64_t delete_retained_ = 0;
-    uint64_t delete_unknown_ = 0;
-    uint64_t tombstone_insert_failures_ = 0;
-    uint64_t tombstone_erase_misses_ = 0;
-    uint64_t backpressure_rejections_ = 0;
+    std::atomic<uint64_t> double_returns_{0};
+    std::atomic<uint64_t> create_backoffs_{0};
+    std::atomic<uint64_t> fence_drained_completions_{0};
+    std::atomic<uint64_t> drain_begin_{0};
+    std::atomic<uint64_t> drain_delete_ready_{0};
+    std::atomic<uint64_t> drain_quarantined_{0};
+    std::atomic<uint64_t> delete_consumed_{0};
+    std::atomic<uint64_t> delete_retained_{0};
+    std::atomic<uint64_t> delete_unknown_{0};
+    std::atomic<uint64_t> tombstone_insert_failures_{0};
+    std::atomic<uint64_t> tombstone_erase_misses_{0};
+    std::atomic<uint64_t> backpressure_rejections_{0};
     bool tombstone_backpressure_ = false;
     bool quarantine_backpressure_ = false;
 };

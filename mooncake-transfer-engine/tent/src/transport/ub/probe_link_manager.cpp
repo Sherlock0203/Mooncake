@@ -344,6 +344,7 @@ void ProbeLinkManager::publishHealthyLocked(const PathVersion& version,
                                             const char* reason,
                                             Effects& effects) {
     runtime.next_probe_ns = 0;
+    runtime.post_rejections = 0;
     setHealthLocked(version, runtime, LinkHealth::kHealthy, reason, effects);
 }
 
@@ -633,11 +634,17 @@ void ProbeLinkManager::onPostResult(const std::shared_ptr<ProbeRecord>& record,
              !record->core.finalize_claimed.load(std::memory_order_acquire))) {
             return;
         }
+        bool retryable_handled = false;
         switch (outcome) {
-            case ProbePostOutcome::kAccepted:
+            case ProbePostOutcome::kAccepted: {
                 // The completion may legally have arrived before the post
                 // returned; the WR was still accepted, so count it either way.
                 ++stats_.probe_posted;
+                PathRuntime* accepted_runtime =
+                    findPathLocked(record->key.version);
+                if (accepted_runtime != nullptr) {
+                    accepted_runtime->post_rejections = 0;
+                }
                 if (record->core.finalize_claimed.load(
                         std::memory_order_acquire))
                     return;
@@ -645,6 +652,7 @@ void ProbeLinkManager::onPostResult(const std::shared_ptr<ProbeRecord>& record,
                 record->posted_ns = now;
                 record->deadline_ns = now + params_.timeoutNs();
                 return;
+            }
             case ProbePostOutcome::kUnknown:
                 // The provider could not prove non-acceptance: treat it as
                 // accepted, never resend (design §8.6).
@@ -659,53 +667,105 @@ void ProbeLinkManager::onPostResult(const std::shared_ptr<ProbeRecord>& record,
                 return;
             case ProbePostOutcome::kRejected:
                 break;
+            case ProbePostOutcome::kRejectedRetryable: {
+                // F8: capacity/not-ready rejections are not evidence against
+                // the path. Release the slot and budget (the concurrent quota
+                // really was returned) but keep the verification obligation:
+                // the campaign entry stays queued, so timeEligibleLocked()
+                // schedules the next attempt once the backoff expires.
+                ++stats_.probe_post_rejected_retryable;
+                record->state = RecordState::kRejected;
+                const uint64_t token = record->core.token;
+                inflight_.erase(token);
+                inflight_cv_.notify_all();
+                PortRuntime* port =
+                    findPortLocked(record->key.version.path.local_nic);
+                if (port != nullptr) releaseSlotLocked(*port, *record);
+                releaseBudgetLocked(record->peer);
+                PathRuntime* runtime = findPathLocked(record->key.version);
+                if (runtime != nullptr) {
+                    const uint32_t rejections = ++runtime->post_rejections;
+                    if (record->test_probe) {
+                        runtime->test_due_ns = now + params_.testIntervalNs();
+                    } else if (rejections > params_.post_rejection_cap) {
+                        // Give up the obligation explicitly and count it.
+                        ++stats_.probe_verification_abandoned;
+                        campaignProgressLocked(record->key,
+                                               EntryState::kCanceled);
+                        LOG_EVERY_N(WARNING, 10)
+                            << "UB probe verification abandoned after "
+                            << rejections << " retryable post rejections: "
+                            << probeKeyText(record->key);
+                    } else {
+                        const uint32_t shift =
+                            std::min<uint32_t>(rejections, 4);
+                        runtime->next_probe_ns =
+                            now +
+                            std::min<uint64_t>(params_.intervalNs() << shift,
+                                               params_.backoffMaxNs());
+                    }
+                }
+                releaseTaskSlotLocked(*record);
+                source = std::move(record->source);
+                area = std::move(record->area);
+                // Do not fall into the terminal-rejection block below: the
+                // obligation is still alive, so the campaign entry must not be
+                // cancelled and probe_post_rejected must not be charged.
+                retryable_handled = true;
+                break;
+            }
         }
 
-        if (record->core.finalize_claimed.exchange(true)) {
-            // A real completion already claimed this record even though the
-            // provider reported "not accepted": the resource is
-            // self-contradictory, so retire the probe lane without rolling
-            // back health (design §8.6).
-            ++stats_.probe_post_conflict;
-            LOG_EVERY_N(WARNING, 10) << "UB probe post/completion conflict: "
-                                     << probeKeyText(record->key);
-            PortRuntime* port =
-                findPortLocked(record->key.version.path.local_nic);
-            if (port != nullptr && !params_.test_periodic_all) {
-                laneRetireLocked(*port, now, record->key.version,
-                                 Status::InternalError(
-                                     "probe post rejected after completion"),
-                                 effects);
-            }
-        } else {
-            ++stats_.probe_post_rejected;
-            LOG_EVERY_N(WARNING, 100)
-                << "UB probe post rejected: " << probeKeyText(record->key);
-            record->state = RecordState::kRejected;
-            const uint64_t token = record->core.token;
-            inflight_.erase(token);
-            inflight_cv_.notify_all();
-            PortRuntime* port =
-                findPortLocked(record->key.version.path.local_nic);
-            if (port != nullptr) releaseSlotLocked(*port, *record);
-            releaseBudgetLocked(record->peer);
-            PathRuntime* runtime = findPathLocked(record->key.version);
-            if (runtime != nullptr) {
-                if (record->test_probe) {
-                    runtime->test_due_ns = now + params_.testIntervalNs();
-                } else {
-                    runtime->next_probe_ns =
-                        now +
-                        std::min(params_.intervalNs(), kPostRejectedRetryCapNs);
+        if (!retryable_handled) {
+            if (record->core.finalize_claimed.exchange(true)) {
+                // A real completion already claimed this record even though the
+                // provider reported "not accepted": the resource is
+                // self-contradictory, so retire the probe lane without rolling
+                // back health (design §8.6).
+                ++stats_.probe_post_conflict;
+                LOG_EVERY_N(WARNING, 10)
+                    << "UB probe post/completion conflict: "
+                    << probeKeyText(record->key);
+                PortRuntime* port =
+                    findPortLocked(record->key.version.path.local_nic);
+                if (port != nullptr && !params_.test_periodic_all) {
+                    laneRetireLocked(
+                        *port, now, record->key.version,
+                        Status::InternalError(
+                            "probe post rejected after completion"),
+                        effects);
                 }
+            } else {
+                ++stats_.probe_post_rejected;
+                LOG_EVERY_N(WARNING, 100)
+                    << "UB probe post rejected: " << probeKeyText(record->key);
+                record->state = RecordState::kRejected;
+                const uint64_t token = record->core.token;
+                inflight_.erase(token);
+                inflight_cv_.notify_all();
+                PortRuntime* port =
+                    findPortLocked(record->key.version.path.local_nic);
+                if (port != nullptr) releaseSlotLocked(*port, *record);
+                releaseBudgetLocked(record->peer);
+                PathRuntime* runtime = findPathLocked(record->key.version);
+                if (runtime != nullptr) {
+                    if (record->test_probe) {
+                        runtime->test_due_ns = now + params_.testIntervalNs();
+                    } else {
+                        runtime->next_probe_ns =
+                            now + std::min(params_.intervalNs(),
+                                           kPostRejectedRetryCapNs);
+                    }
+                }
+                // A rejected post is not a path fault, but retrying it in a
+                // tight loop burns probe_seq without ever producing a
+                // completion. Close the campaign entry; the next
+                // campaign/periodic event retries.
+                campaignProgressLocked(record->key, EntryState::kCanceled);
+                releaseTaskSlotLocked(*record);
+                source = std::move(record->source);
+                area = std::move(record->area);
             }
-            // A rejected post is not a path fault, but retrying it in a tight
-            // loop burns probe_seq without ever producing a completion. Close
-            // the campaign entry; the next campaign/periodic event retries.
-            campaignProgressLocked(record->key, EntryState::kCanceled);
-            releaseTaskSlotLocked(*record);
-            source = std::move(record->source);
-            area = std::move(record->area);
         }
     }
 

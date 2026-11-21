@@ -115,6 +115,62 @@ TEST(UbProbePosterTest, RejectsMissingSourceSegment) {
     EXPECT_TRUE(adapter->shutdown().ok());
 }
 
+// F8: the probe side must not turn a capacity rejection into a dropped
+// verification obligation. Capacity / not-ready / transient device errors are
+// retryable; argument and identity errors are terminal.
+TEST(UbProbePosterTest, ClassifiesRejectionRetryability) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+    ContextPtr context;
+    ASSERT_TRUE(adapter->openContext(fakeDevice(), context).ok());
+    JfcPtr jfc;
+    ASSERT_TRUE(adapter->createJfc(context, JfcOptions{}, jfc).ok());
+    JettyOptions jetty_options;
+    jetty_options.transport_mode = JettyTransportMode::kRm;
+    JettyPtr jetty;
+    ASSERT_TRUE(adapter->createJetty(context, jfc, jetty_options, jetty).ok());
+
+    ProbePostTarget target;
+    target.probe_jetty = jetty;
+    target.jetty_generation = 1;
+    target.remote_jetty = RemoteJettyInfo{"eid", 401, 501, 0xACFE};
+    target.source_segment = std::make_shared<FakeLocalSegment>(0x100000, 4096);
+    target.area_segment = std::make_shared<FakeRemoteSegment>(
+        0xA00000, 4096, makeDescriptor(0xA00000, 4096));
+    ProbeWorkRequest request;
+    request.token = makeProbeToken(9);
+    request.source_address = 0x100000;
+    request.source_length = 1;
+    request.area_address = 0xA00000;
+    request.area_length = 1;
+
+    UrmaProbePoster poster(adapter);
+    auto classify = [&](const Status& status) {
+        adapter->setNextPostOutcome(status, /*posted_count=*/0);
+        size_t posted = 1;
+        ProbePostOutcome outcome = ProbePostOutcome::kAccepted;
+        const Status result = poster.post(target, request, posted, outcome);
+        EXPECT_FALSE(result.ok());
+        EXPECT_EQ(posted, 0U);
+        return outcome;
+    };
+
+    EXPECT_EQ(classify(Status::TooManyRequests("capacity")),
+              ProbePostOutcome::kRejectedRetryable);
+    EXPECT_EQ(classify(Status::DeviceNotFound("not ready")),
+              ProbePostOutcome::kRejectedRetryable);
+    EXPECT_EQ(classify(Status::RdmaError("transient")),
+              ProbePostOutcome::kRejectedRetryable);
+    // Argument/identity errors are terminal: retrying cannot help.
+    EXPECT_EQ(classify(Status::InvalidArgument("bad version")),
+              ProbePostOutcome::kRejected);
+    EXPECT_EQ(classify(Status::AlreadyExists("superseded")),
+              ProbePostOutcome::kRejected);
+
+    ASSERT_TRUE(adapter->resetJetty(jetty).ok());
+    ASSERT_TRUE(adapter->deleteJetty(jetty).ok());
+}
+
 }  // namespace
 }  // namespace ub
 }  // namespace tent

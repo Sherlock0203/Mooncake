@@ -359,6 +359,10 @@ struct ProbeParams {
     uint64_t timeout_ms{1000};
     uint32_t peer_budget{4};
     uint32_t failure_threshold{3};
+    // F8: consecutive retryable post rejections after which the verification
+    // obligation is abandoned explicitly (and counted) instead of silently
+    // dropped.
+    uint32_t post_rejection_cap{8};
     bool stop_on_recovery{true};
     uint32_t recover_success_threshold{1};
     ProbeJfcMode jfc_mode{ProbeJfcMode::kDedicated};
@@ -565,7 +569,12 @@ struct ProbeStats {
 // header so both the poster interface and the link manager can name it.
 enum class ProbePostOutcome : uint8_t {
     kAccepted,
+    // Terminal: the version was revoked/superseded or the request itself was
+    // invalid; the verification obligation may be dropped.
     kRejected,
+    // Retryable: capacity, not-ready, transient provider/device error. The
+    // verification obligation is kept and retried with backoff (F8).
+    kRejectedRetryable,
     kUnknown,
 };
 

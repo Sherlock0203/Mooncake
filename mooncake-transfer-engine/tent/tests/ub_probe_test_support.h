@@ -158,6 +158,7 @@ class RecordingReportSink : public ProbeReportSink {
 enum class FakePostResult : uint8_t {
     kAccepted,
     kRejected,
+    kRejectedRetryable,
     kUnknown,
 };
 
@@ -195,13 +196,38 @@ class FakeProbePoster : public ProbePoster {
                 posted = 1;
                 break;
             case FakePostResult::kRejected:
-                status = Status::InternalError("fake probe post rejected");
+                status = Status::InvalidArgument("fake probe post rejected");
+                break;
+            case FakePostResult::kRejectedRetryable:
+                // Capacity-style rejection with no acceptance.
+                status = Status::TooManyRequests(
+                    "fake probe post rejected (retryable)");
                 break;
             case FakePostResult::kUnknown:
                 // Provider returns OK but proves no acceptance: unknown.
                 break;
         }
         cv_.notify_all();
+        return status;
+    }
+
+    Status post(const ProbePostTarget& target, const ProbeWorkRequest& request,
+                size_t& posted, ProbePostOutcome& outcome) override {
+        const Status status = post(target, request, posted);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (result_ == FakePostResult::kRejectedRetryable) {
+                outcome = ProbePostOutcome::kRejectedRetryable;
+                return status;
+            }
+        }
+        if (posted >= 1) {
+            outcome = ProbePostOutcome::kAccepted;
+        } else if (!status.ok()) {
+            outcome = ProbePostOutcome::kRejected;
+        } else {
+            outcome = ProbePostOutcome::kUnknown;
+        }
         return status;
     }
 

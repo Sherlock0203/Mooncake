@@ -33,6 +33,7 @@
 #include "tent/transport/ub/native_budget.h"
 #include "tent/transport/ub/params.h"
 #include "tent/transport/ub/business_jetty_pool.h"
+#include "tent/transport/ub/jetty_refill_worker.h"
 #include "tent/transport/ub/urma_adapter.h"
 
 using mooncake::tent::Config;
@@ -1265,6 +1266,48 @@ Status parseUbParams(const std::string& json_text, UbParams& params) {
     const Status loaded = config.load(json_text);
     if (!loaded.ok()) return loaded;
     return UbParams::FromConfig(config, params);
+}
+
+// F9.2: requestWake() used to notify a predicate that only watched stop_, so
+// the worker slept until the original deadline. A wake edge must run one pass
+// before the interval elapses.
+TEST(UbJettyRefillWorkerTest, RequestWakeRunsAPassBeforeTheInterval) {
+    std::atomic<int> passes{0};
+    JettyRefillWorker worker([&] { passes.fetch_add(1); },
+                             /*interval_ms=*/2000);
+    ASSERT_TRUE(worker.start());
+    EXPECT_TRUE(worker.running());
+    EXPECT_EQ(passes.load(), 0);
+
+    worker.requestWake();
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (passes.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_GE(passes.load(), 1);
+
+    worker.stop();
+    EXPECT_FALSE(worker.running());
+}
+
+// F9.2: one requestWake() is one pass, not a permanent spin.
+TEST(UbJettyRefillWorkerTest, WakeEdgeIsConsumedOnce) {
+    std::atomic<int> passes{0};
+    JettyRefillWorker worker([&] { passes.fetch_add(1); },
+                             /*interval_ms=*/60000);
+    ASSERT_TRUE(worker.start());
+    worker.requestWake();
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (passes.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_GE(passes.load(), 1);
+    const int after_first = passes.load();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_EQ(passes.load(), after_first);
+    worker.stop();
 }
 
 }  // namespace

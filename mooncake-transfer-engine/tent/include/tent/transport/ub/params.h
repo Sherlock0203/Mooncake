@@ -566,6 +566,9 @@ struct UbParams {
         CHECK_STATUS(readPositive(config, "transports/ub/probe/interval_ms",
                                   parsed.probe.interval_ms,
                                   parsed.probe.interval_ms));
+        CHECK_STATUS(readPositive(
+            config, "transports/ub/probe/post_rejection_cap",
+            parsed.probe.post_rejection_cap, parsed.probe.post_rejection_cap));
         CHECK_STATUS(readPositive(config, "transports/ub/probe/backoff_max_ms",
                                   parsed.probe.backoff_max_ms,
                                   parsed.probe.backoff_max_ms));
