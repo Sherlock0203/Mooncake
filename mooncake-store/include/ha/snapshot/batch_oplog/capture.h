@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "ha/standby_metadata_store.h"
+#include "vsegment/vsegment_manager.h"
 
 namespace mooncake {
 
@@ -21,6 +22,8 @@ class BatchOpLogSnapshotCapture {
           producer_view_version(other.producer_view_version),
           segments(std::move(other.segments)),
           weight_metadata(std::move(other.weight_metadata)),
+          object_storage(std::move(other.object_storage)),
+          vsegment_partitions(std::move(other.vsegment_partitions)),
           cursor_(std::move(other.cursor_)),
           generation_(std::exchange(other.generation_, 0)),
           lease_state_(std::move(other.lease_state_)) {}
@@ -33,6 +36,8 @@ class BatchOpLogSnapshotCapture {
             producer_view_version = other.producer_view_version;
             segments = std::move(other.segments);
             weight_metadata = std::move(other.weight_metadata);
+            object_storage = std::move(other.object_storage);
+            vsegment_partitions = std::move(other.vsegment_partitions);
             cursor_ = std::move(other.cursor_);
             generation_ = std::exchange(other.generation_, 0);
             lease_state_ = std::move(other.lease_state_);
@@ -51,6 +56,8 @@ class BatchOpLogSnapshotCapture {
     ViewVersionId producer_view_version;
     std::vector<StandbySegmentInfo> segments;
     WeightMetadataSnapshot weight_metadata;
+    ObjectReplicaSnapshot object_storage;
+    std::vector<vsegment::PartitionVSegmentSnapshot> vsegment_partitions;
 
    private:
     friend class HotStandbyService;

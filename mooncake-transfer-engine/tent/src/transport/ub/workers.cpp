@@ -6,8 +6,15 @@
 #include <algorithm>
 #include <chrono>
 #include <limits>
+#include <new>
+#include <stdexcept>
+#include <thread>
 #include <unordered_set>
 #include <utility>
+
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 
 #include <glog/logging.h>
 
@@ -61,17 +68,34 @@ constexpr size_t kMinResolvedCandidates = 2;
 // far below any user-visible timeout; the epoch bumps remain the fast path.
 constexpr uint64_t kTimedDeferNs = 10'000'000ULL;
 
+// Idle-spin pause (yuanhao-1113, performance). Cheaper than a scheduler
+// handoff while a poller or the posting spinner is waiting for work.
+inline void cpuRelax() {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    asm volatile("yield" ::: "memory");
+#else
+    std::this_thread::yield();
+#endif
+}
+
 }  // namespace
 
 struct UbWorkers::Route {
     SegmentDescRef pin;
     BufferDesc* remote_buffer{nullptr};
+    // Decoded once per slice and reused by device ordering and the import.
     UbBufferMetadata metadata;
     std::vector<Topology::NicID> remote_devices;
     // Declaration gate for this peer, computed once per route.
     AdjacencyView adjacency;
     // Synthetic peer id for the probe graph; 0 when the peer is not declared.
     uint64_t probe_peer_id{LOCAL_SEGMENT_ID};
+    // Local buffer location, resolved once per slice (yuanhao-1113). A buffer
+    // whose registration resolved to one concrete location makes this a cached
+    // string, so the posting path issues no NUMA probe per slice.
+    std::string local_location{kWildcardLocation};
 };
 
 // Owner-side half of a completion record (design §5.3). The shared kernel
@@ -238,6 +262,7 @@ Status UbWorkers::stop() {
             }
         }
         queued_ = 0;
+        queued_hint_.store(0, std::memory_order_release);
         // Nothing may stay parked across a stop: every deferred slice is pulled
         // out and canceled below, so a parked item can never outlive the
         // posting threads that would have reflowed it (design §11.2).
@@ -430,67 +455,139 @@ Status UbWorkers::submit(const UbTask::Ptr& task, uint64_t device_mask) {
     if (!task) {
         return Status::InvalidArgument("Cannot submit a null UB task" LOC_MARK);
     }
+    return submitBatch({task}, device_mask);
+}
+
+thread_local bool UbWorkers::fail_second_enqueue_for_test_ = false;
+
+Status UbWorkers::submitBatch(const std::vector<UbTask::Ptr>& tasks,
+                              uint64_t device_mask) {
+    const bool fail_second_enqueue =
+        std::exchange(fail_second_enqueue_for_test_, false);
     if (!accepting_.load(std::memory_order_acquire)) {
         return Status::InvalidArgument(
             "UB workers are not accepting work" LOC_MARK);
     }
-    const auto snapshot = task->snapshot();
-    if (!snapshot.sealed) {
-        return Status::InvalidArgument(
-            "UB task must be sealed before submission" LOC_MARK);
-    }
-    const int priority =
-        std::clamp(task->request().priority, static_cast<int>(PRIO_HIGH),
-                   static_cast<int>(PRIO_LOW));
 
-    // ---- W3a: bounded queue, all-or-nothing per Task (design §6.1) --------
-    // Two disciplines are load-bearing here and both are easy to get wrong:
-    //
-    //  1. The capacity verdict comes strictly BEFORE any slice state change.
-    //     kQueued has no unmark path, so marking first and rejecting after
-    //     would leave every slice of the rejected Task permanently kQueued and
-    //     every later submit() would report nothing to queue: the Task would
-    //     hang forever (design §5.1 note, W3-IN-4).
-    //  2. `need` counts only slices that can actually be queued. A slice that
-    //     is already terminal or canceled must not inflate the estimate, or a
-    //     cancellation storm would backpressure healthy submissions.
-    const auto slices = task->slices();
+    // ---- Phase 1: validate the whole batch before any slice state changes ---
+    // yuanhao-1113 introduced the batch entry point; tent_merge's W3a rule is
+    // that every verdict which can reject the work is taken *before*
+    // markQueued(), because kQueued has no unmark path. Running the structural
+    // checks for the entire batch first preserves that rule for a batch: a
+    // null, duplicated or unsealed task can never leave an earlier task of the
+    // same batch half-submitted.
+    std::unordered_set<const UbTask*> unique_tasks;
+    for (const auto& task : tasks) {
+        if (!task) {
+            return Status::InvalidArgument(
+                "Cannot submit a null UB task" LOC_MARK);
+        }
+        if (!unique_tasks.insert(task.get()).second) {
+            return Status::InvalidArgument(
+                "Cannot submit the same UB task twice in one batch" LOC_MARK);
+        }
+        if (!task->snapshot().sealed) {
+            return Status::InvalidArgument(
+                "UB task must be sealed before submission" LOC_MARK);
+        }
+    }
+
+    // ---- Phase 2: one capacity verdict for the batch, then mark and insert --
+    // `need` counts only slices that can actually be queued: a slice that is
+    // already terminal or canceled must not inflate the estimate, or a
+    // cancellation storm would backpressure healthy submissions. Parked slices
+    // count against the same budget: a slice waiting for a lease is just as
+    // much queued work as one waiting for a lane.
     size_t need = 0;
-    for (const auto& slice : slices) {
-        if (slice && slice->queuedEligible()) ++need;
+    for (const auto& task : tasks) {
+        for (const auto& slice : task->slices()) {
+            if (slice && slice->queuedEligible()) ++need;
+        }
     }
 
     bool stopped_during_submit = false;
     bool budget_exhausted = false;
+    bool enqueue_failed = false;
+    size_t marked_count = 0;
+    size_t inserted_count = 0;
+    std::array<size_t, PRIO_LOW + 1> inserted_counts{};
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         if (!accepting_.load(std::memory_order_relaxed)) {
             stopped_during_submit = true;
+        } else if (!businessQueueAdmits(
+                       params_.queue_budget, static_cast<uint64_t>(queued_),
+                       static_cast<uint64_t>(defer_.parkedTotal()),
+                       static_cast<uint64_t>(need))) {
+            budget_exhausted = true;
         } else {
-            // Parked slices count against the same budget: a slice waiting for
-            // a lease is just as much queued work as one waiting for a lane.
-            if (!businessQueueAdmits(
-                    params_.queue_budget, static_cast<uint64_t>(queued_),
-                    static_cast<uint64_t>(defer_.parkedTotal()),
-                    static_cast<uint64_t>(need))) {
-                budget_exhausted = true;
-            } else {
-                for (const auto& slice : slices) {
-                    if (!slice || !slice->markQueued()) continue;
-                    queues_[priority].push_back(PendingSlice{
-                        task, slice, device_mask, priority,
-                        task->request().target_id, task->request().opcode});
-                    ++queued_;
+            try {
+                for (const auto& task : tasks) {
+                    const int priority = std::clamp(
+                        task->request().priority,
+                        static_cast<int>(PRIO_HIGH),
+                        static_cast<int>(PRIO_LOW));
+                    for (const auto& slice : task->slices()) {
+                        if (!slice || !slice->markQueued()) continue;
+                        ++marked_count;
+                        if (fail_second_enqueue && inserted_count == 1) {
+                            throw std::length_error(
+                                "Injected UB enqueue failure");
+                        }
+                        queues_[priority].push_back(PendingSlice{
+                            task, slice, device_mask, priority,
+                            task->request().target_id,
+                            task->request().opcode});
+                        ++inserted_counts[priority];
+                        ++inserted_count;
+                        ++queued_;
+                    }
+                }
+            } catch (const std::bad_alloc&) {
+                enqueue_failed = true;
+            } catch (const std::length_error&) {
+                enqueue_failed = true;
+            }
+            if (enqueue_failed) {
+                // Roll the queues back to their pre-batch shape. The slices
+                // stay marked kQueued because there is no unmark path, so the
+                // whole batch is canceled below instead of left unqueueable.
+                for (size_t priority = 0; priority < queues_.size();
+                     ++priority) {
+                    while (inserted_counts[priority] != 0) {
+                        queues_[priority].pop_back();
+                        --queued_;
+                        --inserted_counts[priority];
+                    }
                 }
             }
+            // Single write under queue_mutex_: the hint can never drift from
+            // the authoritative count.
+            queued_hint_.store(queued_, std::memory_order_release);
         }
+    }
+    if (enqueue_failed) {
+        // A markQueued() failure or enqueue exception may occur after earlier
+        // slices changed state. None of them are visible to posting workers;
+        // cancel every task of the batch so no slice remains orphaned in
+        // kQueued and the queue budget stays honest.
+        for (const auto& task : tasks) {
+            (void)task->requestCancellation();
+        }
+        queue_cv_.notify_all();
+        return Status::InternalError(
+            "Unable to enqueue UB task batch" LOC_MARK);
     }
     if (stopped_during_submit) {
         return Status::InvalidArgument(
             "UB workers stopped during submission" LOC_MARK);
     }
+    if (marked_count != need) {
+        return Status::InvalidArgument(
+            "UB task changed while it was being submitted" LOC_MARK);
+    }
     if (budget_exhausted) {
-        // Backpressure, not an error: the caller may resubmit the whole Task
+        // Backpressure, not an error: the caller may resubmit the whole batch
         // and no slice was touched.
         submit_backpressure_.fetch_add(1, std::memory_order_relaxed);
         return Status::TooManyRequests(
@@ -607,7 +704,39 @@ size_t UbWorkers::inflightCount() const {
     return records_.size();
 }
 
+bool UbWorkers::withinIdleSpin(uint64_t now_ns, uint64_t last_ns,
+                               uint32_t window_us) const {
+    if (window_us == 0 || last_ns == 0) return false;
+    // last_ns may be published by another thread after now_ns was sampled.
+    if (last_ns >= now_ns) return true;
+    return now_ns - last_ns < static_cast<uint64_t>(window_us) * 1000ULL;
+}
+
+void UbWorkers::spinForPending() {
+    if (params_.post_idle_spin_us == 0) return;
+    if (queued_hint_.load(std::memory_order_acquire) != 0) return;
+    bool expected = false;
+    if (!post_spinner_active_.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
+        return;
+    }
+    // Spin only while the previous post is recent. The caller always falls
+    // through to the locked condition-variable wait, which rechecks the
+    // queues, so leaving the spin early or late can never lose a wakeup.
+    while (posting_.load(std::memory_order_acquire) &&
+           queued_hint_.load(std::memory_order_acquire) == 0 &&
+           withinIdleSpin(steadyNowNs(),
+                          last_post_ns_.load(std::memory_order_relaxed),
+                          params_.post_idle_spin_us)) {
+        cpuRelax();
+    }
+    post_spinner_active_.store(false, std::memory_order_release);
+}
+
 UbWorkers::PopResult UbWorkers::popPending(PendingSlice& pending) {
+    // Idle spin runs before the lock: it only shortens the handoff of a
+    // pending queue, never replaces the locked predicate below.
+    spinForPending();
     std::unique_lock<std::mutex> lock(queue_mutex_);
     // The wait is bounded by one millisecond instead of the W2 fixed 50us sleep
     // (design §7.4). Two things need it: a timed defer (a device in recovery
@@ -628,6 +757,8 @@ UbWorkers::PopResult UbWorkers::popPending(PendingSlice& pending) {
             pending = std::move(queue.front());
             queue.pop_front();
             if (queued_ != 0) --queued_;
+            // Single write under queue_mutex_: the hint can never drift.
+            queued_hint_.store(queued_, std::memory_order_relaxed);
             return PopResult::kPending;
         }
     }
@@ -686,6 +817,7 @@ size_t UbWorkers::reflowDeferred() {
                                static_cast<int>(PRIO_LOW))]
                 .push_back(std::move(item));
             ++queued_;
+            queued_hint_.store(queued_, std::memory_order_release);
             reflow_requeued_.fetch_add(1, std::memory_order_relaxed);
         }
     }
@@ -696,9 +828,17 @@ size_t UbWorkers::reflowDeferred() {
 void UbWorkers::pollingLoop(size_t poller_index) {
     // The poller count is unchanged by probe support: probe slots are
     // distributed across the existing poller set (design §3.3 / §11.1).
+#if defined(__linux__)
+    // The default 50us timer slack would stretch the 20us idle sleep below
+    // to as much as 70us of completion latency (yuanhao-1113).
+    (void)prctl(PR_SET_TIMERSLACK, 1UL, 0UL, 0UL, 0UL);
+#endif
     const size_t poller_count = std::max<size_t>(
         1, std::min<size_t>(params_.poller_count, business_slots_.size()));
     uint64_t last_timeout_scan = 0;
+    // Idle-spin anchor for this poller (yuanhao-1113): the 20us sleep below is
+    // the fallback only when neither a completion landed nor a post is recent.
+    uint64_t last_progress_ns = 0;
     while (polling_.load(std::memory_order_acquire)) {
         bool progressed = false;
         // Pass one: probe completion queues first, so a business flood cannot
@@ -719,8 +859,19 @@ void UbWorkers::pollingLoop(size_t poller_index) {
             last_timeout_scan = now;
         }
         logBusinessSummary(now);
-        if (!progressed)
-            std::this_thread::sleep_for(std::chrono::microseconds(20));
+        if (progressed) {
+            last_progress_ns = now;
+            continue;
+        }
+        // Keep polling while a post or completion is recent so a sparse
+        // foreground transfer does not wait out a sleep after its WR lands.
+        const uint64_t last_activity_ns = std::max(
+            last_progress_ns, last_post_ns_.load(std::memory_order_relaxed));
+        if (withinIdleSpin(now, last_activity_ns, params_.poll_idle_spin_us)) {
+            cpuRelax();
+            continue;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(20));
     }
 }
 
@@ -1073,6 +1224,7 @@ void UbWorkers::enqueueRetry(const PendingSlice& pending) {
                                static_cast<int>(PRIO_LOW))]
                 .push_back(pending);
             ++queued_;
+            queued_hint_.store(queued_, std::memory_order_release);
         }
     }
     if (stopped) {
@@ -1097,6 +1249,11 @@ UbWorkers::PendingSlice UbWorkers::withDeferralCount(
 void UbWorkers::deferPending(const PendingSlice& pending, DeferReason reason,
                              uint64_t wait_epoch, uint64_t expire_ns) {
     if (!pending.slice) return;
+    // Diagnostics only (yuanhao-1113): a traced slice counts its deferrals so
+    // the task trace can separate queue latency from device latency.
+    if (pending.task && pending.task->traceEnabled()) {
+        pending.slice->noteDeferred();
+    }
     bool cancel = false;
     bool requeue = false;
     {
@@ -1129,6 +1286,7 @@ void UbWorkers::deferPending(const PendingSlice& pending, DeferReason reason,
                                    static_cast<int>(PRIO_LOW))]
                     .push_back(pending);
                 ++queued_;
+                queued_hint_.store(queued_, std::memory_order_release);
             } else {
                 cancel = true;
             }
@@ -1162,7 +1320,10 @@ Status UbWorkers::buildRoute(const PendingSlice& pending, Route& route) {
             if (!status.ok()) return status;
             route.remote_buffer = buffer;
             route.metadata = std::move(metadata);
-            route.remote_devices = orderedRemoteDevices(*segment, *buffer);
+            // Remote metadata is decoded once in this function and reused by
+            // device ordering and by importRemote (yuanhao-1113).
+            route.remote_devices =
+                orderedRemoteDevices(*segment, *buffer, route.metadata);
             if (probe_topology_ != nullptr) {
                 route.adjacency =
                     probe_topology_->viewFor(segment->name, *segment);
@@ -1180,15 +1341,23 @@ Status UbWorkers::buildRoute(const PendingSlice& pending, Route& route) {
         });
 }
 
+std::string UbWorkers::localLocationOf(const PendingSlice& pending) const {
+    // The registration already probed the buffer; reuse that unless it
+    // spanned several locations, so the common path makes no NUMA syscall.
+    auto location = buffers_->localLocation(
+        reinterpret_cast<uint64_t>(pending.slice->spec().local_address));
+    if (!location.empty()) return location;
+    auto locations = Platform::getLoader().getLocation(
+        pending.slice->spec().local_address, 1, true);
+    if (!locations.empty()) return locations.front().location;
+    return kWildcardLocation;
+}
+
 std::vector<UbWorkers::LocalDeviceCandidate> UbWorkers::orderedLocalDevices(
-    const PendingSlice& pending) const {
+    const PendingSlice& pending, const std::string& location) const {
     std::vector<LocalDeviceCandidate> ordered;
     std::unordered_set<Topology::NicID> seen;
     std::unordered_map<Topology::NicID, size_t> device_rank;
-    std::string location = kWildcardLocation;
-    auto locations = Platform::getLoader().getLocation(
-        pending.slice->spec().local_address, 1, true);
-    if (!locations.empty()) location = locations.front().location;
 
     auto append = [&](Topology::NicID id) {
         auto found = context_by_topology_id_.find(id);
@@ -1254,12 +1423,9 @@ std::vector<UbWorkers::LocalDeviceCandidate> UbWorkers::orderedLocalDevices(
 }
 
 std::vector<Topology::NicID> UbWorkers::orderedRemoteDevices(
-    const SegmentDesc& segment, const BufferDesc& buffer) {
+    const SegmentDesc& segment, const BufferDesc& buffer,
+    const UbBufferMetadata& metadata) {
     std::vector<Topology::NicID> ordered;
-    auto attr = buffer.transport_attrs.find(TransportType::UB);
-    if (attr == buffer.transport_attrs.end()) return ordered;
-    UbBufferMetadata metadata;
-    if (!decodeBufferMetadata(attr->second, metadata).ok()) return ordered;
     std::unordered_set<Topology::NicID> advertised;
     for (const auto& item : metadata.segments) {
         advertised.insert(item.topology_id);
@@ -1305,7 +1471,9 @@ Status UbWorkers::chooseAndResolveEndpoint(
         QuotaAvailability capacity;
     };
 
-    auto local_devices = orderedLocalDevices(pending);
+    // The local buffer's location is resolved once per slice (yuanhao-1113);
+    // a single-location buffer therefore costs no NUMA probe here.
+    auto local_devices = orderedLocalDevices(pending, route.local_location);
     auto remote_devices = route.remote_devices;
     // INV-1/INV-2: in declared mode the candidate set is exactly the resolved
     // bindings x declared adjacency, not the full local x remote discovery
@@ -1960,6 +2128,10 @@ void UbWorkers::processPending(const PendingSlice& pending,
     // then requeues immediately instead of dropping the wake-up (design §7.4).
     const DeferEpochs epochs = readDeferEpochs();
 
+    // Diagnostics only (yuanhao-1113): stamp the dequeue so the task trace can
+    // report queue_us separately from device_us.
+    const bool traced = pending.task && pending.task->traceEnabled();
+    if (traced) pending.slice->noteDequeued(steadyNowNs());
     Route route;
     auto status = buildRoute(pending, route);
     if (!status.ok()) {
@@ -1970,6 +2142,14 @@ void UbWorkers::processPending(const PendingSlice& pending,
         }
         return;
     }
+    route.local_location = localLocationOf(pending);
+    if (traced && pending.slice->spec().request_offset == 0) {
+        pending.task->noteTraceLocations(
+            route.local_location == kWildcardLocation ? std::string()
+                                                      : route.local_location,
+            route.remote_buffer->location);
+    }
+    const uint64_t route_ready_ns = traced ? steadyNowNs() : 0;
 
     std::shared_ptr<UbEndpoint> endpoint;
     UbPostPath path;
@@ -1993,6 +2173,7 @@ void UbWorkers::processPending(const PendingSlice& pending,
         }
         return;
     }
+    const uint64_t path_selected_ns = traced ? steadyNowNs() : 0;
 
     LocalSegmentRef local;
     status = buffers_->findLocal(
@@ -2006,7 +2187,7 @@ void UbWorkers::processPending(const PendingSlice& pending,
     ImportedSegmentRef remote;
     status = buffers_->importRemote(pending.target_id, path.local_topology_id,
                                     path.remote_device_id, *route.remote_buffer,
-                                    pending.opcode,
+                                    route.metadata, pending.opcode,
                                     pending.slice->spec().remote_address,
                                     pending.slice->spec().length, remote);
     if (!status.ok()) {
@@ -2022,6 +2203,7 @@ void UbWorkers::processPending(const PendingSlice& pending,
         }
         return;
     }
+    const uint64_t segments_ready_ns = traced ? steadyNowNs() : 0;
 
     if (!endpoint->tryAcquireOutstanding(pending.slice->spec().length)) {
         (void)quota_->release(reservation);
@@ -2042,6 +2224,12 @@ void UbWorkers::processPending(const PendingSlice& pending,
     // `pooledSendPool() != nullptr` selects the W3 pool-aware admission below;
     // otherwise the W2 path runs byte for byte, touching no lease, credit or K
     // slot (RK10).
+    // Diagnostics only (yuanhao-1113): the prepare phases are stamped right
+    // before the commit, so prep_commit_us is the pool-claim plus post time.
+    if (traced) {
+        pending.slice->notePrepareCheckpoints(route_ready_ns, path_selected_ns,
+                                              segments_ready_ns);
+    }
     const ProbePathKey probe_key = probeKeyFor(route, path);
     if (pooledPoolFor(endpoint)) {
         processPendingPooled(pending, worker_index, route, endpoint, path,
@@ -2111,7 +2299,13 @@ void UbWorkers::postLegacy(const PendingSlice& pending, size_t worker_index,
             status = Status::InternalError(
                 "RM endpoint has no imported target for this Jetty" LOC_MARK);
         } else {
+            // Anchor the pollers' idle-spin window (yuanhao-1113).
+            last_post_ns_.store(record->posted_ns, std::memory_order_relaxed);
             status = adapter_->post(jetty, {work}, posted_count, acceptance);
+            if (record->pending.task &&
+                record->pending.task->traceEnabled()) {
+                record->pending.slice->notePostReturned(steadyNowNs());
+            }
         }
         if (posted_count > 1) {
             // One WR can only produce one record, so more than one accepted WR
@@ -2335,6 +2529,8 @@ void UbWorkers::processPendingPooled(
         size_t posted_count = 0;
         PostAcceptance acceptance = PostAcceptance::kNotAccepted;
         Status status;
+        // Anchor the pollers' idle-spin window (yuanhao-1113).
+        last_post_ns_.store(record->posted_ns, std::memory_order_relaxed);
         if (!jetty) {
             status = Status::InternalError(
                 "UB pooled send Jetty is unavailable" LOC_MARK);
@@ -2359,6 +2555,9 @@ void UbWorkers::processPendingPooled(
             }
         } else {
             status = adapter_->post(jetty, {work}, posted_count, acceptance);
+        }
+        if (record->pending.task && record->pending.task->traceEnabled()) {
+            record->pending.slice->notePostReturned(steadyNowNs());
         }
         if (posted_count > 1) {
             LOG_EVERY_N(WARNING, 100)

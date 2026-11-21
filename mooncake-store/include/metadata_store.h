@@ -9,8 +9,11 @@
 #include <vector>
 
 #include "replica.h"
+#include "vsegment/vsegment_manager.h"
 #include "types.h"
 #include "weight_metadata_store.h"
+#include "storage/distributed/object_replica_state.h"
+#include "partition/vsegment_types.h"
 
 namespace mooncake {
 
@@ -41,11 +44,13 @@ struct StandbyObjectMetadata {
 
     struct_pack::compatible<std::string, 2> session_id;
     struct_pack::compatible<uint64_t, 3> object_checksum;
+    struct_pack::compatible<std::string, 4> residency_affinity_id;
 
     StandbyObjectMetadata() = default;
 
     YLT_REFL(StandbyObjectMetadata, client_id, size, replicas, group_id,
-             data_type, hard_pinned, session_id, object_checksum);
+             data_type, hard_pinned, session_id, object_checksum,
+             residency_affinity_id);
 
     // Check if this metadata has valid replicas
     bool HasReplicas() const { return !replicas.empty(); }
@@ -81,6 +86,28 @@ struct StandbyObjectEntry {
 };
 
 /**
+ * @brief Object-metadata export for a single KV slot (live primary -> live
+ * primary handoff).
+ *
+ * When a live primary gracefully releases a slot it no longer owns (scale-out /
+ * scale-in rebalance), it exports the object metadata of every key in that
+ * slot to etcd. The new owner then imports it to materialize the same
+ * key -> Replica::Descriptor[] mapping without moving any data bytes (which
+ * stay in their segments). Serialized with struct_pack (msgpack binary) and
+ * stored as a binary etcd value.
+ */
+struct SlotMetadataExport {
+    uint16_t slot{0};
+    std::string source_master_id;
+    std::vector<StandbyObjectEntry> objects;
+    struct_pack::compatible<vsegment::PartitionVSegmentSnapshot, 1>
+        vsegment_partition;
+
+    YLT_REFL(SlotMetadataExport, slot, source_master_id, objects,
+             vsegment_partition);
+};
+
+/**
  * Complete snapshot exported from standby at promotion time.
  * Includes applied OpLog sequence ID, all object metadata,
  * and all registered segments.
@@ -89,10 +116,14 @@ struct StandbySnapshot {
     uint64_t oplog_sequence_id{0};
     std::vector<StandbySegmentInfo> segments;
     std::vector<StandbyObjectEntry> objects;
+    // struct_pack compatible fields must stay last.
     struct_pack::compatible<WeightMetadataSnapshot, 1> weight_metadata;
+    struct_pack::compatible<ObjectReplicaSnapshot, 2> object_storage;
+    struct_pack::compatible<std::vector<vsegment::PartitionVSegmentSnapshot>, 3>
+        vsegment_partitions;
 
     YLT_REFL(StandbySnapshot, oplog_sequence_id, segments, objects,
-             weight_metadata);
+             weight_metadata, object_storage, vsegment_partitions);
 };
 
 /**
@@ -111,9 +142,10 @@ struct MetadataPayload {
 
     struct_pack::compatible<std::string, 2> session_id;
     struct_pack::compatible<uint64_t, 3> object_checksum;
+    struct_pack::compatible<std::string, 4> residency_affinity_id;
 
     YLT_REFL(MetadataPayload, client_id, size, replicas, group_id, data_type,
-             hard_pinned, session_id, object_checksum);
+             hard_pinned, session_id, object_checksum, residency_affinity_id);
 
     // Convert to StandbyObjectMetadata
     StandbyObjectMetadata ToStandbyMetadata() const {
@@ -126,6 +158,7 @@ struct MetadataPayload {
         meta.object_checksum = object_checksum;
         meta.data_type = data_type.value_or(ObjectDataType::UNKNOWN);
         meta.hard_pinned = hard_pinned.value_or(false);
+        meta.residency_affinity_id = residency_affinity_id.value_or("");
         return meta;
     }
 };
@@ -166,6 +199,12 @@ class StandbySegmentRegistry {
 class MetadataStore {
    public:
     virtual ~MetadataStore() = default;
+
+    virtual bool ApplyObjectReplicaMutation(
+        const std::string& tenant_id, const std::string& key,
+        const ObjectReplicaMutation& mutation) {
+        return false;
+    }
 
     // NEW: tenant-aware methods (primary API)
     virtual bool PutMetadata(const std::string& tenant_id,

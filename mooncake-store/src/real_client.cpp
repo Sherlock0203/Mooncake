@@ -13,19 +13,27 @@
 #include <cstring>
 #include <algorithm>
 #include <atomic>
+#include <climits>
 #include <condition_variable>
 #include <functional>
+#include <future>
 #include <limits>
 #include <mutex>
 #include <new>
 #include <optional>
 #include <span>
+#include <string_view>
+#include <ctime>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "real_client.h"
+#include "gpu_direct_read.h"
+#ifdef USE_UB
+#include "ub_allocator.h"
+#endif
 #include "embedded_master.h"
 #include "environ.h"
 #include "environment_variables.h"
@@ -37,10 +45,12 @@
 #include "batch_read_fanout.h"
 #include "common.h"
 #include "config.h"
+#include "config/distributed_storage_config.h"
 #include "config/rpc_protocol_config.h"
 #include "store_rpc_client_io_context.h"
 #include "bool_parser.h"
 #include "client_auto_port_config.h"
+#include "mooncake_logging.h"
 #include "config/cxl_segment_config.h"
 #include "config/egm_store_pool_config.h"
 #include "config/hugepage_config.h"
@@ -377,7 +387,7 @@ void *AllocateMemFabricStoreSegment(size_t segment_size,
     MemFabricHostAllocFn host_alloc = nullptr;
     size_t host_align = 0;
     size_t alloc_size = segment_size;
-    if (use_hugepage) {
+    if (use_hugepage && !memfabric_use_fabric_mem(protocol)) {
         host_align = get_hugepage_size_from_env();
         alloc_size = align_up(segment_size, host_align);
         host_alloc =
@@ -505,6 +515,17 @@ inline tl::expected<void, ErrorCode> gather_maybe_device_to_host(
     return {};
 }
 
+#if defined(USE_NOF) && defined(USE_NOF_URMA)
+inline bool NofEndpointIsUrma(const std::string &te_endpoint) {
+    return te_endpoint.find("trtype:URMA") != std::string::npos;
+}
+
+inline bool NofGpuStagingFallbackEnabled() {
+    const char *value = std::getenv("MC_NOF_GPU_STAGING_FALLBACK");
+    return value != nullptr && std::string(value) == "1";
+}
+#endif
+
 // SelectBestReplica and the replica-scoring helpers live in
 // replica_selection.h (included above) so they can be unit-tested directly.
 using mooncake::SelectBestReplica;
@@ -514,12 +535,14 @@ using mooncake::SelectBestReplica;
 inline QueryResult FilterQueryResult(const QueryResult &qr,
                                      const Replica::Descriptor &replica,
                                      bool include_object_checksum = true) {
-    return QueryResult(
+    QueryResult result(
         RetainMemoryReadCandidates(qr.replicas, replica,
                                    StoreHcaAffinityEnabled()),
         qr.lease_timeout,
         include_object_checksum ? qr.object_checksum : std::nullopt,
         qr.resolved_tenant_id);
+    result.vsegment_layouts = qr.vsegment_layouts;
+    return result;
 }
 
 // Shared object-byte range overflow check (same semantics as
@@ -604,7 +627,129 @@ inline bool HasMemoryReplica(const std::vector<Replica::Descriptor> &replicas) {
     return false;
 }
 
+// --- Start of *_breakdown observation helpers (ported from 930) ---
+
+// Aggregated timing of the three phases of an SSD-offload read (RPC to the
+// offload server, transfer-engine data fetch, release of the server-side
+// buffer lease). Written by batch_get_into_offload_object_internal and read
+// by get_into_breakdown logging.
+struct OffloadReadTiming {
+    uint64_t offload_rpc_us{0};
+    uint64_t transfer_data_us{0};
+    uint64_t release_buffer_us{0};
+};
+
+thread_local OffloadReadTiming *current_offload_read_timing = nullptr;
+
+// Installs (and on destruction restores) the thread-local timing sink for the
+// duration of one ranged read. Pass timing == nullptr to disable collection.
+class ScopedOffloadReadTiming {
+   public:
+    explicit ScopedOffloadReadTiming(OffloadReadTiming *timing)
+        : previous_(current_offload_read_timing) {
+        current_offload_read_timing = timing;
+    }
+    ~ScopedOffloadReadTiming() { current_offload_read_timing = previous_; }
+
+    ScopedOffloadReadTiming(const ScopedOffloadReadTiming &) = delete;
+    ScopedOffloadReadTiming &operator=(const ScopedOffloadReadTiming &) = delete;
+
+   private:
+    OffloadReadTiming *previous_;
+};
+
+// Formats a wall-clock timestamp as "YYYY-MM-DD HH:MM:SS.ffffff" in the local
+// timezone (matching the 930 *_breakdown start_time field).
+std::string FormatWallClock(std::chrono::system_clock::time_point tp) {
+    auto seconds =
+        std::chrono::time_point_cast<std::chrono::seconds>(tp);
+    auto microsecond_count =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            tp.time_since_epoch())
+            .count() % 1000000;
+    std::time_t raw_time =
+        std::chrono::system_clock::to_time_t(seconds);
+    struct tm tm_buf;
+    localtime_r(&raw_time, &tm_buf);
+    char buffer[32];
+    std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &tm_buf);
+    char result[64];
+    snprintf(result, sizeof(result), "%s.%06lld", buffer,
+             static_cast<long long>(microsecond_count));
+    return std::string(result);
+}
+
+// Human-readable replica classification for *_breakdown logs. Mirrors the
+// 930 DescribeReplicaForObservability helper: type is one of memory_local /
+// memory_remote / nof_local / nof_remote / vsegment / local_disk_local /
+// local_disk_remote / disk, remote_endpoint is the transport endpoint when
+// applicable and "-" otherwise.
+struct ReplicaObservabilityInfo {
+    std::string type{"unknown"};
+    std::string remote_endpoint{"-"};
+};
+
+ReplicaObservabilityInfo DescribeReplicaForObservability(
+    const Replica::Descriptor &replica,
+    const std::unordered_set<std::string> &local_endpoints,
+    const UUID &client_id) {
+    ReplicaObservabilityInfo info;
+    if (replica.is_memory_replica()) {
+        info.remote_endpoint = replica.get_memory_descriptor()
+                                   .buffer_descriptor.transport_endpoint_;
+        info.type = local_endpoints.count(info.remote_endpoint) > 0
+                        ? "memory_local"
+                        : "memory_remote";
+    } else if (replica.is_nof_replica()) {
+        info.remote_endpoint = replica.get_nof_descriptor()
+                                   .buffer_descriptor.transport_endpoint_;
+        info.type = local_endpoints.count(info.remote_endpoint) > 0
+                        ? "nof_local"
+                        : "nof_remote";
+    } else if (replica.is_vsegment_replica()) {
+        // A vsegment spans multiple member endpoints, so there is no single
+        // remote endpoint or meaningful local/remote suffix to report here.
+        info.type = "vsegment";
+    } else if (replica.is_local_disk_replica()) {
+        const auto &descriptor = replica.get_local_disk_descriptor();
+        info.remote_endpoint = descriptor.transport_endpoint;
+        info.type = descriptor.client_id == client_id ? "local_disk_local"
+                                                       : "local_disk_remote";
+    } else if (replica.is_disk_replica()) {
+        info.type = "disk";
+    } else if (replica.is_dfs_replica()) {
+        // 930 did not have DFS replicas; this branch is the one deliberate
+        // extension so the newer replica kind does not log as "unknown".
+        info.type = "dfs";
+    }
+    return info;
+}
+
+// --- End of *_breakdown observation helpers ---
+
 }  // namespace
+
+bool RealClient::can_read_ub_device_memory_direct(
+    const Replica::Descriptor &replica, void *dst, size_t size) const {
+#ifdef USE_UB
+    if (!client_) return false;
+    const char *mode = std::getenv("MC_UB_GPU_MODE");
+    const auto region = resolve_writable_buffer_region(dst);
+    if (!CanReadUbGpuDirect(replica.is_memory_replica(), client_->GetProtocol(),
+                            mode ? mode : "", region.has_value(),
+                            region ? region->size : 0,
+                            region ? region->offset : 0, size)) {
+        return false;
+    }
+    return client_->IsUbTransportSegment(
+        replica.get_memory_descriptor().buffer_descriptor.transport_endpoint_);
+#else
+    (void)replica;
+    (void)dst;
+    (void)size;
+    return false;
+#endif
+}
 
 class RealClient::OffloadRestoreLease {
    public:
@@ -625,8 +770,19 @@ class RealClient::OffloadRestoreLease {
             owner_->client_requester_ == nullptr) {
             return;
         }
-        owner_->client_requester_->release_offload_buffer(endpoint_,
-                                                          response_.batch_id);
+        // Observation only: time the owner-side release RPC. The non-null
+        // timing argument also lets the requester emit
+        // offload_release_client_breakdown under its own dice roll.
+        const auto release_start = std::chrono::steady_clock::now();
+        ClientRequester::RpcTiming release_timing;
+        owner_->client_requester_->release_offload_buffer(
+            endpoint_, response_.batch_id, &release_timing);
+        if (current_offload_read_timing) {
+            current_offload_read_timing->release_buffer_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - release_start)
+                    .count();
+        }
     }
 
     OffloadRestoreLease(const OffloadRestoreLease &) = delete;
@@ -1005,6 +1161,14 @@ void RealClient::SetTeUnregisterHookForTesting(
     TeUnregisterHookForTestingSlot() = std::move(hook);
 }
 
+Status RealClient::configureScheduling(
+    const scheduling::SchedulerConfig &scheduler_config) {
+    if (!client_) {
+        return Status::InvalidArgument("Real client is not initialized");
+    }
+    return client_->configureScheduling(scheduler_config);
+}
+
 tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &local_hostname, const std::string &metadata_server,
     size_t global_segment_size, size_t local_buffer_size,
@@ -1015,14 +1179,15 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     bool enable_ssd_offload, bool start_offload_rpc_server,
     const std::string &ssd_offload_path, const std::string &tenant_id,
     bool enable_client_http_server, int client_http_port,
-    bool enable_embedded_master) {
-    return setup_internal(EgmStorePoolConfig{}, local_hostname, metadata_server,
-                          global_segment_size, local_buffer_size, protocol,
-                          rdma_devices, master_server_addr, transfer_engine,
-                          ipc_socket_path, local_rpc_port, enable_ssd_offload,
-                          start_offload_rpc_server, ssd_offload_path, tenant_id,
-                          enable_client_http_server, client_http_port,
-                          enable_embedded_master);
+    bool enable_embedded_master, size_t offload_rpc_thread_num,
+    const std::string &ub_numa_nodes) {
+    return setup_internal(
+        EgmStorePoolConfig{}, local_hostname, metadata_server,
+        global_segment_size, local_buffer_size, protocol, rdma_devices,
+        master_server_addr, transfer_engine, ipc_socket_path, local_rpc_port,
+        enable_ssd_offload, start_offload_rpc_server, ssd_offload_path,
+        tenant_id, enable_client_http_server, client_http_port,
+        enable_embedded_master, offload_rpc_thread_num, ub_numa_nodes);
 }
 
 tl::expected<void, ErrorCode> RealClient::setup_internal(
@@ -1035,7 +1200,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     bool enable_ssd_offload, bool start_offload_rpc_server,
     const std::string &ssd_offload_path, const std::string &tenant_id,
     bool enable_client_http_server, int client_http_port,
-    bool enable_embedded_master) {
+    bool enable_embedded_master, size_t offload_rpc_thread_num,
+    const std::string &ub_numa_nodes_config) {
     // Re-entry guard (mirrors initAll_internal): a second setup would
     // overwrite client_ and skip the first instance's ordered cleanup.
     if (client_) {
@@ -1075,6 +1241,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
+    const bool should_use_hugepage = use_hugepage_ && protocol != "ubshmem";
     if (!enable_embedded_master &&
         Environ::Process().GetTypedOr(
             EmbeddedMasterEnvironmentVariables::MOONCAKE_ENABLE_EMBEDDED_MASTER,
@@ -1207,14 +1374,18 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // fail in some rdma implementations.
     // Dummy Client can create shm and share it with Real Client, so Real Client
     // can create client buffer allocator on the shared memory later.
+    bool use_hugepage_for_client_buffer =
+        use_hugepage_ && !globalConfig().ascend_use_fabric_mem;
+#ifdef USE_MEMFABRIC
+    use_hugepage_for_client_buffer &= !memfabric_use_fabric_mem(this->protocol);
+#endif
     // Inject the SPDK DMA allocator only when NoF is actually available;
     // otherwise pass nullptr so allocate_buffer_allocator_memory falls
     // through to exactly the same path as use_spdk_dma=false today
     // (protocol-specific allocation -> VRAM -> aligned_alloc).
     try {
         client_buffer_allocator_ = ClientBufferAllocator::create(
-            local_buffer_size, this->protocol,
-            use_hugepage_ && !globalConfig().ascend_use_fabric_mem,
+            local_buffer_size, this->protocol, use_hugepage_for_client_buffer,
             nof_runtime_.initiator ? nof_runtime_.dma_allocator : nullptr);
     } catch (const std::bad_alloc &) {
         // The NoF DMA allocator yields nullptr when the SPDK env is
@@ -1225,12 +1396,13 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                       "hugepage/SPDK environment)";
         return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
+    client_->SetReplicaTransferStagingAllocator(client_buffer_allocator_);
     if (local_buffer_size > 0 && protocol != "cxl") {
         LOG(INFO) << "Registering local memory: " << local_buffer_size
                   << " bytes";
         auto result = client_->RegisterLocalMemory(
             client_buffer_allocator_->getBase(), local_buffer_size,
-            kWildcardLocation, false, true);
+            kWildcardLocation, client_->SupportsGatherRead(), true);
         if (!result.has_value()) {
             LOG(ERROR) << "Failed to register local memory: "
                        << toString(result.error());
@@ -1367,7 +1539,44 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         size_t next_numa_node = 0;
 
         const bool parallel_hugetlb_population =
-            protocol == "rdma" && use_hugepage_;
+            (protocol == "rdma" || protocol == "efa") &&
+            should_use_hugepage;
+
+        // UB uses one segment per selected NUMA node. The explicit setting
+        // takes precedence over automatic discovery and the environment.
+#ifdef USE_UB
+        std::vector<int> ub_numa_nodes;
+        if (protocol == "ub" && !egm_config.enabled) {
+            const auto available_nodes = client_->GetNumaNodes();
+            std::string requested_nodes = ub_numa_nodes_config;
+            if (requested_nodes.empty()) {
+                const char *env_nodes = std::getenv("MC_UB_NUMA_NODES");
+                if (env_nodes != nullptr) requested_nodes = env_nodes;
+            }
+            const bool explicit_selection = !requested_nodes.empty();
+            if (explicit_selection) {
+                auto parsed_nodes = try_parse_numa_nodes(requested_nodes);
+                if (!parsed_nodes) {
+                    LOG(ERROR)
+                        << "Invalid UB NUMA node list '" << requested_nodes
+                        << "': expected unique non-negative node IDs "
+                           "separated by commas";
+                    return tl::unexpected(ErrorCode::INVALID_PARAMS);
+                }
+                for (int node : *parsed_nodes) {
+                    if (!std::binary_search(available_nodes.begin(),
+                                            available_nodes.end(), node)) {
+                        LOG(ERROR) << "Requested UB NUMA node " << node
+                                   << " is not present in the local topology";
+                        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+                    }
+                }
+                ub_numa_nodes = std::move(*parsed_nodes);
+            } else if (available_nodes.size() > 1) {
+                ub_numa_nodes = available_nodes;
+            }
+        }
+#endif
 
         while (global_segment_size > 0) {
             size_t segment_size = GetNextSegmentSize(
@@ -1381,11 +1590,58 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             }
             global_segment_size -= segment_size;
 
+#ifdef USE_UB
+            if (!ub_numa_nodes.empty()) {
+                const size_t page_size =
+                    should_use_hugepage ? get_hugepage_size_from_env()
+                                        : static_cast<size_t>(getpagesize());
+                const size_t aligned_size = align_up(segment_size, page_size);
+                const size_t page_count = aligned_size / page_size;
+                const size_t node_count = ub_numa_nodes.size();
+                if (page_count < node_count) {
+                    LOG(ERROR) << "UB per-NUMA segment has " << page_count
+                               << " pages, fewer than the " << node_count
+                               << " selected NUMA nodes";
+                    return tl::unexpected(ErrorCode::INVALID_PARAMS);
+                }
+                const size_t base_pages = page_count / node_count;
+                const size_t extra_pages = page_count % node_count;
+                for (size_t i = 0; i < node_count; ++i) {
+                    const int node = ub_numa_nodes[i];
+                    const size_t node_size =
+                        (base_pages + (i < extra_pages ? 1 : 0)) * page_size;
+                    void *node_ptr = mooncake::ub_allocate_memory_onnode(
+                        page_size, node_size, node);
+                    if (!node_ptr) {
+                        LOG(ERROR) << "UB per-NUMA allocation failed for node "
+                                   << node;
+                        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+                    }
+                    ub_segment_ptrs_.emplace_back(node_ptr,
+                                                  UbSegmentDeleter{node_size});
+                    const std::string location = genCpuNodeName(node);
+                    auto mount_result = client_->MountSegment(
+                        node_ptr, node_size, protocol, location);
+                    if (!mount_result) {
+                        LOG(ERROR) << "Failed to mount UB NUMA segment: "
+                                   << toString(mount_result.error());
+                        return tl::unexpected(mount_result.error());
+                    }
+                }
+                current_glbseg_size += segment_size;
+                LOG(INFO) << "Mounting UB NUMA segments: " << segment_size
+                          << " bytes, " << current_glbseg_size << " of "
+                          << total_glbseg_size;
+                continue;
+            }
+#endif
+
             size_t mapped_size = segment_size;
             void *ptr = nullptr;
             std::unique_ptr<NvlinkHostNumaAllocation> egm_owner;
             std::string seg_location = kWildcardLocation;
-            bool use_mmap_segment = !seg_numa_nodes.empty() || use_hugepage_;
+            bool use_mmap_segment =
+                !seg_numa_nodes.empty() || should_use_hugepage;
             std::vector<int> segment_numa_nodes;
 
             if (egm_config.enabled) {
@@ -1415,11 +1671,15 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                               int>{seg_numa_nodes[next_numa_node++ %
                                                   seg_numa_nodes.size()]}
                         : seg_numa_nodes;
-                size_t page_sz = use_hugepage_
+                size_t page_sz = should_use_hugepage
                                      ? get_hugepage_size_from_env()
                                      : static_cast<size_t>(getpagesize());
-                mapped_size =
-                    align_up(segment_size, page_sz * segment_numa_nodes.size());
+                // Base pages are THP-advised: keep every region and the tail
+                // on 2MB boundaries, so no huge page straddles two bindings.
+                const size_t region_align =
+                    should_use_hugepage ? page_sz : SZ_2MB;
+                mapped_size = align_up(
+                    segment_size, region_align * segment_numa_nodes.size());
                 ptr = allocate_buffer_numa_segments(
                     mapped_size, segment_numa_nodes, page_sz);
                 seg_location =
@@ -1429,15 +1689,15 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 #ifdef USE_ASCEND_DIRECT
             } else if (protocol == "ascend" || protocol == "ubshmem") {
                 ptr = AllocateAscendStoreSegment(
-                    segment_size, this->protocol, use_hugepage_,
+                    segment_size, this->protocol, should_use_hugepage,
                     parallel_hugetlb_population, &mapped_size);
 #elif defined(USE_MEMFABRIC)
             } else if (protocol == "ascend") {
                 ptr = AllocateMemFabricStoreSegment(
-                    segment_size, this->protocol, use_hugepage_,
+                    segment_size, this->protocol, should_use_hugepage,
                     parallel_hugetlb_population, &mapped_size);
 #endif
-            } else if (use_hugepage_) {
+            } else if (should_use_hugepage) {
                 mapped_size =
                     align_up(segment_size, get_hugepage_size_from_env());
                 ptr = allocate_buffer_mmap_memory(mapped_size,
@@ -1446,9 +1706,17 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 #ifndef USE_VRAM_SEGMENT
             } else if (protocol == "efa") {
                 // EFA host segments must be THP backed and must not pile up
-                // on one NUMA node; see allocate_buffer_thp_interleaved().
+                // on one NUMA node; see allocate_buffer_thp().
                 mapped_size = align_up(segment_size, SZ_2MB);
-                ptr = allocate_buffer_thp_interleaved(mapped_size);
+                ptr = allocate_buffer_thp(mapped_size,
+                                          ThpNumaPolicy::kInterleaveIfDefault);
+                use_mmap_segment = true;
+            } else if (protocol == "rdma") {
+                // At most one usable NIC NUMA node: THP backed like the
+                // NUMA-segmented path, under the task's own NUMA policy.
+                mapped_size = align_up(segment_size, SZ_2MB);
+                ptr = allocate_buffer_thp(mapped_size,
+                                          ThpNumaPolicy::kInheritTask);
                 use_mmap_segment = true;
 #endif
             } else {
@@ -1472,7 +1740,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             } else if (this->protocol == "ascend" ||
                        this->protocol == "ubshmem") {
 #ifdef USE_MEMFABRIC
-                if (use_hugepage_) {
+                if (should_use_hugepage &&
+                    !memfabric_use_fabric_mem(this->protocol)) {
                     hugepage_segment_ptrs_.emplace_back(
                         ptr, HugepageSegmentDeleter{mapped_size});
                 } else {
@@ -1480,7 +1749,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                         ptr, MemFabricSegmentDeleter{this->protocol});
                 }
 #else
-                if (use_hugepage_ && !globalConfig().ascend_use_fabric_mem) {
+                if (should_use_hugepage &&
+                    !globalConfig().ascend_use_fabric_mem) {
                     hugepage_segment_ptrs_.emplace_back(
                         ptr, HugepageSegmentDeleter{mapped_size});
                 } else {
@@ -1497,11 +1767,14 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                     << "sunrise_link protocol requires USE_SUNRISE build";
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
 #endif
-            } else if (this->protocol == "ub") {
+            } else if (this->protocol == "ub" && !use_mmap_segment) {
+                // Only allocate_buffer_allocator_memory() memory goes back
+                // through the UB free path; hugepage mmaps fall through to
+                // munmap below.
                 ub_segment_ptrs_.emplace_back(ptr,
                                               UbSegmentDeleter{mapped_size});
             } else if (use_mmap_segment) {
-                // NUMA-segmented, hugepage or EFA THP: track as mmap
+                // NUMA-segmented, hugepage or EFA/RDMA THP: track as mmap
                 // allocation for munmap cleanup
                 hugepage_segment_ptrs_.emplace_back(
                     ptr, HugepageSegmentDeleter{mapped_size});
@@ -1569,10 +1842,22 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     if (enable_ssd_offload && start_offload_rpc_server) {
         // Start RPC server for offload operations (batch_get / release_buffer).
         // Use port 0 to let the OS auto-allocate an available port.
-        offload_rpc_server_ =
-            std::make_unique<coro_rpc::coro_rpc_server>(1, 0, "0.0.0.0");
+        if (offload_rpc_thread_num == 0) {
+            LOG(WARNING) << "Invalid offload_rpc_thread_num=0, using 1";
+            offload_rpc_thread_num = 1;
+        }
+        offload_rpc_server_ = std::make_unique<coro_rpc::coro_rpc_server>(
+            offload_rpc_thread_num, 0, "0.0.0.0");
         offload_rpc_server_
             ->register_handler<&RealClient::batch_get_offload_object>(this);
+        offload_rpc_server_
+            ->register_handler<&RealClient::batch_get_offload_object_ranges>(
+                this);
+        offload_rpc_server_
+            ->register_handler<&RealClient::batch_get_offload_object_push>(
+                this);
+        offload_rpc_server_
+            ->register_handler<&RealClient::service_ready_internal>(this);
         offload_rpc_server_
             ->register_handler<&RealClient::release_offload_buffer>(this);
         offload_rpc_server_->register_handler<&RealClient::verify_disk_replica>(
@@ -1594,8 +1879,14 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         this->local_rpc_addr = buildHostNameWithPort(
             getHostNameWithoutPort(this->local_hostname), offload_rpc_port_);
     }
-    if (enable_ssd_offload) {
+    const auto distributed_config = DistributedStorageConfig::FromEnvironment();
+    const bool enable_kvcs = distributed_config.UsesKvcs();
+    if (enable_ssd_offload || enable_kvcs) {
         auto file_storage_config = FileStorageConfig::FromEnvironment();
+        if (enable_kvcs) {
+            file_storage_config.storage_backend_type =
+                StorageBackendType::kDistributed;
+        }
         if (!ssd_offload_path.empty()) {
             file_storage_config.storage_filepath = ssd_offload_path;
         }
@@ -1608,6 +1899,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                        << init_result.error();
             return init_result;
         }
+    }
+    if (enable_ssd_offload) {
         // The dangling-replica heal in Client::Put needs an existence check
         // against this process's offload files, which only the FileStorage
         // owns. true: backing file is gone, false: present, nullopt: unknown.
@@ -1631,6 +1924,17 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             });
     }
     client_requester_ = std::make_shared<ClientRequester>();
+    if (Environ::Get().GetYltRpcPoolWarmupEnabled(true)) {
+        auto endpoints_result = client_->GetOffloadEndpoints();
+        if (!endpoints_result) {
+            LOG(WARNING) << "Failed to fetch offload RPC endpoints for pool "
+                         << "warmup: " << toString(endpoints_result.error());
+        } else {
+            for (const auto &endpoint : *endpoints_result) {
+                client_requester_->WarmupRpcPool(endpoint);
+            }
+        }
+    }
     if (enable_ssd_prefetch_) {
         // Prefetch needs the master-facing client for metadata and task
         // registration; local promotion additionally needs file_storage_.
@@ -1645,6 +1949,29 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                   << ssd_prefetch_cooldown_sec_ << "s, "
                   << CONFIG_KEY_SSD_PREFETCH_DEDUP_TTL_SEC << "="
                   << ssd_prefetch_dedup_ttl_sec_ << "s";
+    }
+    // Optionally warm up transport connections to every segment the master
+    // has registered, so a burst of small-object traffic does not storm the
+    // listeners with on-demand RDMA QP handshakes (seen as TRANSFER_FAIL).
+    // MC_STORE_WARMUP enables it; it is off by default.
+    if (client_ && Environ::Get().GetStoreWarmupEnabled(false)) {
+        // The warmup transfers use a buffer from client_buffer_allocator_,
+        // which is registered with the transfer engine only when the local
+        // buffer is (not for cxl or a zero-sized buffer).
+        if (!local_buffer_region_.has_value() ||
+            local_buffer_region_->size == 0) {
+            LOG(WARNING) << "Warmup enabled but local buffer is not "
+                         << "registered (protocol=" << this->protocol
+                         << "), skipping warmup";
+        } else {
+            LOG(INFO) << "Warming up connections to all registered segments";
+            auto warmup_result = client_->warmup(client_buffer_allocator_);
+            if (!warmup_result) {
+                LOG(WARNING)
+                    << "Warmup failed: " << toString(warmup_result.error())
+                    << ", continuing setup (will connect on demand)";
+            }
+        }
     }
     const bool should_start_http_server =
         enable_client_http_server || FLAGS_enable_http_server;
@@ -1679,7 +2006,9 @@ int RealClient::setup_real(
         local_hostname, metadata_server, global_segment_size, local_buffer_size,
         protocol, rdma_devices, master_server_addr, transfer_engine,
         ipc_socket_path, 50052, enable_ssd_offload, true, ssd_offload_path,
-        tenant_id, enable_client_http_server, client_http_port));
+        tenant_id, enable_client_http_server, client_http_port,
+        /*enable_embedded_master=*/false, /*offload_rpc_thread_num=*/8,
+        /*ub_numa_nodes=*/""));
 }
 
 namespace {
@@ -1824,6 +2153,15 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 
     std::string ssd_offload_path = get_config(config, "ssd_offload_path");
     std::string tenant_id = get_config(config, CONFIG_KEY_TENANT_ID, "default");
+    auto offload_rpc_thread_num_opt =
+        get_config_size(config, "offload_rpc_thread_num",
+                        Environ::Get().GetOffloadRpcThreadNum(8));
+    if (!offload_rpc_thread_num_opt.has_value()) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const size_t offload_rpc_thread_num = *offload_rpc_thread_num_opt;
+    const std::string ub_numa_nodes =
+        get_config(config, CONFIG_KEY_UB_NUMA_NODES);
     bool enable_ssd_offload =
         get_config_bool(config, "enable_ssd_offload", false);
     bool enable_client_http_server =
@@ -1863,7 +2201,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             local_buffer_size, protocol, rdma_devices, master_server_addr,
             nullptr, ipc_socket_path, 50052, enable_ssd_offload, true,
             ssd_offload_path, tenant_id, enable_client_http_server,
-            client_http_port, enable_embedded_master);
+            client_http_port, enable_embedded_master, offload_rpc_thread_num,
+            ub_numa_nodes);
         if (!result && egm_config->enabled) {
             (void)tearDownAll_internal();
         }
@@ -1885,7 +2224,10 @@ tl::expected<void, ErrorCode> RealClient::initAll_internal(
     uint64_t buffer_allocator_size = 1024 * 1024 * 1024;
     return setup_internal("localhost:12345", "127.0.0.1:2379",
                           mount_segment_size, buffer_allocator_size, protocol_,
-                          device_name);
+                          device_name, "127.0.0.1:50051", nullptr, "", 50052,
+                          false, false, "", "default", false,
+                          DEFAULT_CLIENT_HTTP_PORT, false,
+                          /*offload_rpc_thread_num=*/8, "");
 }
 
 int RealClient::initAll(const std::string &protocol_,
@@ -2711,6 +3053,15 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
         LOG(ERROR) << "Client buffer allocator is not provided";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+    // One dice roll per request (MC_HIFREQ_LOG_SAMPLE_RATE, default 1.0)
+    // gates both the breakdown timing capture and its emission below.
+    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog(
+        mooncake::logging::CurrentTraceId());
+    auto t0 = breakdown_log ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
+    auto t0_wall = breakdown_log ? std::chrono::system_clock::now()
+                                 : std::chrono::system_clock::time_point{};
+    auto t_alloc = t0;
     auto alloc_result = client_buffer_allocator->allocate(value.size_bytes());
     if (!alloc_result) {
         LOG(ERROR) << "Failed to allocate buffer for put operation, key: "
@@ -2725,12 +3076,35 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
     }
 
     std::vector<Slice> slices = split_into_slices(buffer_handle);
+    if (breakdown_log) t_alloc = std::chrono::steady_clock::now();
 
     auto put_result = client_->Put(key, slices, config);
+
+    auto log_put = [&](const char *status) {
+        if (!breakdown_log) return;
+        auto now = std::chrono::steady_clock::now();
+        auto alloc_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(t_alloc - t0)
+                .count();
+        auto write_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(now - t_alloc)
+                .count();
+        auto total_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(now - t0)
+                .count();
+        MC_LOG(INFO) << "put_breakdown key[" << key << "] start_time["
+                     << FormatWallClock(t0_wall) << "] alloc_us[" << alloc_us
+                     << "] write_us[" << write_us << "] total_us[" << total_us
+                     << "] size[" << value.size_bytes() << "] status[" << status
+                     << "]";
+    };
+
     if (!put_result) {
+        log_put(toString(put_result.error()).c_str());
         return tl::unexpected(put_result.error());
     }
 
+    log_put("ok");
     return {};
 }
 
@@ -2757,6 +3131,7 @@ tl::expected<void, ErrorCode> RealClient::put_dummy_helper(
 
 int RealClient::put(const std::string &key, std::span<const char> value,
                     const ReplicateConfig &config) {
+    mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
     auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
         [&]() {
             return put_internal(key, value, config, client_buffer_allocator_);
@@ -2791,6 +3166,16 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
         LOG(ERROR) << "Client buffer allocator is not provided";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+    // One dice roll per request (MC_HIFREQ_LOG_SAMPLE_RATE, default 1.0)
+    // gates both the breakdown timing capture and its emission below.
+    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog(
+        mooncake::logging::CurrentTraceId());
+    auto t0 = breakdown_log ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
+    auto t0_wall = breakdown_log ? std::chrono::system_clock::now()
+                                 : std::chrono::system_clock::time_point{};
+    auto t_prep = t0;
+    uint64_t total_bytes = 0;
     std::vector<BufferHandle> buffer_handles;
     std::unordered_map<std::string, std::vector<Slice>> batched_slices;
     batched_slices.reserve(keys.size());
@@ -2798,6 +3183,7 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
     for (size_t i = 0; i < keys.size(); ++i) {
         auto &key = keys[i];
         auto &value = values[i];
+        total_bytes += value.size_bytes();
         auto alloc_result =
             client_buffer_allocator->allocate(value.size_bytes());
         if (!alloc_result) {
@@ -2831,13 +3217,45 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
         }
     }
 
+    if (breakdown_log) t_prep = std::chrono::steady_clock::now();
+
     auto results = client_->BatchPut(keys, ordered_batched_slices, config);
 
     // Check if any operations failed
+    ErrorCode first_error = ErrorCode::OK;
+    size_t success_count = 0;
     for (size_t i = 0; i < results.size(); ++i) {
-        if (!results[i]) {
-            return tl::unexpected(results[i].error());
+        if (results[i]) {
+            ++success_count;
+        } else if (first_error == ErrorCode::OK) {
+            first_error = results[i].error();
         }
+    }
+
+    if (breakdown_log) {
+        auto now = std::chrono::steady_clock::now();
+        auto prep_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(t_prep - t0)
+                .count();
+        auto write_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(now - t_prep)
+                .count();
+        auto total_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(now - t0)
+                .count();
+        const char *status = success_count == results.size() ? "ok"
+                             : success_count == 0            ? "err"
+                                                             : "partial";
+        MC_LOG(INFO) << "batch_put_breakdown num_keys[" << keys.size()
+                     << "] start_time[" << FormatWallClock(t0_wall)
+                     << "] prep_us[" << prep_us << "] write_us[" << write_us
+                     << "] total_us[" << total_us << "] size[" << total_bytes
+                     << "] success[" << success_count << "] status[" << status
+                     << "]";
+    }
+
+    if (first_error != ErrorCode::OK) {
+        return tl::unexpected(first_error);
     }
     return {};
 }
@@ -2868,6 +3286,7 @@ tl::expected<void, ErrorCode> RealClient::put_batch_dummy_helper(
 int RealClient::put_batch(const std::vector<std::string> &keys,
                           const std::vector<std::span<const char>> &values,
                           const ReplicateConfig &config) {
+    mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
     auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
         [&]() {
             return put_batch_internal(keys, values, config,
@@ -3258,6 +3677,16 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    // Reject a second local buffer before mapping or registering its memory.
+    // The exclusive lock also keeps this check valid through installation.
+    if (is_local_buffer && context_it != shm_contexts_.end() &&
+        context_it->second.client_buffer_allocator) {
+        LOG(ERROR) << "A local buffer is already mapped for this "
+                      "client shared memory.";
+        close(fd);
+        return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+    }
+
 #ifdef USE_ASCEND_DIRECT
     auto context_result = set_context_if_needed(protocol, physical_device_id,
                                                 "POSIX shm registration");
@@ -3332,12 +3761,6 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
     }
 
     if (is_local_buffer) {
-        if (context.client_buffer_allocator) {
-            LOG(ERROR) << "A local buffer is already mapped for this "
-                          "client shared memory.";
-            munmap(shm_buffer, shm_size);
-            return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
-        }
         context.client_buffer_allocator =
             ClientBufferAllocator::create(shm_buffer, shm_size, this->protocol);
     }
@@ -4009,8 +4432,21 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         return nullptr;
     }
 
+    // One dice roll per request (MC_HIFREQ_LOG_SAMPLE_RATE, default 1.0) gates
+    // both the breakdown timing capture and its emission below.
+    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog(
+        mooncake::logging::CurrentTraceId());
+    auto t0 = breakdown_log ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
+    auto t0_wall = breakdown_log ? std::chrono::system_clock::now()
+                                 : std::chrono::system_clock::time_point{};
+    auto t_query = t0, t_local_endpoints = t0, t_select = t0, t_alloc = t0;
+    std::string replica_type;
+    std::string remote_endpoint = "-";
+
     // Query the object info
     auto query_result = client_->Query(key);
+    if (breakdown_log) t_query = std::chrono::steady_clock::now();
     if (!query_result) {
         if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
             query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
@@ -4033,7 +4469,11 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     // LOCAL_DISK data is on a remote node's SSD — must use offload RPC.
     // MEMORY / DISK / DFS are handled via client_->Get below.
     auto local_endpoints = client_->GetLocalEndpoints();
+    if (breakdown_log) {
+        t_local_endpoints = std::chrono::steady_clock::now();
+    }
     const auto *best_replica = SelectBestReplica(replica_list, local_endpoints);
+    if (breakdown_log) t_select = std::chrono::steady_clock::now();
     if (!best_replica) {
         LOG(ERROR) << "No usable replica for key: " << key;
         return nullptr;
@@ -4045,12 +4485,18 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     const auto &replica = *best_replica;
     uint64_t total_length = calculate_total_size(replica);
 
+    const auto replica_info = DescribeReplicaForObservability(
+        replica, local_endpoints, client_->getClientId());
+    replica_type = replica_info.type;
+    remote_endpoint = replica_info.remote_endpoint;
+
     if (total_length == 0) {
         return nullptr;
     }
 
     // Allocate buffer
     auto alloc_result = client_buffer_allocator->allocate(total_length);
+    if (breakdown_log) t_alloc = std::chrono::steady_clock::now();
     if (!alloc_result) {
         LOG(ERROR) << "Failed to allocate buffer for get_buffer, key: " << key;
         return nullptr;
@@ -4058,6 +4504,46 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
 
     auto buffer_handle =
         std::make_shared<BufferHandle>(std::move(*alloc_result));
+
+    auto log_breakdown = [&](const char *status) {
+        if (!breakdown_log) return;
+        auto now = std::chrono::steady_clock::now();
+        auto query_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(t_query - t0)
+                .count();
+        auto select_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            t_select - t_query)
+                            .count();
+        auto local_endpoints_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                t_local_endpoints - t_query)
+                .count();
+        auto select_replica_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                t_select - t_local_endpoints)
+                .count();
+        auto alloc_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            t_alloc - t_select)
+                            .count();
+        auto read_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(now - t_alloc)
+                .count();
+        auto total_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(now - t0)
+                .count();
+        MC_LOG(INFO) << "get_breakdown key[" << key << "] start_time["
+                     << FormatWallClock(t0_wall) << "] query_us[" << query_us
+                     << "] select_us[" << select_us
+                     << "] local_endpoints_us[" << local_endpoints_us
+                     << "] select_replica_us[" << select_replica_us
+                     << "] alloc_us[" << alloc_us
+                     << "] read_us[" << read_us << "] total_us[" << total_us
+                     << "] type[" << replica_type << "] replica_count["
+                     << replica_list.size() << "] selected_type["
+                     << replica_type << "] local_endpoint["
+                     << client_->GetSegmentEndpoint() << "] remote_endpoint["
+                     << remote_endpoint << "] status[" << status << "]";
+    };
 
     if (best_replica->is_local_disk_replica()) {
         // LOCAL_DISK: data is on remote node's SSD. Use offload RPC.
@@ -4071,6 +4557,7 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         if (!read_result) {
             LOG(ERROR) << "SSD read failed for key '" << key
                        << "': " << toString(read_result.error());
+            log_breakdown("ssd_fail");
             // Same heal as the batch path: the owner proves the backing file
             // gone (evict + re-query) or present (retry the same replica
             // once). kUnknown surfaces the plain miss.
@@ -4094,6 +4581,7 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
                        << "': " << toString(checksum_result.error());
             return nullptr;
         }
+        log_breakdown("ssd_ok");
         return buffer_handle;
     }
 
@@ -4117,14 +4605,17 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     if (!get_result) {
         LOG(ERROR) << "Get failed for key: " << key
                    << " with error: " << toString(get_result.error());
+        log_breakdown("read_fail");
         return nullptr;
     }
 
+    log_breakdown("read_ok");
     return buffer_handle;
 }
 
 // Implementation of get_buffer method
 std::shared_ptr<BufferHandle> RealClient::get_buffer(const std::string &key) {
+    mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
     return execute_timed_operation<std::shared_ptr<BufferHandle>>(
         [&]() { return get_buffer_internal(key, client_buffer_allocator_); },
         [](const auto &buffer) { return buffer != nullptr; },
@@ -4377,8 +4868,22 @@ RealClient::batch_get_buffer_internal(
         return final_results;
     }
 
+    // One dice roll per request (MC_HIFREQ_LOG_SAMPLE_RATE, default 1.0)
+    // gates both the breakdown timing capture and its emission below.
+    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog(
+        mooncake::logging::CurrentTraceId());
+    auto t0 = breakdown_log ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
+    auto t0_wall = breakdown_log ? std::chrono::system_clock::now()
+                                 : std::chrono::system_clock::time_point{};
+    auto t_query = t0, t_prep = t0, t_read = t0;
+    // Per-key replica types, accumulated into one string for a single
+    // aggregated breakdown line after the prep loop.
+    std::string replica_types_log;
+
     // 1. Query metadata for all keys
     auto query_results = client_->BatchQuery(keys);
+    if (breakdown_log) t_query = std::chrono::steady_clock::now();
 
     // 2. Prepare for batch get: filter valid keys and prepare buffers
     struct KeyOp {
@@ -4433,6 +4938,19 @@ RealClient::batch_get_buffer_internal(
             continue;
         }
 
+        // Per-key replica type. Accumulate into one string and emit a single
+        // aggregated line after the loop. Gated by breakdown_log.
+        if (breakdown_log) {
+            const auto rtype = DescribeReplicaForObservability(
+                                   replica, local_endpoints,
+                                   client_->getClientId())
+                                   .type;
+            replica_types_log += key;
+            replica_types_log += '=';
+            replica_types_log += rtype;
+            replica_types_log += ' ';
+        }
+
         auto &allocator = client_buffer_allocator ? client_buffer_allocator
                                                   : client_buffer_allocator_;
         auto alloc_result = allocator->allocate(total_size);
@@ -4480,6 +4998,8 @@ RealClient::batch_get_buffer_internal(
             .slices = std::move(slices),
             .total_size = total_size});
     }
+
+    if (breakdown_log) t_prep = std::chrono::steady_clock::now();
 
     if (valid_ops.empty() && disk_ops.empty()) {
         return final_results;
@@ -4716,12 +5236,41 @@ RealClient::batch_get_buffer_internal(
         }
     }
 
+    if (breakdown_log) {
+        t_read = std::chrono::steady_clock::now();
+        size_t success_count = 0;
+        for (const auto &result : final_results) {
+            if (result) success_count++;
+        }
+        auto query_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(t_query - t0)
+                .count();
+        auto prep_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                           t_prep - t_query)
+                           .count();
+        auto read_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                           t_read - t_prep)
+                           .count();
+        auto total_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(t_read - t0)
+                .count();
+        MC_LOG(INFO) << "batch_get_breakdown num_keys[" << keys.size()
+                     << "] start_time[" << FormatWallClock(t0_wall)
+                     << "] query_us[" << query_us << "] prep_us[" << prep_us
+                     << "] read_us[" << read_us << "] total_us[" << total_us
+                     << "] batch_get_ops[" << valid_ops.size()
+                     << "] ssd_offload_ops[" << disk_ops.size() << "] success["
+                     << success_count << "] replicas[" << replica_types_log
+                     << "]";
+    }
+
     return final_results;
 }
 
 // Implementation of batch_get_buffer method
 std::vector<std::shared_ptr<BufferHandle>> RealClient::batch_get_buffer(
     const std::vector<std::string> &keys) {
+    mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
     return execute_timed_operation<std::vector<std::shared_ptr<BufferHandle>>>(
         [&]() { return batch_get_buffer_internal(keys); },
         [this](const auto &) { return client_ != nullptr; },
@@ -4759,8 +5308,11 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
         }
     }
 
-    auto result = client_->RegisterLocalMemory(buffer, registration_size,
-                                               kWildcardLocation, false, true);
+    // Gather reads are owner-initiated WRITEs. Publish Store output buffers
+    // on supported classic transports; TE's registration defaults stay intact.
+    auto result = client_->RegisterLocalMemory(
+        buffer, registration_size, kWildcardLocation,
+        client_->SupportsGatherRead(), true);
     if (!result) {
         return result;
     }
@@ -4833,6 +5385,11 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
         }
         LOG(WARNING) << "TE reports buffer " << buffer
                      << " as already unregistered; retrying the NoF cleanup";
+    }
+    // TENT may successfully unregister an unknown address. Without a Store
+    // record there is no pending NoF cleanup to retry.
+    if (rec_it == registered_buffer_sizes_.end()) {
+        return tl::unexpected(ErrorCode::NOT_REGISTERED);
     }
     if (nof_runtime_.initiator) {
         auto rc = nof_runtime_.initiator->UnregisterMemory(buffer);
@@ -4913,6 +5470,23 @@ bool RealClient::can_use_direct_memory_read(const Replica::Descriptor &replica,
     return region.has_value() && size <= region->size - region->offset;
 }
 
+bool RealClient::can_use_direct_dfs_read(
+    const Replica::Descriptor &replica,
+    const std::vector<void *> &buffers) const {
+    if (!client_ || !client_->CanReadDfsReplicaIntoHostMemory(replica)) {
+        return false;
+    }
+    // Each destination becomes one iovec, and preadv() rejects more than
+    // IOV_MAX of them; the contiguous staging buffer has no such limit.
+    if (buffers.size() > static_cast<size_t>(IOV_MAX)) return false;
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
+    for (void *buffer : buffers) {
+        if (runtime_accelerator.FindDeviceForPointer(buffer)) return false;
+    }
+    return true;
+}
+
 tl::expected<RealClient::RangedReadMetadata, ErrorCode>
 RealClient::resolve_ranged_read_metadata(
     const std::string &key, const QueryResultCache *query_result_cache,
@@ -4922,12 +5496,17 @@ RealClient::resolve_ranged_read_metadata(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    // Timing capture mirrors the SP930 resolve_ranged_read_metadata: t0
+    // brackets metadata acquisition (cache lookup or a fresh master Query)
+    // and t_query marks the point where the query result is in hand.
+    const auto t0 = std::chrono::steady_clock::now();
     if (query_result_cache) {
         auto cached = query_result_cache->find(key);
         if (cached != query_result_cache->end() &&
             (!cached->second || !cached->second->IsLeaseExpired())) {
-            return build_ranged_read_metadata_from_query_result(key,
-                                                                cached->second);
+            const auto t_query = std::chrono::steady_clock::now();
+            return build_ranged_read_metadata_from_query_result(
+                key, cached->second, t_query, t0);
         }
         if (!allow_query_refresh) {
             return tl::unexpected(cached == query_result_cache->end()
@@ -4938,8 +5517,10 @@ RealClient::resolve_ranged_read_metadata(
     if (!allow_query_refresh) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return build_ranged_read_metadata_from_query_result(key,
-                                                        client_->Query(key));
+    auto query_result = client_->Query(key);
+    const auto t_query = std::chrono::steady_clock::now();
+    return build_ranged_read_metadata_from_query_result(
+        key, std::move(query_result), t_query, t0);
 }
 
 tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
@@ -4989,6 +5570,24 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             return static_cast<int64_t>(total_size);
         }
 
+        if (replica.is_dfs_replica() &&
+            can_use_direct_dfs_read(
+                replica, {static_cast<char *>(buffer) + dst_offset})) {
+            // DFS into host memory: the adapter reads into the destination.
+            std::vector<mooncake::Slice> slices;
+            allocateSlices(slices, replica,
+                           static_cast<char *>(buffer) + dst_offset);
+            auto filtered_qr =
+                FilterQueryResult(query_result, replica, verify_checksum);
+            auto get_result = client_->Get(key, filtered_qr, slices);
+            if (!get_result) {
+                LOG(ERROR) << "DFS Get failed for key: " << key
+                           << " with error: " << toString(get_result.error());
+                return tl::unexpected(get_result.error());
+            }
+            return static_cast<int64_t>(total_size);
+        }
+
         if (replica.is_disk_replica() || replica.is_dfs_replica()) {
             // File-backed full read: use a contiguous temp buffer, then
             // scatter to the requested destination.
@@ -5026,39 +5625,79 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         auto runtime_accelerator =
             device::GetAcceleratorRegistry().RuntimeAccelerators();
         void *dst = static_cast<char *>(buffer) + dst_offset;
-        if (runtime_accelerator.FindDeviceForPointer(dst) &&
-            ((!client_->CanUseLocalMemcpy(replica) &&
-              !can_use_direct_memory_read(replica, dst, total_size)) ||
-             client_->IsHotCacheEnabled())) {
-            if (!client_buffer_allocator_) {
-                LOG(ERROR) << "Client buffer allocator is not provided";
-                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        if (runtime_accelerator.FindDeviceForPointer(dst)) {
+#if defined(USE_NOF) && defined(USE_NOF_URMA)
+            if (replica.is_nof_replica() && nof_runtime_.initiator &&
+                NofEndpointIsUrma(replica.get_nof_descriptor()
+                                      .buffer_descriptor.transport_endpoint_)) {
+                const auto info =
+                    nof_runtime_.initiator->ResolveBuffer(dst, total_size);
+                if (info.type == NofMemoryType::kCuda) {
+                    std::vector<Slice> slices;
+                    allocateSlices(slices, replica, dst);
+                    auto filtered_qr = FilterQueryResult(query_result, replica,
+                                                         verify_checksum);
+                    auto get_result = client_->Get(key, filtered_qr, slices);
+                    if (!get_result) return tl::unexpected(get_result.error());
+                    return static_cast<int64_t>(total_size);
+                }
+                if (!NofGpuStagingFallbackEnabled()) {
+                    LOG(ERROR)
+                        << "NoF GPU Direct resolve failed type="
+                        << static_cast<int>(info.type) << " for key=" << key
+                        << "; refusing host staging";
+                    return tl::unexpected(ErrorCode::TRANSFER_FAIL);
+                }
+                LOG(WARNING) << "NoF GPU Direct unavailable type="
+                             << static_cast<int>(info.type)
+                             << ", fallback to host staging key=" << key;
             }
-            auto alloc_result = client_buffer_allocator_->allocate(total_size);
-            if (!alloc_result) {
-                LOG(ERROR) << "Failed to allocate temp buffer for GPU memory "
-                           << "read, key: " << key << ", size: " << total_size;
-                return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+#endif
+            if (can_read_ub_device_memory_direct(replica, dst, total_size)) {
+                std::vector<Slice> slices;
+                allocateSlices(slices, replica, dst);
+                auto filtered_qr =
+                    FilterQueryResult(query_result, replica, verify_checksum);
+                auto get_result = client_->Get(key, filtered_qr, slices);
+                if (!get_result) return tl::unexpected(get_result.error());
+                return static_cast<int64_t>(total_size);
             }
-            BufferHandle tmp_handle(std::move(*alloc_result));
-            std::vector<mooncake::Slice> tmp_slices;
-            allocateSlices(tmp_slices, replica, tmp_handle.ptr());
+            if ((!client_->CanUseLocalMemcpy(replica) &&
+                 !can_use_direct_memory_read(replica, dst, total_size)) ||
+                client_->IsHotCacheEnabled()) {
+                if (!client_buffer_allocator_) {
+                    LOG(ERROR) << "Client buffer allocator is not provided";
+                    return tl::unexpected(ErrorCode::INVALID_PARAMS);
+                }
+                auto alloc_result =
+                    client_buffer_allocator_->allocate(total_size);
+                if (!alloc_result) {
+                    LOG(ERROR)
+                        << "Failed to allocate temp buffer for GPU memory "
+                        << "read, key: " << key << ", size: " << total_size;
+                    return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+                }
+                BufferHandle tmp_handle(std::move(*alloc_result));
+                std::vector<mooncake::Slice> tmp_slices;
+                allocateSlices(tmp_slices, replica, tmp_handle.ptr());
 
-            auto filtered_qr =
-                FilterQueryResult(query_result, replica, verify_checksum);
-            auto get_result = client_->Get(key, filtered_qr, tmp_slices);
-            if (!get_result) {
-                LOG(ERROR) << "Get failed for key: " << key
-                           << " with error: " << toString(get_result.error());
-                return tl::unexpected(get_result.error());
+                auto filtered_qr =
+                    FilterQueryResult(query_result, replica, verify_checksum);
+                auto get_result = client_->Get(key, filtered_qr, tmp_slices);
+                if (!get_result) {
+                    LOG(ERROR)
+                        << "Get failed for key: " << key
+                        << " with error: " << toString(get_result.error());
+                    return tl::unexpected(get_result.error());
+                }
+                if (auto r = scatter_host_to_maybe_device(
+                        dst, tmp_handle.ptr(), total_size,
+                        "MEMORY full read, key: " + key);
+                    !r) {
+                    return tl::unexpected(r.error());
+                }
+                return static_cast<int64_t>(total_size);
             }
-            if (auto r = scatter_host_to_maybe_device(
-                    dst, tmp_handle.ptr(), total_size,
-                    "MEMORY full read, key: " + key);
-                !r) {
-                return tl::unexpected(r.error());
-            }
-            return static_cast<int64_t>(total_size);
         }
 
         std::vector<mooncake::Slice> slices;
@@ -5075,13 +5714,9 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         return static_cast<int64_t>(total_size);
     }
 
-    // Partial file-backed read: allocate temp buffer, invoke read_op to
-    // fill it, then scatter [src_offset, src_offset+size) to dst.
-    //
-    // buf_size controls how much to allocate / read. DISK/DFS must use
-    // total_size (allocateSlices requires full-object slices).
-    // LOCAL_DISK can use src_offset + size (offload RPC transfers
-    // sequentially from remote offset 0).
+    // Partial file-backed read. read_op fills [0, size) of the temp buffer
+    // with the object bytes at src_offset. The disk read is that window, not
+    // the rest of the object.
     auto partial_disk_read =
         [&](auto &&read_op,
             size_t buf_size) -> tl::expected<int64_t, ErrorCode> {
@@ -5096,10 +5731,9 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         auto read_result = read_op(tmp_handle.ptr());
         if (!read_result) return tl::unexpected(read_result.error());
         void *dst = static_cast<char *>(buffer) + dst_offset;
-        const void *src =
-            static_cast<const char *>(tmp_handle.ptr()) + src_offset;
         if (auto r = scatter_host_to_maybe_device(
-                dst, src, size, "ranged file-backed read, key: " + key);
+                dst, tmp_handle.ptr(), size,
+                "ranged file-backed read, key: " + key);
             !r) {
             return tl::unexpected(r.error());
         }
@@ -5109,55 +5743,70 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     if (replica.is_local_disk_replica()) {
         const auto &endpoint =
             replica.get_local_disk_descriptor().transport_endpoint;
+        if (total_size > uint64_t(std::numeric_limits<int64_t>::max())) {
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        const OffloadReadRange read_range{src_offset,
+                                          static_cast<int64_t>(total_size)};
         void *dst = static_cast<char *>(buffer) + dst_offset;
         std::unordered_map<std::string, std::vector<Slice>> objects{
             {key, {{dst, size}}}};
         if (can_use_pinned_restore_arena(endpoint, objects)) {
-            if (total_size > uint64_t(std::numeric_limits<int64_t>::max())) {
-                return tl::unexpected(ErrorCode::INVALID_PARAMS);
-            }
-            const OffloadReadRange read_range{src_offset,
-                                              static_cast<int64_t>(total_size)};
             auto result = batch_get_into_offload_object_internal(
                 endpoint, objects, &read_range);
             if (!result) return tl::unexpected(result.error());
             return static_cast<int64_t>(size);
         }
 
-        // LOCAL_DISK: offload RPC transfers sequentially from remote offset
-        // 0, so we only need src_offset + size bytes (not total_size).
         return partial_disk_read(
             [&](void *tmp_buf) -> tl::expected<void, ErrorCode> {
                 std::unordered_map<std::string, std::vector<Slice>> objects;
-                objects.emplace(
-                    key, std::vector<Slice>{{static_cast<char *>(tmp_buf),
-                                             src_offset + size}});
-                return batch_get_into_offload_object_internal(endpoint,
-                                                              objects);
+                objects.emplace(key, std::vector<Slice>{
+                                         {static_cast<char *>(tmp_buf), size}});
+                return batch_get_into_offload_object_internal(endpoint, objects,
+                                                              &read_range);
             },
-            src_offset + size);
+            size);
     }
 
     if (replica.is_disk_replica() || replica.is_dfs_replica()) {
-        // DISK/DFS: client_->Get + allocateSlices requires full-object slices,
-        // so we must allocate total_size.
         const char *replica_type = replica.is_dfs_replica() ? "DFS" : "DISK";
-        return partial_disk_read(
-            [&](void *tmp_buf) -> tl::expected<void, ErrorCode> {
-                std::vector<mooncake::Slice> tmp_slices;
-                allocateSlices(tmp_slices, replica, tmp_buf);
-                auto filtered_qr =
-                    FilterQueryResult(query_result, replica, false);
-                auto get_result = client_->Get(key, filtered_qr, tmp_slices);
-                if (!get_result) {
-                    LOG(ERROR)
-                        << replica_type << " Get failed for key: " << key
-                        << " with error: " << toString(get_result.error());
-                    return tl::unexpected(get_result.error());
-                }
-                return {};
-            },
-            total_size);
+        auto read_window =
+            [&](void *read_buf) -> tl::expected<void, ErrorCode> {
+            auto read_results = client_->BatchReadFileReplicaRanges(
+                {key}, {replica}, {Slice{read_buf, size}}, {src_offset});
+            if (read_results.size() != 1) {
+                return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            if (!read_results[0]) {
+                LOG(ERROR) << replica_type
+                           << " range read failed for key: " << key
+                           << " with error: "
+                           << toString(read_results[0].error());
+                return tl::unexpected(read_results[0].error());
+            }
+            return {};
+        };
+        void *dst = static_cast<char *>(buffer) + dst_offset;
+        tl::expected<int64_t, ErrorCode> result;
+        if (replica.is_dfs_replica() &&
+            can_use_direct_dfs_read(replica, {dst})) {
+            auto read_result = read_window(dst);
+            if (!read_result) return tl::unexpected(read_result.error());
+            result = static_cast<int64_t>(size);
+        } else {
+            result = partial_disk_read(read_window, size);
+        }
+        if (!result) return result;
+        // Same contract as Client::Get: the window may finish transferring
+        // after the QueryResult lease deadline. Reject after the successful
+        // read so a DFS/DISK allocation is not treated as still leased.
+        if (query_result.IsLeaseExpired()) {
+            LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
+                         << key;
+            return tl::unexpected(ErrorCode::LEASE_EXPIRED);
+        }
+        return result;
     }
 
     if (!replica.is_memory_replica()) {
@@ -5169,6 +5818,13 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         device::GetAcceleratorRegistry().RuntimeAccelerators();
     void *dst = static_cast<char *>(buffer) + dst_offset;
     auto filtered_qr = FilterQueryResult(query_result, replica, false);
+    if (runtime_accelerator.FindDeviceForPointer(dst) &&
+        can_read_ub_device_memory_direct(replica, dst, size)) {
+        std::vector<Slice> slices{{dst, size}};
+        auto result = client_->Get(key, filtered_qr, slices, src_offset);
+        if (!result) return tl::unexpected(result.error());
+        return static_cast<int64_t>(size);
+    }
     if (runtime_accelerator.FindDeviceForPointer(dst) &&
         !client_->CanUseLocalMemcpy(replica) &&
         !can_use_direct_memory_read(replica, dst, size)) {
@@ -5212,6 +5868,14 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
 tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
     const std::string &key, void *buffer, size_t dst_offset, size_t src_offset,
     size_t size, bool size_is_buffer_capacity, bool verify_checksum) {
+    // One dice roll per request (MC_HIFREQ_LOG_SAMPLE_RATE, default 1.0) gates
+    // both the breakdown timing capture and its emission below.
+    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog(
+        mooncake::logging::CurrentTraceId());
+    auto t0 = breakdown_log ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
+    auto t0_wall = breakdown_log ? std::chrono::system_clock::now()
+                                 : std::chrono::system_clock::time_point{};
     auto metadata_result = resolve_ranged_read_metadata(key);
     if (!metadata_result) {
         if ((metadata_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
@@ -5219,16 +5883,99 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
             src_offset == 0) {
             VLOG(1) << "Object not found for key: " << key;
         }
+        if (breakdown_log) {
+            auto now = std::chrono::steady_clock::now();
+            auto total_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(now - t0)
+                    .count();
+            MC_LOG(INFO) << "get_into_breakdown key[" << key << "] start_time["
+                         << FormatWallClock(t0_wall)
+                         << "] query_us[0] select_us[0] local_endpoints_us[0]"
+                            " select_replica_us[0] read_us[0]"
+                            " offload_rpc_us[0] transfer_data_us[0]"
+                            " release_buffer_us[0] read_overhead_us[0] total_us["
+                         << total_us << "] type[unknown] mode[unknown] status["
+                         << toString(metadata_result.error()) << "]";
+        }
         return tl::unexpected(metadata_result.error());
     }
 
-    return execute_ranged_read(key, buffer, dst_offset, src_offset, size,
-                               metadata_result.value(), size_is_buffer_capacity,
-                               verify_checksum);
+    const auto &metadata = metadata_result.value();
+    OffloadReadTiming offload_timing;
+    ScopedOffloadReadTiming offload_timing_scope(
+        breakdown_log ? &offload_timing : nullptr);
+    auto read_start = breakdown_log
+                          ? std::chrono::steady_clock::now()
+                          : std::chrono::steady_clock::time_point{};
+    auto read_result =
+        execute_ranged_read(key, buffer, dst_offset, src_offset, size,
+                            metadata_result.value(), size_is_buffer_capacity,
+                            verify_checksum);
+
+    if (breakdown_log) {
+        auto read_end = std::chrono::steady_clock::now();
+        const auto actual_size =
+            size_is_buffer_capacity ? metadata.total_size : size;
+        const char *mode =
+            (src_offset == 0 && actual_size == metadata.total_size) ? "full"
+                                                                    : "range";
+        std::string status = "read_ok";
+        if (!read_result) {
+            if (metadata.replica.is_local_disk_replica()) {
+                status = "ssd_fail";
+            } else if (metadata.replica.is_disk_replica()) {
+                status = "disk_fail";
+            } else if (metadata.replica.is_memory_replica()) {
+                status = "mem_fail";
+            } else if (metadata.replica.is_nof_replica()) {
+                status = "nof_fail";
+            } else if (metadata.replica.is_vsegment_replica()) {
+                status = "vsegment_fail";
+            } else {
+                status = toString(read_result.error());
+            }
+        }
+
+        auto read_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                           read_end - read_start)
+                           .count();
+        auto total_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(read_end - t0)
+                .count();
+        const uint64_t known_read_us =
+            offload_timing.offload_rpc_us + offload_timing.transfer_data_us +
+            offload_timing.release_buffer_us;
+        const uint64_t read_overhead_us =
+            read_us > static_cast<int64_t>(known_read_us)
+                ? static_cast<uint64_t>(read_us) - known_read_us
+                : 0;
+        MC_LOG(INFO) << "get_into_breakdown key[" << key << "] start_time["
+                     << FormatWallClock(t0_wall) << "] query_us["
+                     << metadata.query_us << "] select_us["
+                     << metadata.select_us << "] local_endpoints_us["
+                     << metadata.local_endpoints_us << "] select_replica_us["
+                     << metadata.select_replica_us << "] read_us[" << read_us
+                     << "] offload_rpc_us[" << offload_timing.offload_rpc_us
+                     << "] transfer_data_us["
+                     << offload_timing.transfer_data_us
+                     << "] release_buffer_us["
+                     << offload_timing.release_buffer_us
+                     << "] read_overhead_us[" << read_overhead_us
+                     << "] total_us[" << total_us << "] type["
+                     << metadata.replica_type << "] mode[" << mode
+                     << "] replica_count[" << metadata.replica_count
+                     << "] selected_type[" << metadata.replica_type
+                     << "] local_endpoint[" << metadata.local_endpoint
+                     << "] remote_endpoint[" << metadata.remote_endpoint
+                     << "] status[" << status << "]";
+    }
+
+    return read_result;
 }
 
 int64_t RealClient::get_into(const std::string &key, void *buffer,
                              size_t size) {
+    mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
     auto result = execute_timed_operation<tl::expected<int64_t, ErrorCode>>(
         [&]() {
             return get_into_range_internal(key, buffer, 0, 0, size, true, true);
@@ -5298,6 +6045,16 @@ RealClient::get_into_ranges_internal(
     };
     std::unordered_map<std::string, ScatterLease> scatter_leases;
     std::vector<TransferEngine::ScatterTransferRange> memory_transfers;
+    std::vector<std::string> gather_endpoints;
+    auto append_memory_transfer =
+        [&](TransferEngine::ScatterTransferRange transfer,
+            const Replica::Descriptor &replica) {
+            gather_endpoints.push_back(
+                buffer_capacities || client_->CanUseLocalMemcpy(replica)
+                    ? ""
+                    : transfer.remote_segment);
+            memory_transfers.push_back(std::move(transfer));
+        };
     for (size_t i = 0; i < buffer_count; ++i) {
         if (!buffers[i] || (!buffer_capacities && capacities[i] == 0)) {
             continue;
@@ -5444,13 +6201,15 @@ RealClient::get_into_ranges_internal(
                 };
                 if (!StoreHcaAffinityEnabled() ||
                     metadata.query_result.replicas.size() == 1) {
-                    memory_transfers.push_back(std::move(transfer));
+                    append_memory_transfer(std::move(transfer),
+                                           metadata.replica);
                     continue;
                 }
                 auto candidates = FilterQueryResult(metadata.query_result,
                                                     metadata.replica, false);
                 if (candidates.replicas.size() == 1) {
-                    memory_transfers.push_back(std::move(transfer));
+                    append_memory_transfer(std::move(transfer),
+                                           metadata.replica);
                     continue;
                 }
                 Replica::Descriptor selected;
@@ -5487,7 +6246,7 @@ RealClient::get_into_ranges_internal(
                             size_t, const Status &status) {
                             complete(k, status);
                         };
-                    memory_transfers.push_back(std::move(fragment));
+                    append_memory_transfer(std::move(fragment), selected);
                 }
                 continue;
             }
@@ -5542,6 +6301,79 @@ RealClient::get_into_ranges_internal(
 
     // Planning may consume most of a short lease; renew before submission.
     if (allow_query_refresh && !scatter_leases.empty()) refresh_leases();
+    // Choose only compatible contiguous-output groups. Both ordinary and
+    // snapshot reads share this planner and preserve their lease semantics.
+    auto plans =
+        client_->SupportsGatherRead()
+            ? store::PlanGatherReads(memory_transfers, gather_endpoints)
+            : std::vector<store::GatherReadPlan>{};
+    std::vector<std::pair<size_t, store::GatherReadOperation>> gathered;
+    if (!plans.empty()) {
+        // Discovery, pool contention and session negotiation can all block.
+        // Keep renewing every source lease, including earlier submissions,
+        // while one worker prepares and submits the plans.
+        auto submitting = std::async(std::launch::async, [&] {
+            for (size_t i = 0; i < plans.size(); ++i) {
+                const auto &plan = plans[i];
+                auto operation = client_->SubmitGatherRead(
+                    plan.endpoint, plan.ranges, plan.destination, plan.bytes);
+                if (operation) gathered.emplace_back(i, std::move(*operation));
+            }
+        });
+        if (allow_query_refresh) {
+            while (true) {
+                const auto delay = next_refresh_delay();
+                if (delay == std::chrono::nanoseconds::max() ||
+                    submitting.wait_for(delay) == std::future_status::ready)
+                    break;
+                refresh_leases();
+            }
+        }
+        submitting.get();
+    }
+    std::vector<bool> handled(memory_transfers.size(), false);
+    for (auto &[index, operation] : gathered) {
+        store::GatherReadResult result;
+        do {
+            auto delay = allow_query_refresh ? next_refresh_delay()
+                                             : std::chrono::nanoseconds::max();
+            result =
+                delay == std::chrono::nanoseconds::max()
+                    ? operation.wait()
+                    : operation.waitFor(
+                          std::chrono::duration_cast<std::chrono::milliseconds>(
+                              delay));
+            if (result.completion == store::GatherReadCompletion::Pending)
+                refresh_leases();
+        } while (result.completion == store::GatherReadCompletion::Pending);
+        // Rejection guarantees no writes: unsupported/busy owners safely use
+        // scatter. A submitted, drained failure must not silently retry.
+        if (result.rejected()) continue;
+        for (size_t i : plans[index].transfers) {
+            handled[i] = true;
+            const auto &transfer = memory_transfers[i];
+            const auto failure = Status::Socket(result.error);
+            for (size_t k = 0; k < transfer.lengths.size(); ++k) {
+                const auto offset =
+                    reinterpret_cast<uintptr_t>(transfer.local_buffer) +
+                    transfer.local_offsets[k] -
+                    reinterpret_cast<uintptr_t>(plans[index].destination);
+                transfer.on_fragment_complete(
+                    k, result.completedRange(offset, transfer.lengths[k])
+                           ? Status::OK()
+                           : failure);
+            }
+        }
+    }
+    size_t retained = 0;
+    for (size_t i = 0; i < memory_transfers.size(); ++i)
+        if (!handled[i]) {
+            if (retained != i)
+                memory_transfers[retained] = std::move(memory_transfers[i]);
+            ++retained;
+        }
+    memory_transfers.resize(retained);
+    if (memory_transfers.empty()) return results;
     auto operation = client_->SubmitScatterNative(memory_transfers);
     if (!operation.has_value()) {
         const auto failure =
@@ -5614,7 +6446,9 @@ std::vector<tl::expected<QueryResult, ErrorCode>> RealClient::batch_query(
 
 tl::expected<RealClient::RangedReadMetadata, ErrorCode>
 RealClient::build_ranged_read_metadata_from_query_result(
-    const std::string &key, tl::expected<QueryResult, ErrorCode> query_result) {
+    const std::string &key, tl::expected<QueryResult, ErrorCode> query_result,
+    std::chrono::steady_clock::time_point t_query,
+    std::chrono::steady_clock::time_point t0) {
     if (!query_result) {
         if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
             query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
@@ -5632,17 +6466,41 @@ RealClient::build_ranged_read_metadata_from_query_result(
     }
 
     auto local_endpoints = client_->GetLocalEndpoints();
+    auto t_local_endpoints = std::chrono::steady_clock::now();
     const auto *best_replica = SelectBestReplica(replica_list, local_endpoints);
+    auto t_select = std::chrono::steady_clock::now();
     if (!best_replica) {
         LOG(ERROR) << "No usable replica for key: " << key;
         return tl::unexpected(ErrorCode::INVALID_REPLICA);
     }
 
+    const size_t replica_count = replica_list.size();
     auto query_value = std::move(query_result.value());
     auto replica = *best_replica;
-    return RangedReadMetadata{.query_result = std::move(query_value),
-                              .replica = std::move(replica),
-                              .total_size = calculate_total_size(replica)};
+    auto replica_info = DescribeReplicaForObservability(
+        replica, local_endpoints, client_->getClientId());
+    return RangedReadMetadata{
+        .query_result = std::move(query_value),
+        .replica = std::move(replica),
+        .total_size = calculate_total_size(replica),
+        .query_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(t_query - t0)
+                .count(),
+        .select_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                         t_select - t_query)
+                         .count(),
+        .local_endpoints_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                t_local_endpoints - t_query)
+                .count(),
+        .select_replica_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                t_select - t_local_endpoints)
+                .count(),
+        .replica_type = std::move(replica_info.type),
+        .replica_count = replica_count,
+        .local_endpoint = client_->GetSegmentEndpoint(),
+        .remote_endpoint = std::move(replica_info.remote_endpoint)};
 }
 
 std::string RealClient::get_hostname() const { return local_hostname; }
@@ -5650,6 +6508,7 @@ std::string RealClient::get_hostname() const { return local_hostname; }
 std::vector<int> RealClient::batch_put_from(
     const std::vector<std::string> &keys, const std::vector<void *> &buffers,
     const std::vector<size_t> &sizes, const ReplicateConfig &config) {
+    mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<void, ErrorCode>>>(
             [&]() {
@@ -5730,6 +6589,17 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
 
+    // One dice roll per request (MC_HIFREQ_LOG_SAMPLE_RATE, default 1.0) gates
+    // both the breakdown timing capture and its emission below.
+    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog(
+        mooncake::logging::CurrentTraceId());
+    auto t0 = breakdown_log ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
+    auto t0_wall = breakdown_log ? std::chrono::system_clock::now()
+                                 : std::chrono::system_clock::time_point{};
+    auto t_prep = t0;
+    uint64_t total_bytes = 0;
+
     std::unordered_map<std::string, std::vector<mooncake::Slice>> all_slices;
 
     // Create slices from user buffers
@@ -5737,6 +6607,7 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
         const std::string &key = keys[i];
         void *buffer = buffers[i];
         size_t size = sizes[i];
+        total_bytes += size;
 
         all_slices[key] = split_into_slices(buffer, size);
     }
@@ -5754,8 +6625,38 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
         }
     }
 
-    // Call client BatchPut and return the vector<expected> directly
-    return client_->BatchPut(keys, ordered_batched_slices, config);
+    if (breakdown_log) t_prep = std::chrono::steady_clock::now();
+
+    // Call client BatchPut
+    auto results = client_->BatchPut(keys, ordered_batched_slices, config);
+
+    if (breakdown_log) {
+        auto now = std::chrono::steady_clock::now();
+        size_t success_count = 0;
+        for (const auto &r : results) {
+            if (r.has_value()) success_count++;
+        }
+        auto prep_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(t_prep - t0)
+                .count();
+        auto write_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(now - t_prep)
+                .count();
+        auto total_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(now - t0)
+                .count();
+        const char *status = success_count == results.size() ? "ok"
+                             : success_count == 0            ? "err"
+                                                             : "partial";
+        MC_LOG(INFO) << "batch_put_into_breakdown num_keys[" << keys.size()
+                     << "] start_time[" << FormatWallClock(t0_wall)
+                     << "] prep_us[" << prep_us << "] write_us[" << write_us
+                     << "] total_us[" << total_us << "] size[" << total_bytes
+                     << "] success[" << success_count << "] status[" << status
+                     << "]";
+    }
+
+    return results;
 }
 
 tl::expected<void, ErrorCode> RealClient::put_from_internal(
@@ -5777,19 +6678,51 @@ tl::expected<void, ErrorCode> RealClient::put_from_internal(
         return {};
     }
 
+    // One dice roll per request (MC_HIFREQ_LOG_SAMPLE_RATE, default 1.0) gates
+    // both the breakdown timing capture and its emission below.
+    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog(
+        mooncake::logging::CurrentTraceId());
+    auto t0 = breakdown_log ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
+    auto t0_wall = breakdown_log ? std::chrono::system_clock::now()
+                                 : std::chrono::system_clock::time_point{};
+    auto t_prep = t0;
+
     // Create slices directly from the user buffer
     std::vector<mooncake::Slice> slices = split_into_slices(buffer, size);
 
     auto put_result = client_->Put(key, slices, config);
+
+    auto log_put = [&](const char *status) {
+        if (!breakdown_log) return;
+        auto now = std::chrono::steady_clock::now();
+        auto prep_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(t_prep - t0)
+                .count();
+        auto write_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(now - t_prep)
+                .count();
+        auto total_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(now - t0)
+                .count();
+        MC_LOG(INFO) << "put_into_breakdown key[" << key << "] start_time["
+                     << FormatWallClock(t0_wall) << "] prep_us[" << prep_us
+                     << "] write_us[" << write_us << "] total_us[" << total_us
+                     << "] size[" << size << "] status[" << status << "]";
+    };
+
     if (!put_result) {
+        log_put(toString(put_result.error()).c_str());
         return tl::unexpected(put_result.error());
     }
 
+    log_put("ok");
     return {};
 }
 
 int RealClient::put_from(const std::string &key, void *buffer, size_t size,
                          const ReplicateConfig &config) {
+    mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
     auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
         [&]() { return put_from_internal(key, buffer, size, config); },
         [](const auto &ret) { return ret.has_value(); },
@@ -6222,6 +7155,7 @@ int RealClient::upsert_batch(const std::vector<std::string> &keys,
 std::vector<int64_t> RealClient::batch_get_into(
     const std::vector<std::string> &keys, const std::vector<void *> &buffers,
     const std::vector<size_t> &sizes) {
+    mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<int64_t, ErrorCode>>>(
             [&]() { return batch_get_into_internal(keys, buffers, sizes); },
@@ -6672,12 +7606,27 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         return {};
     }
 
+    // One dice roll per request (MC_HIFREQ_LOG_SAMPLE_RATE, default 1.0)
+    // gates both the breakdown timing capture and its emission in the
+    // overload below.
+    BatchGetIntoBreakdownContext breakdown_ctx;
+    breakdown_ctx.sampled = mooncake::logging::ShouldSampleHiFreqLog(
+        mooncake::logging::CurrentTraceId());
+    if (breakdown_ctx.sampled) {
+        breakdown_ctx.t0 = std::chrono::steady_clock::now();
+        breakdown_ctx.t0_wall = std::chrono::system_clock::now();
+    }
+
     const auto query_results = client_->BatchQuery(keys);
+    if (breakdown_ctx.sampled) {
+        breakdown_ctx.t_query = std::chrono::steady_clock::now();
+    }
     return batch_get_into_internal(
         keys, buffers, sizes, query_results,
         [this](const std::string &endpoint, LocalDiskOffloadObjects &objects) {
             return batch_get_into_offload_object_internal(endpoint, objects);
-        });
+        },
+        &breakdown_ctx);
 }
 
 std::vector<tl::expected<int64_t, ErrorCode>>
@@ -6685,8 +7634,11 @@ RealClient::batch_get_into_internal(
     const std::vector<std::string> &keys, const std::vector<void *> &buffers,
     const std::vector<size_t> &sizes,
     const std::vector<tl::expected<QueryResult, ErrorCode>> &query_results,
-    const LocalDiskOffloadReader &local_disk_reader) {
+    const LocalDiskOffloadReader &local_disk_reader,
+    BatchGetIntoBreakdownContext *breakdown_ctx) {
     [[maybe_unused]] auto start_time = std::chrono::steady_clock::now();
+    const bool breakdown_log =
+        breakdown_ctx != nullptr && breakdown_ctx->sampled;
     // Validate preconditions
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -6745,6 +7697,12 @@ RealClient::batch_get_into_internal(
     std::vector<DuplicateFanOutJob> local_disk_dup_jobs;
     std::vector<DiskKeyInfo> disk_operations;
     valid_operations.reserve(num_keys);
+    size_t nof_count = 0;
+    // DFS replicas read directly into the destination buffer; they are
+    // direct transfers (direct_ops) but still disk-backed, so they are also
+    // reported under disk_ops like their temp-buffer DFS siblings.
+    size_t dfs_direct_count = 0;
+    std::string replica_types_log;
 
     auto local_endpoints = client_->GetLocalEndpoints();
     for (size_t i = 0; i < num_keys; ++i) {
@@ -6783,6 +7741,19 @@ RealClient::batch_get_into_internal(
         // Calculate required buffer size
         const auto replica = *best_replica;
         uint64_t total_size = calculate_total_size(replica);
+
+        // Per-key replica type. Accumulate into one string and emit a single
+        // aggregated line after the loop. Gated by breakdown_log.
+        if (breakdown_log) {
+            const auto rtype = DescribeReplicaForObservability(
+                                   replica, local_endpoints,
+                                   client_->getClientId())
+                                   .type;
+            replica_types_log += key;
+            replica_types_log += '=';
+            replica_types_log += rtype;
+            replica_types_log += ' ';
+        }
 
         // Validate buffer capacity
         if (sizes[i] < total_size) {
@@ -6828,9 +7799,11 @@ RealClient::batch_get_into_internal(
             results[i] = static_cast<int64_t>(total_size);
             continue;
         }
-        if (replica.is_disk_replica() || replica.is_dfs_replica()) {
-            // File-backed replicas cannot safely read directly into arbitrary
-            // user buffers. Use a contiguous temp buffer, then scatter.
+        if (replica.is_disk_replica() ||
+            (replica.is_dfs_replica() &&
+             !can_use_direct_dfs_read(replica, {buffers[i]}))) {
+            // DISK replicas, and DFS replicas that cannot be read directly
+            // into the destination, use a contiguous temp buffer, then scatter.
             disk_operations.emplace_back(
                 DiskKeyInfo{.key = key,
                             .original_index = i,
@@ -6841,7 +7814,12 @@ RealClient::batch_get_into_internal(
             results[i] = static_cast<int64_t>(total_size);
             continue;
         }
-        // MEMORY / NOF: RDMA directly to user buffer.
+        // MEMORY / NOF: RDMA directly to user buffer. DFS into host memory:
+        // the fs adapter reads directly to user buffer.
+        // nof_count / dfs_direct_count keep the mem/nof/disk split in the
+        // breakdown line below.
+        if (replica.is_nof_replica()) ++nof_count;
+        if (replica.is_dfs_replica()) ++dfs_direct_count;
         std::vector<Slice> key_slices;
         allocateSlices(key_slices, replica, buffers[i]);
         valid_operations.push_back(
@@ -6855,9 +7833,36 @@ RealClient::batch_get_into_internal(
         results[i] = static_cast<int64_t>(total_size);
     }
 
+    if (breakdown_log) {
+        breakdown_ctx->t_prep = std::chrono::steady_clock::now();
+    }
+
     // Early return if no valid operations
     if (valid_operations.empty() && valid_local_disk_operations.empty() &&
         disk_operations.empty()) {
+        if (breakdown_log) {
+            auto query_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    breakdown_ctx->t_query - breakdown_ctx->t0)
+                    .count();
+            auto prep_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    breakdown_ctx->t_prep - breakdown_ctx->t_query)
+                    .count();
+            auto total_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    breakdown_ctx->t_prep - breakdown_ctx->t0)
+                    .count();
+            MC_LOG(INFO) << "batch_get_into_breakdown num_keys[" << num_keys
+                         << "] start_time["
+                         << FormatWallClock(breakdown_ctx->t0_wall)
+                         << "] query_us[" << query_us << "] prep_us["
+                         << prep_us << "] read_us[0] total_us[" << total_us
+                         << "] direct_ops[0] mem_ops[0] nof_ops[0]"
+                            " disk_ops[0] ssd_offload_ops[0]"
+                         << " success[0] replicas[" << replica_types_log
+                         << "]";
+        }
         return results;
     }
 
@@ -7071,6 +8076,39 @@ RealClient::batch_get_into_internal(
     //           << "us, with memory key count: " << valid_operations.size()
     //           << ", offload key count: " << offload_object_count;
 
+    if (breakdown_log) {
+        size_t success_count = 0;
+        for (const auto &r : results) {
+            if (r.has_value()) success_count++;
+        }
+        auto query_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            breakdown_ctx->t_query - breakdown_ctx->t0)
+                            .count();
+        auto prep_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                           breakdown_ctx->t_prep - breakdown_ctx->t_query)
+                           .count();
+        auto read_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                           end_time - breakdown_ctx->t_prep)
+                           .count();
+        auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            end_time - breakdown_ctx->t0)
+                            .count();
+        MC_LOG(INFO) << "batch_get_into_breakdown num_keys[" << num_keys
+                     << "] start_time["
+                     << FormatWallClock(breakdown_ctx->t0_wall)
+                     << "] query_us[" << query_us << "] prep_us[" << prep_us
+                     << "] read_us[" << read_us << "] total_us[" << total_us
+                     << "] direct_ops[" << valid_operations.size()
+                     << "] mem_ops["
+                     << (valid_operations.size() - nof_count -
+                         dfs_direct_count)
+                     << "] nof_ops[" << nof_count << "] disk_ops["
+                     << (disk_operations.size() + dfs_direct_count)
+                     << "] ssd_offload_ops[" << offload_object_count
+                     << "] success[" << success_count << "] replicas["
+                     << replica_types_log << "]";
+    }
+
     return results;
 }
 
@@ -7252,6 +8290,26 @@ bool SessionBackendResultCountMatches(const char *operation, size_t expected,
     LOG(ERROR) << operation << " result size mismatch: expected=" << expected
                << ", got=" << actual;
     return false;
+}
+
+struct ValueWindow {
+    uint64_t offset = 0;
+    uint64_t length = 0;
+};
+
+tl::expected<ValueWindow, ErrorCode> BoundingValueWindow(
+    const std::vector<std::pair<size_t, size_t>> &ranges) {
+    if (ranges.empty()) return ValueWindow{};
+    uint64_t begin = std::numeric_limits<uint64_t>::max();
+    uint64_t end = 0;
+    for (const auto &[offset, length] : ranges) {
+        if (length > std::numeric_limits<uint64_t>::max() - offset) {
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        begin = std::min(begin, static_cast<uint64_t>(offset));
+        end = std::max(end, static_cast<uint64_t>(offset) + length);
+    }
+    return ValueWindow{begin, end - begin};
 }
 
 }  // namespace
@@ -7450,31 +8508,52 @@ RealClient::DfsSessionStagingArena RealClient::build_dfs_session_staging_arena(
     constexpr size_t kObjectAlignment = 64;
     DfsSessionStagingArena staging_arena;
     size_t arena_size = 0;
+    std::unordered_map<std::string, std::vector<std::pair<size_t, size_t>>>
+        ranges_by_key;
+    std::unordered_map<std::string, const SessionRangeReadRequest *>
+        first_request;
     for (const auto &request : requests) {
-        if (staging_arena.object_offsets.count(request.object_key) != 0) {
+        auto &ranges = ranges_by_key[request.object_key];
+        for (size_t range_index = 0;
+             range_index < request.source_offsets.size(); ++range_index) {
+            ranges.emplace_back(request.source_offsets[range_index],
+                                request.range_sizes[range_index]);
+        }
+        first_request.emplace(request.object_key, &request);
+    }
+    for (const auto &[object_key, ranges] : ranges_by_key) {
+        auto window = BoundingValueWindow(ranges);
+        const auto *request = first_request.at(object_key);
+        const uint64_t object_size =
+            calculate_total_size(request->selected_replica);
+        if (!window || window->offset > object_size ||
+            window->length > object_size - window->offset ||
+            window->length >
+                static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+            fail_file_backed_requests_for_key(
+                requests, object_key, ErrorCode::INVALID_PARAMS, results);
             continue;
         }
-
-        const size_t object_size =
-            static_cast<size_t>(calculate_total_size(request.selected_replica));
+        const size_t window_length = static_cast<size_t>(window->length);
         const size_t padding =
             (kObjectAlignment - arena_size % kObjectAlignment) %
             kObjectAlignment;
         if (padding > std::numeric_limits<size_t>::max() - arena_size ||
-            object_size >
+            window_length >
                 std::numeric_limits<size_t>::max() - arena_size - padding) {
-            fail_file_backed_requests_for_key(requests, request.object_key,
-                                              ErrorCode::BUFFER_OVERFLOW,
-                                              results);
+            fail_file_backed_requests_for_key(
+                requests, object_key, ErrorCode::BUFFER_OVERFLOW, results);
             continue;
         }
 
         arena_size += padding;
-        staging_arena.object_offsets.emplace(request.object_key, arena_size);
-        arena_size += object_size;
-        staging_arena.object_keys.push_back(request.object_key);
+        staging_arena.object_offsets.emplace(object_key, arena_size);
+        staging_arena.window_offsets.emplace(object_key, window->offset);
+        staging_arena.window_lengths.emplace(object_key, window->length);
+        arena_size += window_length;
+        staging_arena.object_keys.push_back(object_key);
         staging_arena.cached_query_results.push_back(FilterQueryResult(
-            request.cached_query_result, request.selected_replica));
+            request->cached_query_result, request->selected_replica));
     }
 
     staging_arena.staging_buffer = AcquireSessionStaging(
@@ -7495,13 +8574,14 @@ RealClient::DfsSessionStagingArena RealClient::build_dfs_session_staging_arena(
             continue;
         }
 
-        std::vector<Slice> slices;
-        allocateSlices(
-            slices, request.selected_replica,
-            static_cast<char *>(staging_arena.staging_buffer->ptr()) +
-                staging_arena.object_offsets.at(request.object_key));
-        staging_arena.object_slices.emplace(request.object_key,
-                                            std::move(slices));
+        const uint64_t window_length =
+            staging_arena.window_lengths.at(request.object_key);
+        staging_arena.object_slices.emplace(
+            request.object_key,
+            std::vector<Slice>{
+                Slice{static_cast<char *>(staging_arena.staging_buffer->ptr()) +
+                          staging_arena.object_offsets.at(request.object_key),
+                      static_cast<size_t>(window_length)}});
     }
     return staging_arena;
 }
@@ -7528,10 +8608,28 @@ void RealClient::execute_session_dfs_range_reads(
     auto staging_arena = build_dfs_session_staging_arena(requests, results);
     if (!staging_arena.staging_buffer) return;
 
-    auto read_results = client_->BatchGet(staging_arena.object_keys,
-                                          staging_arena.cached_query_results,
-                                          staging_arena.object_slices);
-    if (!SessionBackendResultCountMatches("Session DFS BatchGet",
+    std::vector<Replica::Descriptor> replicas;
+    std::vector<Slice> windows;
+    std::vector<uint64_t> offsets;
+    replicas.reserve(staging_arena.object_keys.size());
+    windows.reserve(staging_arena.object_keys.size());
+    offsets.reserve(staging_arena.object_keys.size());
+    for (const auto &object_key : staging_arena.object_keys) {
+        const SessionRangeReadRequest *request = nullptr;
+        for (const auto &candidate : requests) {
+            if (candidate.object_key == object_key) {
+                request = &candidate;
+                break;
+            }
+        }
+        if (request == nullptr) continue;
+        replicas.push_back(request->selected_replica);
+        windows.push_back(staging_arena.object_slices.at(object_key).front());
+        offsets.push_back(staging_arena.window_offsets.at(object_key));
+    }
+    auto read_results = client_->BatchReadFileReplicaRanges(
+        staging_arena.object_keys, replicas, windows, offsets);
+    if (!SessionBackendResultCountMatches("Session DFS range read",
                                           staging_arena.object_keys.size(),
                                           read_results.size())) {
         for (const auto &object_key : staging_arena.object_keys) {
@@ -7554,10 +8652,12 @@ void RealClient::execute_session_dfs_range_reads(
         const void *staging_buffer =
             static_cast<const char *>(staging_arena.staging_buffer->ptr()) +
             staging_arena.object_offsets.at(object_key);
+        const uint64_t window_offset =
+            staging_arena.window_offsets.at(object_key);
         for (const auto &request : requests) {
             if (request.object_key == object_key) {
                 complete_staged_session_range_read(request, staging_buffer,
-                                                   results);
+                                                   window_offset, results);
             }
         }
     }
@@ -7568,10 +8668,13 @@ void RealClient::execute_session_local_disk_range_reads(
     std::vector<int> &results) {
     if (requests.empty()) return;
 
-    // Group by owner endpoint; restore each unique key once, then scatter
-    // object-byte ranges from the restored pointer into the destinations.
+    // Group by owner endpoint. Restore the byte window this layer actually
+    // transfers, then scatter those bytes. The owner must not read the rest
+    // of the object.
     struct KeyPlan {
-        int64_t restore_size{0};
+        int64_t object_size{0};
+        int64_t window_offset{0};
+        int64_t window_length{0};
         std::vector<const SessionRangeReadRequest *> key_requests;
     };
     std::unordered_map<std::string, std::unordered_map<std::string, KeyPlan>>
@@ -7588,27 +8691,66 @@ void RealClient::execute_session_local_disk_range_reads(
             request.selected_replica.get_local_disk_descriptor()
                 .transport_endpoint;
         auto &plan = endpoint_plans[endpoint][request.object_key];
-        plan.restore_size = static_cast<int64_t>(total_size);
+        if (plan.key_requests.empty()) {
+            plan.object_size = static_cast<int64_t>(total_size);
+        }
         plan.key_requests.push_back(&request);
     }
 
     for (const auto &[endpoint, keys] : endpoint_plans) {
         std::vector<std::string> restore_keys;
         std::vector<int64_t> restore_sizes;
+        std::vector<int64_t> restore_offsets;
+        std::vector<int64_t> object_sizes;
         restore_keys.reserve(keys.size());
         restore_sizes.reserve(keys.size());
+        restore_offsets.reserve(keys.size());
+        object_sizes.reserve(keys.size());
         for (const auto &[key, plan] : keys) {
+            std::vector<std::pair<size_t, size_t>> ranges;
+            for (const auto *request : plan.key_requests) {
+                for (size_t range_index = 0;
+                     range_index < request->source_offsets.size();
+                     ++range_index) {
+                    ranges.emplace_back(request->source_offsets[range_index],
+                                        request->range_sizes[range_index]);
+                }
+            }
+            auto window = BoundingValueWindow(ranges);
+            auto &mutable_plan = endpoint_plans[endpoint][key];
+            if (!window ||
+                window->offset >
+                    static_cast<uint64_t>(mutable_plan.object_size) ||
+                window->length >
+                    static_cast<uint64_t>(mutable_plan.object_size) -
+                        window->offset ||
+                window->offset > static_cast<uint64_t>(
+                                     std::numeric_limits<int64_t>::max()) ||
+                window->length > static_cast<uint64_t>(
+                                     std::numeric_limits<int64_t>::max())) {
+                for (const auto *request : plan.key_requests) {
+                    results[request->result_index] =
+                        static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+                }
+                continue;
+            }
+            mutable_plan.window_offset = static_cast<int64_t>(window->offset);
+            mutable_plan.window_length = static_cast<int64_t>(window->length);
             restore_keys.push_back(key);
-            restore_sizes.push_back(plan.restore_size);
+            restore_sizes.push_back(mutable_plan.window_length);
+            restore_offsets.push_back(mutable_plan.window_offset);
+            object_sizes.push_back(mutable_plan.object_size);
+        }
+        if (restore_keys.empty()) {
+            continue;
         }
 
-        auto restored =
-            restore_offload_objects(endpoint, restore_keys, restore_sizes, {},
-                                    /*allow_pinned=*/false);
+        auto restored = restore_offload_objects(
+            endpoint, restore_keys, restore_sizes, {},
+            /*allow_pinned=*/false, &restore_offsets, &object_sizes);
         if (!restored) {
-            for (const auto &[key, plan] : keys) {
-                (void)key;
-                for (const auto *request : plan.key_requests) {
+            for (const auto &key : restore_keys) {
+                for (const auto *request : keys.at(key).key_requests) {
                     results[request->result_index] =
                         static_cast<int>(toInt(restored.error()));
                 }
@@ -7633,7 +8775,7 @@ void RealClient::execute_session_local_disk_range_reads(
                     entry_requests.push_back(request);
                     remote_bases.push_back(lease.response().pointers[i]);
                     remote_sizes.push_back(
-                        static_cast<size_t>(plan.restore_size));
+                        static_cast<size_t>(plan.window_length));
                     range_slices.emplace_back();
                     range_offsets.emplace_back();
                 }
@@ -7646,7 +8788,8 @@ void RealClient::execute_session_local_disk_range_reads(
                         Slice{request->destination_buffers[range_index],
                               request->range_sizes[range_index]});
                     offsets.push_back(static_cast<uint64_t>(
-                        request->source_offsets[range_index]));
+                        request->source_offsets[range_index] -
+                        static_cast<size_t>(plan.window_offset)));
                 }
             }
         }
@@ -7694,44 +8837,69 @@ void RealClient::execute_session_disk_range_reads(
     std::vector<int> &results) {
     if (requests.empty()) return;
 
-    std::vector<std::string> batch_keys;
-    std::vector<QueryResult> batch_query_results;
-    std::unordered_map<std::string, std::vector<Slice>> batch_slices;
-    std::unordered_map<std::string, std::unique_ptr<BufferHandle>> handles;
+    struct DiskPlan {
+        uint64_t window_offset{0};
+        std::unique_ptr<BufferHandle> handle;
+    };
+    std::unordered_map<std::string, std::vector<std::pair<size_t, size_t>>>
+        ranges_by_key;
+    std::unordered_map<std::string, const SessionRangeReadRequest *>
+        first_request;
     for (const auto &request : requests) {
-        if (batch_slices.count(request.object_key) != 0) continue;
-        const uint64_t total_size =
-            calculate_total_size(request.selected_replica);
-        if (!client_buffer_allocator_) {
-            fail_file_backed_requests_for_key(requests, request.object_key,
-                                              ErrorCode::NO_AVAILABLE_HANDLE,
-                                              results);
+        auto &ranges = ranges_by_key[request.object_key];
+        for (size_t range_index = 0;
+             range_index < request.source_offsets.size(); ++range_index) {
+            ranges.emplace_back(request.source_offsets[range_index],
+                                request.range_sizes[range_index]);
+        }
+        first_request.emplace(request.object_key, &request);
+    }
+
+    std::vector<std::string> batch_keys;
+    std::vector<Slice> windows;
+    std::vector<uint64_t> offsets;
+    std::vector<Replica::Descriptor> replicas;
+    std::unordered_map<std::string, DiskPlan> plans;
+    for (const auto &[object_key, ranges] : ranges_by_key) {
+        const auto *request = first_request.at(object_key);
+        auto window = BoundingValueWindow(ranges);
+        const uint64_t object_size =
+            calculate_total_size(request->selected_replica);
+        if (!window || window->offset > object_size ||
+            window->length > object_size - window->offset ||
+            window->length > std::numeric_limits<size_t>::max()) {
+            fail_file_backed_requests_for_key(
+                requests, object_key, ErrorCode::INVALID_PARAMS, results);
             continue;
         }
-        auto allocated = client_buffer_allocator_->allocate(total_size);
+        if (!client_buffer_allocator_) {
+            fail_file_backed_requests_for_key(
+                requests, object_key, ErrorCode::NO_AVAILABLE_HANDLE, results);
+            continue;
+        }
+        auto allocated = client_buffer_allocator_->allocate(
+            static_cast<size_t>(window->length));
         if (!allocated) {
             LOG(ERROR) << "Failed to allocate temp buffer for DISK read, key: "
-                       << request.object_key << ", size: " << total_size;
-            fail_file_backed_requests_for_key(requests, request.object_key,
-                                              ErrorCode::NO_AVAILABLE_HANDLE,
-                                              results);
+                       << object_key << ", size: " << window->length;
+            fail_file_backed_requests_for_key(
+                requests, object_key, ErrorCode::NO_AVAILABLE_HANDLE, results);
             continue;
         }
         auto handle = std::make_unique<BufferHandle>(std::move(*allocated));
-        std::vector<Slice> disk_slices;
-        allocateSlices(disk_slices, request.selected_replica, handle->ptr());
-        batch_keys.push_back(request.object_key);
-        batch_query_results.push_back(FilterQueryResult(
-            request.cached_query_result, request.selected_replica));
-        batch_slices.emplace(request.object_key, std::move(disk_slices));
-        handles.emplace(request.object_key, std::move(handle));
+        batch_keys.push_back(object_key);
+        windows.push_back(Slice{handle->ptr(), window->length});
+        offsets.push_back(window->offset);
+        replicas.push_back(request->selected_replica);
+        plans.emplace(object_key, DiskPlan{window->offset, std::move(handle)});
     }
 
     if (batch_keys.empty()) return;
-    auto disk_results =
-        client_->BatchGet(batch_keys, batch_query_results, batch_slices);
-    if (!SessionBackendResultCountMatches(
-            "Session DISK BatchGet", batch_keys.size(), disk_results.size())) {
+    auto disk_results = client_->BatchReadFileReplicaRanges(
+        batch_keys, replicas, windows, offsets);
+    if (!SessionBackendResultCountMatches("Session DISK range read",
+                                          batch_keys.size(),
+                                          disk_results.size())) {
         for (const auto &object_key : batch_keys) {
             fail_file_backed_requests_for_key(
                 requests, object_key, ErrorCode::INTERNAL_ERROR, results);
@@ -7747,22 +8915,27 @@ void RealClient::execute_session_disk_range_reads(
                 results);
             continue;
         }
-        const void *staging_buffer = handles.at(object_key)->ptr();
+        const auto &plan = plans.at(object_key);
         for (const auto &request : requests) {
             if (request.object_key == object_key) {
-                complete_staged_session_range_read(request, staging_buffer,
-                                                   results);
+                complete_staged_session_range_read(request, plan.handle->ptr(),
+                                                   plan.window_offset, results);
             }
         }
     }
 }
 
 tl::expected<void, ErrorCode> RealClient::scatter_session_range_read(
-    const SessionRangeReadRequest &request, const void *staging_buffer) const {
+    const SessionRangeReadRequest &request, const void *staging_buffer,
+    uint64_t window_offset) const {
     for (size_t range_index = 0;
          range_index < request.destination_buffers.size(); ++range_index) {
+        if (request.source_offsets[range_index] < window_offset) {
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
         const void *source = static_cast<const char *>(staging_buffer) +
-                             request.source_offsets[range_index];
+                             (request.source_offsets[range_index] -
+                              static_cast<size_t>(window_offset));
         if (auto copy = scatter_host_to_maybe_device(
                 request.destination_buffers[range_index], source,
                 request.range_sizes[range_index],
@@ -7776,10 +8949,11 @@ tl::expected<void, ErrorCode> RealClient::scatter_session_range_read(
 
 void RealClient::complete_staged_session_range_read(
     const SessionRangeReadRequest &request, const void *staging_buffer,
-    std::vector<int> &results) {
+    uint64_t window_offset, std::vector<int> &results) {
     if (invalidate_expired_get_session(request, results)) return;
 
-    auto scatter_result = scatter_session_range_read(request, staging_buffer);
+    auto scatter_result =
+        scatter_session_range_read(request, staging_buffer, window_offset);
     if (!scatter_result) {
         results[request.result_index] =
             static_cast<int>(toInt(scatter_result.error()));
@@ -7882,7 +9056,20 @@ std::vector<int> RealClient::batch_put_session_start(
         return std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
     }
     if (!config.HasValidKeyHints(keys.size())) {
-        LOG(ERROR) << "batch_put_session_start: invalid per-key hint count";
+        LOG(ERROR) << "batch_put_session_start: invalid group, affinity or HCA "
+                      "per-key hint count";
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+
+    // Ranged session writes never reach DFS and session end finalizes MEMORY
+    // only, so a DFS reservation would stay PROCESSING until the put-start
+    // discard timeout while the object looks complete.
+    if (config.dfs_replica_num > 0) {
+        LOG(ERROR) << "batch_put_session_start rejects DFS configs: "
+                   << "session path never writes DFS "
+                   << "(dfs_replica_num=" << config.dfs_replica_num
+                   << ", replica_num=" << config.replica_num << ")";
         return std::vector<int>(
             keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     }
@@ -8461,8 +9648,11 @@ RealClient::batch_get_into_multi_buffers_internal(
         const auto &buffers = all_buffers[i];
         std::vector<Slice> key_slices;
         key_slices.reserve(buffers.size());
-        if (replica.is_memory_replica() || replica.is_nof_replica()) {
-            // MEMORY / NOF: RDMA directly to the user buffers.
+        if (replica.is_memory_replica() || replica.is_nof_replica() ||
+            (replica.is_dfs_replica() &&
+             can_use_direct_dfs_read(replica, buffers))) {
+            // MEMORY / NOF: RDMA directly to the user buffers. DFS into host
+            // memory: the fs adapter reads directly to the user buffers.
             for (size_t j = 0; j < buffers.size(); ++j) {
                 key_slices.emplace_back(Slice{buffers[j], sizes[j]});
             }
@@ -9091,7 +10281,11 @@ tl::expected<QueryTaskResponse, ErrorCode> RealClient::query_task(
 }
 async_simple::coro::Lazy<tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
 RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
-                                     const std::vector<int64_t> &sizes) {
+                                     const std::vector<int64_t> &sizes,
+                                     uint64_t trace_id) {
+    const auto handler_start = std::chrono::steady_clock::now();
+    const bool breakdown_log =
+        mooncake::logging::ShouldSampleHiFreqLog(trace_id);
     // Run SSD I/O on a dedicated thread pool so the coro_rpc IO thread is
     // free to handle ping and other RPCs. Same heap-owned state pattern as
     // batch_get_into_dummy_helper: the lambda captures only a raw pointer.
@@ -9099,17 +10293,247 @@ RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
         std::vector<std::string> keys;
         std::vector<int64_t> sizes;
         std::shared_ptr<FileStorage> file_storage;
+        uint64_t trace_id;
+        std::chrono::steady_clock::time_point worker_start;
+        std::chrono::steady_clock::time_point worker_end;
     };
     auto state = std::make_unique<CallState>();
     state->keys = keys;
     state->sizes = sizes;
     state->file_storage = file_storage_;
+    state->trace_id = trace_id;
     auto *s = state.get();
     auto try_result = co_await coro_io::post(
-        [s]() { return s->file_storage->BatchGet(s->keys, s->sizes); });
+        [s]() {
+            s->worker_start = std::chrono::steady_clock::now();
+            mooncake::logging::ScopedTraceId trace(s->trace_id);
+            auto result = s->file_storage->BatchGet(s->keys, s->sizes);
+            s->worker_end = std::chrono::steady_clock::now();
+            return result;
+        });
+    const auto resumed = std::chrono::steady_clock::now();
     auto result = try_result.value();
     if (!result) {
         LOG(ERROR) << "Batch get offload object failed,err_code = "
+                   << result.error();
+        if (breakdown_log) {
+            mooncake::logging::ScopedTraceId trace(trace_id);
+            MC_LOG(INFO) << "offload_rpc_server_breakdown mode=pull"
+                         << " num_keys=" << keys.size() << " queue_us="
+                         << std::chrono::duration_cast<
+                                std::chrono::microseconds>(
+                                s->worker_start - handler_start)
+                                .count()
+                         << " batch_get_us="
+                         << std::chrono::duration_cast<
+                                std::chrono::microseconds>(
+                                s->worker_end - s->worker_start)
+                                .count()
+                         << " resume_us="
+                         << std::chrono::duration_cast<
+                                std::chrono::microseconds>(
+                                resumed - s->worker_end)
+                                .count()
+                         << " response_us=0 total_us="
+                         << std::chrono::duration_cast<
+                                std::chrono::microseconds>(
+                                resumed - handler_start)
+                                .count()
+                         << " status=read_fail error_code="
+                         << static_cast<int>(result.error());
+        }
+        co_return tl::make_unexpected(result.error());
+    }
+    const auto response_start = std::chrono::steady_clock::now();
+    BatchGetOffloadObjectResponse response(
+        result.value().batch_id, std::move(result.value().pointers),
+        client_->GetSegmentEndpoint(),
+        file_storage_->config_.client_buffer_gc_ttl_ms);
+    const auto response_end = std::chrono::steady_clock::now();
+    const auto queue_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                              s->worker_start - handler_start)
+                              .count();
+    const auto batch_get_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            s->worker_end - s->worker_start)
+            .count();
+    const auto resume_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(resumed -
+                                                              s->worker_end)
+            .count();
+    const auto response_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            response_end - response_start)
+            .count();
+    const auto total_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            response_end - handler_start)
+            .count();
+    if (breakdown_log) {
+        mooncake::logging::ScopedTraceId trace(trace_id);
+        MC_LOG(INFO) << "offload_rpc_server_breakdown mode=pull"
+                     << " num_keys=" << keys.size() << " queue_us=" << queue_us
+                     << " batch_get_us=" << batch_get_us
+                     << " resume_us=" << resume_us
+                     << " response_us=" << response_us
+                     << " total_us=" << total_us << " status=ok";
+    }
+    co_return response;
+}
+
+async_simple::coro::Lazy<
+    tl::expected<BatchGetOffloadObjectPushResponse, ErrorCode>>
+RealClient::batch_get_offload_object_push(
+    const BatchGetOffloadObjectPushRequest &req) {
+    const auto handler_start = std::chrono::steady_clock::now();
+    const bool breakdown_log =
+        mooncake::logging::ShouldSampleHiFreqLog(req.trace_id);
+    if (!file_storage_ || !client_) {
+        co_return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (req.keys.size() != req.sizes.size() ||
+        req.keys.size() != req.dst_slices.size()) {
+        co_return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    struct CallState {
+        BatchGetOffloadObjectPushRequest request;
+        std::shared_ptr<FileStorage> storage;
+        Client *client;
+        uint64_t trace_id;
+        std::chrono::steady_clock::time_point worker_start;
+        std::chrono::steady_clock::time_point worker_end;
+        uint64_t batch_get_us{0};
+        uint64_t transfer_us{0};
+        uint64_t release_us{0};
+    };
+    auto state = std::make_unique<CallState>();
+    state->request = req;
+    state->storage = file_storage_;
+    state->client = client_.get();
+    state->trace_id = req.trace_id;
+    auto *s = state.get();
+    auto posted =
+        co_await coro_io::post([s]() -> tl::expected<void, ErrorCode> {
+            s->worker_start = std::chrono::steady_clock::now();
+            mooncake::logging::ScopedTraceId trace(s->trace_id);
+            const auto batch_get_start = std::chrono::steady_clock::now();
+            auto batch =
+                s->storage->BatchGet(s->request.keys, s->request.sizes);
+            s->batch_get_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - batch_get_start)
+                    .count();
+            if (!batch) {
+                LOG(ERROR) << "Push offload BatchGet failed, err_code = "
+                           << batch.error();
+                s->worker_end = std::chrono::steady_clock::now();
+                return tl::unexpected(batch.error());
+            }
+            const uint64_t batch_id = batch->batch_id;
+            const auto transfer_start = std::chrono::steady_clock::now();
+            auto pushed = s->client->BatchPushOffloadObject(
+                s->request.requester_te_addr, s->request.keys, batch->pointers,
+                s->request.dst_slices);
+            s->transfer_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - transfer_start)
+                    .count();
+            const auto release_start = std::chrono::steady_clock::now();
+            s->storage->ReleaseBuffer(batch_id);
+            s->release_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - release_start)
+                    .count();
+            s->worker_end = std::chrono::steady_clock::now();
+            return pushed;
+        });
+    const auto resumed = std::chrono::steady_clock::now();
+    auto result = posted.value();
+    if (!result) {
+        LOG(ERROR) << "Push offload transfer failed, err_code = "
+                   << result.error();
+        if (breakdown_log) {
+            mooncake::logging::ScopedTraceId trace(req.trace_id);
+            MC_LOG(INFO) << "offload_rpc_server_breakdown mode=push"
+                         << " num_keys=" << req.keys.size() << " queue_us="
+                         << std::chrono::duration_cast<
+                                std::chrono::microseconds>(
+                                s->worker_start - handler_start)
+                                .count()
+                         << " batch_get_us=" << s->batch_get_us
+                         << " transfer_data_us=" << s->transfer_us
+                         << " release_buffer_us=" << s->release_us
+                         << " resume_us="
+                         << std::chrono::duration_cast<
+                                std::chrono::microseconds>(
+                                resumed - s->worker_end)
+                                .count()
+                         << " response_us=0 total_us="
+                         << std::chrono::duration_cast<
+                                std::chrono::microseconds>(
+                                resumed - handler_start)
+                                .count()
+                         << " status=failed error_code="
+                         << static_cast<int>(result.error());
+        }
+        co_return tl::unexpected(result.error());
+    }
+    const auto response_start = std::chrono::steady_clock::now();
+    BatchGetOffloadObjectPushResponse response(ErrorCode::OK);
+    const auto response_end = std::chrono::steady_clock::now();
+    if (breakdown_log) {
+        mooncake::logging::ScopedTraceId trace(req.trace_id);
+        MC_LOG(INFO) << "offload_rpc_server_breakdown mode=push"
+                     << " num_keys=" << req.keys.size() << " queue_us="
+                     << std::chrono::duration_cast<std::chrono::microseconds>(
+                            s->worker_start - handler_start)
+                            .count()
+                     << " batch_get_us=" << s->batch_get_us
+                     << " transfer_data_us=" << s->transfer_us
+                     << " release_buffer_us=" << s->release_us
+                     << " resume_us="
+                     << std::chrono::duration_cast<std::chrono::microseconds>(
+                            resumed - s->worker_end)
+                            .count()
+                     << " response_us="
+                     << std::chrono::duration_cast<std::chrono::microseconds>(
+                            response_end - response_start)
+                            .count()
+                     << " total_us="
+                     << std::chrono::duration_cast<std::chrono::microseconds>(
+                            response_end - handler_start)
+                            .count()
+                     << " status=ok";
+    }
+    co_return response;
+}
+
+async_simple::coro::Lazy<tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
+RealClient::batch_get_offload_object_ranges(
+    const std::vector<std::string> &keys, const std::vector<int64_t> &offsets,
+    const std::vector<int64_t> &sizes,
+    const std::vector<int64_t> &object_sizes) {
+    struct CallState {
+        std::vector<std::string> keys;
+        std::vector<int64_t> offsets;
+        std::vector<int64_t> sizes;
+        std::vector<int64_t> object_sizes;
+        std::shared_ptr<FileStorage> file_storage;
+    };
+    auto state = std::make_unique<CallState>();
+    state->keys = keys;
+    state->offsets = offsets;
+    state->sizes = sizes;
+    state->object_sizes = object_sizes;
+    state->file_storage = file_storage_;
+    auto *s = state.get();
+    auto try_result = co_await coro_io::post([s]() {
+        return s->file_storage->BatchGetRanges(s->keys, s->offsets, s->sizes,
+                                               s->object_sizes);
+    });
+    auto result = try_result.value();
+    if (!result) {
+        LOG(ERROR) << "Batch get offload object range failed, err_code = "
                    << result.error();
         co_return tl::make_unexpected(result.error());
     }
@@ -9119,7 +10543,8 @@ RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
         file_storage_->config_.client_buffer_gc_ttl_ms);
 }
 
-bool RealClient::release_offload_buffer(uint64_t batch_id) {
+bool RealClient::release_offload_buffer(uint64_t batch_id, uint64_t trace_id) {
+    (void)trace_id;
     if (!file_storage_) {
         LOG(WARNING)
             << "release_offload_buffer called but file_storage_ is null";
@@ -9318,8 +10743,12 @@ RealClient::restore_offload_objects(
     const std::vector<std::string> &keys,
     const std::vector<int64_t> &restore_sizes,
     const std::unordered_map<std::string, std::vector<Slice>> &objects,
-    bool allow_pinned) {
-    if (keys.size() != restore_sizes.size()) {
+    bool allow_pinned, const std::vector<int64_t> *value_offsets,
+    const std::vector<int64_t> *object_sizes) {
+    if (keys.size() != restore_sizes.size() ||
+        (value_offsets != nullptr && value_offsets->size() != keys.size()) ||
+        (object_sizes != nullptr && object_sizes->size() != keys.size()) ||
+        ((value_offsets == nullptr) != (object_sizes == nullptr))) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     offload_rpc_read_count_.fetch_add(1, std::memory_order_relaxed);
@@ -9339,10 +10768,20 @@ RealClient::restore_offload_objects(
     auto response =
         [&]() -> tl::expected<BatchGetOffloadObjectResponse, ErrorCode> {
         if (!local_batch) {
+            if (value_offsets != nullptr) {
+                return client_requester_->batch_get_offload_object_ranges(
+                    target_rpc_service_addr, storage_keys, *value_offsets,
+                    restore_sizes, *object_sizes);
+            }
             return client_requester_->batch_get_offload_object(
                 target_rpc_service_addr, storage_keys, restore_sizes);
         }
-        auto result = file_storage_->BatchGetLocal(storage_keys, restore_sizes);
+        auto result =
+            value_offsets != nullptr
+                ? file_storage_->BatchGetLocalRanges(
+                      storage_keys, *value_offsets, restore_sizes,
+                      *object_sizes)
+                : file_storage_->BatchGetLocal(storage_keys, restore_sizes);
         if (!result) {
             return tl::unexpected(result.error());
         }
@@ -9374,6 +10813,11 @@ RealClient::batch_get_into_offload_object_internal(
     const std::string &target_rpc_service_addr,
     std::unordered_map<std::string, std::vector<Slice>> &objects,
     const OffloadReadRange *read_range) {
+    auto start_time = std::chrono::steady_clock::now();
+    // One dice roll per request (MC_HIFREQ_LOG_SAMPLE_RATE, default 1.0)
+    // gates the offload_read_breakdown emission below.
+    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog(
+        mooncake::logging::CurrentTraceId());
     std::vector<std::string> keys;
     std::vector<int64_t> sizes;
     if (read_range && objects.size() != 1) {
@@ -9393,34 +10837,115 @@ RealClient::batch_get_into_offload_object_internal(
         }
         int64_t storage_size = static_cast<int64_t>(total);
         if (read_range) {
-            storage_size = read_range->restore_size;
-            if (storage_size < 0 ||
-                read_range->source_offset > uint64_t(storage_size) ||
-                total > uint64_t(storage_size) - read_range->source_offset) {
+            if (read_range->object_size < 0 ||
+                read_range->source_offset >
+                    static_cast<uint64_t>(read_range->object_size) ||
+                total > static_cast<uint64_t>(read_range->object_size) -
+                            read_range->source_offset ||
+                read_range->source_offset >
+                    static_cast<uint64_t>(
+                        std::numeric_limits<int64_t>::max())) {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
         }
         sizes.emplace_back(storage_size);
     }
 
+    std::vector<int64_t> value_offsets;
+    std::vector<int64_t> object_sizes;
+    const std::vector<int64_t> *offsets_arg = nullptr;
+    const std::vector<int64_t> *object_sizes_arg = nullptr;
+    if (read_range) {
+        value_offsets.push_back(
+            static_cast<int64_t>(read_range->source_offset));
+        object_sizes.push_back(read_range->object_size);
+        offsets_arg = &value_offsets;
+        object_sizes_arg = &object_sizes;
+    }
+    static const bool kOffloadPush = []() {
+        const char *value = std::getenv("MC_OFFLOAD_PUSH");
+        return value != nullptr && (std::string_view(value) == "true" ||
+                                    std::string_view(value) == "1");
+    }();
+    if (kOffloadPush && read_range == nullptr && client_ && client_requester_ &&
+        client_->GetSegmentEndpoint().size() > 0) {
+        // The pull path is counted inside restore_offload_objects; count the
+        // push path here so both offload read modes increment the counter.
+        offload_rpc_read_count_.fetch_add(1, std::memory_order_relaxed);
+        const TenantId tenant_id(client_->tenant_id());
+        BatchGetOffloadObjectPushRequest request;
+        request.keys.reserve(keys.size());
+        request.sizes = sizes;
+        request.dst_slices.reserve(keys.size());
+        for (const auto &key : keys) {
+            request.keys.emplace_back(tenant_id.MakeScopedKey(key));
+            std::vector<OffloadDstSlice> dst;
+            for (const auto &slice : objects.at(key)) {
+                dst.emplace_back(reinterpret_cast<uint64_t>(slice.ptr),
+                                 slice.size);
+            }
+            request.dst_slices.emplace_back(std::move(dst));
+        }
+        request.requester_te_addr = client_->GetSegmentEndpoint();
+        request.trace_id = mooncake::logging::CurrentTraceId();
+        const auto rpc_start = std::chrono::steady_clock::now();
+        ClientRequester::RpcTiming rpc_timing;
+        auto pushed = client_requester_->batch_get_offload_object_push(
+            target_rpc_service_addr, request, &rpc_timing);
+        const auto rpc_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - rpc_start)
+                .count();
+        if (current_offload_read_timing) {
+            current_offload_read_timing->offload_rpc_us = rpc_us;
+        }
+        if (!pushed) return tl::unexpected(pushed.error());
+        if (pushed->error_code != ErrorCode::OK) {
+            return tl::unexpected(pushed->error_code);
+        }
+        const auto push_end_time = std::chrono::steady_clock::now();
+        if (breakdown_log) {
+            MC_LOG(INFO) << "offload_read_breakdown mode=push"
+                         << " endpoint=" << target_rpc_service_addr
+                         << " num_keys=" << objects.size()
+                         << " total_us="
+                         << std::chrono::duration_cast<
+                                std::chrono::microseconds>(
+                                push_end_time - start_time)
+                                .count()
+                         << " status=ok";
+        }
+        return {};
+    }
+    const auto rpc_start = std::chrono::steady_clock::now();
     auto restored =
-        restore_offload_objects(target_rpc_service_addr, keys, sizes, objects);
+        restore_offload_objects(target_rpc_service_addr, keys, sizes, objects,
+                                true, offsets_arg, object_sizes_arg);
+    const auto rpc_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - rpc_start)
+            .count();
+    if (current_offload_read_timing) {
+        current_offload_read_timing->offload_rpc_us = rpc_us;
+    }
     if (!restored) {
         return tl::unexpected(restored.error());
     }
     auto &lease = **restored;
-    if (read_range) {
-        if (lease.response().pointers[0] >
-            std::numeric_limits<uint64_t>::max() - read_range->source_offset) {
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        lease.response().pointers[0] += read_range->source_offset;
-    }
+    const auto transfer_start = std::chrono::steady_clock::now();
     auto result = client_->BatchGetOffloadObject(
         lease.response().transfer_engine_addr, keys, lease.response().pointers,
         objects,
         lease.local_batch() ? OffloadBufferAccess::kLocalAddress
                             : OffloadBufferAccess::kTransferEngine);
+    const auto transfer_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - transfer_start)
+            .count();
+    if (current_offload_read_timing) {
+        current_offload_read_timing->transfer_data_us = transfer_us;
+    }
+    const auto end_time = std::chrono::steady_clock::now();
     const auto elapsed_time = lease.ElapsedMs();
     LOG(INFO) << "Time taken for batch_get_into_offload_object_internal: "
               << elapsed_time
@@ -9428,6 +10953,19 @@ RealClient::batch_get_into_offload_object_internal(
               << ", key size: " << objects.size()
               << ", batch_id: " << lease.response().batch_id
               << ", gc ttl: " << lease.response().gc_ttl_ms << "ms.";
+
+    if (breakdown_log) {
+        MC_LOG(INFO) << "offload_read_breakdown mode=pull"
+                     << " endpoint=" << target_rpc_service_addr
+                     << " num_keys=" << objects.size()
+                     << " batch_id=" << lease.response().batch_id
+                     << " gc_ttl_ms=" << lease.response().gc_ttl_ms
+                     << " pre_release_total_us="
+                     << std::chrono::duration_cast<std::chrono::microseconds>(
+                            end_time - start_time)
+                            .count()
+                     << " status=" << (result ? "ok" : "transfer_fail");
+    }
 
     if (!result) {
         LOG(ERROR) << "Batch get into offload object failed with error: "
@@ -9438,6 +10976,60 @@ RealClient::batch_get_into_offload_object_internal(
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
     }
     return {};
+}
+
+void ClientRequester::WarmupRpcPool(const std::string &client_addr) {
+    if (!Environ::Get().GetYltRpcPoolWarmupEnabled(true)) return;
+    auto client_pool = client_pools_->at(client_addr);
+    const size_t target = Environ::Get().GetYltRpcPoolWarmupConnections(
+        client_pool->get_pool_config().max_connection);
+    if (target == 0) return;
+    std::unique_lock lock(warmed_rpc_pool_mutex_);
+    if (!warmed_rpc_pools_.insert(client_addr).second) return;
+    std::vector<std::future<bool>> futures;
+    futures.reserve(target);
+    for (size_t i = 0; i < target; ++i) {
+        futures.emplace_back(
+            std::async(std::launch::async, [this, client_addr] {
+                return invoke_rpc<&RealClient::service_ready_internal, void>(
+                           client_addr, nullptr)
+                    .has_value();
+            }));
+    }
+    for (auto &future : futures) {
+        try {
+            (void)future.get();
+        } catch (const std::exception &e) {
+            LOG(WARNING) << "Offload RPC pool warmup failed for " << client_addr
+                         << ": " << e.what();
+        }
+    }
+}
+
+tl::expected<BatchGetOffloadObjectPushResponse, ErrorCode>
+ClientRequester::batch_get_offload_object_push(
+    const std::string &client_addr,
+    const BatchGetOffloadObjectPushRequest &request, RpcTiming *timing) {
+    auto result = invoke_rpc<&RealClient::batch_get_offload_object_push,
+                             BatchGetOffloadObjectPushResponse>(
+        client_addr, timing, request);
+    if (timing && mooncake::logging::ShouldSampleHiFreqLog(request.trace_id)) {
+        mooncake::logging::ScopedTraceId trace(request.trace_id);
+        MC_LOG(INFO) << "offload_rpc_client_breakdown mode=push"
+                     << " endpoint=" << client_addr
+                     << " num_keys=" << request.keys.size()
+                     << " pool_lookup_us=" << timing->pool_lookup_us
+                     << " rpc_call_us=" << timing->rpc_call_us
+                     << " result_get_us=" << timing->result_get_us
+                     << " result_parse_us=" << timing->result_parse_us
+                     << " total_us=" << timing->total_us
+                     << " status=" << (result ? "ok" : "rpc_fail");
+    }
+    if (!result) {
+        LOG(ERROR) << "Failed to invoke batch_get_offload_object_push at "
+                   << client_addr << ": " << result.error();
+    }
+    return result;
 }
 
 ClientRequester::ClientRequester() {
@@ -9459,6 +11051,14 @@ ClientRequester::ClientRequester() {
     pool_conf.connect_retry_count = 3;
     pool_conf.reconnect_wait_time = std::chrono::milliseconds{1000};
     pool_conf.host_alive_detect_duration = std::chrono::milliseconds{0};
+    pool_conf.max_connection =
+        Environ::Get().GetYltRpcPoolMaxConnection(pool_conf.max_connection);
+    pool_conf.idle_timeout =
+        std::chrono::milliseconds(Environ::Get().GetYltRpcPoolIdleTimeoutMs(
+            pool_conf.idle_timeout.count()));
+    pool_conf.short_connect_idle_timeout = std::chrono::milliseconds(
+        Environ::Get().GetYltRpcPoolShortIdleTimeoutMs(
+            pool_conf.short_connect_idle_timeout.count()));
 
     // Honour the same timeout overrides as the master pool. Without this the
     // connect timeout stays at coro_rpc's built-in 30s, so a read that picks a
@@ -9489,14 +11089,43 @@ ClientRequester::~ClientRequester() {
 tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
 ClientRequester::batch_get_offload_object(const std::string &client_addr,
                                           const std::vector<std::string> &keys,
-                                          const std::vector<int64_t> &sizes) {
-    auto result =
-        invoke_rpc<&RealClient::batch_get_offload_object,
-                   BatchGetOffloadObjectResponse>(client_addr, keys, sizes);
+                                          const std::vector<int64_t> &sizes,
+                                          RpcTiming *timing) {
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
+    auto result = invoke_rpc<&RealClient::batch_get_offload_object,
+                             BatchGetOffloadObjectResponse>(
+        client_addr, timing, keys, sizes, trace_id);
+    if (timing && mooncake::logging::ShouldSampleHiFreqLog(trace_id)) {
+        MC_LOG(INFO) << "offload_rpc_client_breakdown mode=pull"
+                     << " endpoint=" << client_addr
+                     << " num_keys=" << keys.size()
+                     << " pool_lookup_us=" << timing->pool_lookup_us
+                     << " rpc_call_us=" << timing->rpc_call_us
+                     << " result_get_us=" << timing->result_get_us
+                     << " result_parse_us=" << timing->result_parse_us
+                     << " total_us=" << timing->total_us
+                     << " status=" << (result ? "ok" : "rpc_fail");
+    }
     if (!result) {
         LOG(ERROR)
             << "Failed to invoke batch_get_offload_object, client_addr = "
             << client_addr << ", error is: " << result.error();
+    }
+    return result;
+}
+
+tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
+ClientRequester::batch_get_offload_object_ranges(
+    const std::string &client_addr, const std::vector<std::string> &keys,
+    const std::vector<int64_t> &offsets, const std::vector<int64_t> &sizes,
+    const std::vector<int64_t> &object_sizes) {
+    auto result = invoke_rpc<&RealClient::batch_get_offload_object_ranges,
+                             BatchGetOffloadObjectResponse>(
+        client_addr, nullptr, keys, offsets, sizes, object_sizes);
+    if (!result) {
+        LOG(ERROR) << "Failed to invoke batch_get_offload_object_ranges, "
+                      "client_addr = "
+                   << client_addr << ", error is: " << result.error();
     }
     return result;
 }
@@ -9506,7 +11135,7 @@ ClientRequester::verify_disk_replica(const std::string &client_addr,
                                      const VerifyDiskReplicaRequest &request) {
     auto result =
         invoke_rpc<&RealClient::verify_disk_replica, VerifyDiskReplicaResponse>(
-            client_addr, request);
+            client_addr, nullptr, request);
     if (!result) {
         LOG(ERROR) << "Failed to invoke verify_disk_replica, client_addr = "
                    << client_addr << ", error is: " << result.error();
@@ -9515,10 +11144,22 @@ ClientRequester::verify_disk_replica(const std::string &client_addr,
 }
 
 void ClientRequester::release_offload_buffer(const std::string &client_addr,
-                                             uint64_t batch_id) {
+                                             uint64_t batch_id,
+                                             RpcTiming *timing) {
     // Fire-and-forget: attempt to release buffer, log errors but don't block
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
     auto result = invoke_rpc<&RealClient::release_offload_buffer, bool>(
-        client_addr, batch_id);
+        client_addr, timing, batch_id, trace_id);
+    if (timing && mooncake::logging::ShouldSampleHiFreqLog(trace_id)) {
+        MC_LOG(INFO) << "offload_release_client_breakdown endpoint="
+                     << client_addr << " batch_id=" << batch_id
+                     << " pool_lookup_us=" << timing->pool_lookup_us
+                     << " rpc_call_us=" << timing->rpc_call_us
+                     << " result_get_us=" << timing->result_get_us
+                     << " result_parse_us=" << timing->result_parse_us
+                     << " total_us=" << timing->total_us
+                     << " status=" << (result ? "ok" : "rpc_fail");
+    }
     if (!result) {
         // This is expected in some cases (e.g., network issues, buffer already
         // GC'd) Log at INFO level since GC will eventually clean up anyway
@@ -9537,7 +11178,7 @@ void ClientRequester::prefetch_offload_object(
     // Best-effort: old peers reject the unknown handler and network errors
     // are logged, never propagated. The keys simply stay SSD-only.
     auto result = invoke_rpc<&RealClient::prefetch_offload_object, bool>(
-        client_addr, keys, sizes, tenant_id);
+        client_addr, nullptr, keys, sizes, tenant_id);
     if (!result) {
         VLOG(1) << "Failed to invoke prefetch_offload_object, client_addr = "
                 << client_addr << ", error is: " << result.error();
@@ -9546,25 +11187,46 @@ void ClientRequester::prefetch_offload_object(
 
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> ClientRequester::invoke_rpc(
-    const std::string &client_addr, Args &&...args) {
+    const std::string &client_addr, RpcTiming *timing, Args &&...args) {
+    const auto total_start = std::chrono::steady_clock::now();
     RpcDrainGuard::ScopedCall inflight(rpc_drain_);
     if (!inflight.ok()) {
         return tl::make_unexpected(ErrorCode::RPC_FAIL);
     }
     auto client_pool = client_pools_->at(client_addr);
-    return async_simple::coro::syncAwait(
+    if (timing) {
+        timing->pool_lookup_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - total_start)
+                .count();
+    }
+    auto rpc_result = async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>> {
+            const auto rpc_call_start = std::chrono::steady_clock::now();
             auto ret = co_await client_pool->send_request(
                 [&](coro_io::client_reuse_hint,
                     coro_rpc::coro_rpc_client &client) {
                     return client.send_request<ServiceMethod>(
                         std::forward<Args>(args)...);
                 });
+            if (timing) {
+                timing->rpc_call_us =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - rpc_call_start)
+                        .count();
+            }
             if (!ret.has_value()) {
                 LOG(ERROR) << "Dummy Client not available";
                 co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
             }
+            const auto result_get_start = std::chrono::steady_clock::now();
             auto result = co_await std::move(ret.value());
+            if (timing) {
+                timing->result_get_us =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - result_get_start)
+                        .count();
+            }
             if (!result) {
                 if (result.error().code == coro_rpc::errc::timed_out) {
                     LOG(ERROR) << "RPC call timed out: " << result.error().msg;
@@ -9573,7 +11235,33 @@ tl::expected<ReturnType, ErrorCode> ClientRequester::invoke_rpc(
                 LOG(ERROR) << "RPC call failed: " << result.error().msg;
                 co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
             }
-            co_return result->result();
+            const auto parse_start = std::chrono::steady_clock::now();
+            if constexpr (std::is_void_v<ReturnType>) {
+                result->result();
+                if (timing) {
+                    timing->result_parse_us =
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - parse_start)
+                            .count();
+                }
+                co_return tl::expected<ReturnType, ErrorCode>{};
+            } else {
+                auto response = std::move(result->result());
+                if (timing) {
+                    timing->result_parse_us =
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - parse_start)
+                            .count();
+                }
+                co_return std::move(response);
+            }
         }());
+    if (timing) {
+        timing->total_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - total_start)
+                .count();
+    }
+    return rpc_result;
 }
 }  // namespace mooncake

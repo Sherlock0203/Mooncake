@@ -2,6 +2,8 @@
 .vscode
 build
 build_ofed4
+build-xpu-ci/
+xpu-ci-output/
 old
 local_test
 go.sum
@@ -9,6 +11,7 @@ go.sum
 *.so
 bin
 mod
+.agents/
 
 # python
 # Byte-compiled / optimized / DLL files
@@ -209,3 +212,6 @@ core_*
 # MacOS
 .DS_Store
 .envrc
+
+# 个人实验记录/部署手记（不入库；已跟踪的文件需 git rm -r --cached 才生效）
+docs/yin/

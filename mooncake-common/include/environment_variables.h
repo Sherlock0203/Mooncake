@@ -45,11 +45,20 @@ struct FilePerKeyEnvironmentVariables {
 };
 
 struct BucketBackendEnvironmentVariables {
+    // 0/false: buffered; packed/true/1: packed direct writes;
+    // aligned: aligned direct writes
+    // (BucketBackendConfig::aligned_direct_write).
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_OFFLOAD_BUCKET_COPY_THREADS);
     MC_DEFINE_ENV_VAR(bool, MOONCAKE_OFFLOAD_FLUSH_PARTIAL_BUCKETS);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_BUCKET_MAX_TOTAL_SIZE);
+    // Comma-separated per-disk quotas, positionally aligned with the disk
+    // list in MOONCAKE_OFFLOAD_FILE_STORAGE_PATH. Kept as a string because it
+    // is a list, not a scalar.
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE_LIST);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS);
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY);
@@ -134,6 +143,7 @@ struct DistributedStorageEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_DISTRIBUTED_ROOT_DIR);
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_DFS_FS_ADAPTER);
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_DISTRIBUTED_FS_TYPE);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_KVCS_EFC_CONFIG);
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_DFS_ALLOCATOR);
     MC_DEFINE_ENV_VAR(bool, MOONCAKE_DISTRIBUTED_HEALTH_CHECK);
     MC_DEFINE_ENV_VAR(int, MOONCAKE_DFS_SHARD_COUNT);
@@ -147,6 +157,17 @@ struct DistributedStorageEnvironmentVariables {
     MC_DEFINE_ENV_VAR(double, MOONCAKE_DFS_EVICTION_LOW_WATERMARK);
     MC_DEFINE_ENV_VAR(int, MOONCAKE_DFS_DEFERRED_FREE_SECONDS);
     MC_DEFINE_ENV_VAR(int, MOONCAKE_DFS_EVICTION_CHECK_INTERVAL);
+};
+
+struct KvcsEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_KVCS_EFC_SOCKET);
+    MC_DEFINE_ENV_VAR(uint64_t, MOONCAKE_KVCS_MAX_VALUE_SIZE);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_KVCS_MAX_KEY_SIZE);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_KVCS_MAX_KEYS_PER_BATCH);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_KVCS_GET_WORKERS);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_KVCS_SET_WORKERS);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_KVCS_SIMPLE_WORKERS);
+    MC_DEFINE_ENV_VAR(uint64_t, MOONCAKE_KVCS_OPERATION_TIMEOUT_MS);
 };
 
 struct OssAdapterEnvironmentVariables {
@@ -268,6 +289,20 @@ struct SpdkControllerEnvironmentVariables {
     MC_DEFINE_ENV_VAR(uint64_t, MC_NVME_FABRICS_CONNECT_TIMEOUT_US);
     MC_DEFINE_ENV_VAR(bool, MC_NVME_HEADER_DIGEST);
     MC_DEFINE_ENV_VAR(bool, MC_NVME_DATA_DIGEST);
+    // Unset keeps SPDK's default KATO (10 s); 0 disables keep-alive.
+    MC_DEFINE_ENV_VAR(uint32_t, MC_NVME_KEEP_ALIVE_TIMEOUT_MS);
+    // I/O queue pairs ("lanes") opened per NoF segment, 1..64 (default 4).
+    MC_DEFINE_ENV_VAR(uint32_t, MC_NOF_QPAIRS_PER_SEGMENT);
+};
+
+// SPDK *environment* knobs, read before spdk_env_init(). Kept separate from
+// SpdkControllerEnvironmentVariables: those feed one controller's
+// spdk_nvme_ctrlr_opts in the probe callback, while these describe the
+// process-wide EAL setup.
+struct SpdkEnvEnvironmentVariables {
+    // Default true. false keeps EAL's main-lcore placement of the initializing
+    // thread instead of restoring the caller's mask.
+    MC_DEFINE_ENV_VAR(bool, MC_SPDK_RESET_AFFINITY);
 };
 
 struct NvmeKvConnectorEnvironmentVariables {

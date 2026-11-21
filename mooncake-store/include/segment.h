@@ -79,11 +79,10 @@ class ScopedSegmentAccess {
         : segment_manager_(segment_manager), lock_(mutex) {}
 
     /**
-     * @brief Mount a segment
+     * @brief Mount a segment under its non-null owner's client ID.
      */
-    ErrorCode MountSegment(
-        const Segment& segment, const UUID& client_id,
-        std::shared_ptr<ClientLivenessRecord> client_liveness);
+    ErrorCode MountSegment(const Segment& segment,
+                           ClientSessionSharedPtr owner_session);
 
     /**
      * @brief Re-mount a segment. To avoid infinite remount trying, only the
@@ -91,9 +90,8 @@ class ScopedSegmentAccess {
      * errors. When encounters unsolvable errors, the segment will not be
      * mounted while the return value will be OK.
      */
-    ErrorCode ReMountSegment(
-        const std::vector<Segment>& segments, const UUID& client_id,
-        std::shared_ptr<ClientLivenessRecord> client_liveness);
+    ErrorCode ReMountSegment(const std::vector<Segment>& segments,
+                             ClientSessionSharedPtr owner_session);
 
     ErrorCode ValidateRemountSegment(const Segment& segment,
                                      const UUID& client_id) const;
@@ -141,15 +139,10 @@ class ScopedSegmentAccess {
                                 std::vector<Segment>& segments) const;
 
     /**
-     * @brief Rebind restored client-owned segment resources to a fresh
-     *        liveness record. Segment snapshots intentionally do not persist
-     *        record implementation state.
+     * @brief Bind all segments of the owner's client ID to `owner_session`.
      */
-    void BindClientLiveness(
-        const UUID& client_id,
-        const std::shared_ptr<ClientLivenessRecord>& client_liveness);
+    void BindClientSession(const ClientSessionSharedPtr& owner_session);
     void BindBufferToSegment(const UUID& segment_id, AllocatedBuffer& buffer);
-    [[nodiscard]] bool RebindBufferToOwningSegment(AllocatedBuffer& buffer);
 
     /**
      * @brief Get the names of all the segments
@@ -160,6 +153,21 @@ class ScopedSegmentAccess {
      * @brief Get all the segments with their complete information
      */
     ErrorCode GetAllSegments(
+        std::vector<std::pair<Segment, UUID>>& all_segments);
+
+    /**
+     * @brief Get all segments with their exact owner client ids.
+     *
+     * Unlike the pair-version GetAllSegments() above, which resolves the
+     * owner via client_by_name_ (name-granular and therefore ambiguous when
+     * an old and a new generation of the same-named worker coexist during a
+     * restart window), this variant builds the reverse map from
+     * client_segments_ so each segment is attributed to its true mounting
+     * client. Required by generation-replacement eviction
+     * (MasterService::EvictStaleGenerationForHost) to unmount stale segments
+     * without leaving dead ids in client_segments_.
+     */
+    ErrorCode GetAllSegmentsWithOwner(
         std::vector<std::pair<Segment, UUID>>& all_segments);
 
     std::vector<std::string> GetHostOrderedSegments(
@@ -366,6 +374,14 @@ class SegmentManager {
         return ScopedSegmentAccess(this, segment_mutex_);
     }
 
+    // Bulk read of segment runtime locations under a shared lock. Returns false
+    // if any segment is missing or has no transport endpoint. Unlike
+    // getSegmentAccess()/GetSegment(), this does not take the segment mutex
+    // exclusively.
+    bool GetSegmentLocations(const std::vector<UUID>& segment_ids,
+                             std::vector<std::string>* endpoints,
+                             std::vector<uint64_t>* bases) const;
+
     /**
      * @brief Get RAII-style access to use allocators
      * @return ScopedAllocatorAccess object that holds the lock
@@ -402,6 +418,13 @@ class SegmentManager {
     bool HasSegmentByEndpoint(const std::string& endpoint) const;
     bool GetSegmentBasicInfo(const UUID& segment_id, std::string& segment_name,
                              std::string& te_endpoint) const;
+
+    // Returns the client_id that owns the segment with the given name,
+    // or nullopt if the segment is not registered.
+    // Used by post-promotion cleanup to determine whether a memory
+    // replica's owning client has reconnected.
+    std::optional<UUID> getClientIdBySegmentName(
+        const std::string& segment_name) const;
 
    private:
     void AttachMountedUsageTrackers();

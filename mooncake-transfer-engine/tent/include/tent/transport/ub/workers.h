@@ -218,6 +218,8 @@ class UbWorkers final : public gate::Sink {
 
     Status start();
     Status stop();
+    Status submitBatch(const std::vector<UbTask::Ptr>& tasks,
+                       uint64_t device_mask = ~0ULL);
     Status submit(const UbTask::Ptr& task, uint64_t device_mask = ~0ULL);
     Status cancel(const UbTask::Ptr& task);
 
@@ -264,6 +266,11 @@ class UbWorkers final : public gate::Sink {
     }
 
    private:
+    friend class UbWorkersTestPeer;
+    // Scoped to the submitting thread so transport tests can exercise the
+    // real workers without changing their lifecycle or racing posting lanes.
+    static thread_local bool fail_second_enqueue_for_test_;
+
     struct PendingSlice {
         // Keep the task alive until every queued/in-flight slice reaches a
         // terminal state. Callers may release the sub-batch handle before the
@@ -312,7 +319,19 @@ class UbWorkers final : public gate::Sink {
 
     void postingLoop(size_t worker_index);
     void pollingLoop(size_t poller_index);
+    // tent_merge's tri-state pop is authoritative: kStopped must exit the
+    // posting thread, kReflow must run the defer reflow, kPending may still
+    // carry an empty PendingSlice ("woke up, nothing to do").
     PopResult popPending(PendingSlice& pending);
+
+    // ---- idle spin (yuanhao-1113, performance) ---------------------------
+    // Purely a scheduling hint. spinForPending() never consumes work and never
+    // bypasses the locked predicate: the caller always falls through to
+    // queue_cv_, which rechecks posting_ and every queue under queue_mutex_,
+    // so an early or late exit can never lose a wakeup.
+    void spinForPending();
+    [[nodiscard]] bool withinIdleSpin(uint64_t now_ns, uint64_t last_ns,
+                                      uint32_t window_us) const;
     void enqueueRetry(const PendingSlice& pending);
     // Parks one slice against the availability epoch that was read *before*
     // the failing condition was evaluated (design §7.4). Never blocks and never
@@ -429,10 +448,14 @@ class UbWorkers final : public gate::Sink {
     void failUnposted(const PendingSlice& pending,
                       TransferStatusEnum outcome = FAILED);
     uint64_t nextCompletionToken();
+    // `location` is the local buffer's location as resolved by
+    // localLocationOf().
     std::vector<LocalDeviceCandidate> orderedLocalDevices(
-        const PendingSlice& pending) const;
+        const PendingSlice& pending, const std::string& location) const;
+    std::string localLocationOf(const PendingSlice& pending) const;
     static std::vector<Topology::NicID> orderedRemoteDevices(
-        const SegmentDesc& segment, const BufferDesc& buffer);
+        const SegmentDesc& segment, const BufferDesc& buffer,
+        const UbBufferMetadata& metadata);
 
     std::shared_ptr<UrmaAdapter> adapter_;
     std::vector<UbContextPtr> contexts_;
@@ -457,11 +480,25 @@ class UbWorkers final : public gate::Sink {
     std::array<std::deque<PendingSlice>, PRIO_LOW + 1> queues_;
     // Slices currently in `queues_`, kept incrementally so submit() can apply
     // the all-or-nothing budget check without walking every queue (design
-    // §6.1/§6.3).
+    // §6.1/§6.3). This stays the authoritative count.
     size_t queued_{0};
     // W3 defer buckets. Always mutated under queue_mutex_ together with the
     // queue, so "park" and "bump" are ordered (see post_scheduler.h).
     DeferRegistry<PendingSlice> defer_;
+
+    // ---- idle spin state (yuanhao-1113, performance) ---------------------
+    // Lock-free mirror of queued_, maintained under queue_mutex_ at every site
+    // that mutates queued_. Only the idle posting spinner reads it, as a hint;
+    // the queues stay authoritative and are rechecked under the lock. Parked
+    // (deferred) slices are deliberately NOT counted: while everything is
+    // parked the posting thread must fall through to the bounded wait so the
+    // defer bucket wakeups drive it.
+    std::atomic<size_t> queued_hint_{0};
+    // At most one posting worker spins at a time.
+    std::atomic<bool> post_spinner_active_{false};
+    // steadyNowNs() of the most recent post attempt; anchors the idle-spin
+    // windows of pollers and the posting spinner.
+    std::atomic<uint64_t> last_post_ns_{0};
 
     mutable std::mutex records_mutex_;
     mutable std::mutex endpoint_drain_mutex_;

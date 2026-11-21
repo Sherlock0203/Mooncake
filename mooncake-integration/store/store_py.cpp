@@ -2,6 +2,7 @@
 #include <pybind11/stl.h>
 #include <numa.h>
 
+#include <chrono>
 #include <functional>
 #include <limits>
 #include <mutex>
@@ -25,14 +26,9 @@
 #include "integration_utils.h"
 #include "buffer_pool.h"
 
-// Forward declaration for EngramStore bindings
-namespace mooncake {
-namespace engram {
-void bind_engram_store(py::module &m);
-}
-}  // namespace mooncake
-#include "engram/engram_store.h"
-#include "engram/engram_store_config.h"
+#define SPDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
+#define SPDIAG_PROGRAM_NAME "mooncake_store"
+#include "spdiag/auto_perf.h"
 
 namespace py = pybind11;
 
@@ -157,6 +153,23 @@ std::optional<ParsedTensorMetadata> parse_tensor_metadata_from_buffer(
 std::pair<int64_t, int64_t> calculate_shard_range(int64_t dim_size, int rank,
                                                   int shard_count);
 
+py::object materialize_contiguous_tensor(const py::handle &tensor) {
+    py::object contiguous = tensor.attr("contiguous")();
+#ifdef USE_MLU
+    if (!contiguous.is(tensor) &&
+        contiguous.attr("device").attr("type").cast<std::string>() == "mlu") {
+        // CNRT copies do not wait for work on PyTorch's current MLU stream.
+        // The caller can synchronize its input, but this new copy is ours.
+        // Wait before exposing its pointer to Store, including for TP shards.
+        py::module_::import("torch")
+            .attr("mlu")
+            .attr("current_stream")(contiguous.attr("device"))
+            .attr("synchronize")();
+    }
+#endif
+    return contiguous;
+}
+
 PyTensorInfo extract_tensor_info_impl(const py::object &tensor,
                                       const std::string &key_name,
                                       bool require_contiguous,
@@ -181,7 +194,7 @@ PyTensorInfo extract_tensor_info_impl(const py::object &tensor,
         }
 
         py::object inspected =
-            require_contiguous ? tensor : tensor.attr("contiguous")();
+            require_contiguous ? tensor : materialize_contiguous_tensor(tensor);
         info.owner = inspected;
         info.data_ptr = inspected.attr("data_ptr")().cast<uintptr_t>();
         size_t numel = inspected.attr("numel")().cast<size_t>();
@@ -491,6 +504,27 @@ inline int to_py_ret(ErrorCode error_code) {
     return static_cast<int>(error_code);
 }
 
+// View a Python buffer as the bytes it covers. `buffer_info::size` counts
+// elements, not bytes, so the byte length is size * itemsize; a span cannot
+// describe a non-contiguous buffer, so those are rejected. Call this before
+// releasing the GIL: it may raise.
+inline std::span<const char> contiguous_buffer_span(
+    const py::buffer_info &info) {
+    if (info.size > 0) {
+        py::ssize_t expected_stride = info.itemsize;
+        for (py::ssize_t dim = info.ndim - 1; dim >= 0; --dim) {
+            if (info.shape[dim] > 1 && info.strides[dim] != expected_stride) {
+                throw py::value_error(
+                    "value must be a C-contiguous buffer (bytes, bytearray, "
+                    "or a contiguous array); got a strided view");
+            }
+            expected_stride *= info.shape[dim];
+        }
+    }
+    return {static_cast<const char *>(info.ptr),
+            static_cast<size_t>(info.size * info.itemsize)};
+}
+
 #include "store_py_internal.h"
 
 }  // namespace
@@ -654,8 +688,12 @@ class MooncakeStorePyWrapper {
     }
 
     pybind11::bytes get(const std::string &key) {
+        SpDiag::PerfPoint pt(PerfKey::GET_STORE_PY_GET,
+                             SpDiag::PerfLevel::SUB_SYSTEM);
+        pt.Start();
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
+            pt.End(-1);
             return pybind11::bytes("\\0", 0);
         }
 
@@ -663,13 +701,19 @@ class MooncakeStorePyWrapper {
 
         {
             py::gil_scoped_release release_gil;
+            SpDiag::PerfPoint pt_full(PerfKey::GET_BUFFER_INTERNAL,
+                                      SpDiag::PerfLevel::KEY_MODULE);
+            pt_full.Start();
             auto buffer_handle = store_->get_buffer(key);
+            pt_full.End(buffer_handle ? 0 : -1);
             if (!buffer_handle) {
+                pt.End(-1);
                 py::gil_scoped_acquire acquire_gil;
                 return kNullString;
             }
 
             py::gil_scoped_acquire acquire_gil;
+            pt.End(0);
             auto runtime_accelerator =
                 mooncake::device::GetAcceleratorRegistry()
                     .RuntimeAccelerators();
@@ -691,18 +735,46 @@ class MooncakeStorePyWrapper {
 
     std::vector<pybind11::bytes> get_batch(
         const std::vector<std::string> &keys) {
+        auto start = std::chrono::steady_clock::now();
+        LOG(INFO) << "get_batch start num_keys[" << keys.size() << "]";
+
+        SpDiag::PerfPoint pt(PerfKey::GET_STORE_PY_GET_BATCH,
+                             SpDiag::PerfLevel::SUB_SYSTEM);
+        pt.Start();
         const auto kNullString = pybind11::bytes("\\0", 0);
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
+            pt.End(-1);
             py::gil_scoped_acquire acquire_gil;
+            auto elapsed_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - start)
+                    .count();
+            LOG(INFO) << "get_batch complete num_keys[" << keys.size()
+                      << "] rc[-1] elapsed_us[" << elapsed_us << "]";
             return {kNullString};
         }
 
         {
             py::gil_scoped_release release_gil;
+            SpDiag::PerfPoint pt_full(PerfKey::GET_BATCH_BUFFER_INTERNAL,
+                                      SpDiag::PerfLevel::KEY_MODULE);
+            pt_full.Start();
             auto batch_data = store_->batch_get_buffer(keys);
+            pt_full.End(0);
             if (batch_data.empty()) {
+                pt.End(-1);
                 py::gil_scoped_acquire acquire_gil;
+                auto elapsed_us =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - start)
+                        .count();
+                LOG(INFO) << "get_batch complete num_keys[" << keys.size()
+                          << "] rc[-1] elapsed_us[" << elapsed_us << "]";
+                if (elapsed_us > 10000) {
+                    LOG(WARNING) << "get_batch_slow num_keys[" << keys.size()
+                                 << "] elapsed_us[" << elapsed_us << "]";
+                }
                 return {kNullString};
             }
 
@@ -710,11 +782,13 @@ class MooncakeStorePyWrapper {
             std::vector<pybind11::bytes> results;
             results.reserve(batch_data.size());
 
+            size_t success_count = 0;
             auto runtime_accelerator =
                 mooncake::device::GetAcceleratorRegistry()
                     .RuntimeAccelerators();
 
             for (const auto &data : batch_data) {
+                if (data) success_count++;
                 if (!data) {
                     results.emplace_back(kNullString);
                     continue;
@@ -732,6 +806,18 @@ class MooncakeStorePyWrapper {
                     results.emplace_back(
                         pybind11::bytes((char *)data->ptr(), data->size()));
                 }
+            }
+            pt.End(0);
+            auto elapsed_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - start)
+                    .count();
+            LOG(INFO) << "get_batch complete num_keys[" << keys.size()
+                      << "] success[" << success_count << "] rc[0] elapsed_us["
+                      << elapsed_us << "]";
+            if (elapsed_us > 10000) {
+                LOG(WARNING) << "get_batch_slow num_keys[" << keys.size()
+                             << "] elapsed_us[" << elapsed_us << "]";
             }
             return results;
         }
@@ -1178,6 +1264,7 @@ class MooncakeStorePyWrapper {
         const ReplicateConfig &config,
         const std::vector<size_t> &original_indices, int repeat_count) const {
         if (!config.group_ids && !config.session_ids &&
+            !config.residency_affinity_ids &&
             !config.per_key_preferred_hca_names) {
             return config;
         }
@@ -1201,9 +1288,10 @@ class MooncakeStorePyWrapper {
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
         if (!config.HasValidKeyHints(key_count)) {
-            LOG(ERROR) << operation_name
-                       << ": group_ids and per-key HCA hint counts must match "
-                          "keys size";
+            LOG(ERROR)
+                << operation_name
+                << ": group, affinity and per-key HCA hint counts must match "
+                   "keys size";
             return std::vector<int>(key_count,
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
@@ -1214,11 +1302,20 @@ class MooncakeStorePyWrapper {
         const std::string &key, pybind11::object tensor,
         const ReplicateConfig &config = ReplicateConfig{}, int tp_rank = 0,
         int tp_size = 1, int split_dim = 0) {
-        // Single-tensor TP keeps per-shard group/HCA hints and one source
-        // session ID, which is expanded to all shards below.
-        if (!config.ValidSessionIds(1) || !config.HasValidKeyHints(tp_size))
+        // Single-tensor TP keeps per-shard group/HCA hints. Session and
+        // residency affinity IDs describe the source tensor, not each shard.
+        if (!config.ValidSessionIds(1) ||
+            (config.residency_affinity_ids &&
+             config.residency_affinity_ids->size() != 1))
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         try {
+            ReplicateConfig tp_config = config;
+            if (config.residency_affinity_ids) {
+                tp_config.residency_affinity_ids = std::vector<std::string>(
+                    tp_size, config.residency_affinity_ids->front());
+            }
+            if (!tp_config.HasValidKeyHints(tp_size))
+                return to_py_ret(ErrorCode::INVALID_PARAMS);
             std::vector<std::string> tp_keys;
             tp_keys.reserve(tp_size);
             for (int rank = 0; rank < tp_size; ++rank) {
@@ -1230,7 +1327,6 @@ class MooncakeStorePyWrapper {
             if (!infos.has_value()) {
                 return to_py_ret(ErrorCode::INVALID_PARAMS);
             }
-            ReplicateConfig tp_config = config;
             if (config.session_ids) {
                 tp_config.session_ids =
                     std::vector<std::string>(tp_size, config.SessionId());
@@ -2175,6 +2271,18 @@ PYBIND11_MODULE(_store, m) {
                 if (ids) config.session_ids = std::move(*ids);
             })
         .def_property(
+            "residency_affinity_ids",
+            [](const ReplicateConfig &config)
+                -> std::optional<std::vector<std::string>> {
+                if (!config.residency_affinity_ids) return std::nullopt;
+                return *config.residency_affinity_ids;
+            },
+            [](ReplicateConfig &config,
+               std::optional<std::vector<std::string>> ids) {
+                config.residency_affinity_ids.reset();
+                if (ids) config.residency_affinity_ids = std::move(*ids);
+            })
+        .def_property(
             "preferred_hca_names",
             [](const ReplicateConfig &config)
                 -> std::optional<std::vector<std::string>> {
@@ -2372,55 +2480,33 @@ PYBIND11_MODULE(_store, m) {
     py::class_<MooncakeDistributedNoFRegisterPyWrapper>(
         m, "MooncakeDistributedNoFRegister")
         .def(py::init<>())
+        // Modified By Yida (v3): trtype 显式作为参数传递（RDMA/TCP/URMA），
+        // 避免依赖 MC_NOF_TRTYPE 环境变量造成 register/unregister 不一致。
+        // trtype 放在最后，社区既有的位置参数调用保持不变。
         .def("real_register",
              [](MooncakeDistributedNoFRegisterPyWrapper &self,
                 const std::string &nqn = "", size_t nsid = 1,
                 const std::string &traddr = "", size_t trsvcid = 4420,
                 uintptr_t base = 0x0, size_t size = 1024,
-                const std::string &master_server_addr = "127.0.0.1:50051") {
+                const std::string &master_server_addr = "127.0.0.1:50051",
+                const std::string &trtype = "") {
                  self.register_ = std::make_shared<NoFRegisterClient>();
                  return self.register_->set_register(nqn, nsid, traddr, trsvcid,
-                                                     base, size,
+                                                     trtype, base, size,
                                                      master_server_addr);
              })
         .def("real_unregister_by_endpoint",
              [](MooncakeDistributedNoFRegisterPyWrapper &self,
                 const std::string &nqn = "", size_t nsid = 1,
                 const std::string &traddr = "", size_t trsvcid = 4420,
-                const std::string &master_server_addr = "127.0.0.1:50051") {
+                const std::string &master_server_addr = "127.0.0.1:50051",
+                const std::string &trtype = "") {
                  self.register_ = std::make_shared<NoFRegisterClient>();
                  return self.register_->set_unregister_by_endpoint(
-                     nqn, nsid, traddr, trsvcid, master_server_addr);
+                     nqn, nsid, traddr, trsvcid, trtype, master_server_addr);
              });
     // Create a wrapper that exposes DistributedObjectStore with Python-specific
     // methods
-    // Helper function to extract PyClient shared_ptr from
-    // MooncakeStorePyWrapper This is used by EngramStore to get the underlying
-    // PyClient We return it as a Python capsule to avoid type registration
-    // issues
-    m.def(
-        "_get_pyclient_from_wrapper",
-        [](MooncakeStorePyWrapper &wrapper) -> py::object {
-            if (!wrapper.store_) {
-                return py::none();
-            }
-            // Return as a capsule containing the shared_ptr
-            // The caller (engram_store_py.cpp) will extract it
-            // Use unique_ptr for RAII: if py::capsule throws, the pointer is
-            // freed; otherwise release() transfers ownership to the capsule.
-            auto ptr =
-                std::make_unique<std::shared_ptr<PyClient>>(wrapper.store_);
-            std::shared_ptr<PyClient> *raw_ptr = ptr.get();
-            py::object cap = py::capsule(raw_ptr, [](void *p) {
-                delete static_cast<std::shared_ptr<PyClient> *>(p);
-            });
-            (void)ptr.release();  // Transfer ownership to capsule
-            return cap;
-        },
-        py::arg("wrapper"),
-        "Get PyClient from MooncakeDistributedStore (internal use, returns "
-        "capsule)");
-
     py::class_<MooncakeStorePyWrapper>(m, "MooncakeDistributedStore")
         .def(py::init<>())
         .def(
@@ -2457,6 +2543,9 @@ PYBIND11_MODULE(_store, m) {
                bool enable_client_http_server = false,
                int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
                bool enable_embedded_master = false) {
+                SpDiag::PerfPoint pt(PerfKey::STORE_PY_SETUP,
+                                     SpDiag::PerfLevel::KEY_MODULE);
+                pt.Start();
                 auto real_client = self.init_real_client();
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
@@ -2473,7 +2562,8 @@ PYBIND11_MODULE(_store, m) {
                         master_server_addr, transfer_engine, "", 50052,
                         enable_ssd_offload, true, ssd_offload_path, tenant_id,
                         enable_client_http_server, client_http_port,
-                        enable_embedded_master);
+                        enable_embedded_master,
+                        /*offload_rpc_thread_num=*/8, /*ub_numa_nodes=*/"");
                     ret = result.has_value() ? 0
                                              : static_cast<int>(result.error());
                 }
@@ -2491,6 +2581,9 @@ PYBIND11_MODULE(_store, m) {
         .def(
             "setup",
             [](MooncakeStorePyWrapper &self, const py::dict &config_dict) {
+                SpDiag::PerfPoint pt(PerfKey::STORE_PY_SETUP,
+                                     SpDiag::PerfLevel::KEY_MODULE);
+                pt.Start();
                 auto real_client = self.init_real_client();
 
                 // Convert py::dict to ConfigDict (all values as strings)
@@ -2508,6 +2601,8 @@ PYBIND11_MODULE(_store, m) {
                     ret = result.has_value() ? 0
                                              : static_cast<int>(result.error());
                 }
+                pt.End(ret == 0 ? 0 : -1);
+                // MC_LOG 在下沉层 setup_real 输出（Q1b）
                 return ret;
             },
             py::arg("config"),
@@ -2525,6 +2620,7 @@ PYBIND11_MODULE(_store, m) {
             "client-buffer allocator.\n"
             "  egm_numa_nodes: Provider NUMA nodes ('auto' or comma-separated "
             "IDs; default 'auto').\n"
+            "  ub_numa_nodes: Comma-separated NUMA nodes for UB segments.\n"
             "  master_server_addr: Master server address.\n"
             "  ipc_socket_path: IPC socket path.\n"
             "  enable_ssd_offload: Enable SSD offload (default false).\n"
@@ -2635,8 +2731,20 @@ PYBIND11_MODULE(_store, m) {
         .def(
             "remove_all",
             [](MooncakeStorePyWrapper &self, bool force) {
+                SpDiag::PerfPoint pt(PerfKey::STORE_PY_REMOVE_ALL,
+                                     SpDiag::PerfLevel::KEY_MODULE);
+                pt.Start();
+                auto t0 = std::chrono::steady_clock::now();
                 py::gil_scoped_release release;
-                return self.store_->removeAll(force);
+                auto ret = self.store_->removeAll(force);
+                auto t1 = std::chrono::steady_clock::now();
+                auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                      t1 - t0).count();
+                pt.End(ret == 0 ? 0 : -1);
+                // 下沉 removeAll 不加 MC_LOG，入口层输出汇总（Q1b）
+                MC_LOG(INFO) << "[remove_all] elapsed_us=" << elapsed_us
+                             << " success=" << (ret == 0 ? 1 : 0);
+                return ret;
             },
             py::arg("force") = false,
             "Remove all objects from the store. If force=True, skip lease "
@@ -2958,12 +3066,9 @@ PYBIND11_MODULE(_store, m) {
                     return to_py_ret(ErrorCode::INVALID_PARAMS);
                 }
                 py::buffer_info info = buf.request(/*writable=*/false);
+                const auto value = contiguous_buffer_span(info);
                 py::gil_scoped_release release;
-                return self.store_->upsert(
-                    key,
-                    std::span<const char>(static_cast<char *>(info.ptr),
-                                          static_cast<size_t>(info.size)),
-                    config);
+                return self.store_->upsert(key, value, config);
             },
             py::arg("key"), py::arg("value"),
             py::arg("config") = ReplicateConfig{},
@@ -3016,9 +3121,7 @@ PYBIND11_MODULE(_store, m) {
 
                 for (const auto &buf : buffers) {
                     infos.emplace_back(buf.request(/*writable=*/false));
-                    const auto &info = infos.back();
-                    spans.emplace_back(static_cast<const char *>(info.ptr),
-                                       static_cast<size_t>(info.size));
+                    spans.emplace_back(contiguous_buffer_span(infos.back()));
                 }
 
                 py::gil_scoped_release release;
@@ -3031,10 +3134,16 @@ PYBIND11_MODULE(_store, m) {
             "register_buffer",
             [](MooncakeStorePyWrapper &self, uintptr_t buffer_ptr,
                size_t size) {
+                SpDiag::PerfPoint pt(PerfKey::STORE_PY_REGISTER_BUFFER,
+                                     SpDiag::PerfLevel::KEY_MODULE);
+                pt.Start();
                 // Register memory buffer for RDMA operations
                 void *buffer = reinterpret_cast<void *>(buffer_ptr);
                 py::gil_scoped_release release;
-                return self.store_->register_buffer(buffer, size);
+                auto ret = self.store_->register_buffer(buffer, size);
+                pt.End(ret == 0 ? 0 : -1);
+                // MC_LOG 在下沉层 register_buffer 输出汇总（Q1b）
+                return ret;
             },
             py::arg("buffer_ptr"), py::arg("size"),
             "Register a memory buffer for direct access operations")
@@ -3225,12 +3334,9 @@ PYBIND11_MODULE(_store, m) {
                py::buffer buf,
                const ReplicateConfig &config = ReplicateConfig{}) {
                 py::buffer_info info = buf.request(/*writable=*/false);
+                const auto value = contiguous_buffer_span(info);
                 py::gil_scoped_release release;
-                return self.store_->put(
-                    key,
-                    std::span<const char>(static_cast<char *>(info.ptr),
-                                          static_cast<size_t>(info.size)),
-                    config);
+                return self.store_->put(key, value, config);
             },
             py::arg("key"), py::arg("value"),
             py::arg("config") = ReplicateConfig{})
@@ -3268,21 +3374,46 @@ PYBIND11_MODULE(_store, m) {
                const std::vector<std::string> &keys,
                const std::vector<py::buffer> &buffers,
                const ReplicateConfig &config = ReplicateConfig{}) {
+                auto start = std::chrono::steady_clock::now();
+
+                SpDiag::PerfPoint pt(PerfKey::PUT_STORE_PY_PUT_BATCH,
+                                     SpDiag::PerfLevel::SUB_SYSTEM);
+                pt.Start();
                 // Convert pybuffers to spans without copying
                 std::vector<py::buffer_info> infos;
                 std::vector<std::span<const char>> spans;
                 infos.reserve(buffers.size());
                 spans.reserve(buffers.size());
 
+                size_t total_size = 0;
                 for (const auto &buf : buffers) {
                     infos.emplace_back(buf.request(/*writable=*/false));
-                    const auto &info = infos.back();
-                    spans.emplace_back(static_cast<const char *>(info.ptr),
-                                       static_cast<size_t>(info.size));
+                    spans.emplace_back(contiguous_buffer_span(infos.back()));
                 }
 
+                LOG(INFO) << "put_batch start num_keys[" << keys.size()
+                          << "] total_size[" << total_size << "]";
+
                 py::gil_scoped_release release;
-                return self.store_->put_batch(keys, spans, config);
+                SpDiag::PerfPoint pt_full(PerfKey::PUT_BATCH_INTERNAL_FULL,
+                                          SpDiag::PerfLevel::KEY_MODULE);
+                pt_full.Start();
+                auto ret = self.store_->put_batch(keys, spans, config);
+                pt_full.End(ret == 0 ? 0 : -1);
+                pt.End(ret == 0 ? 0 : -1);
+
+                auto elapsed_us =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - start)
+                        .count();
+                LOG(INFO) << "put_batch complete num_keys[" << keys.size()
+                          << "] rc[" << ret << "] elapsed_us[" << elapsed_us
+                          << "]";
+                if (elapsed_us > 10000) {
+                    LOG(WARNING) << "put_batch_slow num_keys[" << keys.size()
+                                 << "] elapsed_us[" << elapsed_us << "]";
+                }
+                return ret;
             },
             py::arg("keys"), py::arg("values"),
             py::arg("config") = ReplicateConfig{})
@@ -3297,13 +3428,20 @@ PYBIND11_MODULE(_store, m) {
                const std::vector<std::vector<uintptr_t>> &all_buffer_ptrs,
                const std::vector<std::vector<size_t>> &all_sizes,
                const ReplicateConfig &config = ReplicateConfig{}) {
+                SpDiag::PerfPoint pt(PerfKey::STORE_PY_BATCH_PUT_MULTI,
+                                     SpDiag::PerfLevel::KEY_MODULE);
+                pt.Start();
                 if (!self.is_client_initialized()) {
                     LOG(ERROR) << "Client is not initialized";
+                    pt.End(-1);
                     return std::vector<int>{};
                 }
                 py::gil_scoped_release release;
-                return self.store_->batch_put_from_multi_buffers(
+                auto ret = self.store_->batch_put_from_multi_buffers(
                     keys, CastAddrs2Ptrs(all_buffer_ptrs), all_sizes, config);
+                pt.End(ret.empty() ? -1 : 0);
+                // MC_LOG 在下沉层 *_internal 输出 汇总+per-key（Q1b）
+                return ret;
             },
             py::arg("keys"), py::arg("all_buffer_ptrs"), py::arg("all_sizes"),
             py::arg("config") = ReplicateConfig{},
@@ -3317,10 +3455,16 @@ PYBIND11_MODULE(_store, m) {
                const std::vector<std::vector<uintptr_t>> &all_buffer_ptrs,
                const std::vector<std::vector<size_t>> &all_sizes,
                bool prefer_alloc_in_same_node = false) {
+                SpDiag::PerfPoint pt(PerfKey::STORE_PY_BATCH_GET_INTO_MULTI,
+                                     SpDiag::PerfLevel::KEY_MODULE);
+                pt.Start();
                 py::gil_scoped_release release;
-                return self.store_->batch_get_into_multi_buffers(
+                auto ret = self.store_->batch_get_into_multi_buffers(
                     keys, CastAddrs2Ptrs(all_buffer_ptrs), all_sizes,
                     prefer_alloc_in_same_node);
+                pt.End(ret.empty() ? -1 : 0);
+                // MC_LOG 在下沉层 *_internal 输出 汇总+per-key（Q1b）
+                return ret;
             },
             py::arg("keys"), py::arg("all_buffer_ptrs"), py::arg("all_sizes"),
             py::arg("prefer_alloc_in_same_node") = false,
@@ -3443,8 +3587,14 @@ PYBIND11_MODULE(_store, m) {
             "batch_get_replica_desc",
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys) {
+                SpDiag::PerfPoint pt(PerfKey::STORE_PY_BATCH_GET_REPLICA_DESC,
+                                     SpDiag::PerfLevel::KEY_MODULE);
+                pt.Start();
                 py::gil_scoped_release release;
-                return self.store_->batch_get_replica_desc(keys);
+                auto ret = self.store_->batch_get_replica_desc(keys);
+                pt.End(0);
+                // MC_LOG 在下沉层 batch_get_replica_desc 输出 per-key（Q1b）
+                return ret;
             },
             py::arg("keys"))
         .def(
@@ -3562,9 +3712,6 @@ PYBIND11_MODULE(_store, m) {
 
     m.def("get_alloc_func_addr", &get_alloc_func_addr);
     m.def("get_free_func_addr", &get_free_func_addr);
-
-    // Add EngramStore bindings
-    mooncake::engram::bind_engram_store(m);
 }
 
 }  // namespace mooncake

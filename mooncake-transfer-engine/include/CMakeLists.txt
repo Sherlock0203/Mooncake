@@ -1,6 +1,8 @@
 configure_file(mooncake_te_build_config.h.in mooncake_te_build_config.h @ONLY)
 
 install(FILES transfer_engine_c.h DESTINATION include)
+install(FILES task_congestion_status.h task_congestion_status_c.h
+        DESTINATION include)
 install(FILES buffer_range_index.h DESTINATION include)
 install(FILES common.h DESTINATION include)
 install(FILES config.h DESTINATION include)
@@ -20,8 +22,14 @@ if(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL)
   install(
     FILES
       ${CMAKE_CURRENT_SOURCE_DIR}/../src/common/adaptive_congestion_control/adaptive_congestion_control.h
+      ${CMAKE_CURRENT_SOURCE_DIR}/../src/common/adaptive_congestion_control/task_congestion_observation.h
     DESTINATION include)
 endif()
+install(FILES
+        scheduler/scheduling_hint.h
+        scheduler/scheduler_policy.h
+        scheduler/scheduler_core.h
+        DESTINATION include/scheduler)
 
 # Device API headers (header-only, consumed by EP kernel)
 install(FILES transport/device/device_transport.h

@@ -94,6 +94,9 @@ class RealClient : public PyClient {
     // Factory to create shared instances and auto-register to ResourceTracker
     static std::shared_ptr<RealClient> create();
 
+    Status configureScheduling(
+        const scheduling::SchedulerConfig &scheduler_config);
+
     int setup_real(
         const std::string &local_hostname, const std::string &metadata_server,
         size_t global_segment_size = 1024 * 1024 * 16,
@@ -127,6 +130,13 @@ class RealClient : public PyClient {
     int register_buffer(void *buffer, size_t size);
 
     int unregister_buffer(void *buffer);
+
+    // Install before concurrent I/O. No metadata lookup is added by this hook.
+    bool set_read_replica_validator(Client::ReadReplicaValidator validator) {
+        if (!client_) return false;
+        client_->SetReadReplicaValidator(std::move(validator));
+        return true;
+    }
 
     struct WritableBufferRegion {
         void *base{nullptr};
@@ -691,7 +701,8 @@ class RealClient : public PyClient {
         const std::string &tenant_id = "default",
         bool enable_client_http_server = false,
         int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
-        bool enable_embedded_master = false);
+        bool enable_embedded_master = false, size_t offload_rpc_thread_num = 8,
+        const std::string &ub_numa_nodes = "");
 
     // Overload that accepts a configuration dictionary
     tl::expected<void, ErrorCode> setup_internal(const ConfigDict &config);
@@ -715,17 +726,30 @@ class RealClient : public PyClient {
         QueryResult query_result;
         Replica::Descriptor replica;
         uint64_t total_size;
+        int64_t query_us;
+        int64_t select_us;
+        int64_t local_endpoints_us;
+        int64_t select_replica_us;
+        std::string replica_type;
+        size_t replica_count{0};
+        std::string local_endpoint{"-"};
+        std::string remote_endpoint{"-"};
     };
 
     tl::expected<RangedReadMetadata, ErrorCode>
     build_ranged_read_metadata_from_query_result(
         const std::string &key,
-        tl::expected<QueryResult, ErrorCode> query_result);
+        tl::expected<QueryResult, ErrorCode> query_result,
+        std::chrono::steady_clock::time_point t_query,
+        std::chrono::steady_clock::time_point t0);
 
     tl::expected<RangedReadMetadata, ErrorCode> resolve_ranged_read_metadata(
         const std::string &key,
         const QueryResultCache *query_result_cache = nullptr,
         bool allow_query_refresh = true);
+
+    bool can_read_ub_device_memory_direct(const Replica::Descriptor &replica,
+                                          void *dst, size_t size) const;
 
     tl::expected<int64_t, ErrorCode> execute_ranged_read(
         const std::string &key, void *buffer, size_t dst_offset,
@@ -757,13 +781,25 @@ class RealClient : public PyClient {
     using LocalDiskOffloadReader = std::function<tl::expected<void, ErrorCode>(
         const std::string &, LocalDiskOffloadObjects &)>;
 
+    // Sampling/observation state shared between the two internal
+    // batch_get_into overloads so that a single sampling decision covers the
+    // query (3-arg overload) and the read phases (5-arg overload).
+    struct BatchGetIntoBreakdownContext {
+        bool sampled = false;
+        std::chrono::steady_clock::time_point t0;
+        std::chrono::steady_clock::time_point t_query;
+        std::chrono::steady_clock::time_point t_prep;
+        std::chrono::system_clock::time_point t0_wall;
+    };
+
     // Dependency-injected overload used to verify routing decisions without
     // requiring multiple live SSD offload servers.
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
         const std::vector<tl::expected<QueryResult, ErrorCode>> &query_results,
-        const LocalDiskOffloadReader &local_disk_reader);
+        const LocalDiskOffloadReader &local_disk_reader,
+        BatchGetIntoBreakdownContext *breakdown_ctx = nullptr);
 
     std::vector<tl::expected<int64_t, ErrorCode>>
     batch_get_into_multi_buffers_internal(
@@ -926,7 +962,28 @@ class RealClient : public PyClient {
     async_simple::coro::Lazy<
         tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
     batch_get_offload_object(const std::vector<std::string> &keys,
-                             const std::vector<int64_t> &sizes);
+                             const std::vector<int64_t> &sizes,
+                             uint64_t trace_id = 0);
+
+    /**
+     * @brief Push-mode offload handler, run on the data owner. Reads the
+     * requested keys from SSD into the local ClientBuffer, WRITEs them
+     * directly into the requester's destination slices over the transfer
+     * engine, then releases the ClientBuffer locally. The requester therefore
+     * needs no follow-up READ nor a separate release_offload_buffer RPC.
+     * @param req keys/sizes plus the requester's TE endpoint and dst slices.
+     * @return per-batch result; data already landed in requester memory.
+     */
+    async_simple::coro::Lazy<
+        tl::expected<BatchGetOffloadObjectPushResponse, ErrorCode>>
+    batch_get_offload_object_push(const BatchGetOffloadObjectPushRequest &req);
+
+    async_simple::coro::Lazy<
+        tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
+    batch_get_offload_object_ranges(const std::vector<std::string> &keys,
+                                    const std::vector<int64_t> &offsets,
+                                    const std::vector<int64_t> &sizes,
+                                    const std::vector<int64_t> &object_sizes);
 
     /**
      * @brief Releases buffer associated with a specific batch_id.
@@ -934,7 +991,7 @@ class RealClient : public PyClient {
      * @param batch_id The unique identifier of the batch to release
      * @return true if batch was found and released, false otherwise
      */
-    bool release_offload_buffer(uint64_t batch_id);
+    bool release_offload_buffer(uint64_t batch_id, uint64_t trace_id = 0);
 
     /**
      * @brief RPC handler: a remote requester asks this node (the LOCAL_DISK
@@ -970,7 +1027,7 @@ class RealClient : public PyClient {
      */
     struct OffloadReadRange {
         uint64_t source_offset;
-        int64_t restore_size;
+        int64_t object_size;
     };
 
     tl::expected<void, ErrorCode> batch_get_into_offload_object_internal(
@@ -992,7 +1049,9 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<int64_t> &restore_sizes,
         const std::unordered_map<std::string, std::vector<Slice>> &objects,
-        bool allow_pinned = true);
+        bool allow_pinned = true,
+        const std::vector<int64_t> *value_offsets = nullptr,
+        const std::vector<int64_t> *object_sizes = nullptr);
 
     bool can_use_pinned_restore_arena(
         const std::string &target_rpc_service_addr,
@@ -1369,6 +1428,8 @@ class RealClient : public PyClient {
         std::vector<std::string> object_keys;
         std::vector<QueryResult> cached_query_results;
         std::unordered_map<std::string, std::vector<Slice>> object_slices;
+        std::unordered_map<std::string, uint64_t> window_offsets;
+        std::unordered_map<std::string, uint64_t> window_lengths;
     };
 
     bool validate_session_range_batch_arguments(
@@ -1412,12 +1473,12 @@ class RealClient : public PyClient {
         std::vector<int> &results);
 
     tl::expected<void, ErrorCode> scatter_session_range_read(
-        const SessionRangeReadRequest &request,
-        const void *staging_buffer) const;
+        const SessionRangeReadRequest &request, const void *staging_buffer,
+        uint64_t window_offset) const;
 
     void complete_staged_session_range_read(
         const SessionRangeReadRequest &request, const void *staging_buffer,
-        std::vector<int> &results);
+        uint64_t window_offset, std::vector<int> &results);
 
     bool invalidate_expired_get_session(const SessionRangeReadRequest &request,
                                         std::vector<int> &results);
@@ -1440,13 +1501,21 @@ class RealClient : public PyClient {
         bool enable_ssd_offload, bool start_offload_rpc_server,
         const std::string &ssd_offload_path, const std::string &tenant_id,
         bool enable_client_http_server, int client_http_port,
-        bool enable_embedded_master);
+        bool enable_embedded_master, size_t offload_rpc_thread_num,
+        const std::string &ub_numa_nodes_config);
 
     friend class DirectGpuReadTest;
     friend class test::PrefetchTeardownTest;
+    friend class RangedDiskLeaseTest;
 
     bool can_use_direct_memory_read(const Replica::Descriptor &replica,
                                     void *buffer, size_t size) const;
+
+    // DFS replicas whose fs adapter accepts arbitrary host read buffers are
+    // read straight into host destinations; device destinations, more than
+    // IOV_MAX destinations and other DFS adapters keep the staging buffer.
+    bool can_use_direct_dfs_read(const Replica::Descriptor &replica,
+                                 const std::vector<void *> &buffers) const;
 
     std::unordered_map<std::string, MountedSegmentRecord>
         mounted_segment_records_;

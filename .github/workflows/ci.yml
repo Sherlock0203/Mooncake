@@ -32,6 +32,30 @@ env:
   SCCACHE_GHA_RW_MODE: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'READ_WRITE' || 'READ_ONLY' }}
 
 jobs:
+  engram-cpu-contracts:
+    name: Engram CPU contracts (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.12']
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Run CPU table, facade and range-plan contracts without a native build
+      env:
+        # mooncake-wheel holds the pure-Python modules the installed wheel
+        # merges into the package, such as mooncake._partial_read.
+        PYTHONPATH: ${{ github.workspace }}/python:${{ github.workspace }}/mooncake-wheel
+      run: |
+        python -m pip install --disable-pip-version-check numpy pytest msgpack hypothesis==6.141.0
+        python -m pytest -q scripts/test_engram_tables.py python/tests/store/test_facade.py python/tests/store/test_structured_ranges_properties.py
+
   # Build the artifact tested below through the exact release wheel path. The
   # Ubuntu jobs remain consumer tests, not an alternate wheel build environment.
   build-wheel:
@@ -235,6 +259,7 @@ jobs:
           -DUSE_CXL=ON \
           -DUSE_UB=ON \
           -DUSE_ETCD=ON \
+          -DUSE_REDIS=ON \
           -DUSE_CUDA=ON \
           -DUSE_MNNVL=ON \
           -DWITH_P2P_STORE=ON \
@@ -242,6 +267,7 @@ jobs:
           -DSTORE_USE_ETCD=ON \
           -DCMAKE_BUILD_TYPE=Release \
           -DBUILD_UNIT_TESTS=ON \
+          -DENABLE_DEBUG_SYMBOLS=OFF \
           -DENABLE_SCCACHE=ON
       shell: bash
 
@@ -250,7 +276,7 @@ jobs:
 
     - name: Build project and unit tests
       run: |
-        cmake --build build --parallel 128
+        cmake --build build --parallel 2
         sudo -E cmake --install build
       shell: bash
 
@@ -646,6 +672,11 @@ jobs:
     uses: ./.github/workflows/ci_rocm.yml
     secrets: inherit
 
+  build-wheel-xpu:
+    needs: [spell-check, clang-format, check-paths]
+    if: *run-ci-for-source-changes
+    uses: ./.github/workflows/ci_xpu.yml
+
   tent-ci:
     needs: [spell-check, clang-format, check-paths]
     if: needs.check-paths.outputs.tent == 'true'
@@ -680,13 +711,18 @@ jobs:
             build_targets: ''
           # Exercise the native UB target with its injected mock adapter. A
           # Debug build also catches ODR/link errors hidden by optimization.
+          # USE_UB_MOCK adds the test-only loopback URMA adapter, which lets
+          # the two Store test executables below run over TENT UB without
+          # hardware.
           - name: ub-mock
             cmake_flags: >-
-              -DUSE_CUDA=OFF -DUSE_UB=ON -DCMAKE_BUILD_TYPE=Debug
-              -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF
+              -DUSE_CUDA=OFF -DUSE_UB=ON -DUSE_UB_MOCK=ON
+              -DCMAKE_BUILD_TYPE=Debug -DWITH_STORE_RUST=OFF
             need_cuda: false
             metrics_flags: ''
-            build_targets: ''
+            build_targets: >-
+              mooncake-transfer-engine/all
+              client_integration_test real_client_hugepage_register_test
           # Compile against stub ACL headers and embed host-only ACL stubs in
           # transfer_engine for Rust checks; no CANN, NPU, or libmf_smem is required.
           - name: memfabric-mock
@@ -797,6 +833,15 @@ jobs:
       run: |
         ctest --test-dir build-tent --output-on-failure --no-tests=error \
           -R '^transfer_task_tent_shared_segment_test$'
+      shell: bash
+
+    # The hugepage case skips itself when the runner grants no hugepages.
+    - name: Test Store over the TENT UB loopback adapter
+      if: matrix.name == 'ub-mock'
+      run: |
+        sudo sysctl -w vm.nr_hugepages=64 || true
+        ctest --test-dir build-tent --output-on-failure --no-tests=error \
+          -R '^(client_integration_ub_mock_test|real_client_hugepage_ub_mock_test)$'
       shell: bash
 
     # Only run tests on the cuda-off leg. GitHub runners have no real GPU;
@@ -1000,6 +1045,7 @@ jobs:
       - build-wheel-cu13-arm64
       - build-wheel-efa
       - build-wheel-rocm
+      - build-wheel-xpu
       - tent-ci
       - store-rs-ci
     runs-on: ubuntu-latest
@@ -1033,6 +1079,7 @@ jobs:
             ${{ needs.build-wheel-cu13-arm64.result }}
             ${{ needs.build-wheel-efa.result }}
             ${{ needs.build-wheel-rocm.result }}
+            ${{ needs.build-wheel-xpu.result }}
         run: |
           for result in $RESULTS; do
             test "$result" = "$EXPECTED" || exit 1

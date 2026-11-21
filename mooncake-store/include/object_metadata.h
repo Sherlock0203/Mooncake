@@ -27,6 +27,8 @@
 #include <utility>
 #include <vector>
 
+#include <boost/container/small_vector.hpp>
+
 #include "common/heap_optional.h"
 #include "lease.h"
 #include "master_metric_manager.h"
@@ -60,6 +62,7 @@ struct ObjectMetadata {
     // RAII-style metric management
     ~ObjectMetadata() {
         MasterMetricManager::instance().dec_key_count(1);
+        MasterMetricManager::instance().dec_key_group(key_group, TotalLength());
         if (soft_pin_timeout) {
             MasterMetricManager::instance().dec_soft_pin_key_count(1);
         }
@@ -75,17 +78,22 @@ struct ObjectMetadata {
                    bool enable_hard_pin = false,
                    ObjectDataType data_type_ = ObjectDataType::UNKNOWN,
                    std::string group_id_ = "", TenantId tenant_id_ = TenantId(),
-                   std::string user_key_ = {})
+                   std::string user_key_ = {},
+                   std::string residency_affinity_id_ = "")
         : client_id(client_id_),
           put_start_time(put_start_time_),
           data_type(data_type_),
           group_id(std::move(group_id_)),
+          residency_affinity_id(std::move(residency_affinity_id_)),
           tenant_id(std::move(tenant_id_)),
           user_key(std::move(user_key_)),
+          key_group(
+              MasterMetricManager::instance().classify_key_group(user_key)),
           soft_pin_timeout(std::move(committed_soft_pin_timeout)),
           hard_pinned(enable_hard_pin) {
         parts_.emplace_back(value_length, std::move(reps));
         MasterMetricManager::instance().inc_key_count(1);
+        MasterMetricManager::instance().inc_key_group(key_group, value_length);
         if (soft_pin_timeout) {
             MasterMetricManager::instance().inc_soft_pin_key_count(1);
         }
@@ -103,8 +111,10 @@ struct ObjectMetadata {
     std::chrono::system_clock::time_point put_start_time;
     const ObjectDataType data_type{ObjectDataType::UNKNOWN};
     const std::string group_id;
+    const std::string residency_affinity_id;
     const TenantId tenant_id;
     const std::string user_key;
+    const uint8_t key_group;
 
     // Committed attribution only; protected by the key's lock.
     std::string session_id;
@@ -210,6 +220,10 @@ struct ObjectMetadata {
 
     ObjectPart& MutablePart(size_t index) { return parts_.at(index); }
 
+    bool HasVSegmentReplica() const {
+        return HasReplica([](const Replica& replica) { return replica.is_vsegment_replica(); });
+    }
+
     size_t TotalLength() const {
         size_t total = 0;
         for (const auto& part : parts_) {
@@ -314,6 +328,22 @@ struct ObjectMetadata {
     void GrantReadLease(std::chrono::milliseconds ttl) const {
         SpinLocker locker(&lock);
         lease_->GrantReadLease(ttl);
+    }
+
+    // SP930 port: extend the lease, and — when a soft pin is committed —
+    // the soft pin with it. Both deadlines only ever move forward; an
+    // object without a committed soft pin does not gain one here.
+    std::optional<std::chrono::system_clock::time_point> GrantLease(
+        std::chrono::milliseconds ttl,
+        std::chrono::milliseconds soft_ttl) const {
+        SpinLocker locker(&lock);
+        lease_->GrantReadLease(ttl);
+        if (soft_pin_timeout) {
+            const auto now = std::chrono::system_clock::now();
+            soft_pin_timeout = std::max(*soft_pin_timeout,
+                                        ComputeSoftPinDeadline(now, soft_ttl));
+        }
+        return soft_pin_timeout;
     }
 
     // Whether the authoritative lease is expired.
@@ -507,7 +537,8 @@ struct ObjectMetadata {
     }
 
    private:
-    std::vector<ObjectPart> parts_;
+    // The first part sits in the object itself: every object has one today.
+    boost::container::small_vector<ObjectPart, 1> parts_;
 };
 
 }  // namespace mooncake

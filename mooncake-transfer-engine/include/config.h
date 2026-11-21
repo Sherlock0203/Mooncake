@@ -28,6 +28,18 @@
 
 namespace mooncake {
 
+enum class UrmaBondingMode {
+    kAuto,
+    kBalance,
+    kStandalone,
+    kActiveBackup,
+};
+
+enum class UrmaBondingLevel {
+    kIodie,
+    kPort,
+};
+
 enum class EndpointStoreType {
     FIFO = 0,
     SIEVE = 1,
@@ -75,6 +87,13 @@ struct GlobalConfig {
     int retry_cnt = 9;
     int auto_gid_max_retries = 2;
     int handshake_listen_backlog = 128;
+    // Number of worker threads that concurrently handle inbound handshake
+    // requests on the listener. The legacy implementation processed requests
+    // strictly serially in a single thread, so under high concurrency (e.g.
+    // many small-file transfers firing simultaneous QP handshakes) the
+    // listener backlog was exhausted and clients hit the 60s read timeout,
+    // surfacing as TRANSFER_FAIL. Override via MC_HANDSHAKE_WORKER_THREADS.
+    int handshake_worker_threads = 16;
     // Connect timeout (seconds) for outbound handshake-port RPCs (QP
     // handshake, probe, notify, metadata exchange). A plain blocking
     // connect() has no deadline: to an unroutable address (e.g. a
@@ -234,10 +253,42 @@ struct GlobalConfig {
     // ub config parameters
     size_t num_jfc_per_ctx = 2;
     size_t num_jfce_per_ctx = 2;
+    // URMA EID index (not a physical port or list offset); MC_EID_INDEX.
+    // A malformed override sets -1 so UB initialization fails explicitly.
     int eid_index = 0;
     uint64_t max_seg_size = 0x10000000000;
     size_t max_jfc_e = 4096;  // urma is temporarily using this default value.
     size_t num_jetty_per_ep = 1;
+    // urma transport mode: "RM" (default), "RC", "UM"; override via
+    // MC_URMA_TRANS_MODE
+    std::string urma_trans_mode = "RM";
+    // urma active port: -1 (default) for auto-selection by scanning port
+    // attributes, >=0 for user-specified port index; override via
+    // MC_URMA_ACTIVE_PORT
+    int urma_active_port = -1;
+    // enable bonding BALANCE+PORT mode; default off (STANDALONE); override via
+    // MC_URMA_BONDING_BALANCE
+    bool urma_bonding_balance = false;
+    // enable bonding multipath mode; default off (STANDALONE); override via
+    // MC_URMA_BONDING_MULTIPATH_ENABLE
+    bool urma_bonding_multipath = false;
+    // Device bonding mode. kAuto preserves the legacy behavior derived from
+    // urma_bonding_multipath. Override via MC_URMA_BONDING_MODE with
+    // BALANCE, STANDALONE, or ACTIVE-BACKUP.
+    UrmaBondingMode urma_bonding_mode = UrmaBondingMode::kAuto;
+    // Device bonding level; override via MC_URMA_BONDING_LEVEL with IODIE or
+    // PORT. PORT preserves the current default.
+    UrmaBondingLevel urma_bonding_level = UrmaBondingLevel::kPort;
+    // enable UB NUMA affinity: store splits the global segment into one
+    // segment per NIC-NUMA node, and transfers pin src/dst chip by NUMA.
+    // Independent from urma_bonding_multipath; default off; override via
+    // MC_UB_NUMA_AFFINITY_ENABLE
+    bool ub_numa_affinity = false;
+    // Electrical networking routes both ends through the remote segment chip;
+    // optical networking keeps the local/remote segment chip pair. Default to
+    // electrical for backward compatibility; override via
+    // MC_UB_ELECTRICAL_NETWORK_ENABLE.
+    bool ub_electrical_network = true;
 };
 
 struct RpcCommunicatorConfig {

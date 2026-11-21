@@ -17,6 +17,11 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::SEGMENT_NOT_FOUND, "SEGMENT_NOT_FOUND"},
         {ErrorCode::SEGMENT_ALREADY_EXISTS, "SEGMENT_ALREADY_EXISTS"},
         {ErrorCode::CLIENT_NOT_FOUND, "CLIENT_NOT_FOUND"},
+        {ErrorCode::VSEGMENT_STATIC_QUOTA_INSUFFICIENT,
+         "VSEGMENT_STATIC_QUOTA_INSUFFICIENT"},
+        {ErrorCode::VSEGMENT_CREATING, "VSEGMENT_CREATING"},
+        {ErrorCode::VSEGMENT_SERVICE_NOT_READY, "VSEGMENT_SERVICE_NOT_READY"},
+        {ErrorCode::VSEGMENT_MOUNT_QUIET_PERIOD, "VSEGMENT_MOUNT_QUIET_PERIOD"},
         {ErrorCode::NO_AVAILABLE_HANDLE, "NO_AVAILABLE_HANDLE"},
         {ErrorCode::INVALID_VERSION, "INVALID_VERSION"},
         {ErrorCode::INVALID_KEY, "INVALID_KEY"},
@@ -54,6 +59,8 @@ const std::string& toString(ErrorCode errorCode) noexcept {
          "UNAVAILABLE_IN_CURRENT_STATUS"},
         {ErrorCode::UNAVAILABLE_IN_CURRENT_MODE, "UNAVAILABLE_IN_CURRENT_MODE"},
         {ErrorCode::NOT_SUPPORTED, "NOT_SUPPORTED"},
+        {ErrorCode::SLOT_NOT_OWNED, "SLOT_NOT_OWNED"},
+        {ErrorCode::SLOT_MIGRATING, "SLOT_MIGRATING"},
         {ErrorCode::FILE_NOT_FOUND, "FILE_NOT_FOUND"},
         {ErrorCode::FILE_OPEN_FAIL, "FILE_OPEN_FAIL"},
         {ErrorCode::FILE_READ_FAIL, "FILE_READ_FAIL"},
@@ -65,6 +72,7 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::BUCKET_ALREADY_EXISTS, "BUCKET_ALREADY_EXISTS"},
         {ErrorCode::KEYS_EXCEED_BUCKET_LIMIT, "KEYS_EXCEED_BUCKET_LIMIT"},
         {ErrorCode::KEYS_ULTRA_LIMIT, "KEYS_ULTRA_LIMIT"},
+        {ErrorCode::NO_AVAILABLE_DISK, "NO_AVAILABLE_DISK"},
         {ErrorCode::UNABLE_OFFLOAD, "UNABLE_OFFLOAD"},
         {ErrorCode::UNABLE_OFFLOADING, "UNABLE_OFFLOADING"},
         {ErrorCode::SERIALIZE_UNSUPPORTED, "SERIALIZE_UNSUPPORTED"},
@@ -82,7 +90,13 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::DFS_PARTIAL_WRITE, "DFS_PARTIAL_WRITE"},
         {ErrorCode::TENANT_QUOTA_EXCEEDED, "TENANT_QUOTA_EXCEEDED"},
         {ErrorCode::TENANT_NOT_REGISTERED, "TENANT_NOT_REGISTERED"},
-        {ErrorCode::TENANT_NOT_EMPTY, "TENANT_NOT_EMPTY"}};
+        {ErrorCode::TENANT_NOT_EMPTY, "TENANT_NOT_EMPTY"},
+        {ErrorCode::NOT_OWNER, "NOT_OWNER"},
+        {ErrorCode::STALE_ROUTE, "STALE_ROUTE"},
+        {ErrorCode::MIGRATION_IN_PROGRESS, "MIGRATION_IN_PROGRESS"},
+        {ErrorCode::STALE_ALLOCATOR_EPOCH, "STALE_ALLOCATOR_EPOCH"},
+        {ErrorCode::VSEGMENT_NOT_FOUND, "VSEGMENT_NOT_FOUND"},
+        {ErrorCode::VSEGMENT_INVALID, "VSEGMENT_INVALID"}};
 
     auto it = errorCodeMap.find(errorCode);
     static const std::string unknownError = "UNKNOWN_ERROR";

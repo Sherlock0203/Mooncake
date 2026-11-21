@@ -18,6 +18,7 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
@@ -33,8 +34,9 @@
 #include "tent/common/config.h"
 #include "tent/common/status.h"
 #include "tent/transport/ub/bootstrap.h"
-#include "tent/transport/ub/probe_types.h"
 #include "tent/transport/ub/device_selection.h"
+#include "tent/transport/ub/probe_types.h"
+#include "tent/transport/ub/urma_adapter.h"
 
 namespace mooncake {
 namespace tent {
@@ -227,6 +229,10 @@ struct UbParams {
     // trusted identities and never falls back to name-based classification.
     bool physical_only = false;
     std::vector<DeviceIdentity> device_identities;
+    // yuanhao-1113 carried bonding_mode/bonding_level here. This deployment
+    // does not use bonding devices: the physical-device requirement above is
+    // the only selection policy, and the adapter keeps its own hardcoded
+    // STANDALONE/IODIE bonding control behind an isBondingDevice() guard.
 
     uint32_t worker_count = 6;
     uint32_t poller_count = 2;
@@ -238,6 +244,13 @@ struct UbParams {
     uint32_t max_retries = 8;
     uint32_t slice_timeout_ms = 5000;
     uint32_t endpoint_cooldown_ms = 1000;
+    // After the most recent post, JFC pollers keep polling instead of
+    // sleeping, and one posting worker spins on the queue instead of waiting
+    // on the condition variable, for this long. Sparse foreground transfers
+    // then skip a scheduler wakeup on both the post and the completion side.
+    // 0 restores the sleep/wait-only behaviour.
+    uint32_t poll_idle_spin_us = 1000;
+    uint32_t post_idle_spin_us = 1000;
 
     // Defaults are the verified RC legacy baseline; pool and probe stay off.
     UbRuntimeProfile runtime_profile = UbRuntimeProfile::kRcLegacy;
@@ -293,6 +306,7 @@ struct UbParams {
             return Status::InvalidArgument(
                 "transports/ub/physical_only requires device_identities");
         }
+        CHECK_STATUS(readTransportMode(config, parsed.trans_mode));
         CHECK_STATUS(readPositive(config, "transports/ub/worker_count",
                                   parsed.worker_count, parsed.worker_count));
         CHECK_STATUS(readPositive(config, "transports/ub/poller_count",
@@ -332,6 +346,17 @@ struct UbParams {
         CHECK_STATUS(readPositive(config, "transports/ub/endpoint_cooldown_ms",
                                   parsed.endpoint_cooldown_ms,
                                   parsed.endpoint_cooldown_ms));
+        CHECK_STATUS(readNonNegative(config, "transports/ub/poll_idle_spin_us",
+                                     parsed.poll_idle_spin_us,
+                                     parsed.poll_idle_spin_us));
+        CHECK_STATUS(readNonNegative(config, "transports/ub/post_idle_spin_us",
+                                     parsed.post_idle_spin_us,
+                                     parsed.post_idle_spin_us));
+        if (parsed.poll_idle_spin_us > kMaxIdleSpinUs ||
+            parsed.post_idle_spin_us > kMaxIdleSpinUs) {
+            return Status::InvalidArgument(
+                "transports/ub/*_idle_spin_us must not exceed 1000000");
+        }
         CHECK_STATUS(readBool(config,
                               "transports/ub/enable_bandwidth_estimation",
                               parsed.enable_bandwidth_estimation,
@@ -799,6 +824,10 @@ struct UbParams {
         }
         return Status::OK();
     }
+
+    // Upper bound for the idle-spin windows (yuanhao-1113). Anything larger is
+    // a configuration mistake, not a tuning choice.
+    static constexpr uint32_t kMaxIdleSpinUs = 1'000'000;
 
     template <typename T>
     static Status readPositive(const Config& config, const char* key,
