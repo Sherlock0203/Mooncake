@@ -500,7 +500,6 @@ TEST(UbProbeLinkManagerTest, ContextAvailableRecoveryNeedsAProbeToBeHealthy) {
     auto posted = postNext(plm, token_seq, clock.now());
     ASSERT_TRUE(posted.has_value());
     plm.onPostResult(posted->record, ProbePostOutcome::kAccepted, clock.now());
-    plm.onPostResult(posted->record, ProbePostOutcome::kAccepted, clock.now());
     ASSERT_TRUE(
         plm.onProbeCompletion(makeCompletion(posted->token), clock.now()));
     EXPECT_EQ(healthOf(plm, version).health, LinkHealth::kHealthy);
