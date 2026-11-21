@@ -10,7 +10,9 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <memory>
+#include <thread>
 #include <utility>
 
 #include "tent/transport/ub/tombstone.h"
@@ -241,6 +243,95 @@ TEST(TombstoneTableTest, SameEntityNewerGenerationSupersedes) {
     EXPECT_EQ(table.size(), 2U);
     EXPECT_TRUE(table.erase(idOf(5, 4)));
     EXPECT_EQ(table.lookup(entityOf(5))->generation, 3U);
+}
+
+// F3/INV-BUD-1: creation failure has exactly one cleanup path
+// (retireUnpublished). A provider that fails but still hands back a partially
+// allocated handle must not be pre-deleted by the caller nor have its budget
+// released before destruction is proven.
+TEST(UbPoolBudgetTest, CreateFailureKeepsBudgetWhenDeleteFails) {
+    auto table = std::make_shared<TombstoneTable>(/*capacity=*/8);
+    PoolFixture fixture(/*jfc_count=*/1, /*desired_serving=*/1,
+                        /*credit_capacity=*/8, /*quarantine_budget=*/64, table);
+    fixture.adapter()->failNextCreateJettyWithHandle();
+    fixture.adapter()->failNextDeleteJetty();
+
+    LeaseWithCredit grant;
+    const Status status = fixture.pool().tryLease(
+        PoolFixture::key(), PoolFixture::attempt(1), grant);
+    EXPECT_FALSE(status.ok());
+
+    const auto stats = fixture.pool().stats();
+    EXPECT_EQ(stats.create_failures, 1U);
+    EXPECT_EQ(stats.create_failures_unproven, 1U);
+    EXPECT_EQ(stats.budget_release_anomalies, 0U);
+    EXPECT_GE(stats.quarantined_members, 1U);
+    // The unproven handle is retained, its budget stays charged and the
+    // tombstone keeps the generation addressable.
+    EXPECT_EQ(fixture.adapter()->liveJettyCount(), 1U);
+    EXPECT_EQ(fixture.budget()->snapshot(PoolFixture::kDeviceKey).total_jetties,
+              1U);
+    EXPECT_EQ(table->size(), 1U);
+}
+
+TEST(UbPoolBudgetTest, CreateFailureReleasesExactlyOnceWhenDeleteSucceeds) {
+    auto table = std::make_shared<TombstoneTable>(/*capacity=*/8);
+    PoolFixture fixture(/*jfc_count=*/1, /*desired_serving=*/1,
+                        /*credit_capacity=*/8, /*quarantine_budget=*/64, table);
+
+    // Two consecutive partial-handle failures: each reservation is released
+    // by retireUnpublished and never by a second, caller-side path.
+    for (int round = 0; round < 2; ++round) {
+        fixture.adapter()->failNextCreateJettyWithHandle();
+        LeaseWithCredit grant;
+        EXPECT_FALSE(fixture.pool()
+                         .tryLease(PoolFixture::key(),
+                                   PoolFixture::attempt(10 + round), grant)
+                         .ok());
+    }
+
+    const auto stats = fixture.pool().stats();
+    EXPECT_EQ(stats.create_failures, 2U);
+    EXPECT_EQ(stats.create_failures_unproven, 0U);
+    EXPECT_EQ(stats.budget_release_anomalies, 0U);
+    EXPECT_EQ(stats.quarantined_members, 0U);
+    EXPECT_EQ(fixture.adapter()->liveJettyCount(), 0U);
+    EXPECT_EQ(fixture.budget()->snapshot(PoolFixture::kDeviceKey).total_jetties,
+              0U);
+    EXPECT_EQ(table->size(), 0U);
+}
+
+TEST(UbPoolBudgetTest, StoppedWhileCreatingUsesTheSingleCleanupPath) {
+    auto table = std::make_shared<TombstoneTable>(/*capacity=*/8);
+    PoolFixture fixture(/*jfc_count=*/1, /*desired_serving=*/1,
+                        /*credit_capacity=*/8, /*quarantine_budget=*/64, table);
+    fixture.adapter()->holdNextCreateJetty();
+
+    Status status = Status::OK();
+    std::thread creator([&] {
+        LeaseWithCredit grant;
+        status = fixture.pool().tryLease(PoolFixture::key(),
+                                         PoolFixture::attempt(1), grant);
+    });
+    for (int spin = 0; spin < 2000 && !fixture.adapter()->createGateWaiting();
+         ++spin) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_TRUE(fixture.adapter()->createGateWaiting());
+    // Stop while createJetty is inside the provider: the fresh handle must be
+    // retired through retireUnpublished, not a second caller-side delete.
+    fixture.pool().beginStop();
+    fixture.adapter()->releaseCreateJetty();
+    creator.join();
+
+    EXPECT_TRUE(status.IsTooManyRequests());
+    const auto stats = fixture.pool().stats();
+    EXPECT_EQ(stats.create_failures_unproven, 0U);
+    EXPECT_EQ(stats.budget_release_anomalies, 0U);
+    EXPECT_EQ(fixture.adapter()->liveJettyCount(), 0U);
+    EXPECT_EQ(fixture.budget()->snapshot(PoolFixture::kDeviceKey).total_jetties,
+              0U);
+    EXPECT_EQ(table->size(), 0U);
 }
 
 }  // namespace

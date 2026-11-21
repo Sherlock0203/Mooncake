@@ -16,6 +16,7 @@
 #ifndef TENT_TRANSPORT_UB_BUSINESS_JETTY_POOL_H_
 #define TENT_TRANSPORT_UB_BUSINESS_JETTY_POOL_H_
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -316,6 +317,12 @@ struct SendJettyPoolStats {
     uint64_t leaked_leases = 0;
     uint64_t created_members = 0;
     uint64_t create_failures = 0;
+    // Create failures whose cleanup could not prove destruction (the handle
+    // and the budget stay in quarantined_). Observability for INV-BUD-1.
+    uint64_t create_failures_unproven = 0;
+    // A proven-destruction budget release that the ledger rejected. Must stay
+    // zero; a non-zero value means the single-release invariant was violated.
+    uint64_t budget_release_anomalies = 0;
     uint64_t double_returns = 0;
     uint64_t create_backoffs = 0;
     // Completions returned by a retirement fence. A pooled member serves one
@@ -511,8 +518,6 @@ class BusinessJettyPool final
     };
 
     Status createAndPublish(const PoolKey& pool_key);
-    void retireUnpublished(JettyPtr jetty, BudgetReservation reservation,
-                           const PoolKey& pool_key);
     void retireMemberLocked(std::shared_ptr<PoolMember> member,
                             const std::string& reason);
     void enqueueRetirementLocked(std::shared_ptr<PoolMember> member);
@@ -535,6 +540,12 @@ class BusinessJettyPool final
     // True only when native budget may be released: a tombstone was recorded
     // (and is erased now) or no table is attached.
     bool eraseTombstoneForProvenDestruction(PoolMember& member);
+    // Destroys a Jetty that never published. The single cleanup point for
+    // failed/stopped creation: reset -> delete -> release only when the
+    // destruction is proven; otherwise the handle and budget stay quarantined.
+    // Returns the cause status when destruction is unproven.
+    Status retireUnpublished(JettyPtr jetty, BudgetReservation reservation,
+                             const PoolKey& pool_key);
     void refreshBackpressureLocked();
     [[nodiscard]] bool admissionBlockedLocked() const;
 
@@ -594,6 +605,8 @@ class BusinessJettyPool final
     uint64_t leaked_leases_ = 0;
     uint64_t created_members_ = 0;
     uint64_t create_failures_ = 0;
+    std::atomic<uint64_t> create_failures_unproven_{0};
+    std::atomic<uint64_t> budget_release_anomalies_{0};
     uint64_t double_returns_ = 0;
     uint64_t create_backoffs_ = 0;
     uint64_t fence_drained_completions_ = 0;

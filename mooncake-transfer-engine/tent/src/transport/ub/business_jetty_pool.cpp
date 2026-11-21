@@ -394,16 +394,16 @@ Status BusinessJettyPool::createAndPublish(const PoolKey& pool_key) {
 
     if (!created.ok()) {
         // Provider contract: a failed createJetty may still hand back a
-        // partially allocated handle. It was never posted, so one
-        // best-effort delete is the natural cleanup; either way the budget
-        // reservation is released because no serving object exists.
-        if (jetty) (void)adapter_->deleteJetty(jetty);
-        budget_->transition(*reservation, BudgetObjectState::kQuarantined);
-        budget_->releaseAfterProvenDestruction(*reservation, true);
-        // partially allocated handle. It was never posted, so it retires
-        // through the RESET-before-delete contract; the budget is released
-        // only when destruction is proven.
-        retireUnpublished(std::move(jetty), std::move(*reservation), pool_key);
+        // partially allocated handle. retireUnpublished is the *only* cleanup
+        // point: it does reset -> delete -> release-after-proof, and on an
+        // unproven destruction keeps the handle and the budget in
+        // quarantined_ (INV-BUD-1/INV-1). The caller must not delete the Jetty
+        // or release the reservation before it runs.
+        const Status retired = retireUnpublished(
+            std::move(jetty), std::move(*reservation), pool_key);
+        if (!retired.ok()) {
+            create_failures_unproven_.fetch_add(1, std::memory_order_relaxed);
+        }
         std::lock_guard<std::mutex> lock(mutex_);
         auto bucket = buckets_.find(pool_key);
         if (bucket != buckets_.end() && bucket->second.creating > 0) {
@@ -458,32 +458,25 @@ Status BusinessJettyPool::createAndPublish(const PoolKey& pool_key) {
         return Status::OK();
     }
 
-    // Stopped (or activation failed) after creation: retire the fresh
-    // object. It never posted a WR, so deletion proves destruction and the
-    // budget can be released.
-    if (member != nullptr) {
-        reservation = std::move(member->budget);
-        budget_->transition(*reservation, BudgetObjectState::kQuarantined);
-        adapter_->deleteJetty(member->jetty);
-        budget_->releaseAfterProvenDestruction(*reservation, true);
-    } else {
-        budget_->transition(*reservation, BudgetObjectState::kQuarantined);
-        adapter_->deleteJetty(jetty);
-        budget_->releaseAfterProvenDestruction(*reservation, true);
-    }
-    // object through the RESET-before-delete contract. It never posted a
-    // WR; a failed destruction keeps the handle and budget quarantined.
+    // Stopped (or activation failed) after creation: retire the fresh object
+    // through the same single cleanup point. It never posted a WR, so a
+    // successful reset+delete proves destruction and releases the budget; a
+    // failed one keeps both quarantined for a later retry.
     JettyPtr doomed =
         member != nullptr ? std::move(member->jetty) : std::move(jetty);
     if (member != nullptr) reservation = std::move(member->budget);
-    retireUnpublished(std::move(doomed), std::move(*reservation), pool_key);
+    const Status retired =
+        retireUnpublished(std::move(doomed), std::move(*reservation), pool_key);
+    if (!retired.ok()) {
+        create_failures_unproven_.fetch_add(1, std::memory_order_relaxed);
+    }
     return Status::TooManyRequests(
         "UB send pool stopped while creating a member" LOC_MARK);
 }
 
-void BusinessJettyPool::retireUnpublished(JettyPtr jetty,
-                                          BudgetReservation reservation,
-                                          const PoolKey& pool_key) {
+Status BusinessJettyPool::retireUnpublished(JettyPtr jetty,
+                                            BudgetReservation reservation,
+                                            const PoolKey& pool_key) {
     // Destroys a Jetty that never published (failed or stopped creation).
     // A live handle must pass the RESET-before-delete contract required by
     // the provider; a partially allocated handle without a native resource
@@ -499,8 +492,16 @@ void BusinessJettyPool::retireUnpublished(JettyPtr jetty,
         }
     }
     if (destroyed.ok()) {
-        budget_->releaseAfterProvenDestruction(reservation, true);
-        return;
+        const Status released =
+            budget_->releaseAfterProvenDestruction(reservation, true);
+        if (!released.ok()) {
+            // Should be impossible: exactly one release per reservation.
+            budget_release_anomalies_.fetch_add(1, std::memory_order_relaxed);
+            LOG_EVERY_N(ERROR, 10)
+                << "UB pool budget release anomaly on unpublished creation: "
+                << released.ToString();
+        }
+        return Status::OK();
     }
     // Unknown destruction: keep the handle and the budget (INV09/INV10) so
     // a later drainQuarantined can retry the native delete.
@@ -514,6 +515,7 @@ void BusinessJettyPool::retireUnpublished(JettyPtr jetty,
     noteTombstoneLocked(member);
     quarantined_.push_back(std::move(member));
     refreshBackpressureLocked();
+    return destroyed;
 }
 
 Status BusinessJettyPool::returnOnce(SliceJettyLease lease,
@@ -1286,6 +1288,10 @@ SendJettyPoolStats BusinessJettyPool::stats() const {
     result.leaked_leases = leaked_leases_;
     result.created_members = created_members_;
     result.create_failures = create_failures_;
+    result.create_failures_unproven =
+        create_failures_unproven_.load(std::memory_order_relaxed);
+    result.budget_release_anomalies =
+        budget_release_anomalies_.load(std::memory_order_relaxed);
     result.double_returns = double_returns_;
     result.create_backoffs = create_backoffs_;
     result.fence_drained_completions = fence_drained_completions_;

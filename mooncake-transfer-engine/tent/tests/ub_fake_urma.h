@@ -276,6 +276,27 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         auto fake_jfc = std::dynamic_pointer_cast<FakeJfc>(jfc);
         if (!fake_jfc) return Status::InvalidArgument("bad JFC");
         last_jetty_transport_mode_ = options.transport_mode;
+        // Deterministic stop-while-creating hook: the first createJetty after
+        // holdNextCreateJetty() waits until releaseCreateJetty().
+        if (create_gate_.exchange(false, std::memory_order_acq_rel)) {
+            create_waiting_.store(true, std::memory_order_release);
+            std::unique_lock<std::mutex> gate_lock(create_gate_mutex_);
+            create_gate_cv_.wait(gate_lock, [this] {
+                return !create_waiting_.load(std::memory_order_acquire);
+            });
+        }
+        // Provider contract under test: a failed create may still hand back a
+        // partially allocated handle, which the caller must clean up through
+        // its single retirement path.
+        if (create_jetty_failure_with_handle_.exchange(
+                false, std::memory_order_acq_rel)) {
+            auto created =
+                std::make_shared<FakeJetty>(next_jetty_id_++, fake_jfc);
+            jetty = std::move(created);
+            live_jetties_.fetch_add(1, std::memory_order_relaxed);
+            return Status::InternalError(
+                "injected createJetty failure with a partial handle");
+        }
         if (create_jetty_failures_.load(std::memory_order_acquire) != 0 &&
             create_jetty_failures_.fetch_sub(1, std::memory_order_acq_rel) >
                 0) {
@@ -653,6 +674,23 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     void failNextCreateJetty() {
         create_jetty_failures_.fetch_add(1, std::memory_order_acq_rel);
     }
+    // Fails the next createJetty() but still hands back a partially allocated
+    // handle (the provider contract the pool must retire safely).
+    void failNextCreateJettyWithHandle() {
+        create_jetty_failure_with_handle_.store(true,
+                                                std::memory_order_release);
+    }
+    void holdNextCreateJetty() {
+        create_gate_.store(true, std::memory_order_release);
+    }
+    void releaseCreateJetty() {
+        create_gate_.store(false, std::memory_order_release);
+        create_waiting_.store(false, std::memory_order_release);
+        create_gate_cv_.notify_all();
+    }
+    bool createGateWaiting() const {
+        return create_waiting_.load(std::memory_order_acquire);
+    }
     // Fails the next `count` deleteJetty() calls. Two consecutive failures are
     // needed to observe a quarantined member, because shutdown retries once.
     void failJettyDeletes(size_t count) {
@@ -904,6 +942,11 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     std::atomic<bool> auto_bind_created_jetties_{false};
     std::atomic<bool> rm_post_delivers_completion_{false};
     std::atomic<size_t> create_jetty_failures_{0};
+    std::atomic<bool> create_jetty_failure_with_handle_{false};
+    std::atomic<bool> create_gate_{false};
+    std::atomic<bool> create_waiting_{false};
+    std::mutex create_gate_mutex_;
+    std::condition_variable create_gate_cv_;
     std::atomic<size_t> delete_jetty_failures_{0};
     std::atomic<uint32_t> last_quiesced_jetty_id_{0};
     std::optional<PostOutcome> forced_post_outcome_;
