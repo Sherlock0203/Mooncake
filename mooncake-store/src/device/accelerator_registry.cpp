@@ -8,8 +8,9 @@
 namespace mooncake {
 namespace device {
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
-    defined(USE_HYGON) || defined(USE_COREX) || defined(USE_SUPA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) ||   \
+    defined(USE_HYGON) || defined(USE_COREX) || defined(USE_SUPA) || \
+    defined(USE_MLU)
 void EnsureCudaLikeAcceleratorDeviceLinked();
 #endif
 #if defined(USE_XPU)
@@ -66,7 +67,12 @@ class AcceleratorRegistryImpl final : public AcceleratorRegistry {
 
     static bool ShouldRefresh(bool ensure,
                               const DeviceListPtr& available_devices) {
-        return ensure || !available_devices || available_devices->empty();
+        // An empty list is a valid cached result on CPU-only hosts. Treating it
+        // as uninitialized makes every host memcpy re-run accelerator probes
+        // under refresh_mutex_, serializing otherwise independent transfers.
+        // Register() clears the pointer when a new backend is registered, and
+        // callers can still request an explicit re-probe with ensure=true.
+        return ensure || !available_devices;
     }
 
     DeviceListPtr BuildAvailableDevices() const {
@@ -99,8 +105,9 @@ void RegisterStaticAcceleratorDevice(const AcceleratorDevice& device) {
 }  // namespace
 
 const AcceleratorRegistry& GetAcceleratorRegistry() {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
-    defined(USE_HYGON) || defined(USE_COREX) || defined(USE_SUPA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) ||   \
+    defined(USE_HYGON) || defined(USE_COREX) || defined(USE_SUPA) || \
+    defined(USE_MLU)
     EnsureCudaLikeAcceleratorDeviceLinked();
 #endif
 #if defined(USE_XPU)

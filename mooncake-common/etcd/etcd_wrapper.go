@@ -33,17 +33,23 @@ import "C"
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
 	rpctypes "go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/client/v3/concurrency"
+	"google.golang.org/grpc"
 )
 
 // prefixWatchInfo stores cancel function and callback context for a prefix watch
@@ -104,8 +110,9 @@ var (
 	globalMutex    sync.Mutex
 	globalRefCount int
 	// etcd client for store
-	storeClient *clientv3.Client
-	storeMutex  sync.Mutex
+	storeClient              *clientv3.Client
+	storeMutex               sync.Mutex
+	storeMaxSendMessageBytes int64 = 32 * 1024 * 1024
 	// keep alive contexts for store
 	storeKeepAliveCtx   = make(map[int64]context.CancelFunc)
 	storeKeepAliveMutex sync.Mutex
@@ -134,15 +141,162 @@ const (
 	storeDialKeepAliveTime    = 10 * time.Second
 	storeDialKeepAliveTimeout = 3 * time.Second
 	maintenanceStartupTimeout = 5 * time.Second
+	// storeMaxMsgSize caps the gRPC message size for the store client (planner /
+	// master). It must accommodate large values such as the vsegment partition
+	// quota snapshot, which can exceed the go.etcd.io/client/v3 default of 2MB
+	// (e.g. 16384 partitions x 2 segments ~= 4.6MB). Aligned with NewEtcdClient.
+	storeMaxMsgSize = 32 * 1024 * 1024 // 32MB
 )
 
-func newStoreClientConfig(validEndpoints []string) clientv3.Config {
+const (
+	mooncakeEtcdCACertEnv     = "MOONCAKE_ETCD_CA_CERT"
+	mooncakeEtcdClientCertEnv = "MOONCAKE_ETCD_CLIENT_CERT"
+	mooncakeEtcdClientKeyEnv  = "MOONCAKE_ETCD_CLIENT_KEY"
+	mooncakeEtcdServerNameEnv = "MOONCAKE_ETCD_SERVER_NAME"
+)
+
+type etcdTLSConfigSpec struct {
+	CACertPath     string
+	ClientCertPath string
+	ClientKeyPath  string
+	ServerName     string
+}
+
+// getenvViaLibc reads an env var directly from libc's `environ`, bypassing
+// the Go runtime's `syscall.envs` snapshot (which is frozen at the moment
+// `goenvs_unix()` runs — typically the first cgo dlopen). Without this,
+// any env var set by the host process AFTER libetcd_wrapper.so is dlopened
+// (e.g. via os.environ in Python, or via libc.setenv) is invisible to
+// Go's os.Getenv, causing TLS config to be silently dropped.
+func getenvViaLibc(name string) string {
+	cName := C.CString(name)
+	defer C.free(unsafe.Pointer(cName))
+	v := C.getenv(cName)
+	if v == nil {
+		return ""
+	}
+	return C.GoString(v)
+}
+
+func loadEtcdTLSConfigSpecFromEnv() (*etcdTLSConfigSpec, error) {
+	ca := strings.TrimSpace(getenvViaLibc(mooncakeEtcdCACertEnv))
+	cert := strings.TrimSpace(getenvViaLibc(mooncakeEtcdClientCertEnv))
+	key := strings.TrimSpace(getenvViaLibc(mooncakeEtcdClientKeyEnv))
+	serverName := strings.TrimSpace(getenvViaLibc(mooncakeEtcdServerNameEnv))
+
+	if ca == "" && cert == "" && key == "" {
+		if serverName != "" {
+			return nil, fmt.Errorf("%s requires an etcd CA or client certificate", mooncakeEtcdServerNameEnv)
+		}
+		return nil, nil
+	}
+	if (cert == "") != (key == "") {
+		return nil, fmt.Errorf("%s and %s must be set together",
+			mooncakeEtcdClientCertEnv, mooncakeEtcdClientKeyEnv)
+	}
+
+	return &etcdTLSConfigSpec{
+		CACertPath:     ca,
+		ClientCertPath: cert,
+		ClientKeyPath:  key,
+		ServerName:     serverName,
+	}, nil
+}
+
+func validateEtcdTLSFiles(spec *etcdTLSConfigSpec) error {
+	for envName, path := range map[string]string{
+		mooncakeEtcdCACertEnv:     spec.CACertPath,
+		mooncakeEtcdClientCertEnv: spec.ClientCertPath,
+		mooncakeEtcdClientKeyEnv:  spec.ClientKeyPath,
+	} {
+		if path == "" {
+			continue
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			return fmt.Errorf("failed to access %s (%s): %w", envName, path, err)
+		}
+		if info.IsDir() {
+			return fmt.Errorf("%s points to a directory, expected a file: %s", envName, path)
+		}
+	}
+	return nil
+}
+
+func buildEtcdTLSConfig(spec *etcdTLSConfigSpec) (*tls.Config, error) {
+	config := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		ServerName: spec.ServerName,
+	}
+	if spec.CACertPath != "" {
+		caPEM, err := os.ReadFile(spec.CACertPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read etcd CA certificate file %s: %w", spec.CACertPath, err)
+		}
+		pool := x509.NewCertPool()
+		if ok := pool.AppendCertsFromPEM(caPEM); !ok {
+			return nil, fmt.Errorf("failed to parse etcd CA certificate bundle from %s", spec.CACertPath)
+		}
+		config.RootCAs = pool
+	}
+	if spec.ClientCertPath != "" {
+		cert, err := tls.LoadX509KeyPair(spec.ClientCertPath, spec.ClientKeyPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load etcd client certificate/key (%s, %s): %w",
+				spec.ClientCertPath, spec.ClientKeyPath, err)
+		}
+		config.Certificates = []tls.Certificate{cert}
+	}
+	return config, nil
+}
+
+// buildEtcdClientTLSFromEnv returns (nil, nil) when no TLS env vars are set,
+// so existing deployments retain their endpoint-defined transport behavior.
+// A partial or broken configuration is an error rather than a silent downgrade.
+func buildEtcdClientTLSFromEnv(endpoints []string) (*tls.Config, error) {
+	spec, err := loadEtcdTLSConfigSpecFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	if spec == nil {
+		return nil, nil
+	}
+	for _, endpoint := range endpoints {
+		// clientv3 deliberately drops transport credentials for http:// URLs.
+		if strings.HasPrefix(strings.ToLower(endpoint), "http://") {
+			return nil, fmt.Errorf("etcd TLS is configured but endpoint %q uses http://; use https:// or host:port", endpoint)
+		}
+	}
+	if err := validateEtcdTLSFiles(spec); err != nil {
+		return nil, err
+	}
+	return buildEtcdTLSConfig(spec)
+}
+
+func etcdTLSDialOptions(config *tls.Config) []grpc.DialOption {
+	if config == nil || config.ServerName == "" {
+		return nil
+	}
+	// gRPC derives TLS SNI and hostname verification from the connection
+	// authority, which can otherwise override tls.Config.ServerName.
+	return []grpc.DialOption{grpc.WithAuthority(config.ServerName)}
+}
+
+func newStoreClientConfig(validEndpoints []string) (clientv3.Config, error) {
+	tlsConfig, err := buildEtcdClientTLSFromEnv(validEndpoints)
+	if err != nil {
+		return clientv3.Config{}, err
+	}
 	return clientv3.Config{
 		Endpoints:            validEndpoints,
+		MaxCallSendMsgSize:   int(atomic.LoadInt64(&storeMaxSendMessageBytes)),
 		DialTimeout:          5 * time.Second,
 		DialKeepAliveTime:    storeDialKeepAliveTime,
 		DialKeepAliveTimeout: storeDialKeepAliveTimeout,
-	}
+		MaxCallRecvMsgSize:   storeMaxMsgSize,
+		TLS:                  tlsConfig,
+		DialOptions:          etcdTLSDialOptions(tlsConfig),
+	}, nil
 }
 
 func parseEtcdEndpoints(endpoints *C.char) []string {
@@ -190,11 +344,19 @@ func NewEtcdClient(endpoints *C.char, errMsg **C.char) int {
 		return -1
 	}
 
+	tlsConfig, err := buildEtcdClientTLSFromEnv(validEndpoints)
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+
 	cli, err := clientv3.New(clientv3.Config{
 		Endpoints:          validEndpoints,
 		DialTimeout:        5 * time.Second,
 		MaxCallSendMsgSize: MaxMsgSize,
 		MaxCallRecvMsgSize: MaxMsgSize,
+		TLS:                tlsConfig,
+		DialOptions:        etcdTLSDialOptions(tlsConfig),
 	})
 
 	if err != nil {
@@ -284,6 +446,29 @@ func getStoreClient() *clientv3.Client {
 	return storeClient
 }
 
+// Configure before connecting: live clients retain their original gRPC options.
+func configureStoreMaxSendMessageBytes(maxBytes int32) error {
+	if maxBytes <= 0 {
+		return errors.New("etcd store max send message bytes must be positive")
+	}
+	storeMutex.Lock()
+	defer storeMutex.Unlock()
+	if storeClient != nil && int64(maxBytes) != atomic.LoadInt64(&storeMaxSendMessageBytes) {
+		return errors.New("cannot change etcd store send limit after initialization")
+	}
+	atomic.StoreInt64(&storeMaxSendMessageBytes, int64(maxBytes))
+	return nil
+}
+
+//export SetStoreEtcdMaxSendMessageBytes
+func SetStoreEtcdMaxSendMessageBytes(maxBytes C.int32_t, errMsg **C.char) int {
+	if err := configureStoreMaxSendMessageBytes(int32(maxBytes)); err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	return 0
+}
+
 //export NewStoreEtcdClient
 func NewStoreEtcdClient(endpoints *C.char, errMsg **C.char) int {
 	storeMutex.Lock()
@@ -299,7 +484,13 @@ func NewStoreEtcdClient(endpoints *C.char, errMsg **C.char) int {
 		return -1
 	}
 
-	cli, err := clientv3.New(newStoreClientConfig(validEndpoints))
+	clientConfig, err := newStoreClientConfig(validEndpoints)
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+
+	cli, err := clientv3.New(clientConfig)
 
 	if err != nil {
 		*errMsg = C.CString(err.Error())
@@ -318,7 +509,13 @@ func EtcdStoreResetClientWrapper(endpoints *C.char, errMsg **C.char) int {
 		return -1
 	}
 
-	cli, err := clientv3.New(newStoreClientConfig(validEndpoints))
+	clientConfig, err := newStoreClientConfig(validEndpoints)
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+
+	cli, err := clientv3.New(clientConfig)
 	if err != nil {
 		*errMsg = C.CString(err.Error())
 		return -1
@@ -368,11 +565,19 @@ func NewSnapshotEtcdClient(endpoints *C.char, errMsg **C.char) int {
 		return -1
 	}
 
+	tlsConfig, err := buildEtcdClientTLSFromEnv(validEndpoints)
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+
 	cli, err := clientv3.New(clientv3.Config{
 		Endpoints:          validEndpoints,
 		DialTimeout:        10 * time.Second,
 		MaxCallSendMsgSize: snapshotMaxMsgSize,
 		MaxCallRecvMsgSize: snapshotMaxMsgSize,
+		TLS:                tlsConfig,
+		DialOptions:        etcdTLSDialOptions(tlsConfig),
 	})
 
 	if err != nil {
@@ -760,7 +965,12 @@ func EtcdStoreKeepAliveWrapper(leaseId int64, errMsg **C.char) int {
 	}
 	// Keep lease traffic separate from Store traffic. A Store client reset or
 	// a busy Store connection must not stop leadership keep-alive.
-	cli, err := clientv3.New(newStoreClientConfig(storeCli.Endpoints()))
+	clientConfig, err := newStoreClientConfig(storeCli.Endpoints())
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	cli, err := clientv3.New(clientConfig)
 	if err != nil {
 		*errMsg = C.CString(err.Error())
 		return -1
@@ -853,6 +1063,26 @@ func EtcdStorePutWrapper(key *C.char, keySize C.int, value *C.char, valueSize C.
 	return 0
 }
 
+//export EtcdStorePutWithLeaseWrapper
+func EtcdStorePutWithLeaseWrapper(key *C.char, keySize C.int, value *C.char, valueSize C.int,
+	leaseId int64, errMsg **C.char) int {
+	cli := getStoreClient()
+	if cli == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
+	k := C.GoStringN(key, keySize)
+	v := C.GoStringN(value, valueSize)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := cli.Put(ctx, k, v, clientv3.WithLease(clientv3.LeaseID(leaseId)))
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	return 0
+}
+
 // Create key if absent (CAS on CreateRevision==0).
 // Return:
 // - 0 on success
@@ -930,8 +1160,49 @@ func EtcdStoreBatchCreateWrapper(keys **C.char, values **C.char, count C.int, er
 	return 0
 }
 
+//export EtcdStoreBatchPutWithLeaseWrapper
+func EtcdStoreBatchPutWithLeaseWrapper(keys **C.char, keySizes *C.int, values **C.char, valueSizes *C.int, count C.int, leaseId int64, errMsg **C.char) int {
+	cli := getStoreClient()
+	if cli == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
+
+	n := int(count)
+	if n == 0 {
+		return 0
+	}
+
+	// Unsafe casting to access C arrays as Go slices; key/value buffers are
+	// binary-safe (carry explicit sizes).
+	keyPtrs := (*[1 << 28]*C.char)(unsafe.Pointer(keys))[:n:n]
+	keySizeList := (*[1 << 28]C.int)(unsafe.Pointer(keySizes))[:n:n]
+	valPtrs := (*[1 << 28]*C.char)(unsafe.Pointer(values))[:n:n]
+	valSizeList := (*[1 << 28]C.int)(unsafe.Pointer(valueSizes))[:n:n]
+
+	ops := make([]clientv3.Op, 0, n)
+	for i := 0; i < n; i++ {
+		k := C.GoStringN(keyPtrs[i], keySizeList[i])
+		v := C.GoStringN(valPtrs[i], valSizeList[i])
+		// Bind all keys to the single master lease. Caller is responsible for
+		// fencing (the keys must already be absent / owned by self); this is an
+		// unconditional atomic batch, so it can also be reused for reaffirm.
+		ops = append(ops, clientv3.OpPut(k, v, clientv3.WithLease(clientv3.LeaseID(leaseId))))
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	_, err := cli.Txn(ctx).Then(ops...).Commit()
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	return 0
+}
+
 //export EtcdStoreTxnCompareAndPutWrapper
-func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.int, compareKinds *C.int, compareValues **C.char, compareValueSizes *C.int, compareRevisions *int64, compareCount C.int, putKeys **C.char, putKeySizes *C.int, putValues **C.char, putValueSizes *C.int, putPreserveLeases *C.int, putCount C.int, errMsg **C.char) int {
+func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.int, compareKinds *C.int, compareValues **C.char, compareValueSizes *C.int, compareRevisions *int64, compareCount C.int, putKeys **C.char, putKeySizes *C.int, putValues **C.char, putValueSizes *C.int, putPreserveLeases *C.int, putCount C.int, deleteKeys **C.char, deleteKeySizes *C.int, deleteCount C.int, errMsg **C.char) int {
 	cli := getStoreClient()
 	if cli == nil {
 		*errMsg = C.CString("etcd client not initialized")
@@ -940,6 +1211,7 @@ func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.i
 
 	cmpN := int(compareCount)
 	putN := int(putCount)
+	deleteN := int(deleteCount)
 
 	cmps := make([]clientv3.Cmp, 0, cmpN)
 	if cmpN > 0 {
@@ -966,7 +1238,7 @@ func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.i
 		}
 	}
 
-	ops := make([]clientv3.Op, 0, putN)
+	ops := make([]clientv3.Op, 0, putN+deleteN)
 	if putN > 0 {
 		putKeyPtrs := (*[1 << 28]*C.char)(unsafe.Pointer(putKeys))[:putN:putN]
 		putKeySizeList := (*[1 << 28]C.int)(unsafe.Pointer(putKeySizes))[:putN:putN]
@@ -981,6 +1253,14 @@ func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.i
 			} else {
 				ops = append(ops, clientv3.OpPut(k, v))
 			}
+		}
+	}
+	if deleteN > 0 {
+		deleteKeyPtrs := (*[1 << 28]*C.char)(unsafe.Pointer(deleteKeys))[:deleteN:deleteN]
+		deleteKeySizeList := (*[1 << 28]C.int)(unsafe.Pointer(deleteKeySizes))[:deleteN:deleteN]
+		for i := 0; i < deleteN; i++ {
+			k := C.GoStringN(deleteKeyPtrs[i], deleteKeySizeList[i])
+			ops = append(ops, clientv3.OpDelete(k))
 		}
 	}
 
@@ -1077,12 +1357,13 @@ func EtcdStoreGetRangeAsJsonWrapper(startKey *C.char, startKeySize C.int, endKey
 	}
 
 	type kvPair struct {
-		Key   string `json:"key"`
-		Value string `json:"value"`
+		Key            string `json:"key"`
+		Value          string `json:"value"`
+		CreateRevision int64  `json:"create_revision"`
 	}
 	kvs := make([]kvPair, 0, len(resp.Kvs))
 	for _, kv := range resp.Kvs {
-		kvs = append(kvs, kvPair{Key: string(kv.Key), Value: string(kv.Value)})
+		kvs = append(kvs, kvPair{Key: string(kv.Key), Value: string(kv.Value), CreateRevision: kv.CreateRevision})
 	}
 	b, jerr := json.Marshal(kvs)
 	if jerr != nil {

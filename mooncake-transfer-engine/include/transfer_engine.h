@@ -27,6 +27,7 @@
 
 #include "memory_location.h"
 #include "multi_transport.h"
+#include "task_congestion_status.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 
@@ -236,6 +237,10 @@ class TransferEngine {
     ScatterTransferOperation submitScatter(
         const std::vector<ScatterTransferRange>& ranges);
     Status transferScatter(const std::vector<ScatterTransferRange>& ranges);
+    Status configureScheduling(const scheduling::SchedulerConfig& config);
+    Status submitScheduledTransfer(
+        BatchID batch_id, const std::vector<ScheduledTransferRequest>& entries);
+    Status cancelTransfer(BatchID batch_id, size_t task_id);
 
     Status submitTransferWithNotify(BatchID batch_id,
                                     const std::vector<TransferRequest>& entries,
@@ -287,7 +292,19 @@ class TransferEngine {
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus& status);
 
+    Status getTaskCongestionState(BatchID batch_id, size_t task_id,
+                                  TaskCongestionState& state) const;
+
+    Status getTaskCongestionDetail(BatchID batch_id, size_t task_id,
+                                   TaskCongestionDetail& detail) const;
+
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus& status);
+
+    // Read-only per-slice timing samples of one task (observability). Valid
+    // only after the task reached a terminal state. Not supported for TENT
+    // transports or scheduler-owned batches.
+    Status getSliceTimings(BatchID batch_id, size_t task_id,
+                           std::vector<Transport::SliceTiming>& timings);
 
     Status getNicLoadStats(std::vector<NicLoadStats>& stats) const;
 

@@ -25,6 +25,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -181,6 +182,15 @@ struct UbSliceSnapshot {
     uint64_t attempt_started_ns{0};
     uint64_t posted_ns{0};
     uint64_t terminal_ns{0};
+    // Recorded only for traced tasks (see UbTask::enableTrace()).
+    uint64_t dequeued_ns{0};
+    uint64_t post_returned_ns{0};
+    uint32_t defer_count{0};
+    // Prepare sub-phase checkpoints of the posted attempt (traced tasks only):
+    // route resolved, endpoint/quota selected, local+remote segments ready.
+    uint64_t route_ready_ns{0};
+    uint64_t path_selected_ns{0};
+    uint64_t segments_ready_ns{0};
 };
 
 struct UbTask;
@@ -491,6 +501,24 @@ class UbSlice : public std::enable_shared_from_this<UbSlice> {
         return cancel_requested_.load(std::memory_order_acquire);
     }
 
+    // Diagnostics for traced tasks; they never affect slice state.
+    void noteDequeued(uint64_t now_ns) {
+        dequeued_ns_.store(now_ns, std::memory_order_relaxed);
+    }
+    void notePostReturned(uint64_t now_ns) {
+        post_returned_ns_.store(now_ns, std::memory_order_relaxed);
+    }
+    void noteDeferred() {
+        defer_count_.fetch_add(1, std::memory_order_relaxed);
+    }
+    void notePrepareCheckpoints(uint64_t route_ready_ns,
+                                uint64_t path_selected_ns,
+                                uint64_t segments_ready_ns) {
+        route_ready_ns_.store(route_ready_ns, std::memory_order_relaxed);
+        path_selected_ns_.store(path_selected_ns, std::memory_order_relaxed);
+        segments_ready_ns_.store(segments_ready_ns, std::memory_order_relaxed);
+    }
+
     [[nodiscard]] UbSliceSnapshot snapshot() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return UbSliceSnapshot{
@@ -506,7 +534,13 @@ class UbSlice : public std::enable_shared_from_this<UbSlice> {
             queued_ns_,
             attempt_started_ns_,
             posted_ns_,
-            terminal_ns_};
+            terminal_ns_,
+            dequeued_ns_.load(std::memory_order_relaxed),
+            post_returned_ns_.load(std::memory_order_relaxed),
+            defer_count_.load(std::memory_order_relaxed),
+            route_ready_ns_.load(std::memory_order_relaxed),
+            path_selected_ns_.load(std::memory_order_relaxed),
+            segments_ready_ns_.load(std::memory_order_relaxed)};
     }
 
    private:
@@ -553,6 +587,12 @@ class UbSlice : public std::enable_shared_from_this<UbSlice> {
     uint64_t attempt_started_ns_{0};
     uint64_t posted_ns_{0};
     uint64_t terminal_ns_{0};
+    std::atomic<uint64_t> dequeued_ns_{0};
+    std::atomic<uint64_t> post_returned_ns_{0};
+    std::atomic<uint32_t> defer_count_{0};
+    std::atomic<uint64_t> route_ready_ns_{0};
+    std::atomic<uint64_t> path_selected_ns_{0};
+    std::atomic<uint64_t> segments_ready_ns_{0};
 };
 
 struct UbTaskSnapshot {
@@ -639,6 +679,23 @@ struct UbTask : public std::enable_shared_from_this<UbTask> {
     }
     [[nodiscard]] uint32_t maxInflightAttempts() const noexcept {
         return max_inflight_attempts_;
+    }
+
+    // ---- per-task tracing (yuanhao-1113, performance, off by default) ----
+    // Must be called before the task is submitted to the workers.
+    void enableTrace() { trace_enabled_ = true; }
+    [[nodiscard]] bool traceEnabled() const { return trace_enabled_; }
+
+    // Keeps the first reported memory locations of this traced task.
+    void noteTraceLocations(const std::string& local,
+                            const std::string& remote) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (trace_local_location_.empty()) trace_local_location_ = local;
+        if (trace_remote_location_.empty()) trace_remote_location_ = remote;
+    }
+    [[nodiscard]] std::pair<std::string, std::string> traceLocations() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return {trace_local_location_, trace_remote_location_};
     }
 
     // Slices must be added before seal(). Workers may begin processing only
@@ -805,6 +862,9 @@ struct UbTask : public std::enable_shared_from_this<UbTask> {
     bool terminal_notified_{false};
     uint64_t terminal_ns_{0};
     TerminalCallback terminal_callback_;
+    bool trace_enabled_{false};
+    std::string trace_local_location_;
+    std::string trace_remote_location_;
 };
 
 inline bool UbCompletionToken::valid() const {

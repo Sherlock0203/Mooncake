@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <map>
 #include <set>
 #include <string>
@@ -46,6 +47,7 @@
 #ifdef USE_UB
 #include <libgen.h>
 #include <urma_api.h>
+#include "transport/kunpeng_transport/urma/urma_endpoint.h"
 #endif
 
 namespace mooncake {
@@ -216,11 +218,13 @@ static std::vector<InfinibandDevice> listInfiniBandDevices(
 
     struct ibv_device **device_list = ibv_get_device_list(&num_devices);
     if (!device_list) {
-        LOG(WARNING) << "No RDMA devices found, check your device installation";
+        LOG(WARNING)
+            << "No RDMA devices found during RDMA topology discovery";
         return {};
     }
     if (device_list && num_devices <= 0) {
-        LOG(WARNING) << "No RDMA devices found, check your device installation";
+        LOG(WARNING)
+            << "No RDMA devices found during RDMA topology discovery";
         ibv_free_device_list(device_list);
         return {};
     }
@@ -460,12 +464,23 @@ static std::vector<UBDevice> listUBDevices(
     int num_devices = 0;
     std::vector<UBDevice> devices;
     urma_init_attr_t init_attr = {};
+    // Capture device-discovery-phase driver logs too (no-op unless
+    // MC_URMA_LOG_REDIRECT is set). Registered before urma_init; idempotent.
+    UrmaRegisterLogRedirectIfEnabled();
     auto init_ret = urma_init(&init_attr);
+    // URMA is process-lifetime and this function deliberately leaves the
+    // provider initialized on success (see the end of this function), so a
+    // repeat discovery - or an already constructed transport - reports
+    // URMA_EEXIST. That is not a discovery failure: only a provider this call
+    // initialized itself may be released on the error paths below.
     const bool urma_initialized_here = init_ret == URMA_SUCCESS;
-    if (!urma_initialized_here && init_ret != URMA_SUCCESS) {
+    if (init_ret != URMA_SUCCESS && init_ret != URMA_EEXIST) {
         LOG(WARNING) << "Failed to urma init, ret = " << init_ret;
         return {};
     }
+    LOG(INFO) << "URMA module init success (topology discovery), ret="
+              << init_ret << ", initialized_here=" << urma_initialized_here;
+
     urma_device_t **device_list = urma_get_device_list(&num_devices);
     if (!device_list) {
         LOG(WARNING) << "No UB devices found, check your device installation";
@@ -474,7 +489,7 @@ static std::vector<UBDevice> listUBDevices(
         }
         return {};
     }
-    if (device_list && num_devices <= 0) {
+    if (num_devices <= 0) {
         LOG(WARNING) << "No UB devices found, check your device installation";
         urma_free_device_list(device_list);
         if (urma_initialized_here) {
@@ -493,29 +508,48 @@ static std::vector<UBDevice> listUBDevices(
         // Get the PCI bus id for the infiniband device. Note that
         snprintf(path, sizeof(path), "/sys/class/ubcore/%s",
                  device_list[i]->name);
-        LOG(INFO) << "listUBDevices: path " << path;
+        VLOG(1) << "listUBDevices: path " << path;
         if (realpath(path, resolved_path) == NULL) {
-            LOG(ERROR) << "listUBDevices: realpath " << resolved_path
-                       << " failed";
+            LOG(ERROR) << "listUBDevices: realpath failed for " << path;
             continue;
         }
-        LOG(INFO) << "listUBDevices: realpath " << resolved_path;
+        VLOG(1) << "listUBDevices: realpath " << resolved_path;
         std::string pci_bus_id = basename(resolved_path);
 
         int numa_node = -1;
         snprintf(path, sizeof(path), "%s/numa",
                  dirname(dirname(resolved_path)));
-        LOG(INFO) << "listUBDevices: numanodepath " << path;
-        std::ifstream(path) >> numa_node;
-        LOG(INFO) << "UBDevices : performation node ----"
-                  << device_list[i]->name << " : " << numa_node;
+        VLOG(1) << "listUBDevices: numanodepath " << path;
+        // The ubcore "numa" attribute is written in hex (e.g. "0x01"), unlike
+        // the infiniband "numa_node" which is decimal. A plain `>> int` parses
+        // "0x01" as 0 (stops at 'x'), so read as string and pick the base by
+        // the 0x prefix.
+        std::string numa_str;
+        std::ifstream(path) >> numa_str;
+        if (!numa_str.empty()) {
+            int base = (numa_str.rfind("0x", 0) == 0 ||
+                        numa_str.rfind("0X", 0) == 0)
+                           ? 16
+                           : 10;
+            numa_node = static_cast<int>(strtol(numa_str.c_str(), nullptr, base));
+        }
+        LOG(INFO) << "UB device: " << device_list[i]->name
+                  << ", pci=" << pci_bus_id << ", numa=" << numa_node;
+        if (numa_node < 0) {
+            LOG(WARNING) << "UB device " << device_list[i]->name
+                         << ": numa node unavailable; NUMA affinity cannot be "
+                            "applied for this device";
+        }
 
         devices.push_back(UBDevice{.name = std::move(device_name),
                                    .pci_bus_id = std::move(pci_bus_id),
                                    .numa_node = numa_node});
     }
     urma_free_device_list(device_list);
-    // No urma_uninit() here: see ensureUrmaInitialized() above.
+    // No urma_uninit() here: URMA state is process-lifetime and shared with
+    // the transports (which own the matching init/uninit pair), so releasing
+    // it on discovery return would tear the provider out from under sibling
+    // contexts.
     return devices;
 }
 
@@ -596,7 +630,7 @@ static std::vector<TopologyEntry> discoverCpuTopology(
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX) || defined(USE_SUPA)
+    defined(USE_COREX) || defined(USE_SUPA) || defined(USE_ENFLAME)
 
 static int getPciDistance(const char *bus1, const char *bus2) {
     char buf[PATH_MAX];
@@ -839,7 +873,7 @@ int Topology::discover(const std::vector<std::string> &filter,
     }
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX) || defined(USE_SUPA)
+    defined(USE_COREX) || defined(USE_SUPA) || defined(USE_ENFLAME)
     int cuda_rc = 0;
     for (auto &ent : discoverCudaTopology(all_hca, &cuda_rc)) {
         matrix_[ent.name] = ent;
@@ -888,6 +922,11 @@ int Topology::discover(const std::vector<std::string> &filter,
 }
 
 int Topology::parse(const std::string &topology_json) {
+    return parse(topology_json, {});
+}
+
+int Topology::parse(const std::string &topology_json,
+                    const std::vector<std::string> &device_filter) {
     std::set<std::string> rnic_set;
     Json::Value root;
 
@@ -909,6 +948,11 @@ int Topology::parse(const std::string &topology_json) {
 
     matrix_.clear();
     resolved_hca_peer_affinity_by_local_.clear();
+    auto allowed = [&device_filter](const std::string &device_name) {
+        return device_filter.empty() ||
+               std::find(device_filter.begin(), device_filter.end(),
+                         device_name) != device_filter.end();
+    };
     for (const auto &key : root.getMemberNames()) {
         const Json::Value &value = root[key];
         if (value.isArray() && value.size() == 2) {
@@ -916,11 +960,13 @@ int Topology::parse(const std::string &topology_json) {
             topo_entry.name = key;
             for (const auto &array : value[0]) {
                 auto device_name = array.asString();
-                topo_entry.preferred_hca.push_back(device_name);
+                if (allowed(device_name))
+                    topo_entry.preferred_hca.push_back(device_name);
             }
             for (const auto &array : value[1]) {
                 auto device_name = array.asString();
-                topo_entry.avail_hca.push_back(device_name);
+                if (allowed(device_name))
+                    topo_entry.avail_hca.push_back(device_name);
             }
             matrix_[key] = topo_entry;
         } else {
@@ -980,9 +1026,27 @@ int Topology::selectDevice(const std::string storage_type,
     return selectDevice(storage_type, retry_count);
 }
 
-int Topology::selectDeviceByLocalHca(const std::string storage_type,
-                                     std::string_view local_hca,
-                                     int retry_count) {
+namespace {
+// The devices in `device_ids` that `device_filter` accepts, in order. Returns
+// `device_ids` itself when there is no filter or it accepts all of them;
+// otherwise fills `kept` with the accepted ones and returns it.
+const std::vector<int> &filterDevices(
+    const std::vector<int> &device_ids,
+    const std::function<bool(int)> &device_filter, std::vector<int> &kept) {
+    if (!device_filter) return device_ids;
+    auto it = std::find_if_not(device_ids.begin(), device_ids.end(),
+                               std::ref(device_filter));
+    if (it == device_ids.end()) return device_ids;
+    kept.assign(device_ids.begin(), it);
+    std::copy_if(it + 1, device_ids.end(), std::back_inserter(kept),
+                 std::ref(device_filter));
+    return kept;
+}
+}  // namespace
+
+int Topology::selectDeviceByLocalHca(
+    const std::string storage_type, std::string_view local_hca, int retry_count,
+    const std::function<bool(int)> &device_filter) {
     if (!local_hca.empty()) {
         auto local_it =
             resolved_hca_peer_affinity_by_local_.find(std::string(local_hca));
@@ -990,7 +1054,10 @@ int Topology::selectDeviceByLocalHca(const std::string storage_type,
             auto hints_it = local_it->second.find(std::string(storage_type));
             if (hints_it != local_it->second.end() &&
                 !hints_it->second.empty()) {
-                const auto &candidates = hints_it->second;
+                std::vector<int> kept_candidates;
+                const auto &candidates = filterDevices(
+                    hints_it->second, device_filter, kept_candidates);
+                if (candidates.empty()) return ERR_ADDRESS_NOT_REGISTERED;
                 if (retry_count == 0) {
                     int rand_value;
                     if (use_round_robin_) {
@@ -1007,18 +1074,27 @@ int Topology::selectDeviceByLocalHca(const std::string storage_type,
         }
     }
 
-    return selectDevice(storage_type, retry_count);
+    return selectDevice(storage_type, retry_count, device_filter);
 }
 
-int Topology::selectDevice(const std::string storage_type, int retry_count) {
+int Topology::selectDevice(const std::string storage_type, int retry_count,
+                           const std::function<bool(int)> &device_filter) {
     if (resolved_matrix_.count(storage_type) == 0) return ERR_DEVICE_NOT_FOUND;
 
     auto &entry = resolved_matrix_[storage_type];
     if (entry.preferred_hca.empty() && entry.avail_hca.empty()) {
         return ERR_DEVICE_NOT_FOUND;
     }
+    std::vector<int> kept_preferred_hca, kept_avail_hca;
+    const auto &preferred_hca =
+        filterDevices(entry.preferred_hca, device_filter, kept_preferred_hca);
 
     if (retry_count == 0) {
+        const auto &candidates =
+            !preferred_hca.empty()
+                ? preferred_hca
+                : filterDevices(entry.avail_hca, device_filter, kept_avail_hca);
+        if (candidates.empty()) return ERR_ADDRESS_NOT_REGISTERED;
         int rand_value;
         if (use_round_robin_) {
             thread_local int tl_counter = 0;
@@ -1026,18 +1102,18 @@ int Topology::selectDevice(const std::string storage_type, int retry_count) {
             tl_counter = (tl_counter + 1) % 10000;
         } else
             rand_value = SimpleRandom::Get().next();
-        if (!entry.preferred_hca.empty())
-            return entry.preferred_hca[rand_value % entry.preferred_hca.size()];
-        else
-            return entry.avail_hca[rand_value % entry.avail_hca.size()];
+        return candidates[rand_value % candidates.size()];
     } else {
-        size_t index = (retry_count - 1) %
-                       (entry.preferred_hca.size() + entry.avail_hca.size());
-        if (index < entry.preferred_hca.size())
-            return entry.preferred_hca[index];
+        const auto &avail_hca =
+            filterDevices(entry.avail_hca, device_filter, kept_avail_hca);
+        const size_t total = preferred_hca.size() + avail_hca.size();
+        if (total == 0) return ERR_ADDRESS_NOT_REGISTERED;
+        size_t index = (retry_count - 1) % total;
+        if (index < preferred_hca.size())
+            return preferred_hca[index];
         else {
-            index -= entry.preferred_hca.size();
-            return entry.avail_hca[index];
+            index -= preferred_hca.size();
+            return avail_hca[index];
         }
     }
     return ERR_DEVICE_NOT_FOUND;

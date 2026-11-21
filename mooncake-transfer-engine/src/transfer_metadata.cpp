@@ -29,7 +29,11 @@
 #include "common.h"
 #include "config.h"
 #include "error.h"
+#include "mooncake_logging.h"
 #include "transfer_metadata_plugin.h"
+#define SPDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
+#define SPDIAG_PROGRAM_NAME "mooncake_store"
+#include "spdiag/auto_perf.h"
 
 namespace mooncake {
 // Process-lifetime intern pool for RDMA NIC paths. Entries are never erased
@@ -224,6 +228,7 @@ struct TransferHandshakeUtil {
             root["ctrl_channel"] = desc.ctrl_channel;
         }
         root["reply_msg"] = desc.reply_msg;
+        root["trace_id"] = static_cast<Json::UInt64>(desc.trace_id);
 #ifdef USE_EFA
         root["efa_addr"] = desc.efa_addr;  // EFA endpoint address
 #endif
@@ -232,12 +237,20 @@ struct TransferHandshakeUtil {
 #endif
 
 #ifdef USE_UB
+        SpDiag::PerfPoint pt(PerfKey::UB_HANDSHAKE_ENCODE,
+                             SpDiag::PerfLevel::DEBUG);
+        pt.Start();
         Json::Value jettyNums(Json::arrayValue);
         for (const auto &jetty : desc.jetty_num) jettyNums.append(jetty);
         root["jetty_num"] = jettyNums;
-        LOG(INFO) << "Encode: local_nic_path is " << desc.local_nic_path
-                  << " peer_nic_path is " << desc.peer_nic_path
-                  << " jetty_num size is " << desc.jetty_num.size();
+        Json::Value rjettyBlobs(Json::arrayValue);
+        for (const auto &blob : desc.rjetty_blobs) rjettyBlobs.append(blob);
+        root["rjetty_blobs"] = rjettyBlobs;
+        MC_LOG(INFO) << "Encode: local_nic_path is " << desc.local_nic_path
+                     << " peer_nic_path is " << desc.peer_nic_path
+                     << " jetty_num size is " << desc.jetty_num.size()
+                     << " rjetty_blobs size is " << desc.rjetty_blobs.size();
+        pt.End(0);
 #endif
         return root;
     }
@@ -290,6 +303,11 @@ struct TransferHandshakeUtil {
             desc.ctrl_channel = root["ctrl_channel"].asBool();
         }
         desc.reply_msg = root["reply_msg"].asString();
+        if (root.isMember("trace_id") && root["trace_id"].isUInt64()) {
+            desc.trace_id = root["trace_id"].asUInt64();
+        } else {
+            desc.trace_id = 0;
+        }
 #ifdef USE_EFA
         desc.efa_addr = root["efa_addr"].asString();  // EFA endpoint address
 #endif
@@ -299,12 +317,20 @@ struct TransferHandshakeUtil {
 #endif
 
 #ifdef USE_UB
+        SpDiag::PerfPoint pt(PerfKey::UB_HANDSHAKE_DECODE,
+                             SpDiag::PerfLevel::DEBUG);
+        pt.Start();
         for (const auto &jetty : root["jetty_num"]) {
             desc.jetty_num.push_back(jetty.asUInt());
         }
-        LOG(INFO) << "Decode: remote_nic_path is " << desc.local_nic_path
-                  << " peer_nic_path is " << desc.peer_nic_path
-                  << " jetty_num size is " << desc.jetty_num.size();
+        for (const auto &blob : root["rjetty_blobs"]) {
+            desc.rjetty_blobs.push_back(blob.asString());
+        }
+        MC_LOG(INFO) << "Decode: remote_nic_path is " << desc.local_nic_path
+                     << " peer_nic_path is " << desc.peer_nic_path
+                     << " jetty_num size is " << desc.jetty_num.size()
+                     << " rjetty_blobs size is " << desc.rjetty_blobs.size();
+        pt.End(0);
 #endif
         return 0;
     }
@@ -662,6 +688,10 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             Json::Value tsegJSON(Json::arrayValue);
             for (auto &entry : buffer.tseg) tsegJSON.append(entry);
             bufferJSON["tseg"] = tsegJSON;
+            Json::Value tsegCtxJSON(Json::arrayValue);
+            for (auto &entry : buffer.tseg_ctx) tsegCtxJSON.append(entry);
+            bufferJSON["tseg_ctx"] = tsegCtxJSON;
+            bufferJSON["chip_id"] = buffer.chip_id;
             buffersJSON.append(bufferJSON);
         }
         segmentJSON["buffers"] = buffersJSON;
@@ -1159,8 +1189,16 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             for (const auto &tsegJSON : bufferJSON["tseg"]) {
                 buffer.tseg.push_back(tsegJSON.asString());
             }
+            for (const auto &tsegCtxJSON : bufferJSON["tseg_ctx"]) {
+                buffer.tseg_ctx.push_back(tsegCtxJSON.asString());
+            }
+            // Backward compatible: old peers don't publish chip_id -> keep -1.
+            buffer.chip_id = bufferJSON.isMember("chip_id")
+                                 ? bufferJSON["chip_id"].asInt()
+                                 : -1;
             if (buffer.name.empty() || !buffer.addr || !buffer.length ||
-                buffer.tseg.empty()) {
+                buffer.tseg.empty() || buffer.tseg_ctx.empty() ||
+                buffer.tseg_ctx.size() != buffer.tseg.size()) {
                 LOG(WARNING) << "Corrupted segment descriptor, name "
                              << segment_name << " protocol " << desc->protocol;
                 return nullptr;
@@ -1739,9 +1777,8 @@ TransferMetadata::getSegmentDescByID(SegmentID segment_id, bool force_update) {
         // Update cache with write lock
         RWSpinlock::WriteGuard guard(segment_lock_);
         auto old_iter = segment_id_to_desc_map_.find(segment_id);
-        auto old_desc = old_iter == segment_id_to_desc_map_.end()
-                            ? nullptr
-                            : old_iter->second;
+        if (old_iter == segment_id_to_desc_map_.end()) return nullptr;
+        auto old_desc = old_iter->second;
         if (!shouldInstallFetchedSegmentDesc(segment_name, segment_id, old_desc,
                                              segment_desc)) {
             return old_desc;
@@ -1853,6 +1890,13 @@ int TransferMetadata::addLocalMemoryBuffer(const BufferDesc &buffer_desc,
 
 int TransferMetadata::removeLocalMemoryBuffer(void *addr,
                                               bool update_metadata) {
+    return removeLocalMemoryBuffer(
+        addr, [](const BufferDesc &) { return true; }, update_metadata);
+}
+
+int TransferMetadata::removeLocalMemoryBuffer(
+    void *addr, const std::function<bool(const BufferDesc &)> &pred,
+    bool update_metadata) {
     bool addr_exist = false;
     {
         RWSpinlock::WriteGuard guard(segment_lock_);
@@ -1860,12 +1904,13 @@ int TransferMetadata::removeLocalMemoryBuffer(void *addr,
         auto new_segment_desc = std::make_shared<SegmentDesc>(*segment_desc);
         for (auto iter = new_segment_desc->buffers.begin();
              iter != new_segment_desc->buffers.end(); ++iter) {
-            if (iter->addr == (uint64_t)addr
+            if ((iter->addr == (uint64_t)addr
 #ifdef USE_CXL
-                || (iter->offset + new_segment_desc->cxl_base_addr) ==
-                       (uint64_t)addr
+                 || (iter->offset + new_segment_desc->cxl_base_addr) ==
+                        (uint64_t)addr
 #endif
-            ) {
+                 ) &&
+                pred(*iter)) {
                 new_segment_desc->buffers.erase(iter);
                 addr_exist = true;
                 new_segment_desc->rebuildBufferRangeIndex();
@@ -2044,6 +2089,7 @@ int TransferMetadata::startHandshakeDaemon(
                 local = TransferHandshakeUtil::encode(local_desc);
                 return 0;
             }
+            mooncake::logging::ScopedTraceId trace(peer_desc.trace_id);
             if (on_receive_handshake) {
                 int ret = on_receive_handshake(peer_desc, local_desc);
                 if (ret) {
@@ -2059,6 +2105,7 @@ int TransferMetadata::startHandshakeDaemon(
                     return 0;
                 }
             }
+            local_desc.trace_id = peer_desc.trace_id;
             local = TransferHandshakeUtil::encode(local_desc);
             return 0;
         });

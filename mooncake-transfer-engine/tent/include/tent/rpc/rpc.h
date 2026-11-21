@@ -49,7 +49,11 @@ enum RpcFuncID {
     NotifySegmentUpdated,
     // Appended to preserve the numeric values of the existing RPCs.
     BootstrapUb,
+    // tent_merge added the probe bootstrap RPC; yuanhao-1113 added the
+    // bulk send/recv v2 RPCs. Both are live in the merged tree.
     ProbeBootstrapUb,
+    SendDataV2,
+    RecvDataV2,
 };
 
 class ClientPool;

@@ -345,10 +345,10 @@ Status ConfigHelper::loadFromEnv(Config& config) {
     setConfig(config, "MC_SLICE_SIZE", "transports/rdma/workers/block_size");
     setConfig(config, "MC_RETRY_CNT",
               "transports/rdma/workers/max_retry_count");
-    setConfig(config, "MC_DISABLE_GPU_DIRECT_RDMA",
-              "transports/rdma/disable_gpu_direct_rdma");
-    setConfig(config, "MC_LOG_RDMA_SLICE_AFFINITY",
-              "transports/rdma/log_slice_affinity");
+    setBoolConfig(config, "MC_DISABLE_GPU_DIRECT_RDMA",
+                  "transports/rdma/disable_gpu_direct_rdma");
+    setBoolConfig(config, "MC_LOG_RDMA_SLICE_AFFINITY",
+                  "transports/rdma/log_slice_affinity");
     setBoolConfig(config, "MC_STRICT_LOCAL_NUMA",
                   "transports/rdma/strict_local_numa");
     // Restrict which RDMA NICs the engine discovers/uses (comma-separated
@@ -359,6 +359,11 @@ Status ConfigHelper::loadFromEnv(Config& config) {
     // Consumed by filterInfiniBandDevices() in the platform probes.
     setArrayConfig(config, "MC_TE_FILTERS", "topology/rdma_whitelist");
     setArrayConfig(config, "MC_TE_FILTERS_EXCLUDE", "topology/rdma_blacklist");
+    // yuanhao-1113 mapped MC_URMA_BONDING_MODE/LEVEL and a second, uppercase
+    // MC_URMA_TRANS_MODE here. This deployment has no bonding devices, and
+    // MC_URMA_TRANS_MODE is owned by the RM+CTP handler above (rc|rm|rm_legacy|
+    // rm_pool, lowercase) -- running both would let the last writer clobber the
+    // profile the first one resolved.
     // Classic TE custom topology file path. Maps into TENT config so the same
     // MC_CUSTOM_TOPO_JSON works under MC_USE_TENT. Inline
     // topology/priority_matrix in MC_TENT_CONF still takes precedence.

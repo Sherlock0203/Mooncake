@@ -18,12 +18,17 @@
 #include "config/fileread_worker_pool_config.h"
 #include "config/nof_worker_pool_config.h"
 #include "device/accelerator_registry.h"
+#include "store_diagnostics.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
 #ifdef USE_TENT
 #include "tent/transfer_engine.h"
 #endif
 #include "nof/nvmeof_initiator.h"
+#ifdef USE_NOF_URMA
+#include "nof_gpu_direct_report.h"
+#endif
+#include "vsegment/vsegment_transfer.h"
 
 namespace mooncake {
 
@@ -45,6 +50,97 @@ static int GetPositiveEnvOrDefault(const char* name, int default_value) {
     }
 
     return static_cast<int>(parsed);
+}
+
+static bool ParseBoolEnv(const char* name, bool default_value) {
+    const char* raw_value = std::getenv(name);
+    if (!raw_value || raw_value[0] == '\0') {
+        return default_value;
+    }
+    std::string normalized(raw_value);
+    std::transform(
+        normalized.begin(), normalized.end(), normalized.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (normalized == "1" || normalized == "true" || normalized == "yes" ||
+        normalized == "on") {
+        return true;
+    }
+    if (normalized == "0" || normalized == "false" || normalized == "no" ||
+        normalized == "off") {
+        return false;
+    }
+    LOG(WARNING) << "Invalid value for " << name << ": " << raw_value
+                 << ", using default " << default_value;
+    return default_value;
+}
+
+// Batches of at least this many bytes log a transfer_trace line on completion.
+// 0 (the default) disables tracing. TENT UB reads the same variable for its
+// per-slice ub_task_trace line.
+static uint64_t TransferTraceMinBytes() {
+    static const uint64_t value = [] {
+        const char* raw = std::getenv("MC_TRANSFER_TRACE_MIN_BYTES");
+        if (raw == nullptr || *raw == '\0') return uint64_t{0};
+        char* end = nullptr;
+        const unsigned long long parsed = std::strtoull(raw, &end, 10);
+        if (*end != '\0') {
+            LOG(WARNING) << "Invalid MC_TRANSFER_TRACE_MIN_BYTES: " << raw
+                         << ", transfer tracing is disabled";
+            return uint64_t{0};
+        }
+        return static_cast<uint64_t>(parsed);
+    }();
+    return value;
+}
+
+static int64_t ElapsedUs(std::chrono::steady_clock::time_point begin,
+                         std::chrono::steady_clock::time_point end) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(end - begin)
+        .count();
+}
+
+// Used by the polling loop, which also serves TENT batches in
+// USE_EVENT_DRIVEN_COMPLETION builds, so not compiled out there.
+// UB has dedicated posting/polling workers. Long Store-side busy waits can
+// compete with those workers; keep a short spin for fast completions, then
+// optionally back off. Range [0, 1s].
+static int ReadUbPollDelayUs(const char* name, int default_value) {
+    const char* value = std::getenv(name);
+    if (!value) return default_value;
+    char* end = nullptr;
+    errno = 0;
+    const long parsed = std::strtol(value, &end, 10);
+    if (errno || end == value || *end || parsed < 0 || parsed > 1000000) {
+        LOG(WARNING) << "Invalid " << name << "; using " << default_value;
+        return default_value;
+    }
+    return static_cast<int>(parsed);
+}
+
+static int UbPollSpinUs() {
+    static const int value = ReadUbPollDelayUs("MC_STORE_UB_POLL_SPIN_US", 50);
+    return value;
+}
+
+static int UbPollSleepUs() {
+    // Latency-sensitive reads busy poll by default; deployments preferring
+    // lower CPU usage opt into backoff.
+    static const int value = ReadUbPollDelayUs("MC_STORE_UB_POLL_SLEEP_US", 0);
+    return value;
+}
+
+// A lane with I/O in flight and no completion for this long is isolated.
+// 0 disables the check.
+static std::chrono::milliseconds GetNofIoTimeout() {
+    static const auto value = [] {
+        const char* raw_value = std::getenv("MC_NOF_IO_TIMEOUT_MS");
+        if (raw_value && std::string(raw_value) == "0") {
+            return std::chrono::milliseconds(0);
+        }
+        return std::chrono::milliseconds(
+            GetPositiveEnvOrDefault("MC_NOF_IO_TIMEOUT_MS", 60000));
+    }();
+    return value;
 }
 
 static bool IsNofDebugEnabled() {
@@ -77,15 +173,162 @@ static int CountNofQueuedTasks(const mooncake::NofTask* head) {
     return count;
 }
 
+static inline int64_t ElapsedMicros(
+    std::chrono::steady_clock::time_point begin,
+    std::chrono::steady_clock::time_point end) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(end - begin)
+        .count();
+}
+
+// Marks the moment a task becomes its lane's FIFO head, once. The 930
+// source additionally attributed lane-occupancy accumulators here; those
+// were not ported, so the qos_fifo_*_wait_us decomposition reports 0.
+static inline void MarkNofTaskAsQosHead(
+    mooncake::NofTask* task, std::chrono::steady_clock::time_point now) {
+    if (task && task->timing &&
+        task->timing->qos_head_at ==
+            std::chrono::steady_clock::time_point{}) {
+        task->timing->qos_head_at = now;
+    }
+}
+
+// The lane's block budget is exhausted while the task still has bytes to
+// submit: the wait span is attributed to the task's credit_wait_us.
+static inline void StartNofCreditWait(
+    mooncake::NofTask* task, std::chrono::steady_clock::time_point now) {
+    if (task && task->timing && !task->timing->credit_wait_active) {
+        task->timing->credit_wait_active = true;
+        task->timing->credit_wait_started_at = now;
+    }
+}
+
+static inline void StopNofCreditWait(
+    mooncake::NofTask* task, std::chrono::steady_clock::time_point now) {
+    if (task && task->timing && task->timing->credit_wait_active) {
+        task->timing->credit_wait_us +=
+            ElapsedMicros(task->timing->credit_wait_started_at, now);
+        task->timing->credit_wait_active = false;
+    }
+}
+
+// Completes the task once all bytes were submitted and all sub-I/O returned.
+// Idempotent: a failing sub-I/O can complete a task that is still queued at
+// the QoS head (on_chain); popping the head later calls this again. The task
+// is deleted only when it is off the chain.
 static inline void NofTaskCompletion(mooncake::NofTask* task) {
-    if (task->remaining_bytes == 0 && task->outstanding_sub_io == 0) {
+    if (task->remaining_bytes != 0 || task->outstanding_sub_io != 0) {
+        return;
+    }
+    if (!task->completed) {
+        task->completed = true;
+        if (task->nof_qos) {
+            task->nof_qos->live.erase(task);
+        }
+        const uint64_t lane_completion_sequence =
+            task->nof_qos ? ++task->nof_qos->completed_task_sequence : 0;
+        // Publish only tasks whose full submit/completion timeline was
+        // observed: tasks failed before their first successful sub-I/O or
+        // stranded by lane isolation have no meaningful breakdown.
+        std::optional<NofTransferTiming> timing;
+        if (task->timing && task->first_sub_io_submitted &&
+            task->timing->submitted_sub_io_count > 0 &&
+            task->timing->completed_sub_io_count > 0 &&
+            task->timing->worker_dequeued_at !=
+                std::chrono::steady_clock::time_point{} &&
+            task->timing->qos_enqueued_at !=
+                std::chrono::steady_clock::time_point{} &&
+            task->timing->qos_head_at !=
+                std::chrono::steady_clock::time_point{} &&
+            task->timing->last_submit_at !=
+                std::chrono::steady_clock::time_point{} &&
+            task->timing->first_completion_at !=
+                std::chrono::steady_clock::time_point{}) {
+            const auto completed_at = std::chrono::steady_clock::now();
+            auto elapsed_us =
+                [](std::chrono::steady_clock::time_point begin,
+                   std::chrono::steady_clock::time_point end) {
+                    return std::chrono::duration_cast<
+                               std::chrono::microseconds>(end - begin)
+                        .count();
+                };
+            timing.emplace();
+            timing->worker_index = task->worker_index;
+            timing->lane = task->lane_index;
+            // The initiator interface exposes no qpair id; reported as 0.
+            timing->qpair_id = 0;
+            timing->sub_io_count = task->timing->submitted_sub_io_count;
+            timing->lane_task_sequence = task->timing->lane_task_sequence;
+            timing->lane_completion_sequence = lane_completion_sequence;
+            timing->qos_tasks_ahead_at_enqueue =
+                task->timing->qos_tasks_ahead_at_enqueue;
+            timing->dispatch_queue_us =
+                elapsed_us(task->queued_at, task->timing->worker_dequeued_at);
+            timing->worker_setup_us =
+                elapsed_us(task->timing->worker_dequeued_at,
+                           task->timing->qos_enqueued_at);
+            timing->qos_fifo_wait_us =
+                elapsed_us(task->timing->qos_enqueued_at,
+                           task->timing->qos_head_at);
+            // Lane-occupancy attribution was not ported; the
+            // qos_fifo_*_wait_us decomposition reports 0.
+            timing->head_to_first_submit_us =
+                elapsed_us(task->timing->qos_head_at,
+                           task->timing->first_submit_at);
+            timing->credit_wait_us = task->timing->credit_wait_us;
+            timing->first_credit_wait_us =
+                task->timing->first_credit_wait_us;
+            timing->qos_queue_us =
+                elapsed_us(task->timing->worker_dequeued_at,
+                           task->timing->first_submit_at);
+            timing->queue_to_first_submit_us =
+                elapsed_us(task->queued_at, task->timing->first_submit_at);
+            timing->first_to_last_submit_us =
+                elapsed_us(task->timing->first_submit_at,
+                           task->timing->last_submit_at);
+            timing->last_submit_to_complete_us =
+                elapsed_us(task->timing->last_submit_at, completed_at);
+            timing->first_submit_to_first_completion_us =
+                elapsed_us(task->timing->first_submit_at,
+                           task->timing->first_completion_at);
+            timing->first_completion_minus_last_submit_us =
+                elapsed_us(task->timing->last_submit_at,
+                           task->timing->first_completion_at);
+            timing->first_completion_to_complete_us =
+                elapsed_us(task->timing->first_completion_at, completed_at);
+            timing->total_us = elapsed_us(task->queued_at, completed_at);
+            timing->max_sub_io_latency_us =
+                task->timing->max_sub_io_latency_us;
+            timing->max_sub_io_index = task->timing->max_sub_io_index;
+            // NofIOCompletion carries no command id; reported as 0.
+            timing->max_sub_io_cid = 0;
+            timing->max_completion_gap_us =
+                task->timing->max_completion_gap_us;
+            timing->max_poll_return_gap_us =
+                task->timing->max_poll_return_gap_us;
+            if (task->nof_qos) {
+                const auto counter_delta = [](uint64_t current,
+                                              uint64_t start) {
+                    return current >= start ? current - start : 0;
+                };
+                timing->poll_calls_during_task =
+                    counter_delta(task->nof_qos->poll_calls,
+                                  task->timing->poll_calls_at_first_submit);
+                timing->empty_polls_during_task = counter_delta(
+                    task->nof_qos->empty_polls,
+                    task->timing->empty_polls_at_first_submit);
+                timing->polled_completions_during_task = counter_delta(
+                    task->nof_qos->polled_completions,
+                    task->timing->polled_completions_at_first_submit);
+            }
+        }
         task->state->set_completed(task->failed
                                        ? mooncake::ErrorCode::TRANSFER_FAIL
                                        : mooncake::ErrorCode::OK,
-                                   std::move(task->error_detail));
-        if (!task->on_chain) {
-            delete task;
-        }
+                                   std::move(task->error_detail),
+                                   std::move(timing));
+    }
+    if (!task->on_chain) {
+        delete task;
     }
 }
 
@@ -101,6 +344,52 @@ static void nof_io_complete(void* ctx, const mooncake::NofIOCompletion& c) {
     mooncake::NofQos* nof_qos = task->nof_qos;
     size_t op = static_cast<size_t>(task->op);
 
+    // Per-completion timing for sampled tasks. A lane head waiting for
+    // credit also needs the current time to stop its wait.
+    bool releases_sampled_credit = false;
+    for (size_t pending_op = 0;
+         pending_op < static_cast<size_t>(NofIOOp::kNum); ++pending_op) {
+        releases_sampled_credit =
+            releases_sampled_credit ||
+            (nof_qos->head[pending_op] &&
+             nof_qos->head[pending_op]->timing &&
+             nof_qos->head[pending_op]->timing->credit_wait_active);
+    }
+    const auto completion_now =
+        (task->timing || releases_sampled_credit)
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
+    if (task->timing) {
+        const int64_t sub_io_latency_us =
+            ElapsedMicros(sub_task->submitted_at, completion_now);
+        if (sub_io_latency_us > task->timing->max_sub_io_latency_us) {
+            task->timing->max_sub_io_latency_us = sub_io_latency_us;
+            task->timing->max_sub_io_index = sub_task->sub_io_index;
+            // NofIOCompletion carries no command id; max_sub_io_cid stays 0.
+        }
+        if (task->timing->previous_completion_at !=
+            std::chrono::steady_clock::time_point{}) {
+            const int64_t completion_gap_us = ElapsedMicros(
+                task->timing->previous_completion_at, completion_now);
+            if (completion_gap_us > task->timing->max_completion_gap_us) {
+                task->timing->max_completion_gap_us = completion_gap_us;
+            }
+        }
+        task->timing->previous_completion_at = completion_now;
+        if (nof_qos->last_poll_return_at !=
+            std::chrono::steady_clock::time_point{}) {
+            const int64_t poll_return_gap_us =
+                ElapsedMicros(nof_qos->last_poll_return_at, completion_now);
+            if (poll_return_gap_us > task->timing->max_poll_return_gap_us) {
+                task->timing->max_poll_return_gap_us = poll_return_gap_us;
+            }
+        }
+        if (task->timing->completed_sub_io_count == 0) {
+            task->timing->first_completion_at = completion_now;
+        }
+        ++task->timing->completed_sub_io_count;
+    }
+
     if (task->io_count &&
         task->io_count->fetch_sub(1, std::memory_order_acq_rel) <= 0) {
         LOG(ERROR) << "total outstanding io < 0";
@@ -112,9 +401,25 @@ static void nof_io_complete(void* ctx, const mooncake::NofIOCompletion& c) {
 
     nof_qos->inflight_blocks[op] -=
         static_cast<int>(sub_task->submit_bytes / nof_qos->block_size);
+    // Credit became available for a lane head that was waiting for it.
+    for (size_t pending_op = 0;
+         pending_op < static_cast<size_t>(NofIOOp::kNum); ++pending_op) {
+        if (nof_qos->head[pending_op] &&
+            nof_qos->inflight_blocks_limit -
+                    nof_qos->inflight_blocks[pending_op] >
+                0) {
+            StopNofCreditWait(nof_qos->head[pending_op], completion_now);
+        }
+    }
     if (nof_qos->inflight_blocks[op] < 0) {
         LOG(ERROR) << "qos inflight blocks < 0";
     }
+    nof_qos->last_progress = std::chrono::steady_clock::now();
+#ifdef USE_NOF_URMA
+    mooncake::RecordNofIoCompleted(task->buffer_info, c.success,
+                                   task->op == mooncake::NofIOOp::kWrite,
+                                   sub_task->submit_bytes);
+#endif
 
     if (!c.success) {
 #ifdef USE_NOF
@@ -222,12 +527,14 @@ std::optional<TransferStatusEnum> ToClassicTransferStatus(
 
 }  // namespace
 
-NofQos::NofQos(uint32_t bs)
+NofQos::NofQos(uint32_t bs, uint32_t lane_count)
     : block_size(bs == 0 || bs == kInvalidBlockSize ? 1 : bs),
       blocks_per_chunk(
           std::max(1, GetNofSubmitChunkBytes() / static_cast<int>(block_size))),
+      // Split per lane so a multi-lane segment keeps the single-lane total.
       inflight_blocks_limit(std::max(
-          1, GetNofInflightBytesLimit() / static_cast<int>(block_size))) {
+          1, GetNofInflightBytesLimit() / static_cast<int>(block_size) /
+                 static_cast<int>(std::max<uint32_t>(lane_count, 1)))) {
     for (size_t i = 0; i < static_cast<size_t>(NofIOOp::kNum); ++i) {
         inflight_blocks[i] = 0;
         head[i] = nullptr;
@@ -396,7 +703,23 @@ void NofWorkerPool::submitTask(NofTask task) {
     int worker_idx = -1;
     {
         std::lock_guard<std::mutex> lock(seg_mutex_);
-        NofSegmentHandle* seg = task.seg_handle;
+        // Each task runs on one lane of its segment; the lane handle then
+        // keys worker affinity and QoS exactly like a single-lane segment.
+        uint32_t lane_count = 1;
+        uint32_t lane_index = 0;
+        NofSegmentHandle* lane =
+            PickLaneLocked(task.seg_handle, &lane_count, &lane_index);
+        if (lane == nullptr) {
+            LOG(ERROR) << "No healthy NoF lane for segment "
+                       << task.seg_handle;
+            task.state->set_completed(ErrorCode::TRANSFER_FAIL,
+                                      "no healthy NoF lane");
+            return;
+        }
+        task.seg_handle = lane;
+        task.lane_count = lane_count;
+        task.lane_index = lane_index;
+        NofSegmentHandle* seg = lane;
         bool new_binding = false;
         if (seg_to_worker_.find(seg) != seg_to_worker_.end()) {
             worker_idx = seg_to_worker_[seg];
@@ -421,6 +744,31 @@ void NofWorkerPool::submitTask(NofTask task) {
         task_queue_[worker_idx].push(std::move(task));
     }
     queue_cv_[worker_idx].notify_one();
+}
+
+NofSegmentHandle* NofWorkerPool::PickLaneLocked(NofSegmentHandle* segment,
+                                                uint32_t* lane_count,
+                                                uint32_t* lane_index) {
+    const size_t count = initiator_->GetLaneCount(segment);
+    *lane_count = static_cast<uint32_t>(std::max<size_t>(count, 1));
+    if (count == 0) {
+        return nullptr;
+    }
+    uint64_t& next = seg_next_lane_[segment];
+    for (size_t attempt = 0; attempt < count; ++attempt) {
+        const uint64_t lane_selector = next++;
+        NofSegmentHandle* lane =
+            initiator_->GetLane(segment, lane_selector % count);
+        if (lane != nullptr && initiator_->IsLaneHealthy(lane)) {
+            // The initiator exposes no qpair id; report the round-robin lane
+            // selector within the segment instead.
+            if (lane_index != nullptr) {
+                *lane_index = static_cast<uint32_t>(lane_selector % count);
+            }
+            return lane;
+        }
+    }
+    return nullptr;
 }
 
 static bool HasBufferedTask(
@@ -455,6 +803,52 @@ static inline bool CheckSubTaskPool(std::stack<NofSubTask*>& sub_task_pool,
     }
 
     return true;
+}
+
+// Isolates a lane after a fatal submit/poll error or an I/O timeout. Runs on
+// the lane's worker (its only polling thread), as ReleaseFailedLane requires.
+// Outstanding I/O is aborted: callbacks either run inside ReleaseFailedLane
+// (failing their tasks normally) or never run, in which case the stranded
+// tasks are failed here. Queued tasks fail without being submitted.
+static void IsolateNofLane(NVMeoFInitiator& initiator, NofSegmentHandle* lane,
+                           NofQos* qos,
+                           std::atomic<int64_t>& total_outstanding_io,
+                           int work_idx, const char* reason) {
+    LOG(ERROR) << "Isolating NoF lane " << lane << " on worker " << work_idx
+               << ": " << reason << " (in-flight tasks=" << qos->live.size()
+               << ")";
+    qos->dead = true;
+    initiator.MarkLaneFailed(lane);
+    initiator.ReleaseFailedLane(lane);
+
+    // Collect every affected task once: a partially submitted task can be
+    // both queued at the head and in flight.
+    std::unordered_set<NofTask*> affected(qos->live.begin(), qos->live.end());
+    for (size_t i = 0; i < static_cast<size_t>(NofIOOp::kNum); ++i) {
+        while (NofTask* task = qos->head[i]) {
+            qos->PopTask(static_cast<NofIOOp>(i));
+            task->on_chain = false;
+            affected.insert(task);
+        }
+        qos->inflight_blocks[i] = 0;
+    }
+    for (NofTask* task : affected) {
+        const int lost = task->outstanding_sub_io;
+        if (lost > 0) {
+            total_outstanding_io.fetch_sub(lost, std::memory_order_acq_rel);
+#ifdef USE_NOF_URMA
+            RecordNofIoAborted(task->buffer_info, task->op == NofIOOp::kWrite,
+                               static_cast<uint64_t>(lost));
+#endif
+        }
+        task->outstanding_sub_io = 0;
+        task->remaining_bytes = 0;
+        task->failed = true;
+        if (task->error_detail.empty()) {
+            task->error_detail = reason;
+        }
+        NofTaskCompletion(task);  // completes once; deletes (off chain)
+    }
 }
 
 void NofWorkerPool::workerThread(int work_idx) {
@@ -513,7 +907,8 @@ void NofWorkerPool::workerThread(int work_idx) {
                 auto it = seg_to_qos.find(task->seg_handle);
                 if (it == seg_to_qos.end()) {
                     auto qos = std::make_unique<NofQos>(
-                        initiator_->GetBlockSize(task->seg_handle));
+                        initiator_->GetBlockSize(task->seg_handle),
+                        task->lane_count);
                     if (qos == nullptr) {
                         LOG(ERROR)
                             << "alloc NofQos failed, worker " << work_idx;
@@ -542,23 +937,95 @@ void NofWorkerPool::workerThread(int work_idx) {
                 } else {
                     nof_qos = it->second.get();
                 }
+                // The lane may have been isolated after this task was routed
+                // to it.
+                const char* reject_reason = nullptr;
+                if (nof_qos->dead ||
+                    !initiator_->IsLaneHealthy(task->seg_handle)) {
+                    reject_reason = "NoF lane failed";
+                }
+#ifdef USE_NOF_URMA
+                if (reject_reason == nullptr) {
+                    // GPU Direct: classify once per task. Device memory that
+                    // cannot be served must fail, never silently stage.
+                    task->buffer_info =
+                        initiator_->ResolveBuffer(task->ptr, task->byte_length);
+                    if (task->buffer_info.type == NofMemoryType::kError ||
+                        task->buffer_info.type ==
+                            NofMemoryType::kNotSupported) {
+                        reject_reason = "NoF buffer classification failed";
+                    }
+                }
+#endif
+                if (reject_reason != nullptr) {
+                    task->state->set_completed(ErrorCode::TRANSFER_FAIL,
+                                               reject_reason);
+                    delete task;
+                    task_queue.pop();
+                    continue;
+                }
+                if (task->timing) {
+                    task->timing->worker_dequeued_at =
+                        std::chrono::steady_clock::now();
+                }
+                task->worker_index = work_idx;
                 task->io_count = total_outstanding_io;
                 task->nof_qos = nof_qos;
                 task->on_chain = true;
+                const size_t task_op = static_cast<size_t>(task->op);
+                const bool lane_was_empty = nof_qos->head[task_op] == nullptr;
+                const uint32_t tasks_ahead =
+                    task->timing
+                        ? static_cast<uint32_t>(
+                              CountNofQueuedTasks(nof_qos->head[task_op]))
+                        : 0;
+                const auto qos_enqueue_now =
+                    task->timing ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point{};
+                if (task->timing) {
+                    task->timing->qos_enqueued_at = qos_enqueue_now;
+                    task->timing->lane_task_sequence =
+                        nof_qos->enqueued_task_sequence + 1;
+                    task->timing->qos_tasks_ahead_at_enqueue = tasks_ahead;
+                }
+                ++nof_qos->enqueued_task_sequence;
                 nof_qos->PushTask(task);
+                if (lane_was_empty) {
+                    MarkNofTaskAsQosHead(task, qos_enqueue_now);
+                }
                 task_queue.pop();
             }
         }
 
         for (auto& [seg_handle, nof_qos] : seg_to_qos) {
+            if (nof_qos->dead) {
+                continue;
+            }
             // block_size comes from the QoS cache; the hot loop no longer
             // queries the initiator.
             const uint32_t block_size = nof_qos->block_size;
             const uint64_t chunk_bytes =
                 static_cast<uint64_t>(nof_qos->blocks_per_chunk) * block_size;
-            for (size_t i = 0; i < static_cast<size_t>(NofIOOp::kNum); ++i) {
+            const char* isolate_reason = nullptr;
+            for (size_t i = 0; i < static_cast<size_t>(NofIOOp::kNum) &&
+                               isolate_reason == nullptr;
+                 ++i) {
                 int avail_blocks = nof_qos->inflight_blocks_limit -
                                    nof_qos->inflight_blocks[i];
+                if (nof_qos->head[i]) {
+                    // Track how long the lane head spends waiting for
+                    // inflight-block credit. Sampled tasks only; the
+                    // un-sampled majority pays one null check.
+                    const auto credit_state_now =
+                        nof_qos->head[i]->timing
+                            ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
+                    if (avail_blocks <= 0) {
+                        StartNofCreditWait(nof_qos->head[i], credit_state_now);
+                    } else {
+                        StopNofCreditWait(nof_qos->head[i], credit_state_now);
+                    }
+                }
                 while (nof_qos->head[i] && avail_blocks > 0) {
                     NofTask* task = nof_qos->head[i];
                     NofSubTask* sub_task;
@@ -587,11 +1054,33 @@ void NofWorkerPool::workerThread(int work_idx) {
                         sub_task->task = task;
                         sub_task->submit_bytes = submit_bytes;
                         sub_task->adaptor = {&nof_io_complete, sub_task};
+                        const auto sub_io_submit_at =
+                            task->timing
+                                ? std::chrono::steady_clock::now()
+                                : std::chrono::steady_clock::time_point{};
 
-                        int ret = initiator_->SubmitIO(
+                        // Host buffers take the classic path inside the
+                        // initiator; device buffers use GPU Direct.
+                        int ret = initiator_->SubmitIOWithBuffer(
                             task->seg_handle, submit_ptr, submit_off,
-                            submit_bytes, task->op, &sub_task->adaptor);
+                            submit_bytes, task->op, &sub_task->adaptor,
+                            task->buffer_info);
                         if (ret != 0) {
+                            // Return the pool slot: a sub-task taken out and
+                            // then failing to submit must be returned, or
+                            // repeated failures would exhaust the 4096 slots
+                            // and allocate new chunks unboundedly.
+                            sub_task->sub_task_pool->push(sub_task);
+                            const bool has_inflight =
+                                nof_qos->inflight_blocks[0] > 0 ||
+                                nof_qos->inflight_blocks[1] > 0;
+                            if ((ret == -EAGAIN || ret == -ENOMEM) &&
+                                has_inflight) {
+                                // Queue pressure: keep the task at the head,
+                                // poll to return credits, retry next round.
+                                avail_blocks = 0;
+                                break;
+                            }
 #ifdef USE_NOF
                             if (task->metric) {
                                 if (task->op == NofIOOp::kWrite) {
@@ -601,18 +1090,55 @@ void NofWorkerPool::workerThread(int work_idx) {
                                 }
                             }
 #endif
-                            LOG(ERROR) << "work " << work_idx << ", seg "
-                                       << task->seg_handle << " submit io fail";
-                            // Return the pool slot: a sub-task taken out
-                            // and then failing to submit must be returned,
-                            // or repeated failures would exhaust the 4096
-                            // slots and allocate new chunks unboundedly.
-                            sub_task->sub_task_pool->push(sub_task);
+                            LOG(ERROR) << "work " << work_idx << ", lane "
+                                       << task->seg_handle
+                                       << " submit io fail: ret " << ret;
+                            if (ret == -ENXIO || ret == -ENODEV) {
+                                // The lane is gone; fail everything on it.
+                                isolate_reason = "NoF lane submit failed";
+                                avail_blocks = 0;
+                                break;
+                            }
                             task->failed = true;
                             task->remaining_bytes = 0;
                         } else {
                             const int submit_blocks =
                                 static_cast<int>(submit_bytes / block_size);
+                            if (nof_qos->live.empty()) {
+                                // Idle -> busy: start the timeout clock.
+                                nof_qos->last_progress =
+                                    std::chrono::steady_clock::now();
+                            }
+                            nof_qos->live.insert(task);
+                            if (task->timing) {
+                                sub_task->submitted_at = sub_io_submit_at;
+                                sub_task->sub_io_index =
+                                    static_cast<uint32_t>(task->idx);
+                                ++task->timing->submitted_sub_io_count;
+                                if (!task->first_sub_io_submitted) {
+                                    task->first_sub_io_submitted = true;
+                                    task->timing->first_submit_at =
+                                        sub_io_submit_at;
+                                    task->timing->poll_calls_at_first_submit =
+                                        nof_qos->poll_calls;
+                                    task->timing->empty_polls_at_first_submit =
+                                        nof_qos->empty_polls;
+                                    task->timing
+                                        ->polled_completions_at_first_submit =
+                                        nof_qos->polled_completions;
+                                    // Credit waited while at the head before
+                                    // this first successful submit. Submits
+                                    // only run with avail_blocks > 0, so any
+                                    // active wait was already stopped.
+                                    task->timing->first_credit_wait_us =
+                                        task->timing->credit_wait_us;
+                                }
+                                if (task->remaining_bytes - submit_bytes ==
+                                    0) {
+                                    task->timing->last_submit_at =
+                                        std::chrono::steady_clock::now();
+                                }
+                            }
                             task->idx++;
                             task->remaining_bytes -= submit_bytes;
                             nof_qos->inflight_blocks[i] += submit_blocks;
@@ -620,22 +1146,84 @@ void NofWorkerPool::workerThread(int work_idx) {
                             task->outstanding_sub_io++;
                             total_outstanding_io->fetch_add(
                                 1, std::memory_order_acq_rel);
+#ifdef USE_NOF_URMA
+                            RecordNofIoSubmitted(task->buffer_info,
+                                                 task->op == NofIOOp::kWrite,
+                                                 submit_bytes);
+#endif
+                            if (task->timing && avail_blocks <= 0 &&
+                                task->remaining_bytes > 0) {
+                                // Credit exhausted mid-task: the head (this
+                                // task) starts waiting for credit release.
+                                StartNofCreditWait(
+                                    task, std::chrono::steady_clock::now());
+                            }
                         }
                     }
+                    if (isolate_reason != nullptr) {
+                        break;
+                    }
                     if (task->remaining_bytes == 0) {
+                        const bool capture_pop_time =
+                            nof_qos->head[i] != nullptr &&
+                            nof_qos->head[i]->nxt != nullptr &&
+                            nof_qos->head[i]->nxt->timing != nullptr;
+                        const auto pop_now =
+                            capture_pop_time
+                                ? std::chrono::steady_clock::now()
+                                : std::chrono::steady_clock::time_point{};
                         nof_qos->PopTask(static_cast<NofIOOp>(i));
                         task->on_chain = false;
+                        MarkNofTaskAsQosHead(nof_qos->head[i], pop_now);
+                        if (nof_qos->head[i] && avail_blocks <= 0) {
+                            // The new head inherits a blocked lane: it starts
+                            // waiting for credit.
+                            StartNofCreditWait(nof_qos->head[i], pop_now);
+                        }
                         NofTaskCompletion(task);
                     }
                 }
             }
+            if (isolate_reason != nullptr) {
+                IsolateNofLane(*initiator_, seg_handle, nof_qos.get(),
+                               *total_outstanding_io, work_idx,
+                               isolate_reason);
+            }
         }
 
         if (total_outstanding_io->load(std::memory_order_acquire) > 0) {
-            for (auto& it : seg_to_qos) {
-                int64_t ret = initiator_->PollCompletion(it.first, 0);
-                if (ret < 0) {
-                    LOG(ERROR) << "poll completion error: ret " << ret;
+            const auto io_timeout = GetNofIoTimeout();
+            const auto now = std::chrono::steady_clock::now();
+            for (auto& [lane, nof_qos] : seg_to_qos) {
+                if (nof_qos->dead) {
+                    continue;
+                }
+                const int64_t ret = initiator_->PollCompletion(lane, 0);
+                ++nof_qos->poll_calls;
+                if (ret == 0) {
+                    ++nof_qos->empty_polls;
+                } else if (ret > 0) {
+                    nof_qos->polled_completions +=
+                        static_cast<uint64_t>(ret);
+                }
+                nof_qos->last_poll_return_at =
+                    std::chrono::steady_clock::now();
+                if (ret == -ENXIO || ret == -ENODEV) {
+                    IsolateNofLane(*initiator_, lane, nof_qos.get(),
+                                   *total_outstanding_io, work_idx,
+                                   "NoF lane poll failed");
+                } else {
+                    if (ret < 0) {
+                        LOG(ERROR) << "poll completion error: ret " << ret;
+                    }
+                    // A lane that keeps failing its polls makes no progress
+                    // either, so the I/O timeout still isolates it.
+                    if (io_timeout.count() > 0 && !nof_qos->live.empty() &&
+                        now - nof_qos->last_progress > io_timeout) {
+                        IsolateNofLane(*initiator_, lane, nof_qos.get(),
+                                       *total_outstanding_io, work_idx,
+                                       "NoF lane I/O timeout");
+                    }
                 }
             }
         }
@@ -678,16 +1266,49 @@ void NofWorkerPool::workerThread(int work_idx) {
 // ============================================================================
 // MemcpyWorkerPool Implementation
 // ============================================================================
-// Since memcpy is bound by memory bandwidth, we only need one worker thread.
-constexpr int kDefaultMemcpyWorkers = 1;
+// A single worker serializes otherwise independent local-memory puts. Four
+// workers expose several cores of memcpy bandwidth without creating an
+// unbounded number of threads. Tune with MC_STORE_MEMCPY_WORKERS (1..64).
+constexpr int kDefaultMemcpyWorkers = 4;
+constexpr int kMaxMemcpyWorkers = 64;
+
+static int GetMemcpyWorkerCount() {
+    static const int worker_count = [] {
+        const unsigned int hardware_threads =
+            std::thread::hardware_concurrency();
+        const int automatic_default =
+            hardware_threads == 0
+                ? kDefaultMemcpyWorkers
+                : std::max(1, std::min(kDefaultMemcpyWorkers,
+                                       static_cast<int>(hardware_threads)));
+        const int parsed = GetPositiveEnvOrDefault("MC_STORE_MEMCPY_WORKERS",
+                                                   automatic_default);
+        if (parsed > kMaxMemcpyWorkers) {
+            LOG(WARNING) << "MC_STORE_MEMCPY_WORKERS=" << parsed
+                         << " exceeds " << kMaxMemcpyWorkers << ", using "
+                         << automatic_default;
+            return automatic_default;
+        }
+        return parsed;
+    }();
+    return worker_count;
+}
+
+// Host-to-host copies run inline on the submitting thread by default
+// (MC_STORE_MEMCPY_INLINE=0 queues them on the pool instead).
+static bool IsInlineHostMemcpyEnabled() {
+    static const bool enabled = ParseBoolEnv("MC_STORE_MEMCPY_INLINE", true);
+    return enabled;
+}
 
 MemcpyWorkerPool::MemcpyWorkerPool() : shutdown_(false) {
-    VLOG(1) << "Creating MemcpyWorkerPool with " << kDefaultMemcpyWorkers
-            << " workers";
+    const int worker_count = GetMemcpyWorkerCount();
+    VLOG(1) << "Creating MemcpyWorkerPool with " << worker_count
+            << " workers; tune with MC_STORE_MEMCPY_WORKERS";
 
     // Start worker threads
-    workers_.reserve(kDefaultMemcpyWorkers);
-    for (int i = 0; i < kDefaultMemcpyWorkers; ++i) {
+    workers_.reserve(worker_count);
+    for (int i = 0; i < worker_count; ++i) {
         workers_.emplace_back(&MemcpyWorkerPool::workerThread, this);
     }
 }
@@ -719,6 +1340,9 @@ void MemcpyWorkerPool::submitTask(MemcpyTask task) {
             task.state->set_completed(ErrorCode::TRANSFER_FAIL);
             return;
         }
+        // Queue depth before this push: how many tasks this one waits
+        // behind. Needed by the memcpy_worker_breakdown queue_wait_us.
+        task.queued_ahead = task_queue_.size();
         task_queue_.push(std::move(task));
     }
     queue_cv_.notify_one();
@@ -749,20 +1373,60 @@ void MemcpyWorkerPool::workerThread() {
 
         // Execute the task if we have one
         if (task.state) {
+            // Worker-pool breakdown is opt-in sampled: un-sampled tasks pay
+            // only the gate check.
+            mooncake::logging::ScopedTraceId trace(task.trace_id);
+            const bool breakdown_log =
+                ShouldSampleStoreTransferDiagnostics(task.trace_id);
+            const auto worker_start =
+                breakdown_log ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
+            auto registry_end = worker_start;
+            int64_t pointer_lookup_us = 0;
+            int64_t copy_us = 0;
+            uint64_t copied_bytes = 0;
             try {
                 bool ok = true;
                 auto runtime_accelerator =
                     device::GetAcceleratorRegistry().RuntimeAccelerators();
+                if (breakdown_log) {
+                    registry_end = std::chrono::steady_clock::now();
+                }
                 for (const auto& op : task.operations) {
+                    const auto lookup_start =
+                        breakdown_log
+                            ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
                     device::PointerInfo src_info;
                     device::PointerInfo dst_info;
                     auto* src_device = runtime_accelerator.FindDeviceForPointer(
                         op.src, &src_info);
                     auto* dst_device = runtime_accelerator.FindDeviceForPointer(
                         op.dest, &dst_info);
+                    if (breakdown_log) {
+                        pointer_lookup_us +=
+                            std::chrono::duration_cast<
+                                std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() -
+                                lookup_start)
+                                .count();
+                    }
 
                     if (!src_device && !dst_device) {
+                        const auto copy_start =
+                            breakdown_log
+                                ? std::chrono::steady_clock::now()
+                                : std::chrono::steady_clock::time_point{};
                         std::memcpy(op.dest, op.src, op.size);
+                        if (breakdown_log) {
+                            copy_us +=
+                                std::chrono::duration_cast<
+                                    std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() -
+                                    copy_start)
+                                    .count();
+                        }
+                        copied_bytes += op.size;
                     } else {
                         if (src_device && dst_device &&
                             src_device != dst_device) {
@@ -792,8 +1456,22 @@ void MemcpyWorkerPool::workerThread() {
                             direction = device::CopyDirection::kHostToDevice;
                         }
                         accelerator->SetContext(device_id);
-                        if (!accelerator->Copy(op.dest, op.src, op.size,
-                                               direction)) {
+                        const auto copy_start =
+                            breakdown_log
+                                ? std::chrono::steady_clock::now()
+                                : std::chrono::steady_clock::time_point{};
+                        const bool copy_ok =
+                            accelerator->Copy(op.dest, op.src, op.size,
+                                             direction);
+                        if (breakdown_log && copy_ok) {
+                            copy_us +=
+                                std::chrono::duration_cast<
+                                    std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() -
+                                    copy_start)
+                                    .count();
+                        }
+                        if (!copy_ok) {
                             LOG(ERROR) << "GPU memcpy failed: src_dev="
                                        << src_info.device_id
                                        << " dst_dev=" << dst_info.device_id
@@ -801,14 +1479,47 @@ void MemcpyWorkerPool::workerThread() {
                             ok = false;
                             break;
                         }
+                        copied_bytes += op.size;
                     }
                 }
+
+                const auto worker_end =
+                    breakdown_log ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
 
                 VLOG(2) << "Memcpy task completed with "
                         << task.operations.size() << " operations"
                         << (ok ? "" : " (with GPU copy failure)");
                 task.state->set_completed(ok ? ErrorCode::OK
                                              : ErrorCode::TRANSFER_FAIL);
+                if (breakdown_log) {
+                    auto elapsed_us =
+                        [](std::chrono::steady_clock::time_point begin,
+                           std::chrono::steady_clock::time_point end) {
+                            return std::chrono::duration_cast<
+                                       std::chrono::microseconds>(end - begin)
+                                .count();
+                        };
+                    MC_LOG(INFO)
+                        << "memcpy_worker_breakdown trace_id="
+                        << task.trace_id
+                        << " operations=" << task.operations.size()
+                        << " bytes=" << copied_bytes
+                        << " queued_ahead=" << task.queued_ahead
+                        << " queue_wait_us="
+                        << elapsed_us(task.submitted_at, worker_start)
+                        << " registry_us="
+                        << elapsed_us(worker_start, registry_end)
+                        << " pointer_lookup_us=" << pointer_lookup_us
+                        << " copy_us=" << copy_us
+                        << " execute_us="
+                        << elapsed_us(worker_start, worker_end)
+                        << " total_us="
+                        << elapsed_us(task.submitted_at, worker_end)
+                        << " status="
+                        << static_cast<int>(ok ? ErrorCode::OK
+                                               : ErrorCode::TRANSFER_FAIL);
+                }
             } catch (const std::exception& e) {
                 LOG(ERROR) << "Exception during async memcpy: " << e.what();
                 task.state->set_completed(ErrorCode::TRANSFER_FAIL);
@@ -850,6 +1561,7 @@ void TransferEngineOperationState::check_task_status() {
     // could cause issues when freeBatchID is called in the destructor.
     bool all_terminated = true;
     std::vector<size_t> failed_task_ids;
+    if (trace_) ++trace_->polls;
 
     for (size_t i = 0; i < batch_size_; ++i) {
         TransferStatus status;
@@ -946,9 +1658,47 @@ void TransferEngineOperationState::set_result_internal(ErrorCode error_code) {
     VLOG(1) << "Setting transfer result for batch " << batch_id_ << " to "
             << static_cast<int>(error_code);
     result_.emplace(error_code);
+    if (trace_) log_trace(error_code);
+}
+
+void TransferEngineOperationState::log_trace(ErrorCode error_code) const {
+    const auto done = std::chrono::steady_clock::now();
+    const auto wait_start =
+        trace_->wait_start == std::chrono::steady_clock::time_point{}
+            ? trace_->submit_end
+            : trace_->wait_start;
+    const int64_t submit_us = trace_->open_segment_us + trace_->alloc_batch_us +
+                              trace_->build_requests_us +
+                              trace_->engine_submit_us;
+    const int64_t wait_us = ElapsedUs(wait_start, done);
+    const int64_t total_us = submit_us + ElapsedUs(trace_->submit_end, done);
+    const double mbps = total_us > 0 ? static_cast<double>(trace_->bytes) /
+                                           static_cast<double>(total_us)
+                                     : 0.0;
+    MC_LOG(INFO) << "transfer_trace trace_id=" << trace_->trace_id
+                 << " batch=0x" << std::hex << batch_id_ << std::dec
+                 << " op=" << (trace_->is_read ? "read" : "write")
+                 << " engine=" << (trace_->is_tent ? "tent" : "classic")
+                 << " requests=" << trace_->requests
+                 << " bytes=" << trace_->bytes
+                 << " open_segment_us=" << trace_->open_segment_us
+                 << " alloc_batch_us=" << trace_->alloc_batch_us
+                 << " build_requests_us=" << trace_->build_requests_us
+                 << " engine_submit_us=" << trace_->engine_submit_us
+                 << " submit_us=" << submit_us << " wait_start_delay_us="
+                 << ElapsedUs(trace_->submit_end, wait_start)
+                 << " wait_us=" << wait_us << " polls=" << trace_->polls
+                 << " total_us=" << total_us << " MBps=" << mbps
+                 << " status=" << static_cast<int>(error_code);
 }
 
 void TransferEngineOperationState::wait_for_completion() {
+    if (trace_) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (trace_->wait_start == std::chrono::steady_clock::time_point{}) {
+            trace_->wait_start = std::chrono::steady_clock::now();
+        }
+    }
     if (is_completed()) {
         return;
     }
@@ -1016,26 +1766,47 @@ void TransferEngineOperationState::wait_for_completion() {
 #endif
     VLOG(1) << "Starting transfer engine polling for batch " << batch_id_;
 
-    while (true) {
-        if (getCurrentTimeInMilli() - start_ts_ > timeout_milliseconds) {
-            LOG(ERROR) << "Failed to complete transfers after "
-                       << timeout_milliseconds << " milliseconds for batch "
-                       << batch_id_;
-            set_result_internal(ErrorCode::TRANSFER_FAIL);
-            return;
-        }
+    const bool ub_transport = engine_.getTransport("ub") != nullptr;
+    const auto sleep_time =
+        std::chrono::microseconds(ub_transport ? UbPollSleepUs() : 0);
+    const auto spin_time =
+        std::chrono::microseconds(ub_transport ? UbPollSpinUs() : 0);
+    auto spin_until = std::chrono::steady_clock::now() + spin_time;
+    if (ub_transport) {
+        LOG_FIRST_N(INFO, 1) << "UB completion polling: spin_us="
+                             << spin_time.count()
+                             << " sleep_us=" << sleep_time.count()
+                             << " (MC_STORE_UB_POLL_SLEEP_US=0 restores "
+                                "busy polling)";
+    }
 
-        std::unique_lock<std::mutex> lock(mutex_);
-        check_task_status();
-        if (result_.has_value()) {
-            VLOG(1) << "Transfer engine operation completed for batch "
-                    << batch_id_
-                    << " with result: " << static_cast<int>(result_.value());
-            break;
+    while (true) {
+        {
+            // Timeout and status are checked under the lock so a concurrent
+            // observer never sees two results.
+            std::unique_lock<std::mutex> lock(mutex_);
+            if (result_.has_value()) return;
+            if (getCurrentTimeInMilli() - start_ts_ > timeout_milliseconds) {
+                LOG(ERROR) << "Failed to complete transfers after "
+                           << timeout_milliseconds << " milliseconds for batch "
+                           << batch_id_;
+                set_result_internal(ErrorCode::TRANSFER_FAIL);
+                return;
+            }
+            check_task_status();
+            if (result_.has_value()) {
+                VLOG(1) << "Transfer engine operation completed for batch "
+                        << batch_id_ << " with result: "
+                        << static_cast<int>(result_.value());
+                break;
+            }
         }
-        // Continue polling
-        VLOG(1) << "Transfer engine operation still pending for batch "
-                << batch_id_;
+        // Lock released before sleeping so other observers see progress.
+        if (sleep_time.count() > 0 &&
+            std::chrono::steady_clock::now() >= spin_until) {
+            std::this_thread::sleep_for(sleep_time);
+            spin_until = std::chrono::steady_clock::now() + spin_time;
+        }
     }
 }
 
@@ -1064,6 +1835,10 @@ ErrorCode TransferFuture::get() { return wait(); }
 
 TransferStrategy TransferFuture::strategy() const {
     return state_->get_strategy();
+}
+
+std::optional<NofTransferTiming> TransferFuture::nofTiming() const {
+    return state_->nof_timing();
 }
 
 // ============================================================================
@@ -1149,6 +1924,11 @@ std::optional<TransferFuture> TransferSubmitter::submit(
         }
 
         future = submitNofOperation(handle, ptr, size, op_code);
+    } else if (replica.is_vsegment_replica()) {
+        // Without this branch a vsegment replica would fall through to the
+        // file-read path.
+        LOG(ERROR) << "VSegment transfer requires an expanded transfer plan";
+        return std::nullopt;
     } else {
         future = submitFileReadOperation(replica, slices, op_code);
     }
@@ -1158,6 +1938,61 @@ std::optional<TransferFuture> TransferSubmitter::submit(
         updateTransferMetrics(slices, op_code);
     }
 
+    return future;
+}
+
+// Opens a transfer segment through TENT when active, else the classic
+// engine. Returns false when the endpoint cannot be opened.
+static bool OpenTransferSegment(TransferEngine& engine,
+                                [[maybe_unused]] void* tent_engine,
+                                const std::string& endpoint,
+                                SegmentHandle* out) {
+#ifdef USE_TENT
+    if (tent_engine) {
+        tent::SegmentID seg_id;
+        auto status = static_cast<tent::TransferEngine*>(tent_engine)
+                          ->openSegment(seg_id, endpoint);
+        if (!status.ok()) {
+            return false;
+        }
+        *out = seg_id;
+        return true;
+    }
+#endif
+    *out = engine.openSegment(endpoint);
+    return *out != static_cast<uint64_t>(ERR_INVALID_ARGUMENT);
+}
+
+std::optional<TransferFuture> TransferSubmitter::submitVSegment(
+    const vsegment::VSegmentTransferPlan& plan,
+    TransferRequest::OpCode op_code) {
+    if (!plan || plan.requests.empty()) return std::nullopt;
+    std::vector<TransferRequest> requests;
+    requests.reserve(plan.requests.size());
+    uint64_t bytes = 0;
+    for (const auto& subrequest : plan.requests) {
+        SegmentHandle segment = 0;
+        if (!OpenTransferSegment(engine_, tent_engine_, subrequest.endpoint,
+                                 &segment)) {
+            LOG(ERROR) << "Failed to open vsegment member endpoint='"
+                       << subrequest.endpoint << "'";
+            return std::nullopt;
+        }
+        TransferRequest request;
+        request.opcode = op_code;
+        request.source =
+            reinterpret_cast<void*>(subrequest.transfer.client_address);
+        request.target_id = segment;
+        request.target_offset = subrequest.transfer.physical_offset;
+        request.length = subrequest.transfer.length;
+        requests.push_back(request);
+        bytes += subrequest.transfer.length;
+    }
+    auto future = submitTransfer(requests);
+    if (future) {
+        std::vector<Slice> metric_slices{{nullptr, bytes}};
+        updateTransferMetrics(metric_slices, op_code);
+    }
     return future;
 }
 
@@ -1725,6 +2560,53 @@ void TransferSubmitter::appendMemcpyOperations(
     }
 }
 
+std::optional<TransferFuture>
+TransferSubmitter::submit_batch_push_offload_object(
+    const std::string& requester_te_addr,
+    const std::vector<std::string>& keys,
+    const std::vector<uint64_t>& src_pointers,
+    const std::vector<std::vector<OffloadDstSlice>>& dst_slices) {
+    if (keys.size() != src_pointers.size() ||
+        keys.size() != dst_slices.size()) {
+        LOG(ERROR) << "submit_batch_push_offload_object size mismatch: keys="
+                   << keys.size() << ", src_pointers=" << src_pointers.size()
+                   << ", dst_slices=" << dst_slices.size();
+        return std::nullopt;
+    }
+    // Open the requester's segment once: all keys share requester_te_addr.
+    SegmentHandle seg = 0;
+    if (!OpenTransferSegment(engine_, tent_engine_, requester_te_addr, &seg)) {
+        LOG(ERROR) << "Failed to open segment " << requester_te_addr;
+        return std::nullopt;
+    }
+    constexpr uint64_t kMaxAddress = std::numeric_limits<uint64_t>::max();
+    std::vector<TransferRequest> requests;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        // src is the owner's contiguous ClientBuffer blob for this key; it
+        // is split across the requester's destination slices.
+        const uint64_t src = src_pointers[i];
+        uint64_t offset = 0;
+        for (const auto& dst : dst_slices[i]) {
+            if (dst.size == 0) continue;
+            if (src == 0 || src > kMaxAddress - offset ||
+                dst.size > kMaxAddress - src - offset) {
+                LOG(ERROR) << "Invalid offload push range for key: "
+                           << keys[i];
+                return std::nullopt;
+            }
+            TransferRequest request;
+            request.opcode = TransferRequest::WRITE;
+            request.source = reinterpret_cast<char*>(src + offset);
+            request.target_id = seg;
+            request.target_offset = dst.addr;
+            request.length = dst.size;
+            requests.emplace_back(request);
+            offset += dst.size;
+        }
+    }
+    return submitTransfer(requests);
+}
+
 std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
     const TransferRequest::OpCode op_code, uint64_t src_offset) {
@@ -1735,10 +2617,100 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperations(
-    std::vector<MemcpyOperation> operations) {
-    auto state = std::make_shared<MemcpyOperationState>();
+    std::vector<MemcpyOperation> operations, uint64_t trace_id) {
+    auto state = std::make_shared<MemcpyOperationState>(trace_id);
+    if (IsInlineHostMemcpyEnabled()) {
+        // Host-only batches are copied right here: queueing them costs a
+        // thread handoff that dominates small copies. Any accelerator
+        // pointer sends the whole batch to the pool.
+        //
+        // Inline-copy breakdown is opt-in sampled: the dice is rolled once
+        // here, and un-sampled copies pay nothing but the gate check.
+        const bool breakdown_log =
+            ShouldSampleStoreTransferDiagnostics(trace_id);
+        const auto inline_start =
+            breakdown_log ? std::chrono::steady_clock::now()
+                          : std::chrono::steady_clock::time_point{};
+        auto registry_end = inline_start;
+        int64_t pointer_lookup_us = 0;
+        int64_t copy_us = 0;
+        uint64_t copied_bytes = 0;
+        try {
+            bool host_only = true;
+            auto runtime_accelerator =
+                device::GetAcceleratorRegistry().RuntimeAccelerators();
+            if (breakdown_log) {
+                registry_end = std::chrono::steady_clock::now();
+            }
+            if (!runtime_accelerator.Devices().empty()) {
+                for (const auto& op : operations) {
+                    const auto lookup_start =
+                        breakdown_log ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
+                    runtime_accelerator.FindDeviceForPointer(op.src);
+                    runtime_accelerator.FindDeviceForPointer(op.dest);
+                    if (breakdown_log) {
+                        pointer_lookup_us +=
+                            std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - lookup_start)
+                                .count();
+                    }
+                    if (runtime_accelerator.FindDeviceForPointer(op.src) ||
+                        runtime_accelerator.FindDeviceForPointer(op.dest)) {
+                        host_only = false;
+                        break;
+                    }
+                }
+            }
+            if (host_only) {
+                const auto copy_start =
+                    breakdown_log ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
+                for (const auto& op : operations) {
+                    std::memcpy(op.dest, op.src, op.size);
+                    copied_bytes += op.size;
+                }
+                const auto inline_end =
+                    breakdown_log ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
+                if (breakdown_log) {
+                    copy_us = std::chrono::duration_cast<
+                                  std::chrono::microseconds>(inline_end -
+                                                             copy_start)
+                                  .count();
+                }
+                state->set_completed(ErrorCode::OK);
+                if (breakdown_log) {
+                    auto elapsed_us =
+                        [](std::chrono::steady_clock::time_point begin,
+                           std::chrono::steady_clock::time_point end) {
+                            return std::chrono::duration_cast<
+                                       std::chrono::microseconds>(end - begin)
+                                .count();
+                        };
+                    MC_LOG(INFO)
+                        << "memcpy_inline_breakdown trace_id=" << trace_id
+                        << " operations=" << operations.size()
+                        << " bytes=" << copied_bytes
+                        << " registry_us="
+                        << elapsed_us(inline_start, registry_end)
+                        << " pointer_lookup_us=" << pointer_lookup_us
+                        << " copy_us=" << copy_us
+                        << " total_us=" << elapsed_us(inline_start, inline_end)
+                        << " status="
+                        << static_cast<int>(ErrorCode::OK);
+                }
+                return TransferFuture(state);
+            }
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Exception while classifying memcpy pointers: "
+                       << e.what();
+            state->set_completed(ErrorCode::TRANSFER_FAIL);
+            return TransferFuture(state);
+        }
+    }
     const size_t operation_count = operations.size();
-    MemcpyTask task(std::move(operations), state);
+    MemcpyTask task(std::move(operations), state, trace_id);
     memcpy_pool_->submitTask(std::move(task));
 
     VLOG(1) << "Memcpy transfer submitted to worker pool with "
@@ -1748,19 +2720,46 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperations(
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitTransfer(
-    std::vector<TransferRequest>& requests, TransferIntent intent) {
+    std::vector<TransferRequest>& requests, TransferIntent intent,
+    int64_t open_segment_us) {
     const size_t batch_size = requests.size();
 
     BatchID batch_id = INVALID_BATCH_ID;
     Status s;
 
+    std::unique_ptr<TransferEngineTrace> trace;
+    if (const uint64_t min_bytes = TransferTraceMinBytes(); min_bytes > 0) {
+        uint64_t bytes = 0;
+        for (const auto& request : requests) bytes += request.length;
+        if (bytes >= min_bytes) {
+            trace = std::make_unique<TransferEngineTrace>();
+            trace->trace_id = mooncake::logging::CurrentTraceId();
+            trace->bytes = bytes;
+            trace->requests = batch_size;
+            trace->is_read = !requests.empty() &&
+                             requests.front().opcode == TransferRequest::READ;
+            trace->open_segment_us = open_segment_us;
+        }
+    }
+    // Advances the phase clock; a no-op for batches that are not traced.
+    auto phase_start = trace ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point{};
+    const auto end_phase = [&](int64_t TransferEngineTrace::* field) {
+        if (!trace) return;
+        const auto now = std::chrono::steady_clock::now();
+        (*trace).*field = ElapsedUs(phase_start, now);
+        phase_start = now;
+    };
+
 #ifdef USE_TENT
     if (tent_engine_) {
+        if (trace) trace->is_tent = true;
         batch_id = tent_engine_->allocateBatch(batch_size);
         if (batch_id == 0) {
             LOG(ERROR) << "Failed to allocate batch ID";
             return std::nullopt;
         }
+        end_phase(&TransferEngineTrace::alloc_batch_us);
         std::vector<tent::Request> tent_reqs;
         tent_reqs.reserve(requests.size());
         auto tent_intent = ToTentIntent(intent);
@@ -1789,6 +2788,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
             tr.intent_type = *tent_intent;
             tent_reqs.push_back(tr);
         }
+        end_phase(&TransferEngineTrace::build_requests_us);
         auto tent_status = tent_engine_->submitTransfer(batch_id, tent_reqs);
         if (!tent_status.ok()) {
             LOG(ERROR) << "Failed to submit all transfers, error: "
@@ -1796,6 +2796,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
             tent_engine_->freeBatch(batch_id);
             return std::nullopt;
         }
+        end_phase(&TransferEngineTrace::engine_submit_us);
     } else
 #endif
     {
@@ -1804,6 +2805,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
             LOG(ERROR) << "Failed to allocate batch ID";
             return std::nullopt;
         }
+        end_phase(&TransferEngineTrace::alloc_batch_us);
         s = engine_.submitTransfer(batch_id, requests);
         if (!s.ok()) {
             LOG(ERROR) << "Failed to submit all transfers, error code is "
@@ -1811,10 +2813,15 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
             engine_.freeBatchID(batch_id);
             return std::nullopt;
         }
+        end_phase(&TransferEngineTrace::engine_submit_us);
     }
 
     auto state = std::make_shared<TransferEngineOperationState>(
         engine_, batch_id, batch_size);
+    if (trace) {
+        trace->submit_end = std::chrono::steady_clock::now();
+        state->set_trace(std::move(trace));
+    }
 
     return TransferFuture(state);
 }
@@ -1828,6 +2835,10 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
                    << handle.buffer_address_;
         return std::nullopt;
     }
+    const bool trace_open = TransferTraceMinBytes() > 0;
+    const auto open_start = trace_open
+                                ? std::chrono::steady_clock::now()
+                                : std::chrono::steady_clock::time_point{};
     SegmentHandle seg = 0;
 #ifdef USE_TENT
     if (tent_engine_) {
@@ -1850,6 +2861,9 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
             return std::nullopt;
         }
     }
+    const int64_t open_segment_us =
+        trace_open ? ElapsedUs(open_start, std::chrono::steady_clock::now())
+                   : 0;
 
     // Create transfer requests
     std::vector<TransferRequest> requests;
@@ -1871,7 +2885,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
         offset += slice.size;
         requests.emplace_back(request);
     }
-    return submitTransfer(requests, intent);
+    return submitTransfer(requests, intent, open_segment_us);
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitMemoryReadOperation(
@@ -2027,7 +3041,13 @@ std::optional<TransferFuture> TransferSubmitter::submitNofOperation(
 
     const NofIOOp op =
         (op_code == TransferRequest::READ) ? NofIOOp::kRead : NofIOOp::kWrite;
-    auto state = std::make_shared<NofOperationState>();
+    // NoF task breakdown is opt-in sampled: the dice is rolled once here,
+    // and every layer (worker, QoS, completion) re-checks only the
+    // task-local flag.
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
+    const bool track_timing = ShouldSampleStoreTransferDiagnostics(trace_id);
+    auto state =
+        std::make_shared<NofOperationState>(trace_id, track_timing);
     NofTask task(seg_handle, ptr, handle.buffer_address_, size, op, state);
     task.metric = nof_metric_;
     nof_pool_->submitTask(std::move(task));

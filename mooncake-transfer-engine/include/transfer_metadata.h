@@ -87,7 +87,13 @@ class TransferMetadata {
         std::string shm_name;  // nvlink/hip IPC blob, or POSIX shm object name
         uint64_t offset;       // for cxl
         std::vector<std::string> tseg;      // for ub/urma
+        std::vector<std::string> tseg_ctx;  // for ub/urma segment context
         std::vector<uint32_t> l_seg_index;  // for ub/urma
+        // for ub: NUMA->chip id of this buffer, computed once by the owner at
+        // registration and published. -1 = not provided (consumer falls back
+        // to resolving from `name`). Only meaningful for single-NUMA ("cpu:N")
+        // buffers; multi-NUMA "segments:..." buffers leave it -1.
+        int chip_id = -1;
 
         bool operator==(const BufferDesc &other) const = default;
     };
@@ -200,8 +206,12 @@ class TransferMetadata {
         uint32_t local_lid = 0;
         std::string local_gid;
         std::string peer_nic_path;
+        uint64_t trace_id = 0;
 #ifdef USE_UB
         std::vector<uint32_t> jetty_num;  // for ub/urma
+        // Serialized remote-jetty descriptors (urma_get_rjetty blobs) that let
+        // the peer resolve the jetty in user space.
+        std::vector<std::string> rjetty_blobs;
 #endif
 #ifdef USE_BAREX
         uint16_t barex_port;
@@ -254,6 +264,15 @@ class TransferMetadata {
     std::shared_ptr<SegmentDesc> getSegmentDescByID(SegmentID segment_id,
                                                     bool force_update = false);
 
+    // Transfer workers must never perform metadata RPCs, even with metacache
+    // off.
+    std::shared_ptr<SegmentDesc> getCachedSegmentDescByID(
+        SegmentID segment_id) {
+        RWSpinlock::ReadGuard guard(segment_lock_);
+        auto it = segment_id_to_desc_map_.find(segment_id);
+        return it == segment_id_to_desc_map_.end() ? nullptr : it->second;
+    }
+
     int updateLocalSegmentDesc(SegmentID segment_id = LOCAL_SEGMENT_ID);
 
     int updateSegmentDesc(const std::string &segment_name,
@@ -279,6 +298,13 @@ class TransferMetadata {
     // publish the updated descriptor rather than remove the entry again.
     // ERR_ADDRESS_NOT_REGISTERED means no matching local entry was present.
     int removeLocalMemoryBuffer(void *addr, bool update_metadata);
+
+    // Removes the buffer at addr only when pred accepts the entry, so
+    // transports sharing an address in the local buffer list remove only
+    // their own entries.
+    int removeLocalMemoryBuffer(
+        void *addr, const std::function<bool(const BufferDesc &)> &pred,
+        bool update_metadata);
 
     // Rebuilds interned NIC paths on `desc` before insert. The caller must
     // exclusively own `desc`; do not pass a live descriptor from the metadata

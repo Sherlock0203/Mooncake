@@ -109,12 +109,29 @@ ErrorCode BatchOpLogSnapshotGc::Run(
                               chunk.crc32c))
                 return ErrorCode::INTERNAL_ERROR;
         }
+        if (manifest->object_storage) {
+            const auto& objects = *manifest->object_storage;
+            if (objects.key != ha::BuildBatchOpLogSnapshotObjectStorageKey(
+                                   root_, descriptor->snapshot_id) ||
+                !VerifyObject(store_, objects.key, objects.stored_size,
+                              objects.crc32c))
+                return ErrorCode::INTERNAL_ERROR;
+        }
         if (manifest->weight_metadata) {
             const auto& weights = *manifest->weight_metadata;
             if (weights.key != ha::BuildBatchOpLogSnapshotWeightMetadataKey(
                                    root_, descriptor->snapshot_id) ||
                 !VerifyObject(store_, weights.key, weights.stored_size,
                               weights.crc32c))
+                return ErrorCode::INTERNAL_ERROR;
+        }
+        if (manifest->vsegment_partitions) {
+            const auto& vsegments = *manifest->vsegment_partitions;
+            if (vsegments.key !=
+                    ha::BuildBatchOpLogSnapshotVSegmentPartitionsKey(
+                        root_, descriptor->snapshot_id) ||
+                !VerifyObject(store_, vsegments.key, vsegments.stored_size,
+                              vsegments.crc32c))
                 return ErrorCode::INTERNAL_ERROR;
         }
         protected_prefixes.insert(prefix);

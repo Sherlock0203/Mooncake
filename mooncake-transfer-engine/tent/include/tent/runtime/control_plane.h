@@ -38,6 +38,7 @@
 #include "tent/rpc/rpc.h"
 #include "tent/runtime/topology.h"
 #include "tent/thirdparty/nlohmann/json.h"
+#include "tent/runtime/tcp_data_plane.h"
 #include "tent/transport/ub/bootstrap_types.h"
 #ifdef USE_UB
 #include "tent/transport/ub/probe_bootstrap.h"
@@ -73,9 +74,14 @@ struct XferDataDesc {
 inline constexpr size_t kTcpMaxReadBytes = size_t{1} << 30;
 inline constexpr size_t kTcpMaxWriteBytes =
     std::numeric_limits<uint32_t>::max() - sizeof(XferDataDesc);
+// yuanhao-1113 added the v2 write protocol; the submit planner must use a
+// limit both protocols accept.
+inline constexpr size_t kTcpDataV2HeaderBytes = 5 * sizeof(uint64_t);
+inline constexpr size_t kTcpMaxWriteV2Bytes =
+    std::numeric_limits<uint32_t>::max() - kTcpDataV2HeaderBytes;
 
 inline constexpr size_t tcpMaxTransferBytes(Request::OpCode opcode) {
-    return opcode == Request::READ ? kTcpMaxReadBytes : kTcpMaxWriteBytes;
+    return opcode == Request::READ ? kTcpMaxReadBytes : kTcpMaxWriteV2Bytes;
 }
 
 using OnReceiveBootstrap =
@@ -129,9 +135,21 @@ class ControlClient {
                            uint64_t peer_mem_addr, void* local_mem_addr,
                            size_t length);
 
+    // yuanhao-1113's v2 TCP data RPCs: the payload is disambiguated by an
+    // explicit data-plane identity instead of the legacy single-writer rules.
+    static Status sendDataV2(const std::string& server_addr,
+                             uint64_t peer_mem_addr, void* local_mem_addr,
+                             size_t length,
+                             const TcpDataPlaneIdentity& identity);
+
     static Status recvData(const std::string& server_addr,
                            uint64_t peer_mem_addr, void* local_mem_addr,
                            size_t length);
+
+    static Status recvDataV2(const std::string& server_addr,
+                             uint64_t peer_mem_addr, void* local_mem_addr,
+                             size_t length,
+                             const TcpDataPlaneIdentity& identity);
 
     static Status notify(const std::string& server_addr,
                          const Notification& message);
@@ -178,6 +196,16 @@ class ControlService {
 
     SegmentManager& segmentManager() { return *manager_.get(); }
 
+    // yuanhao-1113's TCP data plane hooks.
+    TcpBufferRegistry& tcpBufferRegistry() { return tcp_buffer_registry_; }
+    const TcpProcessIdentity& tcpProcessIdentity() const {
+        return tcp_process_identity_;
+    }
+    void setUnsafeLegacyTcpDataRpcEnabled(bool enabled) {
+        unsafe_legacy_tcp_data_rpc_enabled_.store(enabled,
+                                                 std::memory_order_release);
+    }
+
     void setBootstrapRdmaCallback(const OnReceiveBootstrap& callback);
 
     void setBootstrapUbCallback(const OnReceiveUbBootstrap& callback) {
@@ -223,6 +251,10 @@ class ControlService {
 
     void onRecvData(const std::string_view& request, std::string& response);
 
+    void onSendDataV2(const std::string_view& request, std::string& response);
+
+    void onRecvDataV2(const std::string_view& request, std::string& response);
+
     void onNotify(const std::string_view& request, std::string& response);
 
     void onProbe(const std::string_view& request, std::string& response);
@@ -248,6 +280,12 @@ class ControlService {
    private:
     std::unique_ptr<SegmentManager> manager_;
     std::shared_ptr<CoroRpcAgent> rpc_server_;
+    // yuanhao-1113's TCP data plane state. The legacy v1 data RPCs stay
+    // available but must be opted into; the v2 path carries an explicit
+    // per-process identity instead.
+    TcpProcessIdentity tcp_process_identity_;
+    TcpBufferRegistry tcp_buffer_registry_;
+    std::atomic<bool> unsafe_legacy_tcp_data_rpc_enabled_{false};
 
     std::mutex bootstrap_cb_mutex_;
     std::condition_variable bootstrap_cb_cv_;

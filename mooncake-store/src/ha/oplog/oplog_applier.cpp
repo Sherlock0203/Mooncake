@@ -12,13 +12,16 @@ namespace {
 bool SameImmutableWeightReference(const WeightRevisionMetadata& lhs,
                                   const WeightRevisionMetadata& rhs) {
     if (lhs.identity != rhs.identity ||
-        lhs.created_at_ms != rhs.created_at_ms) {
+        lhs.created_at_ms != rhs.created_at_ms ||
+        lhs.affinity_count != rhs.affinity_count ||
+        lhs.affinity_digest != rhs.affinity_digest) {
         return false;
     }
     if (lhs.availability == WeightAvailabilityState::IMPORTING) {
         return lhs.manifest.payload_group_id == rhs.manifest.payload_group_id &&
                lhs.manifest.payload_count == rhs.manifest.payload_count &&
-               lhs.manifest.logical_bytes == rhs.manifest.logical_bytes;
+               lhs.manifest.logical_bytes == rhs.manifest.logical_bytes &&
+               lhs.policy == rhs.policy;
     }
     return lhs.manifest == rhs.manifest;
 }
@@ -84,6 +87,16 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
 
     bool applied = true;
     switch (entry.op_type) {
+        case OpType::OBJECT_STORAGE_MUTATION: {
+            ObjectReplicaMutation mutation;
+            if (struct_pack::deserialize_to(mutation, entry.payload) !=
+                struct_pack::errc::ok) {
+                return false;
+            }
+            applied = metadata_store_->ApplyObjectReplicaMutation(
+                entry.tenant_id, entry.object_key, mutation);
+            break;
+        }
         case OpType::PUT_END:
             ApplyPutEnd(entry);
             break;
@@ -113,6 +126,30 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
             break;
         case OpType::WEIGHT_LEASE_DELETE:
             applied = ApplyWeightLeaseDelete(entry);
+            break;
+        case OpType::VSEGMENT_STATE:
+            if (!vsegment_state_handler_ || !vsegment_state_handler_(entry)) {
+                LOG(ERROR) << "OpLogApplier: vsegment state handler rejected "
+                           << "sequence_id=" << entry.sequence_id;
+                return false;
+            }
+            break;
+        case OpType::VSEGMENT_RESERVE:
+        case OpType::VSEGMENT_RELEASE:
+            // aligned 模式下的 reservation 生命周期记录，复用 vsegment handler：
+            // handler 内部按 entry.op_type 区分（RESERVE / RELEASE）。
+            // 未安装 handler 时（legacy / 仅 full 模式部署）忽略而不阻断重放。
+            if (!vsegment_state_handler_) {
+                VLOG(1) << "OpLogApplier: no vsegment handler installed, "
+                        << "dropping reservation record op_type="
+                        << static_cast<int>(entry.op_type);
+                break;
+            }
+            if (!vsegment_state_handler_(entry)) {
+                LOG(ERROR) << "OpLogApplier: vsegment reservation handler "
+                           << "rejected sequence_id=" << entry.sequence_id;
+                return false;
+            }
             break;
         default:
             LOG(ERROR) << "OpLogApplier: unsupported op_type="
@@ -240,20 +277,8 @@ bool OpLogApplier::ApplyWeightMetadataUpsert(const OpLogEntry& entry) {
     static_assert(struct_pack::get_type_code<WeightMetadataUpsertOp>() !=
                   struct_pack::get_type_code<WeightRevisionMetadata>());
     WeightMetadataUpsertOp upsert;
-    bool decoded = struct_pack::deserialize_to(upsert, entry.payload) ==
-                   struct_pack::errc::ok;
-    if (!decoded) {
-        // Before residency operations, this op type carried metadata directly.
-        // struct_pack checks the distinct type hashes before decoding either
-        // shape. Legacy records could only contain idle metadata.
-        WeightRevisionMetadata legacy;
-        decoded = struct_pack::deserialize_to(legacy, entry.payload) ==
-                      struct_pack::errc::ok &&
-                  legacy.operation == WeightOperationState::NONE;
-        if (decoded) {
-            upsert = {.metadata = std::move(legacy), .operation = std::nullopt};
-        }
-    }
+    const bool decoded = struct_pack::deserialize_to(upsert, entry.payload) ==
+                         struct_pack::errc::ok;
     if (!decoded || !ValidateWeightRevisionMetadata(upsert.metadata).ok() ||
         !MatchesWeightTenantAndKey(entry, upsert.metadata.identity)) {
         LOG(ERROR) << "OpLogApplier: invalid weight metadata upsert, key="
@@ -261,19 +286,14 @@ bool OpLogApplier::ApplyWeightMetadataUpsert(const OpLogEntry& entry) {
         return false;
     }
     const auto& next = upsert.metadata;
-    if ((next.operation != WeightOperationState::NONE &&
+    if ((next.operation_id.has_value() &&
          (!upsert.operation.has_value() ||
           upsert.operation->identity != next.identity ||
-          upsert.operation->operation_id != next.operation_id ||
-          upsert.operation->operation != next.operation ||
+          upsert.operation->operation_id != *next.operation_id ||
           upsert.operation->fenced_metadata_generation !=
               next.metadata_generation ||
-          upsert.operation->processed_members >
-              upsert.operation->total_members ||
-          (!upsert.operation->cursor.empty() &&
-           !IsValidWeightComponent(upsert.operation->cursor)))) ||
-        (next.operation == WeightOperationState::NONE &&
-         upsert.operation.has_value() &&
+          !IsValidWeightOperationShape(*upsert.operation))) ||
+        (!next.operation_id.has_value() && upsert.operation.has_value() &&
          (upsert.operation->identity != next.identity ||
           !IsWeightOperationTerminal(upsert.operation->message) ||
           upsert.operation->fenced_metadata_generation >=
@@ -345,7 +365,6 @@ bool OpLogApplier::ApplyWeightMetadataUpsert(const OpLogEntry& entry) {
             metadata_store_->GetWeightOperation(upsert.operation->operation_id);
         if (!previous ||
             current->operation_id != upsert.operation->operation_id ||
-            current->operation != previous->operation ||
             current->metadata_generation !=
                 previous->fenced_metadata_generation ||
             IsWeightOperationTerminal(previous->message) ||

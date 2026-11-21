@@ -16,16 +16,29 @@
 #define URMA_ENDPOINT_H
 #include <atomic>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <utility>
 #include "common.h"
 #include "config.h"
 #include "urma_api.h"
+#include "urma_ubagg.h"
 #include "transport/kunpeng_transport/ub_context.h"
 #include "transport/kunpeng_transport/ub_endpoint.h"
 
 namespace mooncake {
+
+// Redirect liburma driver logs (default rsyslog) into the application's glog
+// output. Enabled explicitly with MC_URMA_LOG_REDIRECT=1; idempotent, safe to
+// call from any init path before urma_init(). Registers both the plain
+// callback (urma_register_log_func, which is the only one propagated to
+// provider drivers) and the location callback
+// (urma_register_loc_log_func). Levels follow urma_vlog_level_t:
+// 0-3 -> ERROR, 4-5 -> WARNING, 6 -> INFO, 7 -> VLOG(1).
+void UrmaRegisterLogRedirectIfEnabled();
+
 struct UrmaJFC {
     UrmaJFC() : native(nullptr), outstanding(0) {}
 
@@ -54,11 +67,14 @@ class UrmaContext : public UbContext {
     UrmaContext(UbTransport& engine, std::string device_name,
                 int max_endpoints);
     ~UrmaContext();
-    int registerMemoryRegion(uint64_t va, size_t length) override;
+    int registerMemoryRegion(
+        uint64_t va, size_t length,
+        UbMemoryRegionType type = UbMemoryRegionType::kHost) override;
     int unregisterMemoryRegion(uint64_t va) override;
     int doProcessContextEvents() override;
     void* retrieveRemoteSeg(const std::string& value) override;
     int poll(int num_entries, Transport::Slice** failed_slices, int& num_failed,
+             std::vector<Transport::Slice*>& deferred_success_slices,
              std::unordered_map<volatile int*, int>& jetty_depth_set,
              int jfc_index) override;
     volatile int* outstandingCount(int jfc_index) override;
@@ -78,13 +94,17 @@ class UrmaContext : public UbContext {
     urma_jfc_t* jfc();
     urma_jfr_t* jfr();
     urma_jfce_t* JFCE();
+    urma_transport_mode_t transMode() const { return trans_mode_; }
+    uint64_t pendingSliceCount() const {
+        return worker_pool_ ? worker_pool_->pendingSliceCount() : 0;
+    }
     static bool uninit();
     static bool init();
 
    private:
     int construct(GlobalConfig& config) override;
     int deconstruct() override;
-    int openDevice(const std::string& device_name, uint8_t port,
+    int openDevice(const std::string& device_name, int8_t port,
                    int& eid_index) override;
 
     urma_target_seg_t* seg(uint64_t addr);
@@ -129,6 +149,7 @@ class UrmaContext : public UbContext {
     std::vector<urma_target_seg_t*> local_tseg_list_;
     std::vector<urma_seg_t*> remote_seg_list_;
     std::vector<urma_target_seg_t*> imported_seg_list_;
+    std::shared_mutex import_tseg_mutex_;
 
     std::vector<UrmaJFR> jfr_list_;
 
@@ -146,6 +167,8 @@ class UrmaContext : public UbContext {
 
     urma_import_seg_flag_t import_flag_ = mooncake::import_flag;
     std::unordered_map<std::string, urma_target_seg_t*> import_tseg_map;
+
+    urma_transport_mode_t trans_mode_ = URMA_TM_RM;
 };
 
 // define the UrmaEndpoint class
@@ -179,12 +202,16 @@ class UrmaEndpoint : public UbEndPoint {
    private:
     std::vector<uint32_t> JettyNum() const;
 
+    std::vector<std::string> JettyRjettyBlobs() const;
+
     int doSetupConnection(const std::string& peer_eid,
                           std::vector<uint32_t> peer_jetty_num_list,
+                          std::vector<std::string> peer_rjetty_blobs,
                           std::string* reply_msg = nullptr);
 
     int doSetupConnection(int qp_index, const std::string& peer_eid,
                           uint32_t peer_jetty_num,
+                          const std::string& peer_rjetty_blob,
                           std::string* reply_msg = nullptr);
 
    private:

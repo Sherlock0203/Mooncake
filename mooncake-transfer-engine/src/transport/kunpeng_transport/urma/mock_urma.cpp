@@ -45,6 +45,21 @@ urma_eid_info_t mock_eid_info = {
 
 }  // namespace
 
+urma_status_t urma_register_log_func(urma_log_cb_t func) {
+    // Mock device has no driver logs to redirect.
+    (void)func;
+    return URMA_SUCCESS;
+}
+
+urma_status_t urma_register_loc_log_func(urma_loc_log_cb func) {
+    (void)func;
+    return URMA_SUCCESS;
+}
+
+urma_status_t urma_unregister_log_func(void) {
+    return URMA_SUCCESS;
+}
+
 urma_status_t urma_init(urma_init_attr_t *init_attr) {
     std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
     if (initialized) {
@@ -99,7 +114,7 @@ urma_device_t **urma_get_device_list(int *num_devices) {
         if (device_list.empty()) {
             urma_device_t *device = new urma_device_t;
             strcpy(device->name, "mock_urma_device");
-            strcpy(device->path, "/sys/class/infiniband/mock_device");
+            strcpy(device->path, "/sys/class/ubcore/mock_device");
             device->type = URMA_TRANSPORT_UB;
             device->ops = nullptr;
             device->sysfs_dev = nullptr;
@@ -137,7 +152,7 @@ urma_device_t *urma_get_device_by_name(const char *name) {
         if (device_list.empty()) {
             auto *device = new urma_device_t;
             strcpy(device->name, "mock_urma_device");
-            strcpy(device->path, "/sys/class/infiniband/mock_device");
+            strcpy(device->path, "/sys/class/ubcore/mock_device");
             device->type = URMA_TRANSPORT_UB;
             device->ops = nullptr;
             device->sysfs_dev = nullptr;
@@ -317,6 +332,21 @@ urma_target_seg_t *urma_import_seg(urma_context_t *ctx, urma_seg_t *seg,
     return tseg;
 }
 
+urma_status_t urma_get_seg_ctx(urma_target_seg_t *tseg, urma_seg_t **seg,
+                               uint32_t *size) {
+    std::shared_lock<std::shared_mutex> lock(g_rw_mutex);
+    if (!tseg || !seg || !size || seg_map.find(tseg) == seg_map.end()) {
+        return URMA_EINVAL;
+    }
+    auto *seg_ctx = new urma_seg_t;
+    *seg_ctx = tseg->seg;
+    *seg = seg_ctx;
+    *size = sizeof(urma_seg_t);
+    return URMA_SUCCESS;
+}
+
+void urma_put_seg_ctx(urma_seg_t *seg) { delete seg; }
+
 urma_status_t urma_unimport_seg(urma_target_seg_t *tseg) {
     std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
     if (!tseg || seg_map.find(tseg) == seg_map.end()) {
@@ -366,6 +396,26 @@ urma_status_t urma_delete_jetty(urma_jetty_t *jetty) {
     delete jetty;
     return URMA_SUCCESS;
 }
+
+urma_status_t urma_get_rjetty(urma_jetty_t *jetty, urma_rjetty_t **rjetty,
+                              uint32_t *length) {
+    std::shared_lock<std::shared_mutex> lock(g_rw_mutex);
+    if (!jetty || !rjetty || !length ||
+        jetty_map.find(jetty) == jetty_map.end()) {
+        return URMA_EINVAL;
+    }
+    auto *out = new urma_rjetty_t;
+    memset(out, 0, sizeof(urma_rjetty_t));
+    out->jetty_id = jetty->jetty_id;
+    out->trans_mode = jetty->jetty_cfg.jfs_cfg.trans_mode;
+    out->type = URMA_JETTY;
+    out->tp_type = URMA_CTP;
+    *rjetty = out;
+    *length = sizeof(urma_rjetty_t);
+    return URMA_SUCCESS;
+}
+
+void urma_put_rjetty(urma_rjetty_t *rjetty) { delete rjetty; }
 
 urma_status_t urma_unbind_jetty(urma_jetty_t *jetty) {
     std::unique_lock<std::shared_mutex> lock(g_rw_mutex);

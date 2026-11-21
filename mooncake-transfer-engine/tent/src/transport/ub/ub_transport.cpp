@@ -19,8 +19,9 @@
 #include <chrono>
 #include <cstdint>
 #include <limits>
-#include <map>
 #include <condition_variable>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <sstream>
@@ -53,6 +54,7 @@
 #include "tent/transport/ub/tombstone.h"
 #include "tent/transport/ub/quota.h"
 #include "tent/transport/ub/rail_monitor.h"
+#include "tent/transport/ub/task_trace.h"
 #include "tent/transport/ub/slice.h"
 #include "tent/transport/ub/urma_adapter.h"
 #include "tent/transport/ub/workers.h"
@@ -528,6 +530,11 @@ struct UbTransport::Impl {
                         std::min<uint64_t>(safe_slice_size, limit));
                 }
             };
+            // Only the per-operation limits bound a slice: the data path
+            // issues URMA_OPC_READ / URMA_OPC_WRITE, so max_message_size
+            // (SEND/RECV) must not pin slice_size (yuanhao-1113 5dcde226).
+            // The clamp itself stays: exceeding the device limit is not a
+            // tuning choice, and yuanhao's [TEST]-only bypass never shipped.
             clamp_slice(device_caps.max_read_size);
             clamp_slice(device_caps.max_write_size);
             if (device_caps.max_jetty_depth != 0) {
@@ -1030,6 +1037,15 @@ struct UbTransport::Impl {
             }
         }
 
+        // Opt-in task tracing (yuanhao-1113). Off unless
+        // MC_TRANSFER_TRACE_MIN_BYTES is set: the reporter is the only thread
+        // it starts and every data-path hook is a null check.
+        if (ub::ubTaskTraceMinBytes() > 0) {
+            trace_reporter =
+                std::make_shared<ub::UbTaskTraceReporter>(local_topology);
+            LOG(INFO) << "UB task tracing enabled for requests of at least "
+                      << ub::ubTaskTraceMinBytes() << " bytes";
+        }
         installed.store(true, std::memory_order_release);
         LOG(INFO) << "UB installed: probe_links="
                   << (probe_manager ? probe_manager->pathCount() : 0)
@@ -1172,6 +1188,9 @@ struct UbTransport::Impl {
             (void)pool->drainIdle();
             (void)pool->drainQuarantined();
         }
+        // The trace reporter owns a formatting thread: stop it last, after the
+        // workers that push completed tasks into it (yuanhao-1113).
+        trace_reporter.reset();
         if (endpoints) {
             auto status = endpoints->clear();
             if (!status.ok()) return status;
@@ -1663,7 +1682,8 @@ struct UbTransport::Impl {
             return onBootstrapRm(request, response, context_it->second);
         }
         if (request.local_device_id < 0 || request.local_eid.empty() ||
-            request.jetty_ids.empty() || request.endpoint_generation == 0) {
+            request.jetty_ids.empty() || request.endpoint_generation == 0 ||
+            request.jetty_uasids.size() != request.jetty_ids.size()) {
             response.reply_msg = "UB bootstrap request is incomplete";
             return -1;
         }
@@ -1884,6 +1904,9 @@ struct UbTransport::Impl {
                        ub::UbEndpointKeyHash>
         resolve_flights;
     bool probe_bootstrap_callback_installed{false};
+    // Opt-in per-task UB trace reporter (yuanhao-1113). Null unless
+    // MC_TRANSFER_TRACE_MIN_BYTES is set at install time.
+    std::shared_ptr<ub::UbTaskTraceReporter> trace_reporter;
 };
 
 UbTransport::UbTransport(
@@ -1942,6 +1965,7 @@ Status UbTransport::allocateSubBatch(SubBatchRef& batch, size_t max_size) {
     }
     ub_batch->max_size = max_size;
     ub_batch->task_list.reserve(max_size);
+    ub_batch->trace_reporter = impl_->trace_reporter;
     batch = ub_batch;
     return Status::OK();
 }
@@ -1950,6 +1974,13 @@ Status UbTransport::freeSubBatch(SubBatchRef& batch) {
     auto* ub_batch = dynamic_cast<UbSubBatch*>(batch);
     if (!ub_batch) {
         return Status::InvalidArgument("Invalid UB sub-batch" LOC_MARK);
+    }
+    // Uses the batch's own reporter reference: the engine calls this with its
+    // batch lock held, so taking lifecycle_mutex here could deadlock against
+    // the progress notification issued by submitTransferTasks().
+    if (ub_batch->trace_reporter) {
+        ub_batch->trace_reporter->submit(ub_batch->task_list,
+                                         ub_batch->progress_batch_id);
     }
     ub_batch->task_list.clear();
     delete ub_batch;
@@ -1985,6 +2016,7 @@ Status UbTransport::submitTransferTasks(
 
     const auto notify_progress = ub_batch->notify_progress;
     const auto progress_batch_id = ub_batch->progress_batch_id;
+    auto progress_armed = std::make_shared<std::atomic<bool>>(false);
     std::vector<ub::UbTask::Ptr> new_tasks;
     new_tasks.reserve(request_list.size());
     for (const auto& request : request_list) {
@@ -2005,10 +2037,23 @@ Status UbTransport::submitTransferTasks(
                 : 0;
         auto task = ub::UbTask::create(
             request,
-            [notify_progress, progress_batch_id](const TransferStatus&) {
-                if (notify_progress) notify_progress(progress_batch_id);
+            [notify_progress, progress_batch_id,
+             progress_armed](const TransferStatus&) {
+                // Armed only once the task is queryable through the batch, so
+                // a fast completion cannot notify about an unknown task
+                // (yuanhao-1113).
+                if (progress_armed->load(std::memory_order_acquire) &&
+                    notify_progress) {
+                    notify_progress(progress_batch_id);
+                }
             },
             /*created_ns=*/0, task_limit);
+        // Opt-in tracing (yuanhao-1113): only traced tasks pay the per-slice
+        // checkpoint stores; only the reporter formats anything.
+        if (impl_->trace_reporter &&
+            request.length >= ub::ubTaskTraceMinBytes()) {
+            task->enableTrace();
+        }
         size_t offset = 0;
         while (offset < request.length) {
             const size_t length =
@@ -2029,15 +2074,15 @@ Status UbTransport::submitTransferTasks(
         new_tasks.push_back(std::move(task));
     }
 
-    for (auto& task : new_tasks) {
-        ub_batch->task_list.push_back(task);
-        auto status = impl_->workers->submit(task, ub_batch->device_mask);
-        if (!status.ok()) {
-            for (auto& queued : new_tasks) {
-                if (queued) queued->requestCancellation();
-            }
-            return status;
-        }
+    CHECK_STATUS(impl_->workers->submitBatch(new_tasks, ub_batch->device_mask));
+    ub_batch->task_list.insert(ub_batch->task_list.end(), new_tasks.begin(),
+                               new_tasks.end());
+    progress_armed->store(true, std::memory_order_release);
+    // A very small task can finish between worker publication and the batch
+    // append above. Its callback intentionally stays disarmed until the task
+    // is queryable; this notification closes that race.
+    if (!new_tasks.empty() && notify_progress) {
+        notify_progress(progress_batch_id);
     }
     return Status::OK();
 }
