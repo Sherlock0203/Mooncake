@@ -285,6 +285,15 @@ struct UbParams {
     uint32_t task_max_inflight_attempts = 4;
     // Bound on how many parked slices one reflow pass moves back to the queue.
     uint32_t defer_reflow_batch = 256;
+    // F9.1: while the ready queues stay non-empty a parked slice would never be
+    // reflowed (kReflow is only reachable on an empty pop). Force a reflow at
+    // least this often. 0 disables the cadence (legacy behavior).
+    uint32_t defer_reflow_max_gap_ms = 10;
+    // F6c: honor Request::deadline_ns (absolute steady_clock, 0 = none) at
+    // every stage. UB does no predictive cancellation (that is the admission
+    // queue's job); it only terminates requests whose deadline already passed.
+    // false restores byte-for-byte legacy behavior for A/B runs.
+    bool honor_request_deadline = true;
 
     // Probe-link parameters, read from transports/ub/probe/* below.
     ProbeParams probe;
@@ -545,6 +554,12 @@ struct UbParams {
         CHECK_STATUS(readPositive(config, "transports/ub/defer_reflow_batch",
                                   parsed.defer_reflow_batch,
                                   parsed.defer_reflow_batch));
+        CHECK_STATUS(readNonNegative(
+            config, "transports/ub/defer_reflow_max_gap_ms",
+            parsed.defer_reflow_max_gap_ms, parsed.defer_reflow_max_gap_ms));
+        CHECK_STATUS(readBool(config, "transports/ub/honor_request_deadline",
+                              parsed.honor_request_deadline,
+                              parsed.honor_request_deadline));
 
         CHECK_STATUS(readBool(config, "transports/ub/probe/enabled",
                               parsed.probe.enabled, parsed.probe.enabled));

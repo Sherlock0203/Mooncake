@@ -618,6 +618,7 @@ class FakeUrmaAdapter final : public UrmaAdapter {
 
     Status poll(const JfcPtr& jfc, size_t maximum,
                 std::vector<Completion>& completions) override {
+        poll_calls_.fetch_add(1, std::memory_order_relaxed);
         completions.clear();
         if (fail_next_poll_.exchange(false, std::memory_order_acq_rel)) {
             return Status::InternalError("injected JFC poll failure");
@@ -713,6 +714,9 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         create_gate_.store(false, std::memory_order_release);
         create_waiting_.store(false, std::memory_order_release);
         create_gate_cv_.notify_all();
+    }
+    uint64_t pollCalls() const {
+        return poll_calls_.load(std::memory_order_relaxed);
     }
     bool createGateWaiting() const {
         return create_waiting_.load(std::memory_order_acquire);
@@ -977,6 +981,7 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     std::atomic<bool> rm_post_delivers_completion_{false};
     std::atomic<size_t> create_jetty_failures_{0};
     std::atomic<bool> create_jetty_failure_with_handle_{false};
+    std::atomic<uint64_t> poll_calls_{0};
     std::atomic<bool> create_gate_{false};
     std::atomic<bool> create_waiting_{false};
     std::mutex create_gate_mutex_;

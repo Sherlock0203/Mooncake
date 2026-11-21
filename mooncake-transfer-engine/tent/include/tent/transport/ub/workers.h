@@ -15,6 +15,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "tent/common/status.h"
@@ -161,6 +162,17 @@ struct UbBusinessStatsSnapshot {
     uint64_t pool_hard_errors{0};
     uint64_t business_param_error_invalid_edge{0};
     uint64_t business_deadline_timeouts{0};
+    // F6a/F6a2: control-executor scheduling of deadline fences and device
+    // retirement. Rejections leave the responsibility in place for a retry.
+    uint64_t timeout_fence_submitted{0};
+    uint64_t timeout_fence_rejected{0};
+    uint64_t device_retire_rejected{0};
+    // F6c: requests terminated because Request::deadline_ns had passed. All
+    // four stay zero when deadline_ns == 0 or the switch is off.
+    uint64_t expired_in_queue{0};
+    uint64_t expired_parked{0};
+    uint64_t expired_pre_post{0};
+    uint64_t expired_inflight{0};
     uint64_t declared_candidates_total{0};
     uint64_t declared_candidates_denied{0};
     // W3g claim (R-1): rejections by pool-authority reason, the pre-W3g
@@ -210,7 +222,12 @@ class UbWorkers final : public gate::Sink {
               ProbeLinkManager* probe_manager = nullptr,
               std::vector<ProbeJfcSlot> probe_jfcs = {},
               std::shared_ptr<TombstoneTable> tombstones = nullptr,
-              const ProbeTopology* probe_topology = nullptr);
+              const ProbeTopology* probe_topology = nullptr,
+              // F6a: inject a deterministic control executor (tests) or a
+              // dedicated one owned by the transport. Null makes start()
+              // create its own; an executor passed here is never stopped by
+              // the workers.
+              std::shared_ptr<ControlExecutor> control_executor = nullptr);
     ~UbWorkers();
 
     UbWorkers(const UbWorkers&) = delete;
@@ -270,6 +287,11 @@ class UbWorkers final : public gate::Sink {
         probe_refresh_hint_ = std::move(hint);
     }
 
+    // F6a: executor for deadline fences and device retirement. Must be set
+    // before start(); when it is null (tests, or a refused thread) the work
+    // runs inline and the poller keeps the legacy blocking behavior.
+    void setControlExecutor(std::shared_ptr<ControlExecutor> executor);
+
    private:
     friend class UbWorkersTestPeer;
     // Scoped to the submitting thread so transport tests can exercise the
@@ -290,6 +312,9 @@ class UbWorkers final : public gate::Sink {
         // defer_reflow_repark: a reflowed slice that has to wait again means a
         // wake-up source and its condition disagree (design §13).
         uint32_t deferrals{0};
+        // F6c: steady-clock time the batch was accepted, for queue-latency
+        // diagnostics against Request::deadline_ns.
+        uint64_t submit_ns{0};
     };
     struct Route;
     struct BusinessRecord;
@@ -431,6 +456,33 @@ class UbWorkers final : public gate::Sink {
     void handleLocalDeviceFailure(const UbContextPtr& context);
     void progressLocalDeviceFailure(const UbContextPtr& context);
     void scanTimeouts();
+    // F6a: one discovered deadline fence. The poller only claims and enqueues;
+    // the native quiesce runs on the control executor.
+    struct TimeoutFenceJob {
+        uint64_t token{0};
+        std::shared_ptr<BusinessRecord> record;
+        // Attempt generation for log correlation only; the exactly-once
+        // guarantee still comes from the gate claim and eraseRecord()'s
+        // pointer identity check.
+        uint32_t attempt{0};
+    };
+    void enqueueTimeoutFence(const std::shared_ptr<BusinessRecord>& record);
+    void runTimeoutFence(const TimeoutFenceJob& job);
+    // F6c helpers. requestDeadlineNs() returns 0 when the request has no
+    // deadline or the switch is off, so every caller collapses to the legacy
+    // path in that case.
+    [[nodiscard]] uint64_t requestDeadlineNs(const PendingSlice& pending) const;
+    [[nodiscard]] bool requestExpired(const PendingSlice& pending,
+                                      uint64_t now_ns) const;
+    void expirePending(const PendingSlice& pending,
+                       std::atomic<uint64_t>& counter);
+    // F6a2: only the native endpoint barrier moves off the poller; the context
+    // state transition and the PLM notification stay synchronous.
+    void enqueueDeviceRetire(const UbContextPtr& context);
+    void noteControlJobFinished();
+    void drainPendingControlJobs();
+    void startControlExecutor();
+    void stopControlExecutor();
     static WrFacts makeWrFacts(const Completion& completion);
     [[nodiscard]] std::shared_ptr<BusinessRecord> findRecord(
         uint64_t token) const;
@@ -479,6 +531,25 @@ class UbWorkers final : public gate::Sink {
     // retrying cleanup, so a second poller must not observe a false empty
     // barrier and reactivate the context early.
     mutable std::mutex local_device_failure_mutex_;
+    // F6a/F6a2 control-executor bookkeeping. `control_jobs_pending_` counts
+    // both fence and device-retire jobs so stop() can wait for every queued job
+    // before it starts its own shutdown fences.
+    std::shared_ptr<ControlExecutor> control_executor_;
+    bool control_executor_owned_{false};
+    std::mutex control_jobs_mutex_;
+    std::condition_variable control_jobs_cv_;
+    uint64_t control_jobs_pending_{0};
+    std::atomic<uint64_t> expired_in_queue_{0};
+    std::atomic<uint64_t> expired_parked_{0};
+    std::atomic<uint64_t> expired_pre_post_{0};
+    std::atomic<uint64_t> expired_inflight_{0};
+    std::atomic<uint64_t> timeout_fence_submitted_{0};
+    std::atomic<uint64_t> timeout_fence_rejected_{0};
+    std::atomic<uint64_t> device_retire_rejected_{0};
+    // Deduplicates device-retirement jobs per local NIC: the poller sees the
+    // failed context repeatedly and must not queue one job per poll.
+    std::mutex device_retire_mutex_;
+    std::unordered_set<Topology::NicID> device_retire_queued_;
 
     mutable std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
@@ -490,6 +561,9 @@ class UbWorkers final : public gate::Sink {
     // W3 defer buckets. Always mutated under queue_mutex_ together with the
     // queue, so "park" and "bump" are ordered (see post_scheduler.h).
     DeferRegistry<PendingSlice> defer_;
+    // F9.1: last time a parked-item reflow was forced by the bounded cadence.
+    // Atomic because every posting worker runs popPending().
+    std::atomic<uint64_t> last_reflow_ns_{0};
 
     // ---- idle spin state (yuanhao-1113, performance) ---------------------
     // Lock-free mirror of queued_, maintained under queue_mutex_ at every site
