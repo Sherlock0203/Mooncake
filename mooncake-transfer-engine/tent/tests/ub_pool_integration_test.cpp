@@ -255,6 +255,9 @@ class PooledDataPath {
                                         : context_->jfcs().front()->handle();
     }
     [[nodiscard]] bool rmMode() const { return rm_mode_; }
+    [[nodiscard]] uint64_t contextIncarnation() const {
+        return context_->incarnation();
+    }
 
    private:
     std::shared_ptr<FakeUrmaAdapter> adapter_;
@@ -657,6 +660,35 @@ TEST(UbPoolIntegrationTest, RmModePostsThroughThePooledMember) {
     EXPECT_TRUE(path.stop());
 }
 
+// F2/INV-ID-3: the cross-Context lane ledger must not alias pool-local lane
+// generations. Every pool starts its generation sequence at 1, so a bare
+// generation makes another Context's in-flight record look like this lane's
+// convergence (and lets the drain delete a Jetty whose WR is still live).
+TEST(UbPoolIntegrationTest, LaneConvergenceIsScopedByContextIncarnation) {
+    PooledDataPath path(/*slice_timeout_ms=*/5000, /*desired_serving=*/1);
+    ASSERT_TRUE(path.start());
+    path.adapter()->holdNextCompletion();
+
+    auto task = path.makeTask(/*slice_count=*/1);
+    ASSERT_TRUE(path.workers().submit(task).ok());
+    ASSERT_TRUE(PooledDataPath::waitFor(
+        [&] { return path.pool().stats().in_use_members == 1; }));
+
+    const uint64_t context = path.contextIncarnation();
+    // The first lane of a fresh pool has generation 1.
+    EXPECT_FALSE(path.workers().pooledLaneConverged(LaneRefKey{context, 1}));
+    // The same numeric generation under another incarnation owns no record:
+    // it converges immediately instead of borrowing this Context's count.
+    EXPECT_TRUE(path.workers().pooledLaneConverged(
+        LaneRefKey{context + (1ULL << 40), 1}));
+    EXPECT_TRUE(
+        path.workers().pooledLaneConverged(LaneRefKey{context, 987654}));
+
+    ASSERT_TRUE(path.stop());
+    EXPECT_TRUE(PooledDataPath::waitFor(
+        [&] { return task->transferStatus().s != PENDING; }));
+}
+
 // §6.1 at the workers level: a Task that does not fit the budget is rejected as
 // a whole and NO slice is touched (its state must still be the pre-submit one).
 TEST(UbPoolIntegrationTest, QueueBudgetRejectsWholeTaskWithoutTouchingSlices) {
@@ -792,7 +824,7 @@ TEST(UbPoolIntegrationTest, BootstrapAdvertisesTransportModeAndBindRoundTrips) {
     ASSERT_TRUE(endpoint->bind(desc).ok());
     EXPECT_TRUE(endpoint->ready());
     EXPECT_TRUE(endpoint->rmMode());
-    EXPECT_EQ(endpoint->rmTarget(0).id, desc.jetty_ids[0]);
+    EXPECT_EQ(endpoint->rmTarget(0)->id(), desc.jetty_ids[0]);
 
     // An RC peer must still be rejected by an RM endpoint (fail-closed).
     auto other = make_endpoint("peer2@ub:fake0:eid0");

@@ -739,7 +739,7 @@ struct UbTransport::Impl {
                                                             jfc_index);
                         };
                     callbacks.responsibilityConverged =
-                        [this](const ub::PoolLaneKey& lane) {
+                        [this](const ub::LaneRefKey& lane) {
                             // No workers means no record book: fail closed.
                             return workers != nullptr &&
                                    workers->pooledLaneConverged(lane);

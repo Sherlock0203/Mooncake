@@ -321,7 +321,13 @@ bool BusinessJettyPool::eraseTombstoneForProvenDestruction(PoolMember& member) {
         }
         member.tombstone_recorded = true;
     }
-    if (!options_.tombstones->erase(member.lane.lane_generation)) {
+    // Erase exactly the entry this pool inserted (INV-ID-2): the identity
+    // carries the Context incarnation, so a pool never drops another Context's
+    // entry and releases that Context's budget.
+    const ResourceIdentity identity{member.pool_key.context_incarnation,
+                                    EntityKind::kJetty, member.lane.jetty_id,
+                                    member.lane.lane_generation};
+    if (!options_.tombstones->erase(identity)) {
         ++tombstone_erase_misses_;
         return false;
     }

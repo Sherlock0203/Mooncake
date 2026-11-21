@@ -435,8 +435,13 @@ bool JettyDrainController::doFlush(const std::shared_ptr<DrainEntry>& entry) {
 
 bool JettyDrainController::doConvergence(
     const std::shared_ptr<DrainEntry>& entry) {
+    // DrainRequest already carries the owning pool's context incarnation, so
+    // the query needs no new parameter: it just stops relying on the pool-local
+    // generation as if it were globally unique.
+    const LaneRefKey lane{entry->pool_key.context_incarnation,
+                          entry->lane.lane_generation};
     const bool converged = callbacks_.responsibilityConverged
-                               ? callbacks_.responsibilityConverged(entry->lane)
+                               ? callbacks_.responsibilityConverged(lane)
                                : false;
     std::lock_guard<std::mutex> lock(mutex_);
     if (terminalState(entry->state)) return false;
@@ -580,7 +585,9 @@ void JettyDrainController::drainSynchronously() {
         }
         bool converged = false;
         if (callbacks_.responsibilityConverged) {
-            converged = callbacks_.responsibilityConverged(entry->lane);
+            converged = callbacks_.responsibilityConverged(
+                LaneRefKey{entry->pool_key.context_incarnation,
+                           entry->lane.lane_generation});
         }
         {
             std::lock_guard<std::mutex> lock(mutex_);

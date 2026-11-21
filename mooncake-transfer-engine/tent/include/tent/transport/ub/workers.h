@@ -256,7 +256,12 @@ class UbWorkers final : public gate::Sink {
     // completion gate claimed and disposed of every owner. This is the
     // evidence DELETE_READY condition ⑤ asks for, derived from the existing
     // record table (no counter on PoolMember).
-    [[nodiscard]] bool pooledLaneConverged(const PoolLaneKey& lane) const;
+    //
+    // INV-ID-3: the query is keyed by (context incarnation, lane generation).
+    // A pool-local generation alone is not unique across Contexts: every pool
+    // starts at 1, so a bare generation could report convergence while another
+    // Context's WR is still in flight and delete its Jetty too early.
+    [[nodiscard]] bool pooledLaneConverged(const LaneRefKey& lane) const;
 
     // Business path-error hint used by the probe coordinator to refresh the
     // affected peer early. Called outside the PLM lock; nullptr disables it.
@@ -508,10 +513,12 @@ class UbWorkers final : public gate::Sink {
     // Keyed by completion token. Renamed from `inflight_` because W5 adds a
     // second, deadline-ordered index next to it.
     std::unordered_map<uint64_t, std::shared_ptr<BusinessRecord>> records_;
-    // Live records per pooled lane generation. Maintained under records_mutex_
-    // so the drain controller can ask "is this lane fully claimed?" in O(1)
-    // instead of scanning every in-flight business record on each tick.
-    std::unordered_map<uint64_t, size_t> pooled_lane_refs_;
+    // Live records per pooled lane, keyed globally (Context incarnation +
+    // lane generation) because this single ledger spans every Context.
+    // Maintained under records_mutex_ so the drain controller can ask "is this
+    // lane fully claimed?" in O(1) instead of scanning every in-flight record
+    // on each tick.
+    std::unordered_map<LaneRefKey, size_t, LaneRefKeyHash> pooled_lane_refs_;
     // Endpoints whose ERROR transition has not yet reached its native flush
     // fence remain owned here even if every logical token completes naturally.
     std::unordered_map<uint64_t, std::shared_ptr<UbEndpoint>>
@@ -549,6 +556,10 @@ class UbWorkers final : public gate::Sink {
 
     // W3 business counters. Cumulative except the two sampled depths.
     std::atomic<uint64_t> submit_backpressure_{0};
+    // Slices that were admissible when the batch capacity verdict was taken but
+    // could not be marked because a cancellation won the race. Not an error:
+    // the slice is terminal already. Counted so the gap stays observable.
+    std::atomic<uint64_t> submit_partial_cancelled_{0};
     std::atomic<uint64_t> submit_accepted_{0};
     std::array<std::atomic<uint64_t>, kDeferReasonCount> defer_pending_{};
     std::array<std::atomic<uint64_t>, kDeferReasonCount> defer_epoch_wakeup_{};

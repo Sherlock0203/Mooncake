@@ -21,9 +21,10 @@ namespace {
 
 using namespace pool_test;
 
-JettyTombstone makeStone(uint32_t id, uint64_t generation) {
+JettyTombstone makeStone(uint32_t id, uint64_t generation,
+                         uint64_t context = 7) {
     JettyTombstone stone;
-    stone.context_incarnation = 7;
+    stone.context_incarnation = context;
     stone.kind = EntityKind::kJetty;
     stone.native_id = id;
     stone.generation = generation;
@@ -31,6 +32,15 @@ JettyTombstone makeStone(uint32_t id, uint64_t generation) {
     stone.responsibility = Responsibility::kUnknown;
     stone.budget_hold = 1;
     return stone;
+}
+
+ResourceIdentity idOf(uint32_t native_id, uint64_t generation,
+                      uint64_t context = 7) {
+    return ResourceIdentity{context, EntityKind::kJetty, native_id, generation};
+}
+
+ResourceEntity entityOf(uint32_t native_id, uint64_t context = 7) {
+    return ResourceEntity{context, EntityKind::kJetty, native_id};
 }
 
 TEST(TombstoneTableTest, InsertLookupAndEraseByGeneration) {
@@ -44,8 +54,8 @@ TEST(TombstoneTableTest, InsertLookupAndEraseByGeneration) {
     EXPECT_EQ(found->generation, 100U);
     EXPECT_EQ(found->budget_hold, 1U);
 
-    EXPECT_TRUE(table.erase(100));
-    EXPECT_FALSE(table.erase(100));
+    EXPECT_TRUE(table.erase(idOf(11, 100)));
+    EXPECT_FALSE(table.erase(idOf(11, 100)));
     EXPECT_EQ(table.size(), 0U);
     EXPECT_FALSE(table.lookup(EntityKind::kJetty, 11).has_value());
     EXPECT_EQ(table.erased(), 1U);
@@ -62,7 +72,7 @@ TEST(TombstoneTableTest, FullTableBackpressuresWithoutEviction) {
     EXPECT_TRUE(table.lookup(EntityKind::kJetty, 1).has_value());
     EXPECT_FALSE(table.lookup(EntityKind::kJetty, 2).has_value());
     // Erasing the incumbent frees the slot for the next owner.
-    EXPECT_TRUE(table.erase(10));
+    EXPECT_TRUE(table.erase(idOf(1, 10)));
     EXPECT_TRUE(table.insert(makeStone(2, 20)).ok());
 }
 
@@ -74,10 +84,10 @@ TEST(TombstoneTableTest, NewestGenerationWinsForOneNativeIdentity) {
     ASSERT_TRUE(found.has_value());
     EXPECT_EQ(found->generation, 2U);
     // Erasing the older generation leaves the newest entry addressable.
-    EXPECT_TRUE(table.erase(1));
-    EXPECT_EQ(table.lookup(EntityKind::kJetty, 5)->generation, 2U);
-    EXPECT_TRUE(table.erase(2));
-    EXPECT_FALSE(table.lookup(EntityKind::kJetty, 5).has_value());
+    EXPECT_TRUE(table.erase(idOf(5, 1)));
+    EXPECT_EQ(table.lookup(entityOf(5))->generation, 2U);
+    EXPECT_TRUE(table.erase(idOf(5, 2)));
+    EXPECT_FALSE(table.lookup(entityOf(5)).has_value());
 }
 
 TEST(UbTombstonePoolTest, RetirementRecordsAndDestructionErases) {
@@ -172,6 +182,65 @@ TEST(UbTombstonePoolTest, RetirementFenceRunsBeforeDelete) {
     EXPECT_GE(fixture.adapter()->quiesceCalls(), 1U);
     EXPECT_EQ(fixture.adapter()->liveJettyCount(), 0U);
     EXPECT_EQ(fixture.pool().stats().flushing_members, 0U);
+}
+
+// F2/INV-ID-1: two Contexts both start their lane generation at 1. The table
+// must keep both entries instead of treating the numeric generation as a
+// global key (the old table returned OK on a generation collision, so the
+// second Context believed its retirement was recorded).
+TEST(TombstoneTableTest, DistinctContextsSameGenerationBothStored) {
+    TombstoneTable table(/*capacity=*/8);
+    EXPECT_TRUE(table
+                    .insert(makeStone(/*id=*/11, /*generation=*/1,
+                                      /*context=*/7))
+                    .ok());
+    EXPECT_TRUE(table
+                    .insert(makeStone(/*id=*/12, /*generation=*/1,
+                                      /*context=*/8))
+                    .ok());
+    ASSERT_EQ(table.size(), 2U);
+    const auto first = table.lookup(entityOf(11, 7));
+    const auto second = table.lookup(entityOf(12, 8));
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(second.has_value());
+    EXPECT_EQ(first->context_incarnation, 7U);
+    EXPECT_EQ(second->context_incarnation, 8U);
+}
+
+TEST(TombstoneTableTest, EraseOneContextLeavesTheOther) {
+    TombstoneTable table(/*capacity=*/8);
+    ASSERT_TRUE(table.insert(makeStone(11, 1, 7)).ok());
+    ASSERT_TRUE(table.insert(makeStone(12, 1, 8)).ok());
+    // INV-ID-2: erase only removes the entry that was inserted, never the
+    // other Context's same-numbered generation.
+    EXPECT_TRUE(table.erase(idOf(11, 1, 7)));
+    EXPECT_EQ(table.size(), 1U);
+    EXPECT_FALSE(table.lookup(entityOf(11, 7)).has_value());
+    EXPECT_TRUE(table.lookup(entityOf(12, 8)).has_value());
+    EXPECT_FALSE(table.erase(idOf(11, 1, 9)));
+}
+
+TEST(TombstoneTableTest, InsertWithoutIncarnationIsRejected) {
+    TombstoneTable table(/*capacity=*/8);
+    auto anonymous = makeStone(11, 1);
+    anonymous.context_incarnation = 0;
+    EXPECT_TRUE(table.insert(anonymous).IsInvalidArgument());
+    EXPECT_EQ(table.size(), 0U);
+    EXPECT_EQ(table.rejectedInserts(), 0U);
+    EXPECT_EQ(table.invalidIdentityInserts(), 1U);
+}
+
+TEST(TombstoneTableTest, SameEntityNewerGenerationSupersedes) {
+    TombstoneTable table(/*capacity=*/8);
+    ASSERT_TRUE(table.insert(makeStone(5, 3)).ok());
+    ASSERT_TRUE(table.insert(makeStone(5, 4)).ok());
+    const auto newest = table.lookup(entityOf(5));
+    ASSERT_TRUE(newest.has_value());
+    EXPECT_EQ(newest->generation, 4U);
+    // The older entry is retained until its own proven destruction.
+    EXPECT_EQ(table.size(), 2U);
+    EXPECT_TRUE(table.erase(idOf(5, 4)));
+    EXPECT_EQ(table.lookup(entityOf(5))->generation, 3U);
 }
 
 }  // namespace

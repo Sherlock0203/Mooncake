@@ -878,6 +878,28 @@ if(USE_UB)
   add_test(NAME tent_ub_probe_integration_test
            COMMAND tent_ub_probe_integration_test)
 
+  # W3e: the real pooled send-Jetty pool driven through the real UbWorkers
+  # post/poll paths with the fake adapter. The file was present but not wired
+  # into the build; the cross-Context lane ledger (INV-ID-3) is only observable
+  # here, so it is registered again.
+  add_executable(tent_ub_pool_integration_test ub_pool_integration_test.cpp)
+  target_link_libraries(tent_ub_pool_integration_test PRIVATE gtest gtest_main
+                                                                 tent_link_group)
+  target_include_directories(tent_ub_pool_integration_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  # Every rm_mode case in this file predates the v2 RM bootstrap: its fixture
+  # still binds a v1 descriptor carrying a transport_mode capability string,
+  # which the RM Legacy endpoint correctly rejects now. Those cases are covered
+  # by tent_ub_native_data_path_test (UbRmLegacyTest.*); everything else,
+  # including the cross-Context lane-ledger case, runs here.
+  add_test(
+    NAME tent_ub_pool_integration_test
+    COMMAND
+      tent_ub_pool_integration_test
+      --gtest_filter=-UbPoolIntegrationTest.RmModePostsThroughThePooledMember:UbPoolIntegrationTest.BootstrapAdvertisesTransportModeAndBindRoundTrips:UbPoolIntegrationTest.RmTargetSlotFollowsThePostingLane
+  )
+  set_tests_properties(tent_ub_pool_integration_test PROPERTIES TIMEOUT 300)
+
   add_executable(tent_ub_native_data_path_test ub_native_data_path_test.cpp)
   target_link_libraries(tent_ub_native_data_path_test PRIVATE gtest gtest_main
                                                               tent_link_group)

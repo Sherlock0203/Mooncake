@@ -557,6 +557,12 @@ class BusinessJettyPool final
     std::unordered_map<PoolKey, PoolBucket, PoolKeyHash> buckets_;
     std::vector<std::shared_ptr<PoolMember>> retired_;
     std::vector<std::shared_ptr<PoolMember>> quarantined_;
+    // NOTE (INV-ID-2): every container below is *pool-private* and may keep
+    // its uint64_t lane-generation key. A generation is unique within one pool
+    // (next_lane_generation_ is monotonic here), so no ambiguity exists. Only
+    // tables shared across Contexts (TombstoneTable, the workers' lane
+    // reference ledger) must use the global ResourceIdentity/LaneRefKey; do not
+    // "simplify" those back to a bare generation.
     // Members owned by the asynchronous drain chain, keyed by lane generation.
     // The pool retains them (not the controller: an entry must not keep a
     // member alive, design §7) until markDrainDeleteReady/quarantineDrain

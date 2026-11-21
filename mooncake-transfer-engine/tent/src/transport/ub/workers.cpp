@@ -128,6 +128,9 @@ struct UbWorkers::BusinessRecord {
     // itself is handed over on the finalize path, so the lane is snapshotted
     // here while the lease is still valid.
     PoolLaneKey pooled_lane{};
+    // Context incarnation of the leased member. The lane ledger spans all
+    // Contexts, so pooled_lane.lane_generation alone is ambiguous (INV-ID-3).
+    uint64_t context_incarnation{0};
     size_t credit_jfc_index{0};
     uint64_t credit_token{0};
     // The claim anchor: snapshotted before the lease, compared after it, and
@@ -523,10 +526,9 @@ Status UbWorkers::submitBatch(const std::vector<UbTask::Ptr>& tasks,
         } else {
             try {
                 for (const auto& task : tasks) {
-                    const int priority = std::clamp(
-                        task->request().priority,
-                        static_cast<int>(PRIO_HIGH),
-                        static_cast<int>(PRIO_LOW));
+                    const int priority = std::clamp(task->request().priority,
+                                                    static_cast<int>(PRIO_HIGH),
+                                                    static_cast<int>(PRIO_LOW));
                     for (const auto& slice : task->slices()) {
                         if (!slice || !slice->markQueued()) continue;
                         ++marked_count;
@@ -536,8 +538,7 @@ Status UbWorkers::submitBatch(const std::vector<UbTask::Ptr>& tasks,
                         }
                         queues_[priority].push_back(PendingSlice{
                             task, slice, device_mask, priority,
-                            task->request().target_id,
-                            task->request().opcode});
+                            task->request().target_id, task->request().opcode});
                         ++inserted_counts[priority];
                         ++inserted_count;
                         ++queued_;
@@ -582,9 +583,15 @@ Status UbWorkers::submitBatch(const std::vector<UbTask::Ptr>& tasks,
         return Status::InvalidArgument(
             "UB workers stopped during submission" LOC_MARK);
     }
-    if (marked_count != need) {
-        return Status::InvalidArgument(
-            "UB task changed while it was being submitted" LOC_MARK);
+    // A short mark is NOT an error. `need` is sampled before the lock and a
+    // concurrent cancellation can make a slice non-queueable in between; such a
+    // slice is already terminal, so skipping it leaves nothing to do. Failing
+    // here would return an error while the remaining slices are already in
+    // queues_, i.e. the caller would see "rejected" for work that will run, and
+    // a retry would submit the prefix twice.
+    if (marked_count < need) {
+        submit_partial_cancelled_.fetch_add(need - marked_count,
+                                            std::memory_order_relaxed);
     }
     if (budget_exhausted) {
         // Backpressure, not an error: the caller may resubmit the whole batch
@@ -2109,6 +2116,9 @@ std::shared_ptr<UbWorkers::BusinessRecord> UbWorkers::makeRecord(
     record->local_segment = local.segment;
     record->remote_segment = remote.segment;
     record->quota = reservation;
+    record->context_incarnation = endpoint && endpoint->context()
+                                      ? endpoint->context()->incarnation()
+                                      : 0;
     record->posted_ns = steadyNowNs();
     record->deadline_ns = deadlineAfter(
         record->posted_ns,
@@ -2283,7 +2293,9 @@ void UbWorkers::postLegacy(const PendingSlice& pending, size_t worker_index,
             std::lock_guard<std::mutex> lock(records_mutex_);
             records_.emplace(record->core.token, record);
             if (record->pool && record->pooled_lane.lane_generation != 0) {
-                ++pooled_lane_refs_[record->pooled_lane.lane_generation];
+                ++pooled_lane_refs_[LaneRefKey{
+                    record->context_incarnation,
+                    record->pooled_lane.lane_generation}];
             }
         }
         gate_ctx_.stats.record_published.fetch_add(1,
@@ -2302,8 +2314,7 @@ void UbWorkers::postLegacy(const PendingSlice& pending, size_t worker_index,
             // Anchor the pollers' idle-spin window (yuanhao-1113).
             last_post_ns_.store(record->posted_ns, std::memory_order_relaxed);
             status = adapter_->post(jetty, {work}, posted_count, acceptance);
-            if (record->pending.task &&
-                record->pending.task->traceEnabled()) {
+            if (record->pending.task && record->pending.task->traceEnabled()) {
                 record->pending.slice->notePostReturned(steadyNowNs());
             }
         }
@@ -2517,7 +2528,9 @@ void UbWorkers::processPendingPooled(
             std::lock_guard<std::mutex> lock(records_mutex_);
             records_.emplace(record->core.token, record);
             if (record->pool && record->pooled_lane.lane_generation != 0) {
-                ++pooled_lane_refs_[record->pooled_lane.lane_generation];
+                ++pooled_lane_refs_[LaneRefKey{
+                    record->context_incarnation,
+                    record->pooled_lane.lane_generation}];
             }
         }
         gate_ctx_.stats.record_published.fetch_add(1,
@@ -3059,10 +3072,10 @@ bool UbWorkers::settleDrainedWr(const Completion& completion,
     return true;
 }
 
-bool UbWorkers::pooledLaneConverged(const PoolLaneKey& lane) const {
+bool UbWorkers::pooledLaneConverged(const LaneRefKey& lane) const {
     if (lane.lane_generation == 0) return true;
     std::lock_guard<std::mutex> lock(records_mutex_);
-    auto refs = pooled_lane_refs_.find(lane.lane_generation);
+    auto refs = pooled_lane_refs_.find(lane);
     return refs == pooled_lane_refs_.end() || refs->second == 0;
 }
 
@@ -3158,7 +3171,8 @@ void UbWorkers::eraseRecord(uint64_t token, const BusinessRecord* record) {
             records_.erase(it);
             const uint64_t generation = record->pooled_lane.lane_generation;
             if (generation != 0) {
-                auto refs = pooled_lane_refs_.find(generation);
+                auto refs = pooled_lane_refs_.find(
+                    LaneRefKey{record->context_incarnation, generation});
                 if (refs != pooled_lane_refs_.end()) {
                     if (refs->second <= 1) {
                         pooled_lane_refs_.erase(refs);
