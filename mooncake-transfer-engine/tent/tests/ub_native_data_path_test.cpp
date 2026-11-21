@@ -8,6 +8,8 @@
 #include <chrono>
 #include <cstring>
 #include <deque>
+#include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -215,6 +217,7 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         return Status::DeviceNotFound("fake device missing");
     }
     Status closeContext(ContextPtr& context) override {
+        close_context_calls_.fetch_add(1, std::memory_order_relaxed);
         if (auto fake = std::dynamic_pointer_cast<FakeContext>(context)) {
             fake->close();
         }
@@ -267,7 +270,7 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         segment.reset();
         return Status::OK();
     }
-    Status createJetty(const ContextPtr&, const JfcPtr& jfc,
+    Status createJetty(const ContextPtr& context, const JfcPtr& jfc,
                        const JettyOptions& options,
                        JettyPtr& jetty) override {
         create_jetty_calls_.fetch_add(1, std::memory_order_relaxed);
@@ -278,12 +281,34 @@ class FakeUrmaAdapter final : public UrmaAdapter {
             return Status::InvalidArgument(
                 "RM JFS bind mask does not cover URMA_CTP");
         }
+        // Record the exact options each Context's members were created with so
+        // a heterogeneous install can be verified per device (C01 / G-03).
+        if (auto fake_context = std::dynamic_pointer_cast<FakeContext>(context)) {
+            std::lock_guard<std::mutex> lock(created_options_mutex_);
+            created_jetty_options_[fake_context->deviceInfo().topology_name]
+                .push_back(options);
+        }
         jetty =
             std::make_shared<FakeJetty>(next_jetty_id_++, fake_jfc, rm_mode);
+        // Optional interleave hook: lets a test drive beginStop() while an
+        // acquire() is mid-creation (C12 / G-02 "创建中 stop"). Copied under the
+        // lock and invoked outside it so the hook may re-enter the adapter.
+        std::function<void()> hook;
+        {
+            std::lock_guard<std::mutex> lock(hook_mutex_);
+            hook = create_jetty_hook_;
+        }
+        if (hook) hook();
         return Status::OK();
     }
     Status deleteJetty(JettyPtr& jetty) override {
         delete_jetty_calls_.fetch_add(1, std::memory_order_relaxed);
+        if (fail_deletes_.load(std::memory_order_acquire) > 0) {
+            fail_deletes_.fetch_sub(1, std::memory_order_acq_rel);
+            // Provider contract: a failed delete keeps the handle alive so the
+            // owner can retry it on the next drain. Never reset it here.
+            return Status::RdmaError("injected Jetty delete failure");
+        }
         if (auto fake = std::dynamic_pointer_cast<FakeJetty>(jetty)) {
             fake->close();
         }
@@ -528,6 +553,31 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     void failNextShutdown() {
         fail_next_shutdown_.store(true, std::memory_order_release);
     }
+    // Injects the same delete failure into the next `count` deleteJetty calls.
+    // A failed delete keeps the handle alive so the pool can retry it on the
+    // next drain (C12 / G-02 shutdown barrier).
+    void failNextDeletes(int count) {
+        fail_deletes_.store(count, std::memory_order_release);
+    }
+    // Installs a hook invoked inside every createJetty after the member is
+    // allocated, so a test can interleave beginStop() with an in-flight
+    // acquire() (C12 / G-02). Pass nullptr to clear it.
+    void setCreateJettyHook(std::function<void()> hook) {
+        std::lock_guard<std::mutex> lock(hook_mutex_);
+        create_jetty_hook_ = std::move(hook);
+    }
+    uint64_t closeContextCalls() const {
+        return close_context_calls_.load(std::memory_order_relaxed);
+    }
+    // Snapshot of the JettyOptions every member on `topology_name` was created
+    // with, in creation order (C01 / G-03 per-Context profile verification).
+    std::vector<JettyOptions> createdJettyOptions(
+        const std::string& topology_name) const {
+        std::lock_guard<std::mutex> lock(created_options_mutex_);
+        auto found = created_jetty_options_.find(topology_name);
+        if (found == created_jetty_options_.end()) return {};
+        return found->second;
+    }
     size_t pendingCount() const {
         std::lock_guard<std::mutex> lock(pending_mutex_);
         return pending_.size();
@@ -602,6 +652,12 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     std::atomic<uint64_t> rm_post_calls_{0};
     std::atomic<uint32_t> last_post_target_id_{0};
     std::atomic<uint32_t> last_registered_access_{0};
+    std::atomic<uint64_t> close_context_calls_{0};
+    std::atomic<int> fail_deletes_{0};
+    mutable std::mutex hook_mutex_;
+    std::function<void()> create_jetty_hook_;
+    mutable std::mutex created_options_mutex_;
+    std::map<std::string, std::vector<JettyOptions>> created_jetty_options_;
 };
 
 class NullRegistry final : public SegmentRegistry {
@@ -2044,10 +2100,14 @@ TEST(UbRmLegacyTest, BindRmClassifiesRepeatedBootstrapAgainstIncumbent) {
     EXPECT_TRUE(adapter->shutdown().ok());
 }
 
-// Simple send-Jetty reuse: a cleanly retired incarnation returns its
-// drained Jettys to the per-context pool and the next incarnation re-leases
-// them instead of creating new ones.
-TEST(UbRmLegacyTest, SendJettyPoolReusesDrainedJettys) {
+// Legacy send-Jetty lifecycle pool (fail-closed): a cleanly retired
+// incarnation retires (deletes) its drained RESET Jettys and the next
+// incarnation creates fresh replacements, since no rearm proof exists.
+TEST(UbRmLegacyTest, SendJettyPoolRetiresDrainedJettysAndRecreates) {
+    // Fail-closed reuse (C02 / G-01): no proven RESET-rearm guarantee exists
+    // and RealJetty::postable() rejects RESET, so a clean retire retires
+    // (deletes) the drained Jettys and the next incarnation creates fresh
+    // replacements instead of re-posting RESET members.
     auto adapter = std::make_shared<FakeUrmaAdapter>(rmCapableDevice());
     ASSERT_TRUE(adapter->initialize().ok());
     auto context = std::make_shared<UbContext>(0, rmCapableDevice(), adapter);
@@ -2075,7 +2135,7 @@ TEST(UbRmLegacyTest, SendJettyPoolReusesDrainedJettys) {
         peer.peer_nic_path = "seg-a/ub:fake0:eid0";
     };
 
-    // First incarnation leases (creates) two Jettys.
+    // First incarnation creates two fresh Jettys.
     auto first = make_endpoint();
     ASSERT_TRUE(first->prepare().ok());
     EXPECT_EQ(adapter->createJettyCalls(), 2U);
@@ -2084,36 +2144,36 @@ TEST(UbRmLegacyTest, SendJettyPoolReusesDrainedJettys) {
     ASSERT_TRUE(first->bindRm(peer, expectedForRmPeer(peer)).ok());
     EXPECT_EQ(first->importedTargetCount(), 2U);
 
-    // A clean retire returns both Jettys to the pool instead of deleting
-    // them; the imported targets are still unimported.
+    // A clean retire unimports the targets and retires (deletes) both reset-ok
+    // Jettys: no RESET member is kept for reuse without a rearm proof.
     ASSERT_TRUE(first->retire().ok());
     EXPECT_EQ(first->state(), UbEndpoint::State::kDestroyed);
-    EXPECT_EQ(adapter->deleteJettyCalls(), 0U)
-        << "pooled Jettys must not be deleted on retire";
-    EXPECT_EQ(pool->idleCount(), 2U);
+    EXPECT_EQ(adapter->deleteJettyCalls(), 2U)
+        << "drained RESET Jettys must be retired, not idled for reuse";
+    EXPECT_EQ(pool->idleCount(), 0U);
     EXPECT_EQ(first->importedTargetCount(), 0U);
     EXPECT_EQ(adapter->unimportCalls(), 2U);
 
-    // Second incarnation reuses the pooled Jettys: no new createJetty and
-    // the data-plane pairing (2 targets, 2 Jettys) still validates.
+    // Second incarnation creates fresh Jettys (no reuse of retired RESET
+    // members); the data-plane pairing (2 targets, 2 Jettys) still validates.
     auto second = make_endpoint();
     ASSERT_TRUE(second->prepare().ok());
-    EXPECT_EQ(adapter->createJettyCalls(), 2U)
-        << "the second incarnation must lease from the pool";
+    EXPECT_EQ(adapter->createJettyCalls(), 4U)
+        << "the second incarnation must create replacements, not reuse RESET";
     EXPECT_EQ(pool->idleCount(), 0U);
     UbBootstrapDesc second_peer;
     make_peer(second, second_peer);
     ASSERT_TRUE(second->bindRm(second_peer, expectedForRmPeer(second_peer)).ok());
     EXPECT_EQ(second->importedTargetCount(), 2U);
     ASSERT_TRUE(second->retire().ok());
-    EXPECT_EQ(adapter->createJettyCalls(), 2U);
-    EXPECT_EQ(adapter->deleteJettyCalls(), 0U);
-    EXPECT_EQ(pool->idleCount(), 2U);
+    EXPECT_EQ(adapter->createJettyCalls(), 4U);
+    EXPECT_EQ(adapter->deleteJettyCalls(), 4U);
+    EXPECT_EQ(pool->idleCount(), 0U);
 
-    // Context shutdown drains the pool: every idle Jetty is deleted before
-    // the JFCs go away.
+    // Context shutdown drains nothing pending (release already deleted) and
+    // detaches the pool's Context/JFC references before close.
     EXPECT_TRUE(context->shutdown().ok());
-    EXPECT_EQ(adapter->deleteJettyCalls(), 2U);
+    EXPECT_EQ(adapter->deleteJettyCalls(), 4U);
     EXPECT_TRUE(adapter->shutdown().ok());
 }
 
@@ -2196,6 +2256,116 @@ TEST(UbRmLegacyTest, SendJettyPoolExcludesJettysWhoseResetFailed) {
     EXPECT_TRUE(context->shutdown().ok());
     EXPECT_EQ(adapter->deleteJettyCalls(), 2U)
         << "an empty pool drains nothing at shutdown";
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
+// C12 / G-02: an external owner holding the pool shared_ptr (and a copy of the
+// native Context handle) must not block Context shutdown. detach() drops the
+// pool's strong Context/JFC references before closeContext(), so the provider
+// close succeeds and only the external handle copy survives.
+TEST(UbRmLegacyTest, ExternalPoolHolderDoesNotBlockContextShutdown) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(rmCapableDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+    auto context = std::make_shared<UbContext>(0, rmCapableDevice(), adapter);
+    ASSERT_TRUE(context->initialize(1, JfcOptions{}).ok());
+    auto pool = std::make_shared<UbSendJettyPool>(
+        adapter, context->handle(), context->jfcs(), rmJettyOptions());
+    context->attachJettyPool(pool);
+    auto handle_copy = context->handle();
+    EXPECT_GT(handle_copy.use_count(), 1L);
+
+    EXPECT_TRUE(context->shutdown().ok());
+    EXPECT_EQ(adapter->closeContextCalls(), 1U);
+    EXPECT_EQ(context->state(), UbContext::State::kClosed);
+    // detach() released the pool's reference and closeContext() reset the
+    // Context's own handle: the external copy is now the sole owner.
+    EXPECT_EQ(handle_copy.use_count(), 1L);
+
+    // The externally held pool stays frozen after shutdown: no new lease and
+    // no native creation.
+    std::vector<JettyPtr> jetties;
+    std::vector<size_t> jfc_indices;
+    EXPECT_TRUE(pool->acquire(1, jetties, jfc_indices).IsInvalidArgument());
+    EXPECT_TRUE(jetties.empty());
+    EXPECT_EQ(adapter->createJettyCalls(), 0U);
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
+// C12 / G-02 "创建中 stop": beginStop() interleaved with an in-flight acquire
+// must roll the whole lease back. Every created member is deleted, nothing is
+// published to the caller and nothing stays pending.
+TEST(UbRmLegacyTest, StopInterleavedWithCreationRollsBackWithoutPublishing) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(rmCapableDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+    auto context = std::make_shared<UbContext>(0, rmCapableDevice(), adapter);
+    ASSERT_TRUE(context->initialize(1, JfcOptions{}).ok());
+    auto pool = std::make_shared<UbSendJettyPool>(
+        adapter, context->handle(), context->jfcs(), rmJettyOptions());
+    context->attachJettyPool(pool);
+
+    // The stop lands inside createJetty, i.e. while acquire() is mid-creation.
+    adapter->setCreateJettyHook([&] { pool->beginStop(); });
+    std::vector<JettyPtr> jetties;
+    std::vector<size_t> jfc_indices;
+    EXPECT_TRUE(pool->acquire(2, jetties, jfc_indices).IsInvalidArgument());
+    EXPECT_TRUE(jetties.empty());
+    EXPECT_TRUE(jfc_indices.empty());
+    EXPECT_EQ(pool->createdCount(), 2U);
+    EXPECT_EQ(adapter->createJettyCalls(), 2U);
+    EXPECT_EQ(adapter->deleteJettyCalls(), 2U)
+        << "a stop during creation must delete every member it created";
+    EXPECT_EQ(pool->idleCount(), 0U);
+
+    // With the hook cleared the pool still rejects: stopping is permanent.
+    adapter->setCreateJettyHook(nullptr);
+    EXPECT_TRUE(pool->acquire(1, jetties, jfc_indices).IsInvalidArgument());
+    EXPECT_TRUE(jetties.empty());
+    EXPECT_EQ(adapter->createJettyCalls(), 2U);
+
+    EXPECT_TRUE(context->shutdown().ok());
+    EXPECT_EQ(adapter->closeContextCalls(), 1U);
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
+// C12 / G-02 shutdown barrier: a pending Jetty whose delete keeps failing must
+// block JFC/Context close. shutdown() retries drain on every call and only
+// closes the Context once every pending member is deleted.
+TEST(UbRmLegacyTest, FailedDrainBlocksCloseAndRetries) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(rmCapableDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+    auto context = std::make_shared<UbContext>(0, rmCapableDevice(), adapter);
+    ASSERT_TRUE(context->initialize(1, JfcOptions{}).ok());
+    auto pool = std::make_shared<UbSendJettyPool>(
+        adapter, context->handle(), context->jfcs(), rmJettyOptions());
+    context->attachJettyPool(pool);
+
+    std::vector<JettyPtr> jetties;
+    std::vector<size_t> jfc_indices;
+    ASSERT_TRUE(pool->acquire(2, jetties, jfc_indices).ok());
+    ASSERT_EQ(jetties.size(), 2U);
+
+    // Both retire deletes fail: the members stay pending for drain().
+    adapter->failNextDeletes(4);
+    pool->release(std::move(jetties), std::move(jfc_indices));
+    EXPECT_EQ(pool->idleCount(), 2U);
+    EXPECT_EQ(adapter->deleteJettyCalls(), 2U);
+
+    // Shutdown drains again (2 more injected failures) and must return early
+    // without closing the JFCs or the Context while members are pending.
+    EXPECT_FALSE(context->shutdown().ok());
+    EXPECT_EQ(adapter->deleteJettyCalls(), 4U);
+    EXPECT_EQ(adapter->closeContextCalls(), 0U);
+    EXPECT_NE(context->state(), UbContext::State::kClosed);
+    EXPECT_EQ(pool->idleCount(), 2U);
+
+    // Once the provider accepts the deletes, the next shutdown drains the
+    // pending members, detaches the pool and closes the Context.
+    adapter->failNextDeletes(0);
+    EXPECT_TRUE(context->shutdown().ok());
+    EXPECT_EQ(adapter->deleteJettyCalls(), 6U);
+    EXPECT_EQ(pool->idleCount(), 0U);
+    EXPECT_EQ(adapter->closeContextCalls(), 1U);
+    EXPECT_EQ(context->state(), UbContext::State::kClosed);
     EXPECT_TRUE(adapter->shutdown().ok());
 }
 
@@ -3472,6 +3642,120 @@ TEST(UbRmPoolTest, BackgroundRefillTopsUpKnownPoolKey) {
     EXPECT_EQ(source, target);
     EXPECT_EQ(adapter->createJettyCalls(), 3U)
         << "the second attempt must lease a pre-warmed member";
+
+    ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+    EXPECT_TRUE(transport.uninstall().ok());
+    EXPECT_EQ(adapter->deleteJettyCalls(), adapter->createJettyCalls());
+}
+
+// C01 / G-03 heterogeneous install: each Context must create its members with
+// its OWN device's LocalSendProfile. device0 supports CTP at priority 15;
+// device1 only at priority 3 (CTP|RTP). A last-value scalar collapse would
+// give both devices the same priority/mask and misconfigure one of them.
+TEST(UbRmPoolTest, PerContextProfilesKeepHeterogeneousPriorityAndMask) {
+    auto device0 = rmCapableDevice();  // CTP @ priority 15, mask = CTP
+    auto device1 = rmCapableSecondaryDevice();
+    device1.capabilities.priority_tp_type_masks[kUrmaMaxPriority] = 0;
+    device1.capabilities.priority_tp_type_masks[3] =
+        kUrmaTpTypeCtpMask | kUrmaTpTypeRtpMask;
+    auto adapter = std::make_shared<FakeUrmaAdapter>(
+        std::vector<DeviceInfo>{device0, device1});
+
+    auto topology = fakeTwoDeviceTopology();
+    auto control = std::make_shared<ControlService>("p2p", "", nullptr);
+    uint16_t port = 0;
+    ASSERT_TRUE(control->start(port).ok());
+    const std::string segment_name =
+        "127.0.0.1:" + std::to_string(static_cast<unsigned>(port));
+    ASSERT_TRUE(control->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        segment.name = segment_name;
+                        segment.rpc_server_addr = segment_name;
+                        segment.machine_id = "fake-machine";
+                        segment.type = SegmentType::Memory;
+                        segment.detail = MemorySegmentDesc{};
+                        std::get<MemorySegmentDesc>(segment.detail).topology =
+                            *topology;
+                        return Status::OK();
+                    })
+                    .ok());
+
+    auto config = std::make_shared<Config>();
+    config->set("transports/ub/enable", true);
+    config->set("transports/ub/runtime_profile", "rm_pool");
+    config->set("transports/ub/trans_mode", "rm");
+    config->set("transports/ub/worker_count", 1);
+    config->set("transports/ub/poller_count", 1);
+    config->set("transports/ub/jfc_per_context", 1);
+    config->set("transports/ub/jetty_per_endpoint", 1);
+    config->set("transports/ub/max_endpoints", 16);
+    config->set("transports/ub/slice_size", 16);
+    config->set("transports/ub/max_slices_per_task", 4);
+    config->set("transports/ub/max_retries", 1);
+    config->set("transports/ub/slice_timeout_ms", 1000);
+    config->set("transports/ub/endpoint_cooldown_ms", 100);
+    config->set("transports/ub/jetty_pool/enable", true);
+    config->set("transports/ub/send_pool/desired_per_context", 2);
+    config->set("transports/ub/send_pool/background_refill", true);
+    config->set("transports/ub/send_pool/refill_interval_ms", 5);
+    config->set("transports/ub/probe/enabled", true);
+    setPhysicalOnlyIdentities(*config, {device0, device1});
+
+    UbTransport transport(adapter);
+    std::string mutable_segment_name = segment_name;
+    const auto install_status =
+        transport.install(mutable_segment_name, control, topology, config);
+    ASSERT_TRUE(install_status.ok()) << install_status.ToString();
+    // Install stays lazy: no Jetty exists before the first business attempt.
+    EXPECT_EQ(adapter->createJettyCalls(), 0U);
+
+    // A 64-byte WRITE splits into four 16-byte slices across the two local
+    // ports, so both Contexts resolve endpoints and register their PoolKeys.
+    std::array<char, 64> source{};
+    std::array<char, 64> target{};
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>(100 - i);
+    }
+    ASSERT_TRUE(registerSourceTargetBuffers(transport, control, source,
+                                            target));
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = source.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(target.data());
+    request.length = source.size();
+    ASSERT_TRUE(transport.submitTransferTasks(batch, {request}).ok());
+    const auto transfer = pollUntilSettled(transport, batch, 0);
+    EXPECT_EQ(transfer.s, COMPLETED);
+    EXPECT_EQ(source, target);
+
+    // Background refill tops each known PoolKey up to desired_per_context.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((adapter->createdJettyOptions("ub:fake0:eid0").size() < 2 ||
+            adapter->createdJettyOptions("ub:fake1:eid0").size() < 2) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const auto options0 = adapter->createdJettyOptions("ub:fake0:eid0");
+    const auto options1 = adapter->createdJettyOptions("ub:fake1:eid0");
+    ASSERT_GE(options0.size(), 2U);
+    ASSERT_GE(options1.size(), 2U);
+    for (const auto& options : options0) {
+        EXPECT_EQ(options.trans_mode, kUrmaTransportModeRm);
+        EXPECT_EQ(options.priority, 15U);
+        EXPECT_EQ(options.bind_tp_type_mask, kUrmaTpTypeCtpMask);
+    }
+    for (const auto& options : options1) {
+        EXPECT_EQ(options.trans_mode, kUrmaTransportModeRm);
+        EXPECT_EQ(options.priority, 3U);
+        EXPECT_EQ(options.bind_tp_type_mask,
+                  kUrmaTpTypeCtpMask | kUrmaTpTypeRtpMask);
+    }
+    EXPECT_NE(options0.front().priority, options1.front().priority)
+        << "heterogeneous devices must not collapse into one scalar profile";
 
     ASSERT_TRUE(transport.freeSubBatch(batch).ok());
     EXPECT_TRUE(transport.uninstall().ok());

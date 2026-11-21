@@ -36,7 +36,9 @@
 
 #if defined(TENT_HAS_REAL_URMA) && TENT_HAS_REAL_URMA
 #include <urma_api.h>
+#if defined(TENT_UB_HAS_BONDP) && TENT_UB_HAS_BONDP
 #include <urma_ubagg.h>
+#endif
 #endif
 
 namespace mooncake {
@@ -1273,6 +1275,7 @@ class RealUrmaAdapter final : public UrmaAdapter {
             }
 
             if (isBondingDevice(requested)) {
+#if defined(TENT_UB_HAS_BONDP) && TENT_UB_HAS_BONDP
                 bondp_set_bonding_mode_in_t bonding_mode{};
                 bonding_mode.bonding_mode = BONDP_BONDING_MODE_STANDALONE;
                 bonding_mode.bonding_level = BONDP_BONDING_LEVEL_IODIE;
@@ -1290,6 +1293,15 @@ class RealUrmaAdapter final : public UrmaAdapter {
                     return nativeError("urma_user_ctl(SET_BONDING_MODE)",
                                        ctl_rc);
                 }
+#else
+                // D-22: physical-only builds use the standard URMA headers
+                // alone. Without the BONDP provider header the bonding mode
+                // cannot be set; fail closed rather than open the context
+                // with an unconfigured bonding device.
+                (void)urma_delete_context(native_context);
+                return Status::NotImplemented(
+                    "bonding URMA device requires a TENT_UB_HAS_BONDP build");
+#endif
             }
 
             uint32_t ctp_priority = 15;

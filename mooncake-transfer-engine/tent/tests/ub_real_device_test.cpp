@@ -28,6 +28,7 @@
 
 #include <array>
 #include <chrono>
+#include <cstdio>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -45,7 +46,7 @@
 #include "tent/transport/ub/jfc.h"
 #include "tent/transport/ub/topology_attrs.h"
 #include "tent/transport/ub/ub_transport.h"
-#include "tent/transport/ub/jetty_pool.h"
+#include "../src/transport/ub/jetty_pool.h"
 #include "tent/transport/ub/urma_adapter.h"
 
 namespace mooncake::tent::ub {
@@ -60,22 +61,32 @@ bool ubcoreSysfsPresent() {
 JettyOptions rmJettyOptions() {
     JettyOptions options;
     options.trans_mode = kUrmaTransportModeRm;
-    options.bind_tp_type_mask = kUrmaTpTypeRtpMask;
+    // B-01 / G-06: RM binds CTP targets only; RTP is the negative case.
+    options.bind_tp_type_mask = kUrmaTpTypeCtpMask;
     return options;
 }
 
-// The first active device advertising the RM transport mode. Device kind is
-// not required here: the trusted identity published below classifies the
-// device as physical for the install-time capability gate.
+// The first active device advertising RM with a CTP bind mask (B-01: RM
+// binds CTP targets only). Mirrors buildLocalSendProfile: the per-priority
+// tp-type table is the authoritative local signal and rm_tp_cap is advisory
+// (some providers leave it zero while still exposing CTP per priority).
+// Device kind is not required here: the trusted identity published below
+// classifies the device as physical for the install-time capability gate.
 const DeviceInfo* pickRmCapableDevice(const std::vector<DeviceInfo>& devices) {
     for (const auto& device : devices) {
         if (!device.active) continue;
         const auto& caps = device.capabilities;
-
         if ((caps.transport_modes & kUrmaTransportModeRm) == 0) continue;
-        if ((caps.rm_tp_cap & kUrmaTpTypeRtpMask) == 0) continue;
-        if ((caps.priority_tp_type_masks[kUrmaMaxPriority] & kUrmaTpTypeRtpMask) == 0) continue;
-        return &device;
+        if ((caps.priority_tp_type_masks[kUrmaMaxPriority] &
+             kUrmaTpTypeCtpMask) != 0) {
+            return &device;
+        }
+        for (size_t priority = 0; priority < kUrmaPriorityCount; ++priority) {
+            if ((caps.priority_tp_type_masks[priority] &
+                 kUrmaTpTypeCtpMask) != 0) {
+                return &device;
+            }
+        }
     }
     return nullptr;
 }
@@ -161,15 +172,17 @@ TEST_F(UbRealDeviceTest, RealAdapterInitializesAndDiscoversActiveDevices) {
     // the discovered set to contain such a device, otherwise every RM test
     // would fail for an environmental reason.
     for (const auto& device : discovered_) {
-        
-        fprintf(stderr, "【DBG】device.name: %s, path = %s, kind = %s, mode =  %s, rm_tp_cap = 0x%x,
-            prio6_tp = 0x%x, eid = %s, active: %d\n",
-             device.native_device_name.c_str(), device.native_device_path.c_str(),
-             device.kind.c_str(), device.transport_modes.c_str(),
-             device.capabilities.transport_modes,
-             device.capabilities.rm_tp_cap,
-             device.capabilities.priority_tp_type_masks[6],
-             device.eid.c_str(), (int)device.active);
+        fprintf(stderr,
+                "device.name: %s, path = %s, kind = %d, modes = 0x%x, "
+                "rm_tp_cap = 0x%x, prio%d_tp = 0x%x, eid = %s, active: %d\n",
+                device.native_device_name.c_str(),
+                device.native_device_path.c_str(),
+                static_cast<int>(device.kind),
+                static_cast<unsigned>(device.capabilities.transport_modes),
+                device.capabilities.rm_tp_cap,
+                static_cast<int>(kUrmaMaxPriority),
+                device.capabilities.priority_tp_type_masks[kUrmaMaxPriority],
+                device.eid.c_str(), static_cast<int>(device.active));
     }
     size_t active_devices = 0;
     for (const auto& device : discovered_) {
@@ -187,8 +200,8 @@ TEST_F(UbRealDeviceTest, RealAdapterInitializesAndDiscoversActiveDevices) {
 TEST_F(UbRealDeviceTest, RmLegacyJettyLifecycleOverRealUrma) {
     const auto* device = pickRmCapableDevice(discovered_);
     if (!device) {
-        GTEST_SKIP() << "no active RM-RTP-capable URMA device on this node"
-        "(rm_tp_cap or priority tp-type mask lacks RTP)";
+        GTEST_SKIP() << "no active RM-CTP-capable URMA device on this node "
+                        "(per-priority tp-type mask lacks CTP)";
     }
 
     auto context = std::make_shared<UbContext>(0, *device, adapter_);
@@ -223,8 +236,8 @@ TEST_F(UbRealDeviceTest, RmLegacyJettyLifecycleOverRealUrma) {
 TEST_F(UbRealDeviceTest, RmLegacySelfReadWriteOverRealUrma) {
     const auto* device = pickRmCapableDevice(discovered_);
     if (!device) {
-        GTEST_SKIP() << "no active RM-RTP-capable URMA device on this node"
-        "(rm_tp_cap or priority tp-type mask lacks RTP)";
+        GTEST_SKIP() << "no active RM-CTP-capable URMA device on this node "
+                        "(per-priority tp-type mask lacks CTP)";
     }
 
     auto topology = buildSingleDeviceTopology(*device);
@@ -260,7 +273,7 @@ TEST_F(UbRealDeviceTest, RmLegacySelfReadWriteOverRealUrma) {
     config->set("transports/ub/max_retries", 1);
     config->set("transports/ub/slice_timeout_ms", 1000);
     config->set("transports/ub/endpoint_cooldown_ms", 100);
-    // Exercise the simple send-Jetty reuse pool end to end as well.
+    // Exercise the legacy send-Jetty pool (fail-closed retire/recreate) too.
     config->set("transports/ub/jetty_reuse/enable", true);
     applyRmLegacyIdentity(*config, *device);
 
@@ -325,48 +338,63 @@ TEST_F(UbRealDeviceTest, RmLegacySelfReadWriteOverRealUrma) {
     ASSERT_TRUE(transport.freeSubBatch(batch).ok());
     EXPECT_TRUE(transport.uninstall().ok());
 }
-TEST_F(UbRealDeviceTest, RmLegacySelfReadWriteOverRealUrmaWithRmLegacyIdentity) {
+// Legacy send-Jetty pool over the real adapter (C02 / G-01 fail-closed):
+// drained RESET Jettys are retired (deleted), never re-leased without a rearm
+// proof, and the next acquire creates fresh replacements. Context shutdown
+// must succeed while this test still holds the pool shared_ptr (C12 / G-02).
+TEST_F(UbRealDeviceTest, RmLegacyJettyPoolRetireAndRecreateOverRealUrma) {
     const auto* device = pickRmCapableDevice(discovered_);
     if (!device) {
-        GTEST_SKIP() << "no active RM-RTP-capable URMA device on this node"
-        "(rm_tp_cap or priority tp-type mask lacks RTP)";
+        GTEST_SKIP() << "no active RM-CTP-capable URMA device on this node "
+                        "(per-priority tp-type mask lacks CTP)";
     }
     auto context = std::make_shared<UbContext>(0, *device, adapter_);
     ASSERT_TRUE(context->initialize(1, JfcOptions{}).ok());
     ASSERT_FALSE(context->jfcs().empty());
-    auto jetty_pool = std::make_shared<JettyPool>(adapter_, context->handle(), context->jfcs(), rmJettyOptions());
+    auto jetty_pool = std::make_shared<UbSendJettyPool>(
+        adapter_, context->handle(), context->jfcs(), rmJettyOptions());
     context->attachJettyPool(jetty_pool);
 
+    // First lease creates two fresh RM/CTP Jettys on the real provider.
     std::vector<JettyPtr> first;
-    std::vector<JettyPtr> first_jfcs;
-    ASSERT_TRUE(jetty_pool->acquire(2, first, first_jfcs).ok());
+    std::vector<size_t> first_jfc_indices;
+    ASSERT_TRUE(jetty_pool->acquire(2, first, first_jfc_indices).ok());
     ASSERT_EQ(first.size(), 2U);
-    ASSERT_EQ(jetty_pool->createdCount(), 2U);
-    ASSERT_EQ(jetty_pool->idleCount(), 0U);
-    
-    for(auto& jetty : first) {
+    ASSERT_EQ(first_jfc_indices.size(), 2U);
+    EXPECT_EQ(jetty_pool->createdCount(), 2U);
+    EXPECT_EQ(jetty_pool->idleCount(), 0U);
+
+    // RESET fences in-flight WRs; release then retires (deletes) every drained
+    // member because the ProviderContract carries no RESET-rearm proof.
+    for (auto& jetty : first) {
         ASSERT_TRUE(adapter_->resetJetty(jetty).ok());
     }
-    jetty_pool->release(std::move(first), std::move(first_jfcs));
-    EXPECT_EQ(jetty_pool->idleCount(), 2U);
+    jetty_pool->release(std::move(first), std::move(first_jfc_indices));
+    EXPECT_EQ(jetty_pool->idleCount(), 0U)
+        << "drained RESET Jettys must be retired, not idled for reuse";
+    EXPECT_EQ(jetty_pool->createdCount(), 2U);
 
-
+    // Second lease must create fresh replacements, never re-lease RESET
+    // members (RealJetty::postable() rejects RESET without a rearm proof).
     std::vector<JettyPtr> second;
-    std::vector<JettyPtr> second_jfcs;
-    ASSERT_TRUE(jetty_pool->acquire(2, second, second_jfcs).ok());
+    std::vector<size_t> second_jfc_indices;
+    ASSERT_TRUE(jetty_pool->acquire(2, second, second_jfc_indices).ok());
     ASSERT_EQ(second.size(), 2U);
-    ASSERT_EQ(jetty_pool->createdCount(), 2U);
-    ASSERT_EQ(jetty_pool->idleCount(), 0U);
-    
-    for(auto& jetty : second) {
+    EXPECT_EQ(jetty_pool->createdCount(), 4U)
+        << "the second lease must create replacements, not reuse RESET";
+    EXPECT_EQ(jetty_pool->idleCount(), 0U);
+    for (auto& jetty : second) {
         ASSERT_TRUE(adapter_->resetJetty(jetty).ok());
     }
-    jetty_pool->release(std::move(second), std::move(second_jfcs));
-    EXPECT_EQ(jetty_pool->idleCount(), 2U);
+    jetty_pool->release(std::move(second), std::move(second_jfc_indices));
+    EXPECT_EQ(jetty_pool->idleCount(), 0U);
 
+    // G-02: shutdown drains and detaches the pool's Context/JFC references
+    // even though this test still holds the pool shared_ptr.
     EXPECT_TRUE(context->shutdown().ok());
     EXPECT_EQ(jetty_pool->idleCount(), 0U);
     EXPECT_TRUE(adapter_->shutdown().ok());
+}
 
 }  // namespace
 }  // namespace mooncake::tent::ub

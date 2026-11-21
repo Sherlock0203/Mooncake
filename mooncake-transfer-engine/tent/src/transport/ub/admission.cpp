@@ -89,6 +89,9 @@ void TaskPermitTicket::release() {
 
 TaskPermitTicket TaskPermitLedger::tryAcquire() {
     std::lock_guard<std::mutex> lock(mutex_);
+    // K == 0 is fail-closed by construction: active_.size() >= 0 is always
+    // true, so a zero permit budget rejects every acquisition (defer, never
+    // a fault) instead of admitting unbounded attempts.
     if (active_.size() >= max_inflight_attempts_) {
         ++rejected_;
         return TaskPermitTicket();

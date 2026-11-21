@@ -8,6 +8,11 @@ namespace mooncake::tent::ub {
 uint64_t AttemptGate::registerAttempt(const AttemptKey& attempt,
                                       const LaneKey& lane,
                                       uint64_t expected_length) {
+    // A zero attempt identity or lane generation cannot be attributed to any
+    // business attempt; refuse to create a record instead of settling an
+    // unowned completion later. Token 0 is never issued (next_token_ starts
+    // at 1) and is the callers' fail-closed sentinel.
+    if (!attempt.valid() || lane.lane_generation == 0) return 0;
     std::lock_guard<std::mutex> lock(mutex_);
     const uint64_t token = next_token_++;
     GateRecord record;

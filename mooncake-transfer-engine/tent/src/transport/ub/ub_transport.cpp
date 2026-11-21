@@ -34,6 +34,7 @@
 #include "tent/transport/ub/endpoint_store.h"
 #include "tent/transport/ub/identity_import.h"
 #include "tent/transport/ub/native_budget.h"
+#include "tent/transport/ub/node_target_quota.h"
 #include "tent/transport/ub/params.h"
 #include "tent/transport/ub/quota.h"
 #include "tent/transport/ub/rail_monitor.h"
@@ -279,8 +280,13 @@ struct UbTransport::Impl {
         const bool rm_runtime =
             runtime_mode == ub::UbRuntimeMode::kRmLegacy ||
             runtime_mode == ub::UbRuntimeMode::kPooledRm;
-        uint32_t rm_capability_bind_tp_type_mask = 0;
-        uint8_t rm_capability_priority = ub::JettyOptions{}.priority;
+        // Per-Context LocalSendProfile keyed by topology_name (C01 / G-03).
+        // Each selectable device keeps its own priority/bind mask; iterating
+        // the unordered_map must never collapse them into a last-value scalar
+        // shared by every Context (heterogeneous devices would otherwise use
+        // another device's priority tier).
+        std::unordered_map<std::string, ub::LocalSendProfile>
+            rm_profiles_by_topology;
         if (rm_runtime) {
             for (const auto& [name, device] : by_topology_name) {
                 if (preferred_topology_names.find(device.topology_name) ==
@@ -307,9 +313,44 @@ struct UbTransport::Impl {
                         device.native_device_name + ": " +
                         profile_status.ToString() + LOC_MARK));
                 }
-                rm_capability_bind_tp_type_mask = profile.bind_tp_type_mask;
-                rm_capability_priority = profile.priority;
+                rm_profiles_by_topology.emplace(device.topology_name, profile);
             }
+        }
+
+        // Node target quota gate (guidance 4.2.1, rm_pool only): freeze the
+        // process-authoritative limit and verify the static topology demand
+        // (one receive-side target per selected device/EID port) before any
+        // native Context/JFC/Jetty is created. A demand above the limit is
+        // InvalidArgument here; install never trims ports or raises the cap.
+        // RC/RM legacy installs are unaffected by this key.
+        if (runtime_mode == ub::UbRuntimeMode::kPooledRm) {
+            uint64_t required_targets = 0;
+            for (size_t id = 0; id < local_topology->getNicCount(); ++id) {
+                const auto* nic =
+                    local_topology->getNicEntry(static_cast<int>(id));
+                if (!nic || nic->type != Topology::NIC_UB) continue;
+                auto found = by_topology_name.find(nic->name);
+                if (found == by_topology_name.end() || !found->second.active) {
+                    continue;
+                }
+                if (!filterAllows(params.device_filter, found->second)) {
+                    continue;
+                }
+                if (preferred_topology_names.find(
+                        found->second.topology_name) ==
+                    preferred_topology_names.end()) {
+                    continue;
+                }
+                ++required_targets;
+            }
+            status = ub::NodeTargetQuota::acquire(
+                params.max_target_jetties_per_node, node_target_quota);
+            if (!status.ok()) return failInstall(status);
+            status = node_target_quota->validateStaticDemand(required_targets);
+            if (!status.ok()) return failInstall(status);
+            LOG(INFO) << "UB node target quota frozen: limit="
+                      << node_target_quota->limit()
+                      << " static_required=" << required_targets;
         }
 
         std::vector<std::string> preferred_names;
@@ -419,12 +460,11 @@ struct UbTransport::Impl {
         }
 
         size_t safe_slice_size = params.slice_size;
+        // Base/fallback JettyOptions (RC default). RM priority/bind mask are
+        // derived per Context below from each device's own profile (G-03).
         ub::JettyOptions jetty_options;
         if (rm_runtime) {
             jetty_options.trans_mode = ub::kUrmaTransportModeRm;
-            jetty_options.bind_tp_type_mask =
-                rm_capability_bind_tp_type_mask;
-            jetty_options.priority = rm_capability_priority;
         }
         for (const auto& context : contexts) {
             const auto& device_caps = context->deviceInfo().capabilities;
@@ -461,21 +501,42 @@ struct UbTransport::Impl {
             params.slice_size = safe_slice_size;
         }
 
+        // Derive and freeze per-Context JettyOptions (C01 / G-03). RM Contexts
+        // take priority/bind mask from their OWN device profile; RC Contexts
+        // keep the shared base options so the RC baseline is unchanged.
+        for (const auto& context : contexts) {
+            ub::JettyOptions context_options = jetty_options;
+            if (rm_runtime) {
+                const auto& device = context->deviceInfo();
+                auto found = rm_profiles_by_topology.find(device.topology_name);
+                if (found == rm_profiles_by_topology.end()) {
+                    return failInstall(Status::NotImplemented(
+                        "RM capability profile missing for device " +
+                        device.native_device_name + LOC_MARK));
+                }
+                context_options.bind_tp_type_mask =
+                    found->second.bind_tp_type_mask;
+                context_options.priority = found->second.priority;
+            }
+            context->setJettyOptions(context_options);
+        }
+
         buffers = std::make_unique<ub::UbBufferManager>(adapter, contexts);
         endpoints = std::make_unique<ub::EndpointStore>(
             adapter, params.max_endpoints, params.jetty_per_endpoint,
             jetty_options);
-        // Simple send-Jetty reuse (RM Legacy only): attach a per-context idle
-        // pool so endpoint incarnations lease Jettys LIFO instead of always
-        // creating and deleting them. RC installs never attach a pool, so the
-        // legacy create/delete path is unchanged.
+        // Legacy send-Jetty lifecycle pool (RM Legacy only): attach one pool
+        // per Context with that Context's own JettyOptions (G-03). Fail-closed
+        // (G-01): drained RESET members are retired and recreated, never
+        // re-leased without a rearm proof. RC installs never attach a pool, so
+        // the legacy create/delete path is unchanged.
         if (runtime_mode == ub::UbRuntimeMode::kRmLegacy &&
             params.jetty_reuse.enable) {
             for (auto& context : contexts) {
                 context->attachJettyPool(
                     std::make_shared<ub::UbSendJettyPool>(
                         adapter, context->handle(), context->jfcs(),
-                        jetty_options));
+                        context->jettyOptions().value_or(jetty_options)));
             }
         }
         // rm_pool data path (C01/C05/C06): attach one SendJettyPool per
@@ -551,7 +612,11 @@ struct UbTransport::Impl {
                     params.send_pool.background_delete;
                 pool_options.refill_interval_ms =
                     params.send_pool.refill_interval_ms;
-                pool_options.jetty_options = jetty_options;
+                // Per-Context RM profile (C01 / G-03): the pooled members must
+                // be created with this Context's own priority/bind mask, not
+                // the shared base options.
+                pool_options.jetty_options =
+                    context->jettyOptions().value_or(jetty_options);
                 context->attachPooledSendPool(
                     std::make_shared<ub::SendJettyPool>(
                         adapter, context->handle(), context->jfcs(),
@@ -700,6 +765,19 @@ struct UbTransport::Impl {
         native_budget.reset();
         task_permits.reset();
         attempt_gate.reset();
+        if (node_target_quota) {
+            const auto quota_snapshot = node_target_quota->snapshot();
+            LOG(INFO) << "UB node target quota at shutdown: limit="
+                      << quota_snapshot.limit
+                      << " occupied=" << quota_snapshot.total_occupied
+                      << " creating=" << quota_snapshot.creating_reserved
+                      << " active=" << quota_snapshot.active
+                      << " retiring=" << quota_snapshot.retiring_deleting
+                      << " quarantined=" << quota_snapshot.quarantined_unproven
+                      << " rejected=" << quota_snapshot.rejected_reservations
+                      << " leaked=" << quota_snapshot.leaked_tickets;
+        }
+        node_target_quota.reset();
         rails.reset();
         quota.reset();
         if (adapter_initialized && adapter) {
@@ -1033,6 +1111,10 @@ struct UbTransport::Impl {
     std::shared_ptr<ub::NativeBudget> native_budget;
     std::shared_ptr<ub::TaskPermitLedger> task_permits;
     std::shared_ptr<ub::AttemptGate> attempt_gate;
+    // Process-authoritative node target quota (guidance 4.2.1). The ledger
+    // itself lives in the process registry across installs; this member is
+    // the install generation's frozen reference, reset during shutdown.
+    std::shared_ptr<ub::NodeTargetQuota> node_target_quota;
 };
 
 UbTransport::UbTransport(std::shared_ptr<ub::UrmaAdapter> adapter)

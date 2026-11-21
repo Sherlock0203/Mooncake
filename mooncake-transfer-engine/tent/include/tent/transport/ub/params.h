@@ -15,6 +15,7 @@
 #ifndef TENT_TRANSPORT_UB_PARAMS_H_
 #define TENT_TRANSPORT_UB_PARAMS_H_
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <glog/logging.h>
@@ -208,6 +209,12 @@ struct UbParams {
     // Pooled data-path knobs; dormant until the rm_pool gate matrix passes.
     UbSendPoolParams send_pool;
     UbNativeBudgetParams native_budget;
+    // Node-level cap on receive-side target native Jetties (guidance 4.2.1):
+    // total across all senders, Contexts, devices/EIDs, Engines and resource
+    // generations of one node. Default 8 when absent; 0 is never unlimited.
+    // Frozen at node install for rm_pool; RC/RM legacy semantics are
+    // unchanged by this key.
+    uint32_t max_target_jetties_per_node = 8;
 
     bool enable_bandwidth_estimation = true;
     bool enable_notifications = false;
@@ -352,6 +359,8 @@ struct UbParams {
             config, "transports/ub/native_budget/replacement_reserve",
             parsed.native_budget.replacement_reserve,
             parsed.native_budget.replacement_reserve));
+        CHECK_STATUS(readNodeTargetQuotaLimit(
+            config, parsed.max_target_jetties_per_node));
 
         output = std::move(parsed);
         return Status::OK();
@@ -391,6 +400,47 @@ struct UbParams {
             return Status::InvalidArgument(std::string(kKey) +
                                            " must be rc or rm");
         }
+        return Status::OK();
+    }
+
+    // Strict reader for transports/ub/max_target_jetties_per_node (guidance
+    // 4.2.1): absent keeps the default 8, but an explicit null is rejected
+    // just like 0, negatives, bools, strings, floats and overflow. get()
+    // maps both absent and explicit null to null, so paths() (which lists
+    // null leaves) distinguishes the two cases.
+    static Status readNodeTargetQuotaLimit(const Config& config,
+                                           uint32_t& output) {
+        static constexpr const char* kKey =
+            "transports/ub/max_target_jetties_per_node";
+        const json value = config.get<json>(kKey, json());
+        if (value.is_null()) {
+            const auto paths = config.paths();
+            if (std::find(paths.begin(), paths.end(), kKey) != paths.end()) {
+                return Status::InvalidArgument(std::string(kKey) +
+                                               " must not be null");
+            }
+            return Status::OK();
+        }
+        if (!value.is_number_integer()) {
+            return Status::InvalidArgument(
+                std::string(kKey) +
+                " must be an integer in 1..UINT32_MAX");
+        }
+        int64_t signed_value = 0;
+        try {
+            signed_value = value.get<int64_t>();
+        } catch (...) {
+            return Status::InvalidArgument(std::string(kKey) +
+                                           " is outside the supported range");
+        }
+        if (signed_value <= 0 ||
+            static_cast<uint64_t>(signed_value) >
+                std::numeric_limits<uint32_t>::max()) {
+            return Status::InvalidArgument(
+                std::string(kKey) +
+                " must be an integer in 1..UINT32_MAX");
+        }
+        output = static_cast<uint32_t>(signed_value);
         return Status::OK();
     }
 

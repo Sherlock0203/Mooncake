@@ -36,6 +36,12 @@ struct PoolKey {
     uint32_t bind_tp_type_mask = 0;
 
     bool operator==(const PoolKey&) const = default;
+
+    // A zero context incarnation is the unassigned sentinel (bootstrap v2
+    // rejects it); a pool key without one cannot partition members safely.
+    [[nodiscard]] bool valid() const noexcept {
+        return context_incarnation != 0;
+    }
 };
 
 struct PoolKeyHash {
@@ -208,6 +214,10 @@ struct SendJettyPoolStats {
     size_t in_use_members = 0;
     size_t creating_members = 0;
     size_t retired_members = 0;
+    // Members owned by the delete executor whose reset+delete is in flight
+    // (RC-08: their fields mutate outside the pool lock, so diagnostics use
+    // this counter instead of reading member state).
+    size_t deleting_members = 0;
     size_t quarantined_members = 0;
     uint64_t total_leases = 0;
     uint64_t total_returns = 0;
@@ -246,17 +256,22 @@ class SendJettyPool final
     SendJettyPool(const SendJettyPool&) = delete;
     SendJettyPool& operator=(const SendJettyPool&) = delete;
 
-    // Stops both executors (when enabled), drains any pending asynchronous
-    // deletes and gives quarantined members one last delete attempt. The
-    // context normally calls beginStop()/drainIdle()/drainQuarantined()
-    // first; the destructor is the final safety net.
+    // Stops both executors (when enabled) and drains any pending asynchronous
+    // deletes. The destructor never retries native deletion of quarantined
+    // (Unknown) handles: their destruction is unproven, so they keep their
+    // handle and budget, and every reservation still charged here is recorded
+    // as a leak for diagnostics. The context normally calls
+    // beginStop()/drainIdle()/drainQuarantined() first.
     ~SendJettyPool();
 
-    // Non-blocking lease for one attempt. Status codes:
+    // Non-blocking lease for one attempt. `out` must be empty (no unsettled
+    // lease or JFC credit token); a non-empty output is rejected instead of
+    // silently dropping the caller's previous resources. Status codes:
     //   OK               lease (and JFC credit) acquired
     //   TooManyRequests  defer: pool/quota/credit insufficient (never a
     //                    retry charge, never a path fault, never a bypass)
-    //   InvalidArgument  bad key/attempt or pool not attached
+    //   InvalidArgument  bad key/attempt/options, non-empty out, or pool not
+    //                    attached
     Status tryLease(const PoolKey& pool_key, const AttemptKey& attempt,
                     LeaseWithCredit& out);
 
@@ -282,9 +297,10 @@ class SendJettyPool final
     // any native destruction here, so the caller may close the parent JFC
     // afterwards. Precondition (RC-03): every posting/polling consumer must
     // already be stopped (workers->stop()); drainIdle verifies that no lease
-    // is outstanding or mid-creation and logs an error on violation. Handles
-    // whose delete fails stay owned by the pool for the next drain attempt;
-    // their budget stays charged until destruction is proven.
+    // is outstanding or mid-creation and returns InternalError on violation
+    // (the idle members are still deleted). Handles whose delete fails stay
+    // owned by the pool for the next drain attempt; their budget stays
+    // charged until destruction is proven.
     Status drainIdle();
 
     // Attempts to delete quarantined members (e.g. during shutdown after
@@ -353,6 +369,11 @@ class SendJettyPool final
     std::thread delete_thread_;
     bool refill_stop_ = false;
     bool delete_stop_ = false;
+
+    // Members whose reset+delete is in flight on the delete executor (or in
+    // the synchronous stop drain). Incremented when a batch leaves
+    // delete_ready_, decremented per member when destroyRetired finishes it.
+    size_t deleting_members_ = 0;
 
     // Diagnostics counters (protected by mutex_).
     uint64_t total_leases_ = 0;

@@ -15,8 +15,11 @@ namespace mooncake::tent::ub {
 enum class UbBootstrapMode : uint8_t {
     RC,
     RM,
+    // Pooled RM data plane (protocol v3): shared per-port targets, probe
+    // authorization regions and the trusted inventory checksum. Distinct
+    // from the legacy RM v2 endpoint-owned 1:1 target semantics.
+    kPooledRm,
 };
-
 enum class UbBootstrapGenerationComparison : uint8_t {
     kDuplicate,
     kStale,
@@ -35,6 +38,22 @@ struct UbExpectedPeerIdentity {
     int eid_index = -1;
     std::string eid;
     uint16_t transport_modes = 0;
+};
+
+// Trusted anchor for pooled v3 peers (V5 23.2): every expected value comes
+// from independently configured trusted inventory metadata. The checksum
+// anchor proves content consistency but never replaces the trusted source;
+// the descriptor ABI must be on the local whitelist.
+struct UbExpectedPooledPeerIdentity {
+    std::string segment_name;
+    std::string local_nic_path;
+    std::string local_device_identity;
+    std::string local_eid;
+    int eid_index = -1;
+    std::string physical_device_identity;
+    uint16_t transport_modes = 0;
+    std::string descriptor_abi;
+    std::string inventory_checksum;
 };
 
 // Canonical physical device identity used by bootstrap v2: the native device
@@ -56,12 +75,42 @@ Status gateUbBootstrapForMode(UbBootstrapMode expected,
 Status validateUbBootstrapV2PeerIdentity(
     const UbBootstrapDesc& desc, const UbExpectedPeerIdentity& expected);
 
+// Pooled v3 peer identity gate: the descriptor must be a valid v3 request
+// whose self-asserted identity matches the independently configured trusted
+// inventory anchor, including the inventory checksum and descriptor ABI.
+Status validateUbBootstrapV3PeerIdentity(
+    const UbBootstrapDesc& desc,
+    const UbExpectedPooledPeerIdentity& expected);
+
 // Compares candidates for one stable physical device identity. The caller must
 // publish only kNewer snapshots, treat kDuplicate as idempotent, and leave the
 // incumbent untouched for kStale/kConflict.
 Status compareUbBootstrapV2(const UbBootstrapDesc& candidate,
                             const UbBootstrapDesc& current,
                             UbBootstrapGenerationComparison& comparison);
+
+// Pooled v3 generation comparison with the same four-way contract as
+// compareUbBootstrapV2: hierarchical parents (node/context incarnation,
+// topology epoch) create the comparison scope; within one scope no newer
+// leaf (per-port target epochs, endpoint/segment generations) may hide an
+// older one. Content changes under identical generations are conflicts, and
+// diagnostic reply_msg never affects the duplicate classification.
+Status compareUbBootstrapV3(const UbBootstrapDesc& candidate,
+                            const UbBootstrapDesc& current,
+                            UbBootstrapGenerationComparison& comparison);
+
+// Computes the canonical pooled v3 inventory checksum: the SHA-256 (lowercase
+// hex) of the canonical JSON encoding of the descriptor with the diagnostic
+// reply_msg and the checksum field itself excluded. Both the publisher and
+// the validator derive it from the same frozen encoding (nlohmann ordered
+// object keys), so a mismatch means the content was altered or corrupted.
+std::string computePooledInventoryChecksum(const UbBootstrapDesc& desc);
+
+// Strict pooled v3 wire decoder (guidance C03 / V5 23.2): duplicate JSON keys
+// are rejected before the DOM is built, unknown fields are rejected by the
+// allowlist decoder, and the result must pass the full v3 validation. Only
+// protocol_version == 3 envelopes are accepted here.
+Status decodeUbBootstrapV3Strict(const std::string& raw, UbBootstrapDesc& desc);
 
 }  // namespace mooncake::tent::ub
 

@@ -77,22 +77,55 @@ SendJettyPool::SendJettyPool(std::shared_ptr<UrmaAdapter> adapter,
 SendJettyPool::~SendJettyPool() {
     stopRefillExecutor();
     stopDeleteExecutor();
-    (void)drainQuarantined();
+    // INV09/RC-03: the destructor never retries native deletion of Unknown
+    // (quarantined) handles; an unproven delete could double-free or delete
+    // without the RESET contract. Quarantined members keep their handle and
+    // budget. Every reservation still charged at this point is a bookkeeping
+    // leak: record it so diagnostics never silently lose charged budget.
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& member : quarantined_) {
+        budget_->recordLeakedReservation(member->budget);
+    }
+    for (const auto& member : retired_) {
+        budget_->recordLeakedReservation(member->budget);
+    }
+    for (const auto& entry : buckets_) {
+        for (const auto& member : entry.second.idle) {
+            budget_->recordLeakedReservation(member->budget);
+        }
+    }
 }
 
 Status SendJettyPool::tryLease(const PoolKey& pool_key,
                                const AttemptKey& attempt,
                                LeaseWithCredit& out) {
-    out = LeaseWithCredit{};
+    // Never clobber a non-empty output: overwriting it would drop the
+    // caller's previous lease (quarantining its member) and lose its JFC
+    // credit token without a release.
+    if (out.lease.valid() || out.jfc_credit_token != 0) {
+        return Status::InvalidArgument(
+            "UB send pool lease output still holds an unsettled lease or "
+            "JFC credit; settle it before leasing again" LOC_MARK);
+    }
+    if (!pool_key.valid()) {
+        return Status::InvalidArgument(
+            "UB send pool lease requires a valid pool key" LOC_MARK);
+    }
     if (!attempt.valid()) {
         return Status::InvalidArgument(
             "UB send pool lease requires a valid attempt key" LOC_MARK);
+    }
+    if (options_.desired_serving == 0 || options_.max_creating == 0) {
+        return Status::InvalidArgument(
+            "UB send pool requires positive desired_serving and max_creating"
+            LOC_MARK);
     }
     if (adapter_ == nullptr || context_handle_ == nullptr ||
         jfcs_.empty() || budget_ == nullptr || credits_ == nullptr) {
         return Status::InvalidArgument(
             "UB send pool is not fully attached" LOC_MARK);
     }
+    out = LeaseWithCredit{};
 
     for (;;) {
         std::shared_ptr<PoolMember> chosen;
@@ -257,7 +290,13 @@ void SendJettyPool::retireUnpublished(JettyPtr jetty,
     // A live handle must pass the RESET-before-delete contract required by
     // the provider; a partially allocated handle without a native resource
     // only needs its wrapper released.
-    budget_->transition(reservation, BudgetObjectState::kQuarantined);
+    const Status quarantined =
+        budget_->transition(reservation, BudgetObjectState::kQuarantined);
+    if (!quarantined.ok()) {
+        LOG(ERROR) << "UB send pool unpublished retirement could not "
+                      "quarantine its budget reservation: "
+                   << quarantined.ToString() << LOC_MARK;
+    }
     Status destroyed = Status::OK();
     if (jetty != nullptr) {
         if (jetty->valid()) {
@@ -355,6 +394,17 @@ void SendJettyPool::retireMemberLocked(
     std::shared_ptr<PoolMember> member, const std::string& reason) {
     member->state = PoolMemberState::kDraining;
     member->retire_reason = reason;
+    // The budget follows the object into retirement before any native
+    // delete runs, so the ledger never accounts a destroying object as
+    // Active (C05). A failed transition leaves the budget charged; the
+    // destruction path below then fails closed instead of freeing it.
+    const Status retired_budget =
+        budget_->transition(member->budget, BudgetObjectState::kRetiring);
+    if (!retired_budget.ok()) {
+        LOG(ERROR) << "UB send pool retirement could not transition its "
+                      "budget reservation to retiring: "
+                   << retired_budget.ToString() << LOC_MARK;
+    }
     // First real error retires permanently (INV07): the member never
     // re-enters the idle stack even if the path recovers.
     if (options_.background_delete && !delete_stop_) {
@@ -372,6 +422,11 @@ void SendJettyPool::destroyRetired(
     std::vector<std::shared_ptr<PoolMember>> members) {
     // All native calls happen outside the pool lock.
     for (auto& member : members) {
+        // Members that left delete_ready_ were counted as deleting when the
+        // executor (or the synchronous stop drain) took the batch; the
+        // counter is decremented once this member's destruction settles.
+        const bool from_delete_executor =
+            member->state == PoolMemberState::kDeleteReady;
         member->state = PoolMemberState::kDeleting;
         JettyPtr jetty = std::move(member->jetty);
         // The native delete requires a RESET Jetty. A clean member has never
@@ -383,9 +438,15 @@ void SendJettyPool::destroyRetired(
             reset.ok() ? adapter_->deleteJetty(jetty) : reset;
         if (deleted.ok()) {
             member->state = PoolMemberState::kDestroyed;
-            budget_->transition(member->budget,
-                                BudgetObjectState::kRetiring);
-            budget_->releaseAfterProvenDestruction(member->budget, true);
+            // The reservation already moved to kRetiring at retirement
+            // time; proven destruction releases it directly.
+            const Status released =
+                budget_->releaseAfterProvenDestruction(member->budget, true);
+            if (!released.ok()) {
+                LOG(ERROR) << "UB send pool could not release budget after "
+                              "proven destruction: "
+                           << released.ToString() << LOC_MARK;
+            }
         } else {
             // Unknown destruction: keep owner and budget (INV09/INV10).
             // The handle goes back to the member so the next drain attempt
@@ -393,10 +454,18 @@ void SendJettyPool::destroyRetired(
             // native ownership and leak the budget.
             member->jetty = std::move(jetty);
             member->state = PoolMemberState::kQuarantined;
-            budget_->transition(member->budget,
-                                BudgetObjectState::kQuarantined);
-            std::lock_guard<std::mutex> lock(mutex_);
-            quarantined_.push_back(member);
+            const Status quarantined_budget = budget_->transition(
+                member->budget, BudgetObjectState::kQuarantined);
+            if (!quarantined_budget.ok()) {
+                LOG(ERROR) << "UB send pool could not quarantine the budget "
+                              "of an undestroyed member: "
+                           << quarantined_budget.ToString() << LOC_MARK;
+            }
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!deleted.ok()) quarantined_.push_back(member);
+        if (from_delete_executor && deleting_members_ > 0) {
+            --deleting_members_;
         }
     }
 }
@@ -416,7 +485,13 @@ void SendJettyPool::onLeaseLeaked(
         }
     }
     member->state = PoolMemberState::kQuarantined;
-    budget_->transition(member->budget, BudgetObjectState::kQuarantined);
+    const Status quarantined_budget =
+        budget_->transition(member->budget, BudgetObjectState::kQuarantined);
+    if (!quarantined_budget.ok()) {
+        LOG(ERROR) << "UB send pool could not quarantine the budget of a "
+                      "leaked lease: "
+                   << quarantined_budget.ToString() << LOC_MARK;
+    }
     quarantined_.push_back(member);
 }
 
@@ -443,11 +518,23 @@ Status SendJettyPool::drainIdle() {
     // may close the parent JFC safely.
     beginStop();
     std::vector<std::shared_ptr<PoolMember>> to_destroy;
+    bool contract_violation = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         for (auto& entry : buckets_) {
             for (auto& member : entry.second.idle) {
                 member->retire_reason = "drain idle";
+                member->state = PoolMemberState::kDraining;
+                // Retirement starts before the native delete, exactly like
+                // the fault/stop paths (C05).
+                const Status retired_budget = budget_->transition(
+                    member->budget, BudgetObjectState::kRetiring);
+                if (!retired_budget.ok()) {
+                    LOG(ERROR) << "UB send pool drainIdle could not "
+                                  "transition an idle budget reservation to "
+                                  "retiring: "
+                               << retired_budget.ToString() << LOC_MARK;
+                }
                 to_destroy.push_back(std::move(member));
             }
             entry.second.idle.clear();
@@ -463,6 +550,7 @@ Status SendJettyPool::drainIdle() {
             creating += entry.second.creating;
         }
         if (in_use != 0 || creating != 0) {
+            contract_violation = true;
             LOG(ERROR) << "UB send pool drainIdle found " << in_use
                        << " in-use and " << creating
                        << " creating members after the shutdown barrier; "
@@ -472,6 +560,11 @@ Status SendJettyPool::drainIdle() {
         }
     }
     destroyRetired(std::move(to_destroy));
+    if (contract_violation) {
+        return Status::InternalError(
+            "UB send pool drainIdle found outstanding leases or creations "
+            "after the shutdown barrier (RC-03 violated)" LOC_MARK);
+    }
     return Status::OK();
 }
 
@@ -515,7 +608,10 @@ void SendJettyPool::refillLoop() {
     while (!refill_stop_) {
         refill_cv_.wait_for(lock, interval,
                             [this] { return refill_stop_; });
-        if (refill_stop_) break;
+        // stopping_ is set by beginStop() before the executor join; skip
+        // claiming creation slots once the pool stopped accepting so refill
+        // never creates a member only to retire it again during shutdown.
+        if (refill_stop_ || stopping_) break;
 
         // Claim creation slots under the lock, then call the provider
         // outside it. Every known PoolKey is topped back up to the static
@@ -557,6 +653,7 @@ void SendJettyPool::deleteLoop() {
         }
         auto batch = std::move(delete_ready_);
         delete_ready_.clear();
+        deleting_members_ += batch.size();
         lock.unlock();
         // reset + delete + budget release happen on this executor, never on
         // the completion/return path.
@@ -588,6 +685,7 @@ void SendJettyPool::stopDeleteExecutor() {
         std::lock_guard<std::mutex> lock(mutex_);
         pending = std::move(delete_ready_);
         delete_ready_.clear();
+        deleting_members_ += pending.size();
     }
     if (!pending.empty()) destroyRetired(std::move(pending));
 }
@@ -600,7 +698,9 @@ SendJettyPoolStats SendJettyPool::stats() const {
         result.in_use_members += entry.second.in_use;
         result.creating_members += entry.second.creating;
     }
-    result.retired_members = retired_.size() + delete_ready_.size();
+    result.retired_members =
+        retired_.size() + delete_ready_.size() + deleting_members_;
+    result.deleting_members = deleting_members_;
     result.quarantined_members = quarantined_.size();
     result.total_leases = total_leases_;
     result.total_returns = total_returns_;
@@ -628,6 +728,7 @@ std::vector<PoolMemberState> SendJettyPool::memberStates() const {
     // their state without the pool lock; report the queue state instead.
     states.insert(states.end(), delete_ready_.size(),
                   PoolMemberState::kDeleteReady);
+    states.insert(states.end(), deleting_members_, PoolMemberState::kDeleting);
     for (const auto& member : quarantined_) states.push_back(member->state);
     return states;
 }

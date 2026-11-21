@@ -561,7 +561,8 @@ if(USE_UB)
   add_executable(
     tent_ub_core_test ub_core_test.cpp ../src/transport/ub/bootstrap.cpp
                       ../src/transport/ub/quota.cpp
-                      ../src/transport/ub/rail_monitor.cpp)
+                      ../src/transport/ub/rail_monitor.cpp
+                      ../src/transport/ub/sha256.cpp)
   target_link_libraries(tent_ub_core_test PRIVATE tent_common gtest gtest_main)
   target_include_directories(tent_ub_core_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
@@ -575,7 +576,10 @@ if(USE_UB)
     ub_pooled_core_test.cpp ../src/transport/ub/native_budget.cpp
     ../src/transport/ub/admission.cpp ../src/transport/ub/send_jetty_pool.cpp
     ../src/transport/ub/attempt_gate.cpp ../src/transport/ub/jfc.cpp
-    ../src/transport/ub/context.cpp ../src/transport/ub/jetty_pool.cpp)
+    ../src/transport/ub/context.cpp ../src/transport/ub/jetty_pool.cpp
+    ../src/transport/ub/node_target_quota.cpp
+    ../src/transport/ub/target_registry.cpp
+    ../src/transport/ub/path_registry.cpp)
   target_link_libraries(tent_ub_pooled_core_test
                         PRIVATE tent_common gtest gtest_main)
   target_include_directories(tent_ub_pooled_core_test
@@ -590,7 +594,8 @@ if(USE_UB)
     ../src/transport/ub/context.cpp ../src/transport/ub/endpoint.cpp
     ../src/transport/ub/endpoint_store.cpp ../src/transport/ub/jetty_pool.cpp
     ../src/transport/ub/jfc.cpp ../src/transport/ub/native_budget.cpp
-    ../src/transport/ub/admission.cpp ../src/transport/ub/send_jetty_pool.cpp)
+    ../src/transport/ub/admission.cpp ../src/transport/ub/send_jetty_pool.cpp
+    ../src/transport/ub/sha256.cpp)
   target_link_libraries(tent_ub_teardown_test PRIVATE tent_common gtest
                                                       gtest_main)
   target_include_directories(tent_ub_teardown_test

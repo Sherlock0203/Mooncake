@@ -101,7 +101,9 @@ class AttemptGate final {
     AttemptGate& operator=(const AttemptGate&) = delete;
 
     // Registers one attempt; returns the gate token. expected_length is the
-    // business length the single real SUCCESS completion must carry.
+    // business length the single real SUCCESS completion must carry. Returns
+    // 0 (no record created) when the attempt key is invalid or the lane
+    // generation is zero; callers must treat token 0 as fail-closed.
     uint64_t registerAttempt(const AttemptKey& attempt, const LaneKey& lane,
                              uint64_t expected_length);
 
