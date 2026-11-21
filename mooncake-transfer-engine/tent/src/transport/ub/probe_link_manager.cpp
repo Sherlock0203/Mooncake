@@ -1592,6 +1592,9 @@ void ProbeLinkManager::onContextUnavailable(Topology::NicID local_nic,
             if (runtime == nullptr) continue;
             cancelCampaignEntriesLocked(version);
             runtime->task = TaskState::kIdle;
+            // Remember the cause: probe recovery must not revive a path that
+            // the graph or the pooling side revoked on purpose.
+            runtime->disable_cause = DisableCause::kContextFailure;
             setHealthLocked(version, *runtime, LinkHealth::kDisabled,
                             "context_failure", effects);
         }
@@ -1599,6 +1602,60 @@ void ProbeLinkManager::onContextUnavailable(Topology::NicID local_nic,
     }
     effects.bump = true;
     emitEffects(effects);
+}
+
+Status ProbeLinkManager::onContextAvailable(Topology::NicID local_nic,
+                                            uint64_t now_ns) {
+    const uint64_t now = normalizedNow(now_ns);
+    Effects effects;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        // Shutdown settles responsibility only; it never revives paths.
+        if (!accepting_.load()) return Status::OK();
+        PortRuntime* port = findPortLocked(local_nic);
+        if (port == nullptr) {
+            return Status::InvalidArgument(
+                "probe port is not in the probe graph" LOC_MARK);
+        }
+        port->handle_valid = true;
+        port->broken_since_ns = 0;
+        size_t revived = 0;
+        for (const auto& version : port->paths) {
+            PathRuntime* runtime = findPathLocked(version);
+            if (runtime == nullptr) continue;
+            // INV-REC-1: only the context-failure exit revives here.
+            if (runtime->health != LinkHealth::kDisabled ||
+                runtime->disable_cause != DisableCause::kContextFailure) {
+                continue;
+            }
+            runtime->disable_cause = DisableCause::kNone;
+            runtime->consecutive_failures = 0;
+            runtime->task = TaskState::kIdle;
+            // Clear only the context-failure pending mark: a simultaneous
+            // port revocation must keep the port unusable.
+            if (runtime->pending &&
+                runtime->pending_reason == PendingReason::kContextFailure) {
+                runtime->pending = false;
+                runtime->pending_reason = PendingReason::kNone;
+                runtime->pending_since_ns = 0;
+            }
+            // INV-REC-2: never publish HEALTHY from an availability edge.
+            // A successful probe is the only path back to HEALTHY.
+            setHealthLocked(version, *runtime, LinkHealth::kRecovering,
+                            "context_recovered", effects);
+            runtime->next_probe_ns = now;
+            ++revived;
+        }
+        if (revived != 0) {
+            stats_.path_revived_on_context_available += revived;
+            effects.bump = true;
+            LOG(INFO) << "UB probe: context " << local_nic << " is available "
+                      << "again; " << revived
+                      << " path(s) moved to RECOVERING for verification";
+        }
+    }
+    if (effects.bump) emitEffects(effects);
+    return Status::OK();
 }
 
 void ProbeLinkManager::markPortPendingLocked(PortRuntime& port,

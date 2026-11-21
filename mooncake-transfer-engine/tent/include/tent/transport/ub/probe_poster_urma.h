@@ -35,6 +35,11 @@ class UrmaProbePoster final : public ProbePoster {
 
     Status post(const ProbePostTarget& target, const ProbeWorkRequest& request,
                 size_t& posted) override;
+    // F5: carries the adapter's PostEvidence across the probe boundary, so a
+    // failure without a failing-WR position is Unknown and the WR is never
+    // re-sent on a guess.
+    Status post(const ProbePostTarget& target, const ProbeWorkRequest& request,
+                size_t& posted, ProbePostOutcome& outcome) override;
 
    private:
     const std::shared_ptr<UrmaAdapter> adapter_;

@@ -1079,6 +1079,19 @@ bool UbWorkers::pollBusinessSlot(size_t slot_index) {
                       << slot.context->deviceInfo().topology_name
                       << " after endpoint retirement and an error-free JFC "
                          "cooldown";
+            // F7: propagate the availability edge to the probe side. Without
+            // it the paths DISABLED by onContextUnavailable() would stay
+            // disabled forever, because probe recovery waits for a new graph
+            // version that only a rebuild emits.
+            if (probe_manager_ != nullptr) {
+                const Status revived = probe_manager_->onContextAvailable(
+                    slot.context->topologyId());
+                if (!revived.ok()) {
+                    LOG_EVERY_N(WARNING, 100)
+                        << "UB probe context-available event was rejected: "
+                        << revived.ToString();
+                }
+            }
         }
     }
     const int local_nic = slot.context ? slot.context->topologyId() : -1;
@@ -2737,6 +2750,18 @@ void UbWorkers::onFault(CompletionRecord& record, FaultKind kind) {
         // resolves the same one-shot, so the rail sees exactly one timeout.
         business_deadline_timeouts_.fetch_add(1, std::memory_order_relaxed);
         rail_monitor_->recordTimeout(business->path, now);
+        // A deadline timeout is the strongest path-fault evidence there is:
+        // nothing completed and there is no native error code to attribute.
+        // Feed the same isolation/probe chain as an adapter-level TIMEOUT,
+        // otherwise "suspended with no CQE" - the one case that most needs
+        // probe recovery - would never start a probe campaign.
+        //
+        // Deliberately NOT `endpoint_retirer_`: unlike the adapter-level
+        // TIMEOUT, the timeout fence already fenced this specific Jetty, so
+        // retiring the whole endpoint would amplify one budget overrun to a
+        // device-wide retirement. Keep that difference instead of "aligning"
+        // the two paths.
+        report_error(BusinessErrorKind::kPathFault);
         const uint64_t age_us = now > business->posted_ns
                                     ? (now - business->posted_ns) / 1000ULL
                                     : 0ULL;

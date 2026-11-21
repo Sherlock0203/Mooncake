@@ -451,6 +451,89 @@ TEST(UbProbeLinkManagerTest, ContextUnavailableDisablesPortAndCancelsCampaign) {
     EXPECT_TRUE(plm.campaignView().empty());
 }
 
+// F7: the availability edge is the dual of onContextUnavailable(). It must
+// revive exactly the paths the context failure disabled, and only into
+// RECOVERING: HEALTHY is still earned by a real probe.
+TEST(UbProbeLinkManagerTest, ContextAvailableRevivesContextDisabledPaths) {
+    TestClock clock;
+    ProbeLinkManager plm(defaultParams(), clock.clock());
+    auto graph = makeGraph({makePortSupply(0, 1)}, {makeEdgeSupply(0, 10, 0),
+                                                    makeEdgeSupply(0, 10, 1)});
+    ASSERT_TRUE(plm.initialize(graph).ok());
+
+    plm.onContextUnavailable(0, clock.now());
+    ASSERT_EQ(plm.stats().path_state_disabled, 2U);
+    ASSERT_TRUE(plm.pendingActions(clock.now()).empty());
+
+    ASSERT_TRUE(plm.onContextAvailable(0, clock.now()).ok());
+    EXPECT_EQ(plm.stats().path_revived_on_context_available, 2U);
+    for (const auto& entry : plm.healthView()) {
+        EXPECT_EQ(entry.health, LinkHealth::kRecovering);
+        EXPECT_FALSE(entry.pending);
+        EXPECT_EQ(entry.pending_reason, PendingReason::kNone);
+        EXPECT_EQ(entry.task, TaskState::kIdle);
+    }
+    // INV-REC-2: never HEALTHY without evidence.
+    EXPECT_NE(healthOf(plm, PathVersion{ProbePathKey{0, 10, 0}, 1, 1}).health,
+              LinkHealth::kHealthy);
+    // The revived paths are immediately schedulable for verification.
+    EXPECT_FALSE(plm.pendingActions(clock.now()).empty());
+}
+
+TEST(UbProbeLinkManagerTest, ContextAvailableRecoveryNeedsAProbeToBeHealthy) {
+    TestClock clock;
+    ProbeLinkManager plm(defaultParams(), clock.clock());
+    auto graph = makeGraph({makePortSupply(0, 1)}, {makeEdgeSupply(0, 10, 0)});
+    ASSERT_TRUE(plm.initialize(graph).ok());
+    const PathVersion version{ProbePathKey{0, 10, 0}, 1, 1};
+
+    plm.onContextUnavailable(0, clock.now());
+    ASSERT_TRUE(plm.onContextAvailable(0, clock.now()).ok());
+    ASSERT_EQ(healthOf(plm, version).health, LinkHealth::kRecovering);
+
+    uint64_t token_seq = 0;
+    auto posted = postNext(plm, token_seq, clock.now());
+    ASSERT_TRUE(posted.has_value());
+    plm.onPostResult(posted->record, ProbePostOutcome::kAccepted, clock.now());
+    ASSERT_TRUE(
+        plm.onProbeCompletion(makeCompletion(posted->token), clock.now()));
+    EXPECT_EQ(healthOf(plm, version).health, LinkHealth::kHealthy);
+}
+
+TEST(UbProbeLinkManagerTest, ContextAvailableNeverResurrectsARemovedPath) {
+    TestClock clock;
+    ProbeLinkManager plm(defaultParams(), clock.clock());
+    auto graph = makeGraph({makePortSupply(0, 1)}, {makeEdgeSupply(0, 10, 0),
+                                                    makeEdgeSupply(0, 10, 1)});
+    ASSERT_TRUE(plm.initialize(graph).ok());
+    const PathVersion kept{ProbePathKey{0, 10, 0}, 1, 1};
+    const PathVersion removed{ProbePathKey{0, 10, 1}, 1, 1};
+
+    plm.onContextUnavailable(0, clock.now());
+    ProbeEvent removal;
+    removal.kind = ProbeEventKind::kEdgeRemoved;
+    removal.graph_epoch = 1;
+    removal.event_seq = 1;
+    removal.version = removed;
+    ASSERT_TRUE(plm.onPoolAvailabilityChange(removal).ok());
+    ASSERT_FALSE(hasHealth(plm, removed));
+
+    ASSERT_TRUE(plm.onContextAvailable(0, clock.now()).ok());
+    EXPECT_EQ(plm.pathCount(), 1U);
+    EXPECT_EQ(plm.stats().path_revived_on_context_available, 1U);
+    EXPECT_EQ(healthOf(plm, kept).health, LinkHealth::kRecovering);
+    EXPECT_FALSE(hasHealth(plm, removed));
+}
+
+TEST(UbProbeLinkManagerTest, ContextAvailableOnAnUnknownPortIsRejected) {
+    TestClock clock;
+    ProbeLinkManager plm(defaultParams(), clock.clock());
+    auto graph = makeGraph({makePortSupply(0, 1)}, {makeEdgeSupply(0, 10, 0)});
+    ASSERT_TRUE(plm.initialize(graph).ok());
+    EXPECT_TRUE(plm.onContextAvailable(7, clock.now()).IsInvalidArgument());
+    EXPECT_EQ(plm.stats().path_revived_on_context_available, 0U);
+}
+
 TEST(UbProbeLinkManagerTest, StaleCompletionReleasesSlotWithoutChangingHealth) {
     TestClock clock;
     ProbeLinkManager plm(defaultParams(), clock.clock());

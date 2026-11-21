@@ -384,6 +384,32 @@ TEST(UbProbeIntegrationTest, ProbeJfcPollFailureDisablesProbePaths) {
     env.shutdown();
 }
 
+// F6b: a deadline timeout is the strongest path-fault evidence (nothing
+// completed, no native error code). It must feed the same PLM isolation and
+// probe-campaign chain as an adapter-level TIMEOUT, otherwise a suspended path
+// with no CQE would never start recovery.
+TEST(UbProbeIntegrationTest, DeadlineTimeoutIsolatesThePathAndStartsCampaign) {
+    ProbeWorkersEnv env;
+    ASSERT_TRUE(env.initialize());
+    ASSERT_TRUE(env.workers->start().ok());
+
+    const ProbePathKey key = env.version.path;
+    const uint64_t epoch_before = env.plm->businessFaultEpoch(key);
+    // The provider never completes: only the deadline fence can settle it.
+    env.adapter->holdNextCompletion();
+    auto task = env.submitWrite();
+    ASSERT_TRUE(task != nullptr);
+
+    ASSERT_TRUE(
+        pt::waitUntil([&] { return task->transferStatus().s != PENDING; }));
+    EXPECT_EQ(task->transferStatus().s, TIMEOUT);
+    EXPECT_EQ(env.workers->businessStats().business_deadline_timeouts, 1U);
+    EXPECT_GT(env.plm->businessFaultEpoch(key), epoch_before);
+    EXPECT_EQ(env.plm->stats().path_state_isolated, 1U);
+    EXPECT_EQ(env.plm->campaignView().size(), 1U);
+    env.shutdown();
+}
+
 std::shared_ptr<ControlService> startFakeControl(
     const std::shared_ptr<Topology>& topology, std::string& segment_name) {
     auto control = std::make_shared<ControlService>("p2p", "", nullptr);

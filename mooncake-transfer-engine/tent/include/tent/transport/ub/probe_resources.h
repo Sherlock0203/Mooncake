@@ -280,6 +280,24 @@ class ProbePoster {
     // treated as accepted.
     virtual Status post(const ProbePostTarget& target,
                         const ProbeWorkRequest& request, size_t& posted) = 0;
+
+    // F5: tristate probe post with explicit evidence. The default keeps the
+    // old heuristic so existing fake posters need no change; posters with a
+    // native evidence channel override it so "error without a failing WR"
+    // becomes kUnknown instead of kRejected (INV-4).
+    virtual Status post(const ProbePostTarget& target,
+                        const ProbeWorkRequest& request, size_t& posted,
+                        ProbePostOutcome& outcome) {
+        const Status status = post(target, request, posted);
+        if (posted >= 1) {
+            outcome = ProbePostOutcome::kAccepted;
+        } else if (!status.ok()) {
+            outcome = ProbePostOutcome::kRejected;
+        } else {
+            outcome = ProbePostOutcome::kUnknown;
+        }
+        return status;
+    }
 };
 
 // Interface 7 (design §12.2): implemented by the probe side, called directly

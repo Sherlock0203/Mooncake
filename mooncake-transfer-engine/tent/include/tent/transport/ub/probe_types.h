@@ -219,6 +219,19 @@ enum class PendingReason : uint8_t {
     kLaneRetired,
     kPortRevoked,
     kContextFailure,
+    // F12: a replacement event arrived without a drain receipt for the
+    // previous generation, so the port must stay unusable.
+    kReplacementUnproven,
+};
+
+// Why a path was disabled. Recovery needs this: onContextAvailable() may only
+// revive paths that the context failure disabled, never a path the graph or
+// the pooling side revoked on purpose.
+enum class DisableCause : uint8_t {
+    kNone,
+    kContextFailure,
+    kPortRevoked,
+    kGraphRemoval,
 };
 
 constexpr const char* linkHealthName(LinkHealth health) {
@@ -498,6 +511,15 @@ struct ProbeStats {
     uint64_t path_state_isolated{0};
     uint64_t path_state_recovering{0};
     uint64_t path_state_disabled{0};
+    // F7: DISABLED paths moved back to RECOVERING by onContextAvailable().
+    uint64_t path_revived_on_context_available{0};
+    // F12: replacement events rejected because the previous generation had no
+    // drain receipt.
+    uint64_t probe_replacement_unproven{0};
+    // F8: probe posts the provider rejected for a retryable reason (capacity,
+    // not-ready, transient device error) and terminal verification give-ups.
+    uint64_t probe_post_rejected_retryable{0};
+    uint64_t probe_verification_abandoned{0};
     uint64_t probe_inflight_per_port{0};
     uint64_t probe_rr_round{0};
     uint64_t probe_drain_unproven{0};
@@ -539,6 +561,14 @@ struct ProbeStats {
 
 }  // namespace ub
 }  // namespace tent
+// Post acceptance as the probe side observes it. Lives in the leaf types
+// header so both the poster interface and the link manager can name it.
+enum class ProbePostOutcome : uint8_t {
+    kAccepted,
+    kRejected,
+    kUnknown,
+};
+
 }  // namespace mooncake
 
 #endif  // TENT_TRANSPORT_UB_PROBE_TYPES_H_

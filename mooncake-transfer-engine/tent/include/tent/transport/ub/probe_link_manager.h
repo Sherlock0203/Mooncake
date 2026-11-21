@@ -72,11 +72,6 @@ enum class BusinessErrorKind : uint8_t {
 };
 
 // Result of ProbePoster::post() as seen by the PLM (design §8.6).
-enum class ProbePostOutcome : uint8_t {
-    kAccepted,
-    kRejected,
-    kUnknown,
-};
 
 // Probe owner of the shared completion record (design D-9 / W2 §5.5).
 //
@@ -256,6 +251,12 @@ class ProbeLinkManager final : public ProbeAvailabilitySink {
     // is not recovered by probing (design §6.2).
     void onContextUnavailable(Topology::NicID local_nic, uint64_t now_ns = 0);
 
+    // F7: the dual of onContextUnavailable(). Called when the business context
+    // is observed healthy again. It only revives paths that the context
+    // failure disabled (never graph/port-revoked ones) and moves them to
+    // kRecovering: HEALTHY is only ever published by a successful probe.
+    Status onContextAvailable(Topology::NicID local_nic, uint64_t now_ns = 0);
+
     // ---- W3 business-routing gate (design §7.1 / D-10) --------------------
     // Read-only queries used by path selection; they never mutate health and
     // never create a campaign.
@@ -329,6 +330,8 @@ class ProbeLinkManager final : public ProbeAvailabilitySink {
         bool pending{false};
         PendingReason pending_reason{PendingReason::kNone};
         uint64_t pending_since_ns{0};
+        // Why this path is DISABLED. kNone for every other health state.
+        DisableCause disable_cause{DisableCause::kNone};
     };
 
     struct PortRuntime {

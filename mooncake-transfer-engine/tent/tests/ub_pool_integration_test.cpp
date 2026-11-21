@@ -594,6 +594,42 @@ TEST(UbPoolIntegrationTest, NotAcceptedRollsBackAndReturnsTheMember) {
     EXPECT_TRUE(path.stop());
 }
 
+// F5/INV-POST-1: a provider error that does not say where it stopped is not a
+// definite zero acceptance. The record must stay owned and settle through the
+// fence instead of rolling back and handing the member straight back.
+TEST(UbPoolIntegrationTest, ErrorWithoutFailingWrIsUnknownNotRolledBack) {
+    PooledDataPath path(/*slice_timeout_ms=*/20);
+    ASSERT_TRUE(path.start());
+    path.adapter()->setNextPostOutcome(
+        Status::RdmaError("injected post failure without a bad_wr"), 0);
+    path.adapter()->setNextPostEvidence(PostEvidence::kNoFailingWr);
+
+    auto task = path.makeTask(/*slice_count=*/1, /*max_retries=*/0);
+    ASSERT_TRUE(path.workers().submit(task).ok());
+    // The WR may still be in flight: make the record's post return first, then
+    // deliver a completion so the acceptance block is observable.
+    ASSERT_TRUE(PooledDataPath::waitFor(
+        [&] { return path.workers().inflightCount() == 1; }));
+    path.adapter()->injectCompletion(path.businessJfc(), /*token=*/1,
+                                     CompletionCategory::SUCCESS,
+                                     /*completed_bytes=*/16);
+    ASSERT_TRUE(PooledDataPath::waitFor(
+        [&] { return task->transferStatus().s != PENDING; }));
+
+    const auto completion = path.workers().completionStats();
+    EXPECT_EQ(completion.record_rejected, 0U);
+    EXPECT_GE(completion.gate_blocked_by_acceptance, 1U);
+    EXPECT_EQ(completion.not_accepted_with_completion, 0U);
+    ASSERT_TRUE(PooledDataPath::waitFor(
+        [&] { return path.pool().stats().total_returns == 1; }));
+    // The member was retired by the fence, never handed back as "clean".
+    EXPECT_EQ(path.workers().businessStats().pooled_return, 0U);
+    EXPECT_EQ(path.workers().businessStats().pooled_retire, 1U);
+    EXPECT_EQ(path.pool().stats().in_use_members, 0U);
+    EXPECT_EQ(path.credits().outstanding(0), 0U);
+    EXPECT_TRUE(path.stop());
+}
+
 // §9.2 "Unknown" row: a contradictory post result must neither be replayed nor
 // rolled back. The record drains until the timeout fence, then finalizes and
 // retires the member.
