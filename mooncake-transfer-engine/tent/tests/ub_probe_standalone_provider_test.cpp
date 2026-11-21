@@ -383,6 +383,13 @@ TEST(UbProbeStandaloneProviderTest, RebuildPushesTheNewPublicationEpoch) {
     ASSERT_TRUE(provider.waitForRebuilds(2000));
     EXPECT_GT(provider.publicationEpoch(), 1U);
     EXPECT_EQ(pushed_epoch, provider.publicationEpoch());
+    // F12: the replacement event carries the drain receipt for generation 1.
+    ASSERT_FALSE(sink.events.empty());
+    const ProbeEvent& replaced = sink.events.back();
+    ASSERT_EQ(replaced.kind, ProbeEventKind::kProbeHandleReplaced);
+    ASSERT_TRUE(replaced.port.has_value());
+    EXPECT_EQ(replaced.port->previous_generation, 1U);
+    EXPECT_TRUE(replaced.port->previous_drained);
 
     ASSERT_TRUE(provider.shutdown().ok());
     EXPECT_TRUE(adapter->closeContext(context).ok());

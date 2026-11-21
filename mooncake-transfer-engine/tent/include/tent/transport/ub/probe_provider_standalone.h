@@ -266,6 +266,10 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
         bool source_seg_unregistered{false};
         bool area_seg_unregistered{false};
         uint64_t orphan_since_ns{0};
+        // F12: what the next kProbeHandleReplaced publication must claim about
+        // the generation it replaces.
+        uint64_t previous_generation{0};
+        bool previous_drained{false};
         JfcPtr probe_jfc;
         bool owns_jfc{false};
         JettyPtr probe_jetty;

@@ -55,6 +55,12 @@ struct ProbePortSupply {
     ContextPtr context;
     JettyPtr probe_jetty;
     uint64_t jetty_generation{0};
+    // F12: replacement evidence carried by kProbeHandleReplaced.
+    // `previous_generation` names the generation this publication replaces
+    // (0 = first publication); `previous_drained` is the provider's receipt
+    // that no WR of that generation can still reach memory.
+    uint64_t previous_generation{0};
+    bool previous_drained{false};
     // nullptr means probe completions land on the business JFC (shared mode).
     JfcPtr probe_jfc;
     LocalSegmentPtr source_segment;

@@ -102,6 +102,21 @@ struct ProbeRecord {
     // Periodic test-mode probe (probe/test/periodic_all): settlement can skip
     // health application and never applies exponential backoff.
     bool test_probe{false};
+
+    // ---- F11 completion gate ----------------------------------------------
+    // The native post call and its completion may arrive in either order. The
+    // record may only be settled (slot/budget released, health applied) when
+    // both facts are known: `post_returned` (post_refs dropped to zero) and
+    // `completion_seen`. Otherwise a second probe could start on the same port
+    // while the first is still inside the provider call, or the CQE could
+    // release a slot the post side is still using.
+    std::atomic<uint32_t> post_refs{0};
+    std::atomic<bool> post_returned{false};
+    std::atomic<bool> completion_seen{false};
+    // Completion facts, written under the PLM mutex by the poller before
+    // completion_seen is published and read by the post-return side.
+    Completion completion{};
+    uint64_t completion_ns{0};
 };
 
 // One schedulable probe computed by pendingActions() (design §8.1). The handles
@@ -436,6 +451,12 @@ class ProbeLinkManager final : public ProbeAvailabilitySink {
     void releaseSlotLocked(PortRuntime& port, const ProbeRecord& record);
     void releaseBudgetLocked(const ProbePeerKey& peer);
     void releaseTaskSlotLocked(ProbeRecord& record);
+    // F11: the single settlement point once both the post result and the
+    // completion are known. Holds the mutex; returns true when it settled.
+    bool settleCompletionLocked(const std::shared_ptr<ProbeRecord>& record,
+                                uint64_t now_ns, Effects& effects,
+                                LocalSegmentPtr& source,
+                                RemoteSegmentPtr& area);
     void campaignProgressLocked(const ProbeKey& key, EntryState outcome);
     void exitFinishedCampaignsLocked();
     void applyLocked(const Completion& completion, const PathVersion& version,

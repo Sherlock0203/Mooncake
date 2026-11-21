@@ -322,6 +322,8 @@ TEST(UbProbeIntegrationTest,
     ASSERT_FALSE(actions.empty());
     auto record = env.plm->beginPost(actions.front(), makeProbeToken(1), now);
     ASSERT_NE(record, nullptr);
+    // The poster's synchronous return, then the CQE (F11: both are needed).
+    env.plm->onPostResult(record, ProbePostOutcome::kAccepted, now);
     env.probe_jfc->push(Completion{CompletionCategory::SUCCESS, 0,
                                    record->core.token, 1,
                                    env.probe_jetty->id()});
@@ -354,6 +356,7 @@ TEST(UbProbeIntegrationTest, SharedModeRoutesProbeCompletionOnBusinessJfc) {
     ASSERT_FALSE(actions.empty());
     auto record = env.plm->beginPost(actions.front(), makeProbeToken(1), now);
     ASSERT_NE(record, nullptr);
+    env.plm->onPostResult(record, ProbePostOutcome::kAccepted, now);
     auto business_jfc =
         std::dynamic_pointer_cast<FakeJfc>(env.context->jfc(0)->handle());
     ASSERT_NE(business_jfc, nullptr);

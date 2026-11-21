@@ -54,6 +54,7 @@ TEST(UbProbeTestModeTest, ProbesHealthyPathsOnFixedCadence) {
     auto first = postNext(plm, token_seq, clock.now());
     ASSERT_TRUE(first.has_value());
     EXPECT_EQ(plm.stats().probe_test_post, 1U);
+    plm.onPostResult(first->record, ProbePostOutcome::kAccepted, clock.now());
     ASSERT_TRUE(
         plm.onProbeCompletion(makeCompletion(first->token), clock.now()));
     EXPECT_EQ(plm.stats().probe_test_ok, 1U);
@@ -94,6 +95,7 @@ TEST(UbProbeTestModeTest, ApplyHealthFalseNeverChangesHealthOrRetiresLane) {
     uint64_t token_seq = 0;
     auto probe = postNext(plm, token_seq, clock.now());
     ASSERT_TRUE(probe.has_value());
+    plm.onPostResult(probe->record, ProbePostOutcome::kAccepted, clock.now());
     ASSERT_TRUE(plm.onProbeCompletion(
         makeCompletion(probe->token, CompletionCategory::REMOTE_PATH_ERROR),
         clock.now()));
@@ -148,6 +150,7 @@ TEST(UbProbeTestModeTest, MemoryErrorIsolatesWithoutLaneRebuild) {
     clock.advance(kTestIntervalNs);
     auto probe = postNext(plm, token_seq, clock.now());
     ASSERT_TRUE(probe.has_value());
+    plm.onPostResult(probe->record, ProbePostOutcome::kAccepted, clock.now());
     ASSERT_TRUE(plm.onProbeCompletion(
         makeCompletion(probe->token, CompletionCategory::MEMORY_ERROR),
         clock.now()));
@@ -159,6 +162,8 @@ TEST(UbProbeTestModeTest, MemoryErrorIsolatesWithoutLaneRebuild) {
     clock.advance(kTestIntervalNs);
     auto recovered = postNext(plm, token_seq, clock.now());
     ASSERT_TRUE(recovered.has_value());
+    plm.onPostResult(recovered->record, ProbePostOutcome::kAccepted,
+                     clock.now());
     ASSERT_TRUE(
         plm.onProbeCompletion(makeCompletion(recovered->token), clock.now()));
     EXPECT_EQ(healthOf(plm, version).health, LinkHealth::kHealthy);
@@ -184,6 +189,8 @@ TEST(UbProbeTestModeTest, CampaignMemoryErrorDoesNotRebuildLane) {
     ASSERT_TRUE(campaign.has_value());
     ASSERT_TRUE(campaign->record != nullptr);
     EXPECT_FALSE(campaign->record->test_probe);
+    plm.onPostResult(campaign->record, ProbePostOutcome::kAccepted,
+                     clock.now());
     ASSERT_TRUE(plm.onProbeCompletion(
         makeCompletion(campaign->token, CompletionCategory::MEMORY_ERROR),
         clock.now()));

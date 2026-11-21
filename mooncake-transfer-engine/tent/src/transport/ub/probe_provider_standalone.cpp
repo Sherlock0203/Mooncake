@@ -742,6 +742,8 @@ ProbePortSupply StandaloneProbeResourceProvider::makePortSupplyLocked(
     supply.context = port.config.context;
     supply.probe_jetty = port.probe_jetty;
     supply.jetty_generation = port.config.generation;
+    supply.previous_generation = port.previous_generation;
+    supply.previous_drained = port.previous_drained;
     supply.probe_jfc = port.owns_jfc ? port.probe_jfc : nullptr;
     supply.source_segment = port.source_segment;
     supply.source_address = reinterpret_cast<uint64_t>(port.source_memory);
@@ -1327,6 +1329,9 @@ Status StandaloneProbeResourceProvider::rebuildPortLocked(
     next.source_size = page;
     next.config.generation = next_generation;
     next.source_generation = next_generation;
+    // F12: the quiesce above already succeeded, so the replacement is proven.
+    next.previous_generation = old_generation;
+    next.previous_drained = true;
     // next.area_* deliberately unchanged: peer descriptors stay valid.
 
     // Publish only after the new source page and generation are ready. If the
@@ -1351,6 +1356,8 @@ Status StandaloneProbeResourceProvider::rebuildPortLocked(
     port.source_size = page;
     port.config.generation = next_generation;
     port.source_generation = next_generation;
+    port.previous_generation = old_generation;
+    port.previous_drained = true;
     // A probe Jetty rebuild changes target_epoch: peers must refresh quickly
     // instead of waiting for the periodic handshake (design §6.6).
     bumpPublicationEpochLocked();

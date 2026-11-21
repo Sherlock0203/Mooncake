@@ -602,6 +602,9 @@ std::shared_ptr<ProbeRecord> ProbeLinkManager::beginPost(
     record->area = edge->area_segment;
     record->credit = 1;
     record->test_probe = action.test;
+    // F11: the post is now inside the provider call. It is cleared by
+    // onPostResult() before settlement is even considered.
+    record->post_refs.store(1, std::memory_order_release);
 
     port->slot_token = token;
     port->slot_generation = port->generation;
@@ -634,98 +637,58 @@ void ProbeLinkManager::onPostResult(const std::shared_ptr<ProbeRecord>& record,
              !record->core.finalize_claimed.load(std::memory_order_acquire))) {
             return;
         }
-        bool retryable_handled = false;
-        switch (outcome) {
-            case ProbePostOutcome::kAccepted: {
-                // The completion may legally have arrived before the post
-                // returned; the WR was still accepted, so count it either way.
-                ++stats_.probe_posted;
-                PathRuntime* accepted_runtime =
-                    findPathLocked(record->key.version);
-                if (accepted_runtime != nullptr) {
-                    accepted_runtime->post_rejections = 0;
-                }
-                if (record->core.finalize_claimed.load(
-                        std::memory_order_acquire))
-                    return;
-                record->state = RecordState::kAwaiting;
-                record->posted_ns = now;
-                record->deadline_ns = now + params_.timeoutNs();
-                return;
-            }
-            case ProbePostOutcome::kUnknown:
+
+        const bool accepted = outcome == ProbePostOutcome::kAccepted ||
+                              outcome == ProbePostOutcome::kUnknown;
+        const bool retryable = outcome == ProbePostOutcome::kRejectedRetryable;
+        if (accepted) {
+            // The completion may legally have arrived before the post
+            // returned; the WR was still accepted, so count it either way.
+            ++stats_.probe_posted;
+            if (outcome == ProbePostOutcome::kUnknown) {
                 // The provider could not prove non-acceptance: treat it as
                 // accepted, never resend (design §8.6).
-                ++stats_.probe_posted;
                 ++stats_.probe_post_unknown;
-                if (record->core.finalize_claimed.load(
-                        std::memory_order_acquire))
-                    return;
+            }
+            PathRuntime* runtime = findPathLocked(record->key.version);
+            if (runtime != nullptr) runtime->post_rejections = 0;
+        }
+
+        // F11: the provider call has returned. Only now may a deferred
+        // completion settle, and only now may the slot/budget be released.
+        record->post_returned.store(true, std::memory_order_release);
+        record->post_refs.store(0, std::memory_order_release);
+
+        if (accepted) {
+            if (record->completion_seen.load(std::memory_order_acquire)) {
+                (void)settleCompletionLocked(record, record->completion_ns,
+                                             effects, source, area);
+            } else if (!record->core.finalize_claimed.load(
+                           std::memory_order_acquire)) {
                 record->state = RecordState::kAwaiting;
                 record->posted_ns = now;
                 record->deadline_ns = now + params_.timeoutNs();
                 return;
-            case ProbePostOutcome::kRejected:
-                break;
-            case ProbePostOutcome::kRejectedRetryable: {
-                // F8: capacity/not-ready rejections are not evidence against
-                // the path. Release the slot and budget (the concurrent quota
-                // really was returned) but keep the verification obligation:
-                // the campaign entry stays queued, so timeEligibleLocked()
-                // schedules the next attempt once the backoff expires.
-                ++stats_.probe_post_rejected_retryable;
-                record->state = RecordState::kRejected;
-                const uint64_t token = record->core.token;
-                inflight_.erase(token);
-                inflight_cv_.notify_all();
-                PortRuntime* port =
-                    findPortLocked(record->key.version.path.local_nic);
-                if (port != nullptr) releaseSlotLocked(*port, *record);
-                releaseBudgetLocked(record->peer);
-                PathRuntime* runtime = findPathLocked(record->key.version);
-                if (runtime != nullptr) {
-                    const uint32_t rejections = ++runtime->post_rejections;
-                    if (record->test_probe) {
-                        runtime->test_due_ns = now + params_.testIntervalNs();
-                    } else if (rejections > params_.post_rejection_cap) {
-                        // Give up the obligation explicitly and count it.
-                        ++stats_.probe_verification_abandoned;
-                        campaignProgressLocked(record->key,
-                                               EntryState::kCanceled);
-                        LOG_EVERY_N(WARNING, 10)
-                            << "UB probe verification abandoned after "
-                            << rejections << " retryable post rejections: "
-                            << probeKeyText(record->key);
-                    } else {
-                        const uint32_t shift =
-                            std::min<uint32_t>(rejections, 4);
-                        runtime->next_probe_ns =
-                            now +
-                            std::min<uint64_t>(params_.intervalNs() << shift,
-                                               params_.backoffMaxNs());
-                    }
-                }
-                releaseTaskSlotLocked(*record);
-                source = std::move(record->source);
-                area = std::move(record->area);
-                // Do not fall into the terminal-rejection block below: the
-                // obligation is still alive, so the campaign entry must not be
-                // cancelled and probe_post_rejected must not be charged.
-                retryable_handled = true;
-                break;
             }
-        }
-
-        if (!retryable_handled) {
-            if (record->core.finalize_claimed.exchange(true)) {
-                // A real completion already claimed this record even though the
-                // provider reported "not accepted": the resource is
-                // self-contradictory, so retire the probe lane without rolling
-                // back health (design §8.6).
-                ++stats_.probe_post_conflict;
-                LOG_EVERY_N(WARNING, 10)
-                    << "UB probe post/completion conflict: "
-                    << probeKeyText(record->key);
+            // Else: a timeout already claimed it; the tail below is a no-op.
+        } else if (record->completion_seen.load(std::memory_order_acquire)) {
+            // Contradictory provider: it rejected the post, yet a completion
+            // for the same WR arrived. Count the conflict once.
+            ++stats_.probe_post_conflict;
+            LOG_EVERY_N(WARNING, 10) << "UB probe post/completion conflict: "
+                                     << probeKeyText(record->key);
+            if (!record->core.finalize_claimed.load(
+                    std::memory_order_acquire)) {
+                // The CQE was deferred waiting for this post result. The
+                // completion is real evidence that the WR ended, so settle it
+                // exactly once instead of retiring a lane whose WR demonstrably
+                // completed.
+                (void)settleCompletionLocked(record, record->completion_ns,
+                                             effects, source, area);
+            } else {
+                // Already settled by an earlier accepted + completion pair: a
+                // late contradiction may only retire the lane, never release
+                // resources again (design §8.6).
                 PortRuntime* port =
                     findPortLocked(record->key.version.path.local_nic);
                 if (port != nullptr && !params_.test_periodic_all) {
@@ -735,37 +698,75 @@ void ProbeLinkManager::onPostResult(const std::shared_ptr<ProbeRecord>& record,
                             "probe post rejected after completion"),
                         effects);
                 }
-            } else {
-                ++stats_.probe_post_rejected;
-                LOG_EVERY_N(WARNING, 100)
-                    << "UB probe post rejected: " << probeKeyText(record->key);
-                record->state = RecordState::kRejected;
-                const uint64_t token = record->core.token;
-                inflight_.erase(token);
-                inflight_cv_.notify_all();
-                PortRuntime* port =
-                    findPortLocked(record->key.version.path.local_nic);
-                if (port != nullptr) releaseSlotLocked(*port, *record);
-                releaseBudgetLocked(record->peer);
-                PathRuntime* runtime = findPathLocked(record->key.version);
-                if (runtime != nullptr) {
-                    if (record->test_probe) {
-                        runtime->test_due_ns = now + params_.testIntervalNs();
-                    } else {
-                        runtime->next_probe_ns =
-                            now + std::min(params_.intervalNs(),
-                                           kPostRejectedRetryCapNs);
-                    }
-                }
-                // A rejected post is not a path fault, but retrying it in a
-                // tight loop burns probe_seq without ever producing a
-                // completion. Close the campaign entry; the next
-                // campaign/periodic event retries.
-                campaignProgressLocked(record->key, EntryState::kCanceled);
-                releaseTaskSlotLocked(*record);
-                source = std::move(record->source);
-                area = std::move(record->area);
             }
+        } else if (record->core.finalize_claimed.exchange(
+                       true, std::memory_order_acq_rel)) {
+            // A timeout/fence claimed the record while the post was returning;
+            // its path owns the release.
+        } else if (retryable) {
+            // F8: capacity/not-ready rejections are not evidence against the
+            // path. Release the slot and budget but keep the verification
+            // obligation: the campaign entry stays queued, so
+            // timeEligibleLocked() schedules the next attempt after backoff.
+            ++stats_.probe_post_rejected_retryable;
+            record->state = RecordState::kRejected;
+            inflight_.erase(record->core.token);
+            inflight_cv_.notify_all();
+            PortRuntime* port =
+                findPortLocked(record->key.version.path.local_nic);
+            if (port != nullptr) releaseSlotLocked(*port, *record);
+            releaseBudgetLocked(record->peer);
+            PathRuntime* runtime = findPathLocked(record->key.version);
+            if (runtime != nullptr) {
+                const uint32_t rejections = ++runtime->post_rejections;
+                if (record->test_probe) {
+                    runtime->test_due_ns = now + params_.testIntervalNs();
+                } else if (rejections > params_.post_rejection_cap) {
+                    // Give up the obligation explicitly and count it.
+                    ++stats_.probe_verification_abandoned;
+                    campaignProgressLocked(record->key, EntryState::kCanceled);
+                    LOG_EVERY_N(WARNING, 10)
+                        << "UB probe verification abandoned after "
+                        << rejections << " retryable post rejections: "
+                        << probeKeyText(record->key);
+                } else {
+                    const uint32_t shift = std::min<uint32_t>(rejections, 4);
+                    runtime->next_probe_ns =
+                        now + std::min<uint64_t>(params_.intervalNs() << shift,
+                                                 params_.backoffMaxNs());
+                }
+            }
+            releaseTaskSlotLocked(*record);
+            source = std::move(record->source);
+            area = std::move(record->area);
+        } else {
+            ++stats_.probe_post_rejected;
+            LOG_EVERY_N(WARNING, 100)
+                << "UB probe post rejected: " << probeKeyText(record->key);
+            record->state = RecordState::kRejected;
+            inflight_.erase(record->core.token);
+            inflight_cv_.notify_all();
+            PortRuntime* port =
+                findPortLocked(record->key.version.path.local_nic);
+            if (port != nullptr) releaseSlotLocked(*port, *record);
+            releaseBudgetLocked(record->peer);
+            PathRuntime* runtime = findPathLocked(record->key.version);
+            if (runtime != nullptr) {
+                if (record->test_probe) {
+                    runtime->test_due_ns = now + params_.testIntervalNs();
+                } else {
+                    runtime->next_probe_ns =
+                        now +
+                        std::min(params_.intervalNs(), kPostRejectedRetryCapNs);
+                }
+            }
+            // A rejected post is not a path fault, but retrying it in a tight
+            // loop burns probe_seq without ever producing a completion. Close
+            // the campaign entry; the next campaign/periodic event retries.
+            campaignProgressLocked(record->key, EntryState::kCanceled);
+            releaseTaskSlotLocked(*record);
+            source = std::move(record->source);
+            area = std::move(record->area);
         }
     }
 
@@ -860,78 +861,18 @@ bool ProbeLinkManager::onProbeCompletion(const Completion& completion,
                         << record->key.campaign_epoch;
                 }
             }
-            if (record->core.finalize_claimed.exchange(true)) return true;
-            inflight_.erase(inflight);
-            record->state = RecordState::kSettled;
-
-            PortRuntime* port =
-                findPortLocked(record->key.version.path.local_nic);
-            if (port != nullptr) releaseSlotLocked(*port, *record);
-            releaseBudgetLocked(record->peer);
-
-            PathRuntime* runtime = findPathLocked(record->key.version);
-            ProbeEdgeSupply* edge = findEdgeLocked(record->key.version);
-            const StaleReason stale = staleReasonLocked(*record);
-            const bool current = stale == StaleReason::kNone;
-            if (current) {
-                if (record->test_probe && !params_.test_apply_health) {
-                    // Pure link check: no health, campaign or lane change.
-                    LOG(INFO)
-                        << "probe test result: "
-                        << pathText(record->key.version)
-                        << " category=" << static_cast<int>(completion.category)
-                        << " token=" << completion.token;
-                    if (completion.category == CompletionCategory::SUCCESS) {
-                        ++stats_.probe_test_ok;
-                    } else {
-                        ++stats_.probe_test_fail;
-                    }
-                } else {
-                    applyLocked(completion, record->key.version, *runtime,
-                                *edge, *port, now, record->test_probe, effects);
-                }
-            } else {
-                ++stats_.probe_stale;
-                switch (stale) {
-                    case StaleReason::kEpoch:
-                        ++stats_.probe_gate_blocked_by_epoch;
-                        break;
-                    case StaleReason::kGeneration:
-                        ++stats_.probe_handle_generation_mismatch;
-                        break;
-                    case StaleReason::kResource:
-                        ++stats_.probe_gate_blocked_by_resource;
-                        break;
-                    case StaleReason::kNone:
-                        break;
-                }
+            // F11: remember the completion, but settle only once the post
+            // side has returned. Until then the port slot and peer budget stay
+            // held: releasing them here would let a second probe start while
+            // the first is still inside the provider call.
+            record->completion = completion;
+            record->completion_ns = now;
+            record->completion_seen.store(true, std::memory_order_release);
+            if (!record->post_returned.load(std::memory_order_acquire) ||
+                record->post_refs.load(std::memory_order_acquire) != 0) {
+                return true;
             }
-
-            // Campaign accounting is filtered by id/epoch; a stale health
-            // result still terminalizes its matching entry so the campaign
-            // cannot hang on an in-flight item (design §7.3).
-            if (runtime != nullptr) {
-                if (record->test_probe) {
-                    // The test cadence is independent of health and backoff;
-                    // even a stale result advances it so the port does not
-                    // spin.
-                    runtime->test_due_ns = now + params_.testIntervalNs();
-                } else if (!current) {
-                    // A stale campaign completion must not make the path
-                    // immediately due again: that spins beginPost() and
-                    // inflates probe_seq without producing a completion.
-                    runtime->next_probe_ns = std::max(
-                        runtime->next_probe_ns, now + params_.intervalNs());
-                }
-            }
-            campaignProgressLocked(
-                record->key, current ? mapCampaignOutcome(completion.category)
-                                     : EntryState::kCanceled);
-            releaseTaskSlotLocked(*record);
-
-            source = std::move(record->source);
-            area = std::move(record->area);
-            inflight_cv_.notify_all();
+            (void)settleCompletionLocked(record, now, effects, source, area);
         }
     }
 
@@ -940,6 +881,87 @@ bool ProbeLinkManager::onProbeCompletion(const Completion& completion,
     source.reset();
     area.reset();
     emitEffects(effects);
+    return true;
+}
+
+bool ProbeLinkManager::settleCompletionLocked(
+    const std::shared_ptr<ProbeRecord>& record, uint64_t now_ns,
+    Effects& effects, LocalSegmentPtr& source, RemoteSegmentPtr& area) {
+    if (record == nullptr) return false;
+    // Exactly once: a late post result after a deferred completion, or a
+    // duplicate CQE, must not release the slot/budget twice.
+    if (record->core.finalize_claimed.exchange(true,
+                                               std::memory_order_acq_rel)) {
+        return false;
+    }
+    inflight_.erase(record->core.token);
+    record->state = RecordState::kSettled;
+    const Completion& completion = record->completion;
+
+    PortRuntime* port = findPortLocked(record->key.version.path.local_nic);
+    if (port != nullptr) releaseSlotLocked(*port, *record);
+    releaseBudgetLocked(record->peer);
+
+    PathRuntime* runtime = findPathLocked(record->key.version);
+    ProbeEdgeSupply* edge = findEdgeLocked(record->key.version);
+    const StaleReason stale = staleReasonLocked(*record);
+    const bool current = stale == StaleReason::kNone;
+    if (current) {
+        if (record->test_probe && !params_.test_apply_health) {
+            // Pure link check: no health, campaign or lane change.
+            LOG(INFO) << "probe test result: " << pathText(record->key.version)
+                      << " category=" << static_cast<int>(completion.category)
+                      << " token=" << completion.token;
+            if (completion.category == CompletionCategory::SUCCESS) {
+                ++stats_.probe_test_ok;
+            } else {
+                ++stats_.probe_test_fail;
+            }
+        } else {
+            applyLocked(completion, record->key.version, *runtime, *edge, *port,
+                        now_ns, record->test_probe, effects);
+        }
+    } else {
+        ++stats_.probe_stale;
+        switch (stale) {
+            case StaleReason::kEpoch:
+                ++stats_.probe_gate_blocked_by_epoch;
+                break;
+            case StaleReason::kGeneration:
+                ++stats_.probe_handle_generation_mismatch;
+                break;
+            case StaleReason::kResource:
+                ++stats_.probe_gate_blocked_by_resource;
+                break;
+            case StaleReason::kNone:
+                break;
+        }
+    }
+
+    // Campaign accounting is filtered by id/epoch; a stale health result still
+    // terminalizes its matching entry so the campaign cannot hang on an
+    // in-flight item (design §7.3).
+    if (runtime != nullptr) {
+        if (record->test_probe) {
+            // The test cadence is independent of health and backoff; even a
+            // stale result advances it so the port does not spin.
+            runtime->test_due_ns = now_ns + params_.testIntervalNs();
+        } else if (!current) {
+            // A stale campaign completion must not make the path immediately
+            // due again: that spins beginPost() and inflates probe_seq without
+            // producing a completion.
+            runtime->next_probe_ns =
+                std::max(runtime->next_probe_ns, now_ns + params_.intervalNs());
+        }
+    }
+    campaignProgressLocked(record->key,
+                           current ? mapCampaignOutcome(completion.category)
+                                   : EntryState::kCanceled);
+    releaseTaskSlotLocked(*record);
+
+    source = std::move(record->source);
+    area = std::move(record->area);
+    inflight_cv_.notify_all();
     return true;
 }
 
@@ -1914,6 +1936,26 @@ Status ProbeLinkManager::applyEventLocked(const ProbeEvent& event,
             PortRuntime* port = findPortLocked(event.port->local_nic);
             if (port == nullptr) {
                 return Status::InvalidArgument("probe port not in graph");
+            }
+            // F12: fail closed when the provider replaces a generation without
+            // proving the previous one was drained. Trusting the generation
+            // bump alone would let old WRs still targeting the retired page
+            // coexist with a port the LM treats as newly usable.
+            const bool replacing =
+                event.port->previous_generation == port->generation &&
+                port->generation != 0;
+            if (replacing && !event.port->previous_drained) {
+                ++stats_.probe_replacement_unproven;
+                port->handle_valid = false;
+                markPortPendingLocked(
+                    *port, PendingReason::kReplacementUnproven, now_ns);
+                LOG_EVERY_N(WARNING, 10)
+                    << "UB probe lane replaced without a drain receipt: "
+                    << "local_nic=" << event.port->local_nic
+                    << " generation=" << port->generation;
+                return Status::InternalError(
+                    "probe lane replaced without a drain receipt for the "
+                    "previous generation" LOC_MARK);
             }
             // Retire the old generation's in-flight records first: they keep
             // their references in the orphan table and may complete late.
