@@ -175,6 +175,7 @@ UbWorkers::UbWorkers(std::shared_ptr<UrmaAdapter> adapter,
           params_.probe.adjacency_policy.param_error_invalidate_threshold),
       tombstones_(std::move(tombstones)),
       control_executor_(std::move(control_executor)) {
+    gate_ctx_.retry_timeout_write = params_.retry_timeout_write;
     for (const auto& context : contexts_) {
         if (!context) continue;
         context_by_topology_id_[context->topologyId()] = context;
@@ -2106,6 +2107,12 @@ UbWorkers::ClaimDecision UbWorkers::claimPost(
     const AttemptKey& attempt, const LeaseWithCredit& leased,
     const UbPostPath& path, const ProbePathKey& probe_key,
     uint64_t fault_epoch_snapshot) {
+    // The PLM fault epoch compared here is part of the claim *decision*, not an
+    // observation: a path isolated after the pre-lease snapshot must reject
+    // this attempt (the caller rolls back and re-plans).
+    // `post_on_isolated_path_` only observes the inherent window between this
+    // claim and the native post call; it is not the isolation check itself.
+    //
     // W3g R-1. Two independent inputs decide whether the WR may be posted:
     //   1. the pool's synchronized verdict (stopping / member / generation /
     //      error epoch), authoritative for the leased resource;
@@ -2183,6 +2190,7 @@ std::shared_ptr<UbWorkers::BusinessRecord> UbWorkers::makeRecord(
     record->core.path = makeBusinessRecordPath(path);
     record->core.jetty_generation = path.endpoint_generation;
     record->core.owner = record.get();
+    record->core.write_opcode = pending.opcode == Request::WRITE;
     record->pending = pending;
     record->attempt = attempt;
     record->path = path;

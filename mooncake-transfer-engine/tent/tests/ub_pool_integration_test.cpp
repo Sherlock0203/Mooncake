@@ -39,6 +39,16 @@
 #include "ub_fake_urma.h"
 
 namespace mooncake::tent::ub {
+
+// Declared as a friend by UbWorkers so the test can arm the thread-local
+// enqueue-failure hook without a production setter.
+class UbWorkersTestPeer {
+   public:
+    static void failSecondEnqueue() {
+        UbWorkers::fail_second_enqueue_for_test_ = true;
+    }
+};
+
 namespace {
 
 using namespace fake;
@@ -990,6 +1000,29 @@ TEST(UbPoolIntegrationTest, DeviceRetireRunsOffThePoller) {
     EXPECT_GT(executor->runAll(), 0U);
     EXPECT_GE(handler_calls.load(), 1U);
     EXPECT_EQ(path.workers().businessStats().device_retire_rejected, 0U);
+    EXPECT_TRUE(path.stop());
+}
+
+// §6.1 exception path: an enqueue failure after part of the batch was marked
+// must roll the queues back and cancel every slice of the batch, so nothing is
+// left kQueued behind the failure.
+TEST(UbPoolIntegrationTest, BatchEnqueueExceptionRollsBackAndCancels) {
+    PooledDataPath path;
+    ASSERT_TRUE(path.start());
+    auto task = path.makeTask(/*slice_count=*/2);
+    UbWorkersTestPeer::failSecondEnqueue();
+    const Status status = path.workers().submit(task);
+    EXPECT_TRUE(status.IsInternalError());
+    EXPECT_EQ(path.workers().queuedCount(), 0U);
+    EXPECT_EQ(path.workers().businessStats().queue_depth, 0U);
+    for (const auto& slice : task->slices()) {
+        EXPECT_EQ(slice->snapshot().state, UbSliceState::kCanceled);
+    }
+    // The failure did not poison the workers: a later submission still works.
+    auto retry = path.makeTask(/*slice_count=*/1);
+    ASSERT_TRUE(path.workers().submit(retry).ok());
+    ASSERT_TRUE(PooledDataPath::waitFor(
+        [&] { return retry->transferStatus().s == COMPLETED; }));
     EXPECT_TRUE(path.stop());
 }
 

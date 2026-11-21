@@ -231,6 +231,9 @@ struct CompletionRecord {
     // A real fault was recorded. This is a logical flag only: alone it is
     // never release evidence (IN-3).
     std::atomic<bool> fault_seen{false};
+    // F6d: this record's WR carried a WRITE opcode. Recorded so the timeout
+    // retry policy can distinguish READ from WRITE replay.
+    bool write_opcode{false};
     // Executors currently touching reusable state (post stack, settle scope).
     // A gate fact, not a lifetime mechanism (D-4).
     std::atomic<int32_t> handler_refs{0};
@@ -355,9 +358,20 @@ class CompletionStats {
 // (the design's GateContext, minus the clock: no decision in W2 needs one).
 struct GateContext {
     CompletionStats stats{};
+    // F6d: `transports/ub/retry_timeout_write`. Copied once from UbParams so
+    // the settle path never reaches into transport configuration.
+    bool retry_timeout_write{true};
 };
 
 namespace gate {
+
+// F6d: retryability of the delivered logical result. A timed-out WRITE is only
+// retryable when the deployment allows write replay; READ is always retryable
+// (a fixed-length read has no side effect). If a future opcode with non-
+// idempotent semantics joins this path, it must be classified here explicitly.
+[[nodiscard]] bool logicalRetryable(const CompletionRecord& record,
+                                    LogicalOutcome outcome,
+                                    bool retry_timeout_write = true);
 
 // Owner-side side effects. `UbWorkers` implements this; the gate itself only
 // decides *when* each callback may run. Callbacks run outside any record lock,

@@ -289,6 +289,12 @@ struct UbParams {
     // reflowed (kReflow is only reachable on an empty pop). Force a reflow at
     // least this often. 0 disables the cadence (legacy behavior).
     uint32_t defer_reflow_max_gap_ms = 10;
+    // F6d: allow replaying a timed-out WRITE. Fixed-length byte moves are
+    // idempotent while the source is not concurrently rewritten, which is an
+    // existing assumption of the whole design; this switch lets a deployment
+    // that needs strict write-once semantics forbid it. READ replay stays
+    // allowed either way.
+    bool retry_timeout_write = true;
     // F6c: honor Request::deadline_ns (absolute steady_clock, 0 = none) at
     // every stage. UB does no predictive cancellation (that is the admission
     // queue's job); it only terminates requests whose deadline already passed.
@@ -557,6 +563,9 @@ struct UbParams {
         CHECK_STATUS(readNonNegative(
             config, "transports/ub/defer_reflow_max_gap_ms",
             parsed.defer_reflow_max_gap_ms, parsed.defer_reflow_max_gap_ms));
+        CHECK_STATUS(readBool(config, "transports/ub/retry_timeout_write",
+                              parsed.retry_timeout_write,
+                              parsed.retry_timeout_write));
         CHECK_STATUS(readBool(config, "transports/ub/honor_request_deadline",
                               parsed.honor_request_deadline,
                               parsed.honor_request_deadline));

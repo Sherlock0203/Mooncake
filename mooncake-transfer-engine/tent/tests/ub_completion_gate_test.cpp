@@ -861,5 +861,26 @@ TEST(UbCompletionGateTest, PredicatesFollowTheDocumentedMatrix) {
     EXPECT_TRUE(pending.hasResponsibilityEvidence());
 }
 
+// F6d: the READ/WRITE timeout replay policy is explicit, not a blanket
+// "timeouts are retryable". Four combinations: READ/WRITE x switch on/off.
+TEST(UbCompletionGateTest, RetryableTimeoutPolicyIsExplicit) {
+    CompletionRecord read;
+    read.write_opcode = false;
+    CompletionRecord write;
+    write.write_opcode = true;
+
+    EXPECT_TRUE(gate::logicalRetryable(read, LogicalOutcome::kTimeout, true));
+    EXPECT_TRUE(gate::logicalRetryable(read, LogicalOutcome::kTimeout, false));
+    EXPECT_TRUE(gate::logicalRetryable(write, LogicalOutcome::kTimeout, true));
+    EXPECT_FALSE(
+        gate::logicalRetryable(write, LogicalOutcome::kTimeout, false));
+
+    // The switch only affects timeouts: a completed transfer is never retried.
+    EXPECT_FALSE(
+        gate::logicalRetryable(read, LogicalOutcome::kCompleted, true));
+    EXPECT_FALSE(
+        gate::logicalRetryable(write, LogicalOutcome::kCompleted, true));
+}
+
 }  // namespace
 }  // namespace mooncake::tent::ub
