@@ -10,7 +10,7 @@
 #include <unordered_map>
 
 #include "tent/common/status.h"
-#include "tent/transport/ub/business_jetty_pool.h"
+#include "tent/transport/ub/send_jetty_pool.h"
 
 namespace mooncake::tent::ub {
 

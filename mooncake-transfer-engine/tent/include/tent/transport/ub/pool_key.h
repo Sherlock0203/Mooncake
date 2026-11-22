@@ -4,7 +4,7 @@
 // Pool identity types shared by the send-Jetty pool and the asynchronous
 // drain controller (design tent-ub-async-drain-design.md §4.2).
 //
-// These used to live in business_jetty_pool.h. The drain controller needs the
+// These used to live in send_jetty_pool.h. The drain controller needs the
 // exact same identities but cannot include the pool header: the pool includes
 // the controller (it drives beginDrain()), so a dedicated leaf header breaks
 // the cycle without changing a single name or hash.

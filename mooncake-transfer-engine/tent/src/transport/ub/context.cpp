@@ -12,7 +12,7 @@
 #include <utility>
 
 #include "jetty_pool.h"
-#include "tent/transport/ub/business_jetty_pool.h"
+#include "tent/transport/ub/send_jetty_pool.h"
 
 namespace mooncake::tent::ub {
 namespace {
@@ -156,13 +156,23 @@ Status UbContext::shutdownLocked() {
     }
     state_.store(State::kDraining, std::memory_order_release);
 
-    // Drain the send-Jetty reuse pool (when attached) before the JFCs are
-    // closed so no idle Jetty outlives its parent JFC. A failed delete keeps
-    // the handle inside the pool for the next shutdown retry.
+    // Stop, drain and detach the legacy send-Jetty pool (when attached) before
+    // the JFCs are closed so no Jetty outlives its parent JFC (C12 / G-02).
+    // beginStop freezes new leases; drain deletes pending members; detach drops
+    // the pool's strong Context/JFC references so closeContext()/JFC close can
+    // succeed even while an external owner still holds the pool shared_ptr
+    // (releaseTypedHandle requires use_count()==1).
     Status first_error = Status::OK();
     if (jetty_pool_) {
+        jetty_pool_->beginStop();
         auto status = jetty_pool_->drain();
-        if (!status.ok()) first_error = std::move(status);
+        if (!status.ok()) {
+            // A pending Jetty must be deleted before its parent JFC closes.
+            // Keep the pool attached and let the next shutdown retry drain it;
+            // do not close JFCs/Context yet.
+            return status;
+        }
+        jetty_pool_->detach();
     }
     // Drain the pooled rm_pool send pool (when attached) before the JFCs
     // are closed. Idle members are deleted; quarantined members get one
@@ -227,6 +237,16 @@ Status UbContext::shutdownLocked() {
 std::shared_ptr<UbJfc> UbContext::jfc(size_t index) const {
     if (jfcs_.empty()) return nullptr;
     return jfcs_[index % jfcs_.size()];
+}
+
+void UbContext::setJettyOptions(JettyOptions options) {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    jetty_options_ = options;
+}
+
+std::optional<JettyOptions> UbContext::jettyOptions() const {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    return jetty_options_;
 }
 
 void UbContext::addInflight(uint64_t bytes) noexcept {
