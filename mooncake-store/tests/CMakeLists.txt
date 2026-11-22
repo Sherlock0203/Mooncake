@@ -22,6 +22,12 @@ endfunction()
 add_executable(stress_bench_validation_test stress_bench_validation_test.cpp)
 target_include_directories(stress_bench_validation_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+# The Store headers reachable from this test (nof_gpu_direct_report.h ->
+# types.h) include Slab.h and ylt headers, so the dependencies that carry
+# those include paths must be linked even though no symbols are used.
+target_link_libraries(stress_bench_validation_test
+                      PRIVATE cachelib_memory_allocator
+                              yalantinglibs::yalantinglibs)
 add_test(NAME stress_bench_validation_test COMMAND stress_bench_validation_test)
 add_executable(ub_allocator_lifecycle_test
                ub_allocator_lifecycle_test.cpp

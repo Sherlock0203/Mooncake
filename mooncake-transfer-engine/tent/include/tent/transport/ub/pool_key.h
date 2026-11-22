@@ -27,6 +27,12 @@ struct PoolKey {
     uint32_t bind_tp_type_mask = 0;
 
     bool operator==(const PoolKey&) const = default;
+
+    // A zero context incarnation is the unassigned sentinel (bootstrap v2
+    // rejects it); a pool key without one cannot partition members safely.
+    [[nodiscard]] bool valid() const noexcept {
+        return context_incarnation != 0;
+    }
 };
 
 struct PoolKeyHash {

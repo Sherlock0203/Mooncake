@@ -969,28 +969,34 @@ TEST(UbBootstrapTest, ValidatesPooledInventoryAndTargetTopology) {
 
 TEST(UbBootstrapTest, PooledV3GateClassifiesVersionsAndModes) {
     const auto pooled = makeValidPooledBootstrap();
-    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::kPooledRm, pooled).ok());
+    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::kPooledRm,
+                                       UbBootstrapProtocol::kAuto, pooled)
+                    .ok());
     // A successful gate does not claim the pooled data plane exists.
-    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::RM, pooled)
+    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::RM,
+                                       UbBootstrapProtocol::kAuto, pooled)
                     .IsInvalidArgument());
-    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::RC, pooled)
+    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::RC,
+                                       UbBootstrapProtocol::kAuto, pooled)
                     .IsNotImplemented());
 
     // Requests carrying a reply envelope are responses, not requests.
     auto response = pooled;
     response.reply_msg = "response is not a request";
-    EXPECT_TRUE(
-        gateUbBootstrapForMode(UbBootstrapMode::kPooledRm, response)
-            .IsInvalidArgument());
+    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::kPooledRm,
+                                       UbBootstrapProtocol::kAuto, response)
+                    .IsInvalidArgument());
 
     // Mixed versions are explicitly unsupported: v1/v2 never satisfy the
     // pooled gate and are not silently upgraded.
     const auto v2 = makeValidRmBootstrap();
-    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::kPooledRm, v2)
+    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::kPooledRm,
+                                       UbBootstrapProtocol::kAuto, v2)
                     .IsInvalidArgument());
     UbBootstrapDesc v1;
     v1.protocol_version = 1;
-    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::kPooledRm, v1)
+    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::kPooledRm,
+                                       UbBootstrapProtocol::kAuto, v1)
                     .IsInvalidArgument());
 }
 
