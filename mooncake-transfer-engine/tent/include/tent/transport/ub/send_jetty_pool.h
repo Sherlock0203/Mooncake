@@ -9,12 +9,15 @@
 // jetty_refill_worker.h and jetty_retire_worker.h; both run provider calls
 // outside the pool lock.
 //
-// The class is named `BusinessJettyPool` per the target component layout. The
-// previous spelling `SendJettyPool` stays as an alias for one release so
-// downstream code and tests keep compiling while they migrate.
+// Unified naming (merge of business_jetty_pool.h and the former tent_rm
+// send_jetty_pool.h): the class is canonically `SendJettyPool` and lives in
+// send_jetty_pool.h. The implementation is the superset evolution (tombstone
+// bookkeeping, asynchronous drain controller, claim gate, creation backoff,
+// retained-delete retry) that previously lived under the interim spelling
+// `BusinessJettyPool`; that file and alias are gone.
 
-#ifndef TENT_TRANSPORT_UB_BUSINESS_JETTY_POOL_H_
-#define TENT_TRANSPORT_UB_BUSINESS_JETTY_POOL_H_
+#ifndef TENT_TRANSPORT_UB_SEND_JETTY_POOL_H_
+#define TENT_TRANSPORT_UB_SEND_JETTY_POOL_H_
 
 #include <atomic>
 #include <cstddef>
@@ -126,7 +129,7 @@ struct PoolMember {
     uint32_t delete_retry_attempts = 0;
 };
 
-class BusinessJettyPool;
+class SendJettyPool;
 class JettyRetireWorker;
 class JettyRefillWorker;
 
@@ -163,11 +166,11 @@ class SliceJettyLease {
     }
 
    private:
-    friend class BusinessJettyPool;
+    friend class SendJettyPool;
     class JettyRetireWorker;
     class JettyRefillWorker;
     friend class ::UbSendJettyPoolTest_DoubleReturnRejected_Test;
-    SliceJettyLease(std::weak_ptr<BusinessJettyPool> pool,
+    SliceJettyLease(std::weak_ptr<SendJettyPool> pool,
                     std::shared_ptr<PoolMember> member, AttemptKey attempt)
         : pool_(std::move(pool)),
           member_(std::move(member)),
@@ -180,7 +183,7 @@ class SliceJettyLease {
     }
 
     // SendJettyPool is held as a weak reference (RC-04).
-    std::weak_ptr<BusinessJettyPool> pool_;
+    std::weak_ptr<SendJettyPool> pool_;
     std::shared_ptr<PoolMember> member_;
     AttemptKey attempt_{};
 };
@@ -368,10 +371,10 @@ struct SendJettyPoolStats {
 // beginStop()/drainIdle(); drainIdle() verifies that no lease is outstanding
 // and logs an error when the contract is violated. The pool must be owned by
 // a shared_ptr so leases can hold a weak reference (RC-04).
-class BusinessJettyPool final
-    : public std::enable_shared_from_this<BusinessJettyPool> {
+class SendJettyPool final
+    : public std::enable_shared_from_this<SendJettyPool> {
    public:
-    BusinessJettyPool(std::shared_ptr<UrmaAdapter> adapter,
+    SendJettyPool(std::shared_ptr<UrmaAdapter> adapter,
                       ContextPtr context_handle,
                       std::vector<std::shared_ptr<UbJfc>> jfcs,
                       std::shared_ptr<NativeBudget> budget,
@@ -379,14 +382,14 @@ class BusinessJettyPool final
                       std::shared_ptr<JfcCreditLedger> credits,
                       SendJettyPoolOptions options);
 
-    BusinessJettyPool(const BusinessJettyPool&) = delete;
-    BusinessJettyPool& operator=(const BusinessJettyPool&) = delete;
+    SendJettyPool(const SendJettyPool&) = delete;
+    SendJettyPool& operator=(const SendJettyPool&) = delete;
 
     // Stops both executors (when enabled), drains any pending asynchronous
     // deletes and gives quarantined members one last delete attempt. The
     // context normally calls beginStop()/drainIdle()/drainQuarantined()
     // first; the destructor is the final safety net.
-    ~BusinessJettyPool();
+    ~SendJettyPool();
 
     // Non-blocking lease for one attempt. Status codes:
     //   OK               lease (and JFC credit) acquired
@@ -629,9 +632,6 @@ class BusinessJettyPool final
     bool quarantine_backpressure_ = false;
 };
 
-// Migration alias: new code should name BusinessJettyPool directly.
-using SendJettyPool = BusinessJettyPool;
-
 }  // namespace mooncake::tent::ub
 
-#endif  // TENT_TRANSPORT_UB_BUSINESS_JETTY_POOL_H_
+#endif  // TENT_TRANSPORT_UB_SEND_JETTY_POOL_H_

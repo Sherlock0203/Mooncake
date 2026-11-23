@@ -2105,10 +2105,10 @@ TEST(UbRmLegacyTest, BindRmClassifiesRepeatedBootstrapAgainstIncumbent) {
     EXPECT_TRUE(adapter->shutdown().ok());
 }
 
-// Simple send-Jetty reuse: a cleanly retired incarnation returns its
-// drained Jettys to the per-context pool and the next incarnation re-leases
-// them instead of creating new ones.
-TEST(UbRmLegacyTest, SendJettyPoolReusesDrainedJettys) {
+// Fail-closed send-Jetty lifecycle (C02 / G-01): a drained RESET member has no
+// rearm proof, so retiring an incarnation deletes its Jettys instead of idling
+// them and the next incarnation creates fresh ones.
+TEST(UbRmLegacyTest, SendJettyPoolRetiresDrainedJettys) {
     auto adapter = std::make_shared<FakeUrmaAdapter>(rmCapableDevice());
     ASSERT_TRUE(adapter->initialize().ok());
     auto context = std::make_shared<UbContext>(0, rmCapableDevice(), adapter);
@@ -2145,22 +2145,23 @@ TEST(UbRmLegacyTest, SendJettyPoolReusesDrainedJettys) {
     ASSERT_TRUE(first->bindRm(peer, expectedForRmPeer(peer)).ok());
     EXPECT_EQ(first->importedTargetCount(), 2U);
 
-    // A clean retire returns both Jettys to the pool instead of deleting
-    // them; the imported targets are still unimported.
+    // A clean retire retires (deletes) both Jettys: without a RESET-rearm
+    // proof nothing may be idled for reuse. The imported targets are still
+    // unimported.
     ASSERT_TRUE(first->retire().ok());
     EXPECT_EQ(first->state(), UbEndpoint::State::kDestroyed);
-    EXPECT_EQ(adapter->deleteJettyCalls(), 0U)
-        << "pooled Jettys must not be deleted on retire";
-    EXPECT_EQ(pool->idleCount(), 2U);
+    EXPECT_EQ(adapter->deleteJettyCalls(), 2U)
+        << "a drained member must be retired, not idled";
+    EXPECT_EQ(pool->idleCount(), 0U);
     EXPECT_EQ(first->importedTargetCount(), 0U);
     EXPECT_EQ(adapter->unimportCalls(), 2U);
 
-    // Second incarnation reuses the pooled Jettys: no new createJetty and
-    // the data-plane pairing (2 targets, 2 Jettys) still validates.
+    // The second incarnation creates fresh Jettys; a drained member is never
+    // re-leased, and the data-plane pairing (2 targets, 2 Jettys) validates.
     auto second = make_endpoint();
     ASSERT_TRUE(second->prepare().ok());
-    EXPECT_EQ(adapter->createJettyCalls(), 2U)
-        << "the second incarnation must lease from the pool";
+    EXPECT_EQ(adapter->createJettyCalls(), 4U)
+        << "fail-closed reuse never re-leases a drained member";
     EXPECT_EQ(pool->idleCount(), 0U);
     UbBootstrapDesc second_peer;
     make_peer(second, second_peer);
@@ -2168,14 +2169,13 @@ TEST(UbRmLegacyTest, SendJettyPoolReusesDrainedJettys) {
         second->bindRm(second_peer, expectedForRmPeer(second_peer)).ok());
     EXPECT_EQ(second->importedTargetCount(), 2U);
     ASSERT_TRUE(second->retire().ok());
-    EXPECT_EQ(adapter->createJettyCalls(), 2U);
-    EXPECT_EQ(adapter->deleteJettyCalls(), 0U);
-    EXPECT_EQ(pool->idleCount(), 2U);
+    EXPECT_EQ(adapter->createJettyCalls(), 4U);
+    EXPECT_EQ(adapter->deleteJettyCalls(), 4U);
+    EXPECT_EQ(pool->idleCount(), 0U);
 
-    // Context shutdown drains the pool: every idle Jetty is deleted before
-    // the JFCs go away.
+    // Context shutdown drains the pool: nothing is pending for deletion.
     EXPECT_TRUE(context->shutdown().ok());
-    EXPECT_EQ(adapter->deleteJettyCalls(), 2U);
+    EXPECT_EQ(adapter->deleteJettyCalls(), 4U);
     EXPECT_TRUE(adapter->shutdown().ok());
 }
 

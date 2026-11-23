@@ -131,8 +131,13 @@ Status EndpointStore::getOrCreate(const UbEndpointKey& key,
         }
 
         if (!endpoint) {
+            // Per-Context JettyOptions (C01 / G-03): an RM Context carries its
+            // own device's priority/bind mask; fall back to the shared base
+            // options for contexts installed without an explicit profile.
+            const JettyOptions options =
+                context->jettyOptions().value_or(jetty_options_);
             endpoint = std::make_shared<UbEndpoint>(
-                key, context, adapter_, jetty_count_, jetty_options_);
+                key, context, adapter_, jetty_count_, options);
             endpoints_.emplace(key, Entry{endpoint, next_insertion_order_++});
         }
     }

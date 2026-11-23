@@ -9,12 +9,13 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 #include "tent/common/status.h"
 #include "tent/runtime/topology.h"
 #include "tent/transport/ub/jfc.h"
-#include "tent/transport/ub/business_jetty_pool.h"
+#include "tent/transport/ub/send_jetty_pool.h"
 #include "tent/transport/ub/target_registry.h"
 #include "tent/transport/ub/urma_adapter.h"
 
@@ -81,6 +82,14 @@ class UbContext final : public std::enable_shared_from_this<UbContext> {
         return jfcs_;
     }
 
+    // Per-Context send JettyOptions derived from this Context's own trusted
+    // LocalSendProfile at install time (C01 / G-03). Heterogeneous devices each
+    // keep their own priority/bind mask instead of sharing a last-iteration
+    // value. Unset for contexts installed without an explicit profile, so the
+    // EndpointStore falls back to its shared base options (RC baseline).
+    void setJettyOptions(JettyOptions options);
+    [[nodiscard]] std::optional<JettyOptions> jettyOptions() const;
+
     // Simple send-Jetty reuse (RM Legacy only). Null unless the transport
     // installed a pool for this context; endpoints fall back to per-incarnation
     // createJetty when absent, so RC behavior is unchanged.
@@ -146,6 +155,7 @@ class UbContext final : public std::enable_shared_from_this<UbContext> {
     const uint64_t incarnation_;
     ContextPtr handle_;
     std::vector<std::shared_ptr<UbJfc>> jfcs_;
+    std::optional<JettyOptions> jetty_options_;
     std::shared_ptr<UbSendJettyPool> jetty_pool_;
     std::shared_ptr<SendJettyPool> pooled_send_pool_;
     std::shared_ptr<JettyDrainController> drain_controller_;

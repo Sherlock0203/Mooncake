@@ -26,10 +26,13 @@ ErrorCode EtcdHelper::DeleteRange(const char*, size_t, const char*, size_t) {
 }
 
 ErrorCode EtcdHelper::TxnCompareAndPut(const std::vector<TxnCompare>& compares,
-                                       const std::vector<TxnPut>& puts) {
+                                       const std::vector<TxnPut>& puts,
+                                       const std::vector<std::string>&
+                                           delete_keys) {
     ++txn_calls;
     last_compares = compares;
     last_puts = puts;
+    (void)delete_keys;
     return helper_result;
 }
 

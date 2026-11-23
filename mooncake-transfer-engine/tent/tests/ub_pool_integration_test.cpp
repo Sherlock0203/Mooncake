@@ -32,7 +32,7 @@
 #include "tent/transport/ub/native_budget.h"
 #include "tent/transport/ub/quota.h"
 #include "tent/transport/ub/rail_monitor.h"
-#include "tent/transport/ub/business_jetty_pool.h"
+#include "tent/transport/ub/send_jetty_pool.h"
 #include "tent/transport/ub/topology_attrs.h"
 #include "tent/transport/ub/workers.h"
 #include "ub_fake_topology.h"

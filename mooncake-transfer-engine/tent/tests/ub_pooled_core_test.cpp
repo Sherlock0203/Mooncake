@@ -32,8 +32,8 @@
 #include "tent/transport/ub/jfc.h"
 #include "tent/transport/ub/native_budget.h"
 #include "tent/transport/ub/params.h"
-#include "tent/transport/ub/business_jetty_pool.h"
 #include "tent/transport/ub/jetty_refill_worker.h"
+#include "tent/transport/ub/send_jetty_pool.h"
 #include "tent/transport/ub/urma_adapter.h"
 
 using mooncake::tent::Config;
