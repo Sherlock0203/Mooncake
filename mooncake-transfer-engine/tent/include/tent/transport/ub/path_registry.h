@@ -4,6 +4,24 @@
 #ifndef TENT_TRANSPORT_UB_PATH_REGISTRY_H_
 #define TENT_TRANSPORT_UB_PATH_REGISTRY_H_
 
+// ---------------------------------------------------------------------------
+// NOT YET WIRED (audit A3).
+//
+// This file and path_registry.cpp arrived with the v3 control-plane import
+// (tent/tent_rm @ edf6f9e8) and are compiled only because the UB library globs
+// *.cpp. No translation unit outside this pair references any of these types,
+// so a green build says nothing about v3 being active.
+//
+// Expected consumers once the v3 line lands: UbWorkers path selection and
+// SendJettyPool's per-target load cell. Until then:
+//   * do not read this header as an interface contract;
+//   * do not "clean up" the types as dead code - they are the incoming
+//     branch's destination, and removing them here would conflict with the
+//     next sync from that line.
+// If the v3 line is dropped instead, delete the pair in a dedicated change
+// owned by that line, not as part of an unrelated cleanup.
+// ---------------------------------------------------------------------------
+
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>

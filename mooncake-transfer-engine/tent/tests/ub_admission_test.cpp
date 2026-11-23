@@ -363,11 +363,13 @@ TEST(UbAdmissionTest, DeferAttemptOnCanceledSliceTerminalizes) {
     auto token = slice->beginAttempt(path, 1);
     ASSERT_TRUE(token.has_value());
 
-    // Cancellation loses to the posting claim, so the slice is still kPosting;
-    // the deferral is then the only exit and it must not resurrect the slice.
+    // Cancellation loses to the posting claim, so the slice is still kPosting.
+    // The deferral must not resurrect it, and it must report "not accepted":
+    // deferAttempt returns !canceled, and callers rely on that value to tell
+    // parked work from a terminal slice (see the stale-token case above).
     (void)slice->requestCancellation(2);
     EXPECT_EQ(slice->snapshot().state, UbSliceState::kPosting);
-    EXPECT_TRUE(slice->deferAttempt(*token, 3));
+    EXPECT_FALSE(slice->deferAttempt(*token, 3));
     EXPECT_EQ(slice->snapshot().state, UbSliceState::kCanceled);
     EXPECT_EQ(task->transferStatus().s, CANCELED);
 }

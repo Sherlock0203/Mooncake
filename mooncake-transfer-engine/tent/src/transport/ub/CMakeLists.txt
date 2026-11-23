@@ -5,6 +5,20 @@ if(USE_UB)
   if(URMA_LIBRARY)
     target_compile_definitions(tent_xport_ub PRIVATE TENT_HAS_REAL_URMA=1)
   endif()
+  # TENT_HAS_REAL_URMA is only defined when the real liburma is found, so the
+  # RealUrmaAdapter class is normally never parsed and a broken edit can hide
+  # behind the stub. Parsing it needs headers only, and the fetched UMDK tree
+  # always provides those: keep an on-demand target that compiles the real
+  # provider code without linking it. EXCLUDE_FROM_ALL keeps the default build
+  # unchanged; CI builds this target by name.
+  if(URMA_INCLUDE_DIR)
+    add_library(tent_ub_real_urma_syntax OBJECT EXCLUDE_FROM_ALL
+                "${CMAKE_CURRENT_SOURCE_DIR}/urma_adapter.cpp")
+    target_link_libraries(tent_ub_real_urma_syntax PRIVATE tent_common
+                                                          Urma::urma)
+    target_compile_definitions(tent_ub_real_urma_syntax
+                               PRIVATE TENT_HAS_REAL_URMA=1)
+  endif()
   # Test-only loopback adapter. Its source lives under tests/ and is linked in
   # only when USE_UB_MOCK=ON, so normal builds are unchanged.
   if(USE_UB_MOCK)

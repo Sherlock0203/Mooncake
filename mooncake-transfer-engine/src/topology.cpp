@@ -460,9 +460,11 @@ struct UBDevice {
 };
 
 static std::vector<UBDevice> listUBDevices(
-    const std::vector<std::string> &filter) {
+    const std::vector<std::string> &filter,
+    size_t *excluded_by_filter = nullptr) {
     int num_devices = 0;
     std::vector<UBDevice> devices;
+    if (excluded_by_filter != nullptr) *excluded_by_filter = 0;
     urma_init_attr_t init_attr = {};
     // Capture device-discovery-phase driver logs too (no-op unless
     // MC_URMA_LOG_REDIRECT is set). Registered before urma_init; idempotent.
@@ -498,11 +500,18 @@ static std::vector<UBDevice> listUBDevices(
         return {};
     }
 
+    size_t excluded = 0;
     for (int i = 0; i < num_devices; ++i) {
         std::string device_name = device_list[i]->name;
         if (!filter.empty() && std::find(filter.begin(), filter.end(),
-                                         device_name) == filter.end())
+                                         device_name) == filter.end()) {
+            // A whitelist that names no UB device silently removes UB from
+            // the topology; discover() turns this count into one warning.
+            ++excluded;
+            VLOG(1) << "listUBDevices: excluded by whitelist: "
+                    << device_name;
             continue;
+        }
         char path[PATH_MAX + 32];
         char resolved_path[PATH_MAX];
         // Get the PCI bus id for the infiniband device. Note that
@@ -546,6 +555,7 @@ static std::vector<UBDevice> listUBDevices(
                                    .numa_node = numa_node});
     }
     urma_free_device_list(device_list);
+    if (excluded_by_filter != nullptr) *excluded_by_filter = excluded;
     // No urma_uninit() here: URMA state is process-lifetime and shared with
     // the transports (which own the matching init/uninit pair), so releasing
     // it on discovery return would tear the provider out from under sibling
@@ -886,7 +896,15 @@ int Topology::discover(const std::vector<std::string> &filter,
     }
 #endif
 #ifdef USE_UB
-    auto ub_all_hca = listUBDevices(filter);
+    size_t ub_excluded = 0;
+    auto ub_all_hca = listUBDevices(filter, &ub_excluded);
+    if (ub_excluded != 0) {
+        LOG(WARNING) << "Discovery whitelist excluded " << ub_excluded
+                     << " UB device(s): matching is by native UB name (e.g. "
+                        "\"udmac0d1e2\"), not by RDMA HCA name. UB NICs stay "
+                        "out of the topology until the whitelist names them "
+                        "or is empty.";
+    }
     if (!ub_all_hca.empty()) {
         // Merge UB-discovered NICs into the existing matrix entries instead
         // of overwriting them: discoverCpuTopology() rebuilds the "cpu:N"

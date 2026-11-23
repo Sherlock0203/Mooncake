@@ -280,6 +280,13 @@ jobs:
         sudo -E cmake --install build
       shell: bash
 
+    - name: Parse the real URMA adapter (headers only)
+      # TENT_HAS_REAL_URMA is only defined when liburma is found, so the real
+      # adapter class is otherwise never parsed and can hide compile errors
+      # behind the stub. The syntax target needs UMDK headers only.
+      run: ninja -C build tent_ub_real_urma_syntax
+      shell: bash
+
     - name: Run Mooncake Store Rust unit tests
       env:
         MOONCAKE_BUILD_DIR: ${{ github.workspace }}/build
