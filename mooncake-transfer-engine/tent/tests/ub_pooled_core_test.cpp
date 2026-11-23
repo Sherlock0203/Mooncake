@@ -32,7 +32,7 @@
 #include "tent/transport/ub/jfc.h"
 #include "tent/transport/ub/native_budget.h"
 #include "tent/transport/ub/params.h"
-#include "tent/transport/ub/business_jetty_pool.h"
+#include "tent/transport/ub/send_jetty_pool.h"
 #include "tent/transport/ub/urma_adapter.h"
 
 using mooncake::tent::Config;
@@ -777,12 +777,97 @@ TEST(UbSendJettyPoolTest, DrainIdleDeletesOnlyIdleMembers) {
         harness.pool->returnOnce(std::move(leases[0].lease), true).ok());
     ASSERT_TRUE(
         harness.pool->returnOnce(std::move(leases[1].lease), true).ok());
-    // One member remains leased.
-    ASSERT_TRUE(harness.pool->drainIdle().ok());
+    // One member remains leased: the RC-03 shutdown ordering contract is
+    // violated, so drainIdle still deletes the idle members but surfaces
+    // InternalError instead of silently closing the parent JFC.
+    const Status drained = harness.pool->drainIdle();
+    EXPECT_TRUE(drained.IsInternalError());
     EXPECT_EQ(harness.adapter->deleted(), 2);
     EXPECT_EQ(harness.pool->servingCount(key), 1u);
     ASSERT_TRUE(
         harness.pool->returnOnce(std::move(leases[2].lease), true).ok());
+}
+
+TEST(UbSendJettyPoolTest, NonEmptyOutputRejectedWithoutClobber) {
+    PoolHarness harness;
+    ASSERT_TRUE(harness.init(2, 2, 8, 0, 1, 16).ok());
+    const auto key = makePoolKey();
+
+    LeaseWithCredit held;
+    ASSERT_TRUE(
+        harness.pool->tryLease(key, makeAttemptKey(1, 1, 1), held).ok());
+    const uint32_t held_id = held.lease.lane().jetty_id;
+    const uint64_t held_token = held.jfc_credit_token;
+    ASSERT_NE(held_token, 0u);
+
+    // A non-empty output is rejected instead of dropping the caller's lease
+    // and credit token.
+    EXPECT_TRUE(
+        harness.pool->tryLease(key, makeAttemptKey(1, 2, 1), held)
+            .IsInvalidArgument());
+    EXPECT_TRUE(held.lease.valid());
+    EXPECT_EQ(held.lease.lane().jetty_id, held_id);
+    EXPECT_EQ(held.jfc_credit_token, held_token);
+    EXPECT_EQ(harness.pool->stats().total_leases, 1u);
+    EXPECT_EQ(harness.pool->stats().leaked_leases, 0u);
+
+    // A token-only output (lease already returned, credit unsettled) is also
+    // rejected: the credit must be released before leasing again.
+    ASSERT_TRUE(harness.pool->returnOnce(std::move(held.lease), true).ok());
+    EXPECT_FALSE(held.lease.valid());
+    EXPECT_NE(held.jfc_credit_token, 0u);
+    EXPECT_TRUE(
+        harness.pool->tryLease(key, makeAttemptKey(1, 3, 1), held)
+            .IsInvalidArgument());
+
+    // Once fully settled, the same struct leases again.
+    harness.credits->release(held.jfc_index, held.jfc_credit_token);
+    held.jfc_credit_token = 0;
+    ASSERT_TRUE(
+        harness.pool->tryLease(key, makeAttemptKey(1, 4, 1), held).ok());
+    EXPECT_TRUE(held.lease.valid());
+}
+
+TEST(UbSendJettyPoolTest, ZeroPoolKeyAndZeroOptionsRejected) {
+    PoolHarness harness;
+    ASSERT_TRUE(harness.init(1, 1, 8, 0, 1, 16).ok());
+    LeaseWithCredit grant;
+
+    // Zero context incarnation is the unassigned sentinel.
+    const PoolKey zero_key{};
+    EXPECT_FALSE(zero_key.valid());
+    EXPECT_TRUE(
+        harness.pool->tryLease(zero_key, makeAttemptKey(1, 1, 1), grant)
+            .IsInvalidArgument());
+    // Zero task/slice identities are rejected like the zero generation.
+    EXPECT_TRUE(
+        harness.pool->tryLease(makePoolKey(), AttemptKey{0, 1, 1}, grant)
+            .IsInvalidArgument());
+    EXPECT_TRUE(
+        harness.pool->tryLease(makePoolKey(), AttemptKey{1, 0, 1}, grant)
+            .IsInvalidArgument());
+    EXPECT_FALSE(grant.lease.valid());
+    EXPECT_EQ(harness.adapter->created(), 0);
+
+    // Zero desired_serving / max_creating fail closed at lease time.
+    SendJettyPoolOptions bad_options;
+    bad_options.desired_serving = 0;
+    bad_options.max_creating = 1;
+    auto zero_desired = std::make_shared<SendJettyPool>(
+        harness.adapter, harness.context, harness.jfcs, harness.budget,
+        "dev0", harness.credits, bad_options);
+    EXPECT_TRUE(
+        zero_desired->tryLease(makePoolKey(), makeAttemptKey(1, 1, 1), grant)
+            .IsInvalidArgument());
+    bad_options.desired_serving = 1;
+    bad_options.max_creating = 0;
+    auto zero_creating = std::make_shared<SendJettyPool>(
+        harness.adapter, harness.context, harness.jfcs, harness.budget,
+        "dev0", harness.credits, bad_options);
+    EXPECT_TRUE(
+        zero_creating->tryLease(makePoolKey(), makeAttemptKey(1, 1, 1), grant)
+            .IsInvalidArgument());
+    EXPECT_EQ(harness.adapter->created(), 0);
 }
 
 TEST(UbSendJettyPoolTest, InvalidArgumentsRejected) {

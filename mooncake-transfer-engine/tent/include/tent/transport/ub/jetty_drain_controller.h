@@ -169,7 +169,7 @@ struct DrainEntry {
 };
 
 // Pool-side actions injected into the controller, so the controller never
-// depends on BusinessJettyPool (design §4.2).
+// depends on SendJettyPool (design §4.2).
 struct DrainCallbacks {
     // Resolve the live native handle of a lane for one drain step. The
     // controller does not retain the returned handle.

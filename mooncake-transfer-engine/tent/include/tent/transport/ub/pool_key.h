@@ -4,10 +4,11 @@
 // Pool identity types shared by the send-Jetty pool and the asynchronous
 // drain controller (design tent-ub-async-drain-design.md §4.2).
 //
-// These used to live in business_jetty_pool.h. The drain controller needs the
-// exact same identities but cannot include the pool header: the pool includes
-// the controller (it drives beginDrain()), so a dedicated leaf header breaks
-// the cycle without changing a single name or hash.
+// These live in pool_key.h, split out of send_jetty_pool.h. The drain
+// controller needs the exact same identities but cannot include the pool
+// header: the pool includes the controller (it drives beginDrain()), so a
+// dedicated leaf header breaks the cycle without changing a single name or
+// hash.
 
 #ifndef TENT_TRANSPORT_UB_POOL_KEY_H_
 #define TENT_TRANSPORT_UB_POOL_KEY_H_
@@ -27,6 +28,12 @@ struct PoolKey {
     uint32_t bind_tp_type_mask = 0;
 
     bool operator==(const PoolKey&) const = default;
+
+    // A zero context incarnation is the unassigned sentinel (bootstrap v2
+    // rejects it); a pool key without one cannot partition members safely.
+    [[nodiscard]] bool valid() const noexcept {
+        return context_incarnation != 0;
+    }
 };
 
 struct PoolKeyHash {

@@ -14,7 +14,7 @@
 #include "tent/common/status.h"
 #include "tent/runtime/topology.h"
 #include "tent/transport/ub/jfc.h"
-#include "tent/transport/ub/business_jetty_pool.h"
+#include "tent/transport/ub/send_jetty_pool.h"
 #include "tent/transport/ub/target_registry.h"
 #include "tent/transport/ub/urma_adapter.h"
 

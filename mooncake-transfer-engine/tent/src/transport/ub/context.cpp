@@ -12,7 +12,7 @@
 #include <utility>
 
 #include "jetty_pool.h"
-#include "tent/transport/ub/business_jetty_pool.h"
+#include "tent/transport/ub/send_jetty_pool.h"
 
 namespace mooncake::tent::ub {
 namespace {
