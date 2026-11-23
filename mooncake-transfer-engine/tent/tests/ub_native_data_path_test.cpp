@@ -2848,7 +2848,13 @@ TEST(UbRmPoolTest, TransportRunsSelfReadWriteThroughPooledSendPool) {
     config->set("transports/ub/jfc_per_context", 1);
     config->set("transports/ub/jetty_per_endpoint", 1);
     config->set("transports/ub/max_endpoints", 16);
-    config->set("transports/ub/slice_size", 16);
+    // One slice per transfer: the transfer below carries 64 bytes. With a
+    // 16-byte slice four slices would be posted and "return the member" is
+    // asynchronous to "lease the next slice", so two members can legally be in
+    // flight at once (desired_serving = 2). That made the strict createJetty
+    // reuse assertion depend on poller timing. A single slice keeps the
+    // sequence serial, so reuse is deterministic.
+    config->set("transports/ub/slice_size", 64);
     config->set("transports/ub/max_slices_per_task", 8);
     config->set("transports/ub/max_retries", 1);
     config->set("transports/ub/slice_timeout_ms", 1000);
