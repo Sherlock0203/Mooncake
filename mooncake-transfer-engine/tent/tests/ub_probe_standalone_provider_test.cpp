@@ -584,6 +584,45 @@ TEST_F(ProbeCloseTest, ShutdownIsRepeatableWithoutDoubleFree) {
     EXPECT_EQ(adapter_->liveLocalSegmentCount(), 0U);
 }
 
+// D3: a port orphaned by a failed rollback teardown must be retried on the
+// next resource creation instead of silently leaving the probe graph forever.
+TEST(UbProbeStandaloneProviderTest, OrphanedPortIsRecoveredOnRetry) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+    ContextPtr context;
+    ASSERT_TRUE(adapter->openContext(fakeDevice(), context).ok());
+
+    // An invalid edge makes snapshot() fail *after* the local resources were
+    // created, which drives the rollback path.
+    StubPeerDirectory directory({ProbeEdgeSupply{}});
+    StandaloneProbeResourceProvider provider(
+        adapter, makeProbeParams(),
+        {ProbeLocalPortConfig{0, context, nullptr, 1}}, &directory);
+
+    // The rollback teardown cannot prove destruction: reset fails.
+    adapter->failResets();
+    ProbeGraph failed;
+    EXPECT_FALSE(provider.snapshot(failed).ok());
+    auto stats = provider.closeStats();
+    EXPECT_EQ(stats.orphaned_ports, 1U);
+    EXPECT_EQ(stats.recovered_ports, 0U);
+
+    // Provider recovers and the graph becomes valid: the retry must first
+    // destroy the orphan, then re-create the port.
+    adapter->allowResets();
+    directory.set({makeEdge(0, 42, 0)});
+    ProbeGraph graph;
+    ASSERT_TRUE(provider.snapshot(graph).ok());
+    ASSERT_EQ(graph.ports.size(), 1U);
+    stats = provider.closeStats();
+    EXPECT_EQ(stats.orphaned_ports, 0U);
+    EXPECT_EQ(stats.recovered_ports, 1U);
+
+    ASSERT_TRUE(provider.shutdown().ok());
+    EXPECT_TRUE(adapter->closeContext(context).ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
 }  // namespace
 }  // namespace ub
 }  // namespace tent

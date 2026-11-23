@@ -231,6 +231,9 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
     struct CloseStats {
         uint64_t orphaned_ports{0};  // ports currently retained unproven
         uint64_t orphaned_pages{0};  // pages currently retained unproven
+        // Ports that were orphaned and later re-armed by a successful destroy
+        // retry (D3). Cumulative.
+        uint64_t recovered_ports{0};
         bool shutdown_incomplete{false};
     };
     [[nodiscard]] CloseStats closeStats() const;
@@ -309,6 +312,9 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
 
     Status createPortLocked(PortState& port);
     Status destroyPortLocked(PortState& port);
+    // Re-arms a port whose resources are proven released so a later creation
+    // attempt can use it again.
+    void reArmPortLocked(PortState& port);
     // Downgrades the port to kOrphaned, keeps every handle and page, and
     // returns the causing status. Counters are bumped only on the transition.
     Status orphanLocked(PortState& port, const char* stage,
@@ -370,6 +376,7 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
     bool shut_down_{false};
     bool accepting_{true};
     bool shutdown_incomplete_{false};
+    uint64_t recovered_orphaned_ports_{0};
 };
 
 }  // namespace ub

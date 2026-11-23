@@ -680,25 +680,33 @@ Status StandaloneProbeResourceProvider::orphanLocked(PortState& port,
     return cause;
 }
 
+void StandaloneProbeResourceProvider::reArmPortLocked(PortState& port) {
+    // A port whose resources are proven released may be created again by a
+    // later snapshot(). Only a port that actually has a usable Context is
+    // re-armed: a discovery-time context-open failure stays destroyed.
+    if (!port.config.context || !port.config.context->valid()) return;
+    port.lifecycle = PortLifecycle::kActive;
+    port.jetty_destroyed = false;
+    port.jfc_destroyed = false;
+    port.source_seg_unregistered = false;
+    port.area_seg_unregistered = false;
+    port.orphan_since_ns = 0;
+}
+
 void StandaloneProbeResourceProvider::rollbackPortsLocked() {
+    // A rollback always leaves the provider without a usable local resource
+    // set, even if a port survives as kOrphaned. Without this the next
+    // snapshot() would skip creation entirely (resources_ready_ still true)
+    // and publish an empty graph.
+    resources_ready_ = false;
     for (auto& port : ports_) {
         if (port.lifecycle == PortLifecycle::kDestroyed) continue;
         const Status status = destroyPortLocked(port);
         if (!status.ok()) {
-            // Orphaned: kept in ports_ so a later shutdown() can finish.
+            // Orphaned: kept in ports_ so a later retry can finish.
             continue;
         }
-        // A rolled-back port may be created again by a later snapshot(): its
-        // resources are proven released, so re-arm the lifecycle (but not a
-        // port that never had a context in the first place).
-        if (port.config.context && port.config.context->valid()) {
-            port.lifecycle = PortLifecycle::kActive;
-            port.jetty_destroyed = false;
-            port.jfc_destroyed = false;
-            port.source_seg_unregistered = false;
-            port.area_seg_unregistered = false;
-            port.orphan_since_ns = 0;
-        }
+        reArmPortLocked(port);
     }
 }
 
@@ -844,6 +852,19 @@ Status StandaloneProbeResourceProvider::createLocalResourcesLocked() {
     CHECK_STATUS(ensureBoundContextsLocked());
     auto page_status = validatePageSizeLocked();
     if (!page_status.ok()) return page_status;
+
+    // D3: a port orphaned by an earlier failed teardown (a rollback or
+    // snapshot whose destroy could not be proven) must get another chance
+    // here instead of silently leaving the probe graph forever. Retry the
+    // destroy; on success its resources are proven gone, so re-arm it.
+    for (auto& port : ports_) {
+        if (port.lifecycle != PortLifecycle::kOrphaned) continue;
+        if (!destroyPortLocked(port).ok()) continue;
+        reArmPortLocked(port);
+        ++recovered_orphaned_ports_;
+        LOG(INFO) << "UB probe port " << port.config.local_nic
+                  << " recovered from orphaned state on resource creation";
+    }
 
     std::set<Topology::NicID> local_nics;
     size_t available = 0;
@@ -1330,6 +1351,11 @@ Status StandaloneProbeResourceProvider::rebuildPortLocked(
     next.config.generation = next_generation;
     next.source_generation = next_generation;
     // F12: the quiesce above already succeeded, so the replacement is proven.
+    // These two fields MUST be written together: the LM treats "previous_
+    // generation names my live generation" as the replacement signal and only
+    // then requires previous_drained. Writing the generation without the
+    // receipt (or resetting the receipt alone) would flip an ordinary
+    // republication into a fail-closed replacement.
     next.previous_generation = old_generation;
     next.previous_drained = true;
     // next.area_* deliberately unchanged: peer descriptors stay valid.
@@ -1482,6 +1508,7 @@ StandaloneProbeResourceProvider::closeStats() const {
     std::lock_guard<std::mutex> lock(mutex_);
     CloseStats stats;
     stats.shutdown_incomplete = shutdown_incomplete_;
+    stats.recovered_ports = recovered_orphaned_ports_;
     for (const auto& port : ports_) {
         if (port.lifecycle != PortLifecycle::kOrphaned) continue;
         ++stats.orphaned_ports;
