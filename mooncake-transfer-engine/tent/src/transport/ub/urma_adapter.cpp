@@ -2066,7 +2066,7 @@ class RealUrmaAdapter final : public UrmaAdapter {
             if (rm_mode != (request.target != nullptr)) {
                 return fail(Status::InvalidArgument(
                     rm_mode ? "RM work requests must set an explicit target"
-                            : "RC work requests must not set a target");
+                            : "RC work requests must not set a target"));
             }
             urma_target_jetty_t* request_target = nullptr;
             if (rm_mode) {
@@ -2078,13 +2078,13 @@ class RealUrmaAdapter final : public UrmaAdapter {
                 if (real_target->context().get() !=
                     real_jetty->context().get()) {
                     return fail(Status::InvalidArgument(
-                        "RM target belongs to another Context");
+                        "RM target belongs to another Context"));
                 }
                 request_target = real_target->native();
             }
             if (request.token == 0) {
                 return fail(Status::InvalidArgument(
-                    "work request token zero is reserved");
+                    "work request token zero is reserved"));
             }
             if (request.length == 0 ||
                 request.length > std::numeric_limits<uint32_t>::max()) {
@@ -2099,19 +2099,19 @@ class RealUrmaAdapter final : public UrmaAdapter {
             if (!local || !local->valid())
                 return fail(invalidHandle("LocalSegment"));
             if (!remote || !remote->valid()) {
-                return invalidHandle("RemoteSegment");
+                return fail(invalidHandle("RemoteSegment"));
             }
             if (local->context().get() != real_jetty->context().get() ||
                 remote->context().get() != real_jetty->context().get()) {
                 return fail(Status::InvalidArgument(
-                    "work request segments belong to another Context");
+                    "work request segments belong to another Context"));
             }
             if (!checkedRangeContains(local->address(), local->length(),
                                       request.local_address, request.length) ||
                 !checkedRangeContains(remote->address(), remote->length(),
                                       request.remote_address, request.length)) {
                 return fail(Status::InvalidArgument(
-                    "work request lies outside a registered segment");
+                    "work request lies outside a registered segment"));
             }
 
             NativeWorkRequest& native = native_requests[i];
@@ -2209,11 +2209,11 @@ class RealUrmaAdapter final : public UrmaAdapter {
             return fail(invalidHandle("Jetty"));
         if (!real_jetty->reliableMessage()) {
             return fail(Status::InvalidArgument(
-                "per-WR remote target requires an RM Jetty");
+                "per-WR remote target requires an RM Jetty"));
         }
         if (request.token == 0) {
-            return fail(Status::InvalidArgument(
-                "work request token zero is reserved");
+            return fail(
+                Status::InvalidArgument("work request token zero is reserved"));
         }
         if (request.length == 0 ||
             request.length > std::numeric_limits<uint32_t>::max()) {
@@ -2230,14 +2230,14 @@ class RealUrmaAdapter final : public UrmaAdapter {
         if (local->context().get() != real_jetty->context().get() ||
             remote->context().get() != real_jetty->context().get()) {
             return fail(Status::InvalidArgument(
-                "work request segments belong to another Context");
+                "work request segments belong to another Context"));
         }
         if (!checkedRangeContains(local->address(), local->length(),
                                   request.local_address, request.length) ||
             !checkedRangeContains(remote->address(), remote->length(),
                                   request.remote_address, request.length)) {
             return fail(Status::InvalidArgument(
-                "work request lies outside a registered segment");
+                "work request lies outside a registered segment"));
         }
 
         std::lock_guard<std::mutex> jetty_lock(real_jetty->mutex());
