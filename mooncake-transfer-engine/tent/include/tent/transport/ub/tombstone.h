@@ -25,29 +25,9 @@
 #include <unordered_map>
 
 #include "tent/common/status.h"
+#include "tent/transport/ub/pool_key.h"
 
 namespace mooncake::tent::ub {
-
-// Entity kinds covered by the tombstone table. The business path only creates
-// kJetty entries today; JFC/JFR entries exist so an event can be attributed
-// once those entities join the retirement chain.
-enum class EntityKind : uint8_t {
-    kJetty = 0,
-    kJfc = 1,
-    kJfr = 2,
-};
-
-inline const char* entityKindName(EntityKind kind) noexcept {
-    switch (kind) {
-        case EntityKind::kJetty:
-            return "jetty";
-        case EntityKind::kJfc:
-            return "jfc";
-        case EntityKind::kJfr:
-            return "jfr";
-    }
-    return "unknown";
-}
 
 // Whether the tombstone's owner is still responsible for the entity.
 enum class Responsibility : uint8_t {
@@ -88,35 +68,54 @@ class TombstoneTable {
     TombstoneTable(const TombstoneTable&) = delete;
     TombstoneTable& operator=(const TombstoneTable&) = delete;
 
-    // Inserts one tombstone. A full table returns TooManyRequests and does not
-    // shed, evict or trim anything; the caller must backpressure.
+    // Inserts one tombstone keyed by its full ResourceIdentity. Idempotent for
+    // the same identity; two different identities with the same numeric
+    // generation (different Context or different native object) are stored
+    // independently instead of silently colliding. A full table returns
+    // TooManyRequests and does not shed, evict or trim anything; the caller
+    // must backpressure.
+    //
+    // Fail-closed: a stone without a context incarnation has no global
+    // identity, so it is rejected with InvalidArgument and counted.
     Status insert(const JettyTombstone& stone);
 
-    // Returns the newest tombstone for (kind, native_id), if any. This is the
+    // Returns the newest tombstone for one global entity, if any. This is the
     // event-attribution path: a completion without a live record can still be
     // attributed to a retired entity.
     [[nodiscard]] std::optional<JettyTombstone> lookup(
+        const ResourceEntity& entity) const;
+
+    // Attribution-only compatibility overload: newest entry for
+    // (kind, native_id) across every Context. Used where the caller only has a
+    // native id (drain markers) and only needs "a retired entity exists".
+    [[nodiscard]] std::optional<JettyTombstone> lookup(
         EntityKind kind, uint32_t native_id) const;
 
-    // Erases the entry for `generation` after the provider proved destruction.
-    // Returns true when an entry was removed (and its budget may be released).
-    bool erase(uint64_t generation);
+    // Erases exactly the entry identified by `identity` after the provider
+    // proved destruction. Returns true when that entry was removed (and its
+    // budget may be released). Never touches another Context's entry.
+    bool erase(const ResourceIdentity& identity);
 
     [[nodiscard]] size_t size() const;
     [[nodiscard]] size_t capacity() const;
     [[nodiscard]] bool full() const;
     [[nodiscard]] uint64_t rejectedInserts() const;
+    // Inserts rejected because they carried no global identity (context
+    // incarnation == 0). Exposed separately so the fail-closed path is
+    // observable instead of looking like capacity backpressure.
+    [[nodiscard]] uint64_t invalidIdentityInserts() const;
     [[nodiscard]] uint64_t erased() const;
 
    private:
-    static uint64_t entityKey(EntityKind kind, uint32_t native_id) noexcept;
-
     mutable std::mutex mutex_;
     const size_t capacity_;
-    std::unordered_map<uint64_t, JettyTombstone> by_generation_;
-    // (kind, native_id) -> generation of the newest entry.
-    std::unordered_map<uint64_t, uint64_t> newest_by_entity_;
+    std::unordered_map<ResourceIdentity, JettyTombstone, ResourceIdentityHash>
+        by_identity_;
+    // (context_incarnation, kind, native_id) -> generation of the newest entry.
+    std::unordered_map<ResourceEntity, uint64_t, ResourceEntityHash>
+        newest_by_entity_;
     uint64_t rejected_ = 0;
+    uint64_t invalid_identity_ = 0;
     uint64_t erased_ = 0;
 };
 

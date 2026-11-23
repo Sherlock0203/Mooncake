@@ -87,6 +87,9 @@ struct UbWorkers::Route {
     BufferDesc* remote_buffer{nullptr};
     // Decoded once per slice and reused by device ordering and the import.
     UbBufferMetadata metadata;
+    // Remote device id -> its published EID, decoded once per slice so the
+    // scope filter does not re-walk the metadata per candidate.
+    std::unordered_map<Topology::NicID, std::string> remote_eids;
     std::vector<Topology::NicID> remote_devices;
     // Declaration gate for this peer, computed once per route.
     AdjacencyView adjacency;
@@ -115,6 +118,10 @@ struct UbWorkers::BusinessRecord {
     QuotaReservation quota;
     uint64_t posted_ns{0};
     uint64_t deadline_ns{0};
+    // F6c: the deadline above came from Request::deadline_ns (it was earlier
+    // than posted + slice_timeout), so the fence is executing the request
+    // deadline rather than a WR budget overrun.
+    bool deadline_from_request{false};
 
     // ---- W3 pooled ownership (design §5.1) --------------------------------
     // nullptr means the W2 legacy path: nothing below is touched, and the
@@ -128,6 +135,9 @@ struct UbWorkers::BusinessRecord {
     // itself is handed over on the finalize path, so the lane is snapshotted
     // here while the lease is still valid.
     PoolLaneKey pooled_lane{};
+    // Context incarnation of the leased member. The lane ledger spans all
+    // Contexts, so pooled_lane.lane_generation alone is ambiguous (INV-ID-3).
+    uint64_t context_incarnation{0};
     size_t credit_jfc_index{0};
     uint64_t credit_token{0};
     // The claim anchor: snapshotted before the lease, compared after it, and
@@ -149,7 +159,8 @@ UbWorkers::UbWorkers(std::shared_ptr<UrmaAdapter> adapter,
                      ProbeLinkManager* probe_manager,
                      std::vector<ProbeJfcSlot> probe_jfcs,
                      std::shared_ptr<TombstoneTable> tombstones,
-                     const ProbeTopology* probe_topology)
+                     const ProbeTopology* probe_topology,
+                     std::shared_ptr<ControlExecutor> control_executor)
     : adapter_(std::move(adapter)),
       contexts_(std::move(contexts)),
       local_topology_(std::move(local_topology)),
@@ -165,7 +176,9 @@ UbWorkers::UbWorkers(std::shared_ptr<UrmaAdapter> adapter,
       probe_topology_(probe_topology),
       param_error_edges_(
           params_.probe.adjacency_policy.param_error_invalidate_threshold),
-      tombstones_(std::move(tombstones)) {
+      tombstones_(std::move(tombstones)),
+      control_executor_(std::move(control_executor)) {
+    gate_ctx_.retry_timeout_write = params_.retry_timeout_write;
     for (const auto& context : contexts_) {
         if (!context) continue;
         context_by_topology_id_[context->topologyId()] = context;
@@ -206,6 +219,9 @@ Status UbWorkers::start() {
             "UB workers have incomplete dependencies" LOC_MARK);
     }
 
+    // F6a: the poller only discovers and enqueues deadline fences. A refused
+    // thread degrades to the inline path instead of failing the transport.
+    startControlExecutor();
     posting_.store(true, std::memory_order_release);
     polling_.store(true, std::memory_order_release);
     timeout_scans_enabled_.store(true, std::memory_order_release);
@@ -294,6 +310,12 @@ Status UbWorkers::stop() {
     {
         std::lock_guard<std::mutex> lock(endpoint_drain_mutex_);
     }
+    // F6a/F6a2: scans are disabled and the barrier above proves no scan is in
+    // its claim section any more, so every job that can still touch a native
+    // endpoint is already queued. Let them finish before this function starts
+    // its own shutdown fences, then retire the executor.
+    drainPendingControlJobs();
+    stopControlExecutor();
 
     // Snapshot all native work after posting threads have joined; no new WR
     // can cross the adapter boundary beyond this point. Quiesce each endpoint
@@ -523,10 +545,9 @@ Status UbWorkers::submitBatch(const std::vector<UbTask::Ptr>& tasks,
         } else {
             try {
                 for (const auto& task : tasks) {
-                    const int priority = std::clamp(
-                        task->request().priority,
-                        static_cast<int>(PRIO_HIGH),
-                        static_cast<int>(PRIO_LOW));
+                    const int priority = std::clamp(task->request().priority,
+                                                    static_cast<int>(PRIO_HIGH),
+                                                    static_cast<int>(PRIO_LOW));
                     for (const auto& slice : task->slices()) {
                         if (!slice || !slice->markQueued()) continue;
                         ++marked_count;
@@ -534,10 +555,14 @@ Status UbWorkers::submitBatch(const std::vector<UbTask::Ptr>& tasks,
                             throw std::length_error(
                                 "Injected UB enqueue failure");
                         }
-                        queues_[priority].push_back(PendingSlice{
-                            task, slice, device_mask, priority,
-                            task->request().target_id,
-                            task->request().opcode});
+                        PendingSlice entry{task,
+                                           slice,
+                                           device_mask,
+                                           priority,
+                                           task->request().target_id,
+                                           task->request().opcode};
+                        entry.submit_ns = steadyNowNs();
+                        queues_[priority].push_back(std::move(entry));
                         ++inserted_counts[priority];
                         ++inserted_count;
                         ++queued_;
@@ -582,9 +607,15 @@ Status UbWorkers::submitBatch(const std::vector<UbTask::Ptr>& tasks,
         return Status::InvalidArgument(
             "UB workers stopped during submission" LOC_MARK);
     }
-    if (marked_count != need) {
-        return Status::InvalidArgument(
-            "UB task changed while it was being submitted" LOC_MARK);
+    // A short mark is NOT an error. `need` is sampled before the lock and a
+    // concurrent cancellation can make a slice non-queueable in between; such a
+    // slice is already terminal, so skipping it leaves nothing to do. Failing
+    // here would return an error while the remaining slices are already in
+    // queues_, i.e. the caller would see "rejected" for work that will run, and
+    // a retry would submit the prefix twice.
+    if (marked_count < need) {
+        submit_partial_cancelled_.fetch_add(need - marked_count,
+                                            std::memory_order_relaxed);
     }
     if (budget_exhausted) {
         // Backpressure, not an error: the caller may resubmit the whole batch
@@ -659,6 +690,19 @@ UbBusinessStatsSnapshot UbWorkers::businessStats() const {
     out.business_param_error_invalid_edge = param_error_edges_.invalidations();
     out.business_deadline_timeouts =
         business_deadline_timeouts_.load(std::memory_order_relaxed);
+    out.expired_in_queue = expired_in_queue_.load(std::memory_order_relaxed);
+    out.expired_parked = expired_parked_.load(std::memory_order_relaxed);
+    out.expired_pre_post = expired_pre_post_.load(std::memory_order_relaxed);
+    out.expired_inflight = expired_inflight_.load(std::memory_order_relaxed);
+    out.pooled_lane_ref_unmapped =
+        pooled_lane_ref_unmapped_.load(std::memory_order_relaxed);
+    out.eid_scope_denied = eid_scope_denied_.load(std::memory_order_relaxed);
+    out.timeout_fence_submitted =
+        timeout_fence_submitted_.load(std::memory_order_relaxed);
+    out.timeout_fence_rejected =
+        timeout_fence_rejected_.load(std::memory_order_relaxed);
+    out.device_retire_rejected =
+        device_retire_rejected_.load(std::memory_order_relaxed);
     out.declared_candidates_total =
         declared_candidates_total_.load(std::memory_order_relaxed);
     out.declared_candidates_denied =
@@ -752,6 +796,22 @@ UbWorkers::PopResult UbWorkers::popPending(PendingSlice& pending) {
         return defer_.hasActionable(steadyNowNs());
     });
     if (!posting_.load(std::memory_order_acquire)) return PopResult::kStopped;
+    // F9.1: kReflow used to be reachable only when every queue was empty, so a
+    // steady ready-queue supply starved parked items forever. Force one bounded
+    // reflow opportunity per gap. Nothing is popped here yet, so the ready item
+    // is only re-queued by the reflow pass: no work is lost, only one pop's
+    // worth of latency is yielded every `defer_reflow_max_gap_ms`.
+    const uint64_t reflow_gap_ns =
+        static_cast<uint64_t>(params_.defer_reflow_max_gap_ms) * 1'000'000ULL;
+    if (reflow_gap_ns != 0 && defer_.hasDirty()) {
+        const uint64_t now = steadyNowNs();
+        uint64_t last = last_reflow_ns_.load(std::memory_order_relaxed);
+        if (now - last >= reflow_gap_ns &&
+            last_reflow_ns_.compare_exchange_strong(
+                last, now, std::memory_order_acq_rel)) {
+            return PopResult::kReflow;
+        }
+    }
     for (auto& queue : queues_) {
         if (!queue.empty()) {
             pending = std::move(queue.front());
@@ -801,7 +861,14 @@ size_t UbWorkers::reflowDeferred() {
                                                  std::memory_order_relaxed);
             }
         }
+        const uint64_t reflow_now = steadyNowNs();
         for (auto& item : ready) {
+            // F6c stage 2: waking up because the request deadline passed means
+            // "cancel", never "requeue".
+            if (requestExpired(item, reflow_now)) {
+                expirePending(item, expired_parked_);
+                continue;
+            }
             // requeueAfterDefer(), not markQueued(): a slice deferred before
             // beginAttempt() is still kQueued and markQueued() would refuse it,
             // which used to cancel a healthy slice on every reflow (W3 review
@@ -1063,7 +1130,8 @@ bool UbWorkers::pollBusinessSlot(size_t slot_index) {
         return false;
     }
     if (slot.context) {
-        progressLocalDeviceFailure(slot.context);
+        // Cleanup retries are native barriers too: keep them off the poller.
+        enqueueDeviceRetire(slot.context);
         if (slot.context->recordPollSuccess(
                 slot.jfc->index(),
                 static_cast<uint64_t>(params_.endpoint_cooldown_ms) *
@@ -1072,6 +1140,19 @@ bool UbWorkers::pollBusinessSlot(size_t slot_index) {
                       << slot.context->deviceInfo().topology_name
                       << " after endpoint retirement and an error-free JFC "
                          "cooldown";
+            // F7: propagate the availability edge to the probe side. Without
+            // it the paths DISABLED by onContextUnavailable() would stay
+            // disabled forever, because probe recovery waits for a new graph
+            // version that only a rebuild emits.
+            if (probe_manager_ != nullptr) {
+                const Status revived = probe_manager_->onContextAvailable(
+                    slot.context->topologyId());
+                if (!revived.ok()) {
+                    LOG_EVERY_N(WARNING, 100)
+                        << "UB probe context-available event was rejected: "
+                        << revived.ToString();
+                }
+            }
         }
     }
     const int local_nic = slot.context ? slot.context->topologyId() : -1;
@@ -1095,7 +1176,7 @@ bool UbWorkers::pollProbeSlot(size_t slot_index) {
             << "UB probe JFC poll failed: " << status.ToString();
         return false;
     }
-    if (slot.context) progressLocalDeviceFailure(slot.context);
+    if (slot.context) enqueueDeviceRetire(slot.context);
     // The probe JFC is provider-owned and not part of UbContext::jfcs(), so it
     // deliberately does not participate in the business JFC recovery epoch.
     const int local_nic = slot.context ? slot.context->topologyId() : -1;
@@ -1249,6 +1330,14 @@ UbWorkers::PendingSlice UbWorkers::withDeferralCount(
 void UbWorkers::deferPending(const PendingSlice& pending, DeferReason reason,
                              uint64_t wait_epoch, uint64_t expire_ns) {
     if (!pending.slice) return;
+    // F6c stage 2: a parked slice still owes its request deadline. Cap the wake
+    // time (and give previously untimed defers a timer) so an expired request
+    // is cancelled instead of being re-queued forever.
+    const uint64_t request_deadline = requestDeadlineNs(pending);
+    if (request_deadline != 0 &&
+        (expire_ns == 0 || request_deadline < expire_ns)) {
+        expire_ns = request_deadline;
+    }
     // Diagnostics only (yuanhao-1113): a traced slice counts its deferrals so
     // the task trace can separate queue latency from device latency.
     if (pending.task && pending.task->traceEnabled()) {
@@ -1320,6 +1409,10 @@ Status UbWorkers::buildRoute(const PendingSlice& pending, Route& route) {
             if (!status.ok()) return status;
             route.remote_buffer = buffer;
             route.metadata = std::move(metadata);
+            route.remote_eids.clear();
+            for (const auto& segment : route.metadata.segments) {
+                route.remote_eids.emplace(segment.topology_id, segment.eid);
+            }
             // Remote metadata is decoded once in this function and reused by
             // device ordering and by importRemote (yuanhao-1113).
             route.remote_devices =
@@ -1618,6 +1711,10 @@ Status UbWorkers::chooseAndResolveEndpoint(
     size_t adjacency_hard_denied = 0;
     size_t adjacency_transient_denied = 0;
     size_t invalid_edge_denied = 0;
+    // Legacy local x remote pairs refused because the two EIDs are in
+    // different reachability scopes. Declared adjacency applies the same
+    // policy through adjacency_policy.require_same_eid_scope.
+    size_t scope_denied = 0;
     AdjacencyDecision first_adjacency_denial = AdjacencyDecision::kAllowed;
     Topology::NicID first_denied_local = -1;
     Topology::NicID first_denied_remote = -1;
@@ -1641,6 +1738,27 @@ Status UbWorkers::chooseAndResolveEndpoint(
         } else {
             local = local_devices[flat / remote_devices.size()];
             remote_id = remote_devices[flat % remote_devices.size()];
+            if (params_.require_same_eid_scope) {
+                const auto local_context =
+                    context_by_topology_id_.find(local.id);
+                const auto remote_eid = route.remote_eids.find(remote_id);
+                // A missing local context or a peer that did not publish its
+                // EID is not evidence of a cross-scope pair: let the normal
+                // resolution produce the precise error instead.
+                if (local_context != context_by_topology_id_.end() &&
+                    remote_eid != route.remote_eids.end() &&
+                    !sameEidScope(local_context->second->deviceInfo().eid,
+                                  remote_eid->second)) {
+                    ++scope_denied;
+                    eid_scope_denied_.fetch_add(1, std::memory_order_relaxed);
+                    VLOG(1) << "UB endpoint select: cross EID scope pair "
+                            << "local_nic=" << local.id << " local_eid="
+                            << local_context->second->deviceInfo().eid
+                            << " remote_nic=" << remote_id
+                            << " remote_eid=" << remote_eid->second;
+                    continue;
+                }
+            }
         }
         if (route.adjacency.enforced) {
             bool local_declared = false;
@@ -1705,7 +1823,8 @@ Status UbWorkers::chooseAndResolveEndpoint(
             std::move(rail_stats),
             quota_->availability(probe_path, pending.slice->spec().length)});
     }
-    const size_t counted_denied = adjacency_denied + invalid_edge_denied;
+    const size_t counted_denied =
+        adjacency_denied + invalid_edge_denied + scope_denied;
     const size_t health_denied =
         combinations > counted_denied + rails.size()
             ? combinations - counted_denied - rails.size()
@@ -1713,6 +1832,23 @@ Status UbWorkers::chooseAndResolveEndpoint(
     if (route.adjacency.enforced) {
         declared_candidates_denied_.fetch_add(counted_denied,
                                               std::memory_order_relaxed);
+    }
+    if (rails.empty() && !route.adjacency.enforced && combinations != 0 &&
+        scope_denied == combinations) {
+        // Every local x remote pair crosses scopes: retrying can only produce
+        // LOCAL_ACCESS_ERROR and generation churn. Name the knob so the
+        // operator can fix the filter instead of reading a native error.
+        LOG_EVERY_N(WARNING, params_.observability.leaseSampleEvery())
+            << "UB endpoint select denied: task="
+            << reinterpret_cast<uint64_t>(pending.task.get())
+            << " slice=" << pending.slice->snapshot().id
+            << " policy=legacy candidates=" << combinations
+            << " denied{scope=" << scope_denied << "}";
+        return Status::InvalidArgument(
+            "Every UB local/remote device pair crosses the EID reachability "
+            "scope; restrict transports/ub/device_filter to one scope or set "
+            "transports/ub/require_same_eid_scope=false to allow cross-scope "
+            "pairs" LOC_MARK);
     }
     if (rails.empty() && invalid_edge_denied == combinations) {
         LOG_EVERY_N(WARNING, params_.observability.leaseSampleEvery())
@@ -1723,7 +1859,8 @@ Status UbWorkers::chooseAndResolveEndpoint(
             << " candidates=" << combinations << " healthy=" << rails.size()
             << " health_denied=" << health_denied
             << " denied{adjacency=" << adjacency_denied
-            << ",invalid_edge=" << invalid_edge_denied << ",quota=0}";
+            << ",invalid_edge=" << invalid_edge_denied
+            << ",scope=" << scope_denied << ",quota=0}";
         return Status::InvalidArgument(
             "Every declared edge was invalidated after repeated "
             "parameter/memory errors" LOC_MARK);
@@ -1929,7 +2066,8 @@ Status UbWorkers::chooseAndResolveEndpoint(
                       << " rank=" << selected->score.topology_rank
                       << " probe_path=" << (route.probe_peer_id != 0 ? 1 : 0)
                       << " denied{adjacency=" << adjacency_denied
-                      << ",invalid_edge=" << invalid_edge_denied << ",quota=0}"
+                      << ",invalid_edge=" << invalid_edge_denied
+                      << ",scope=" << scope_denied << ",quota=0}"
                       << " healthy=" << rails.size()
                       << " resolved=" << candidates.size()
                       << " health_denied=" << health_denied
@@ -1944,7 +2082,8 @@ Status UbWorkers::chooseAndResolveEndpoint(
                     << " rank=" << selected->score.topology_rank
                     << " probe_path=" << (route.probe_peer_id != 0 ? 1 : 0)
                     << " denied{adjacency=" << adjacency_denied
-                    << ",invalid_edge=" << invalid_edge_denied << ",quota=0}"
+                    << ",invalid_edge=" << invalid_edge_denied
+                    << ",scope=" << scope_denied << ",quota=0}"
                     << " healthy=" << rails.size()
                     << " resolved=" << candidates.size()
                     << " health_denied=" << health_denied << " healthy_paths=["
@@ -2024,6 +2163,12 @@ UbWorkers::ClaimDecision UbWorkers::claimPost(
     const AttemptKey& attempt, const LeaseWithCredit& leased,
     const UbPostPath& path, const ProbePathKey& probe_key,
     uint64_t fault_epoch_snapshot) {
+    // The PLM fault epoch compared here is part of the claim *decision*, not an
+    // observation: a path isolated after the pre-lease snapshot must reject
+    // this attempt (the caller rolls back and re-plans).
+    // `post_on_isolated_path_` only observes the inherent window between this
+    // claim and the native post call; it is not the isolation check itself.
+    //
     // W3g R-1. Two independent inputs decide whether the WR may be posted:
     //   1. the pool's synchronized verdict (stopping / member / generation /
     //      error epoch), authoritative for the leased resource;
@@ -2101,6 +2246,7 @@ std::shared_ptr<UbWorkers::BusinessRecord> UbWorkers::makeRecord(
     record->core.path = makeBusinessRecordPath(path);
     record->core.jetty_generation = path.endpoint_generation;
     record->core.owner = record.get();
+    record->core.write_opcode = pending.opcode == Request::WRITE;
     record->pending = pending;
     record->attempt = attempt;
     record->path = path;
@@ -2109,10 +2255,23 @@ std::shared_ptr<UbWorkers::BusinessRecord> UbWorkers::makeRecord(
     record->local_segment = local.segment;
     record->remote_segment = remote.segment;
     record->quota = reservation;
+    record->context_incarnation = endpoint && endpoint->context()
+                                      ? endpoint->context()->incarnation()
+                                      : 0;
     record->posted_ns = steadyNowNs();
-    record->deadline_ns = deadlineAfter(
+    const uint64_t slice_deadline = deadlineAfter(
         record->posted_ns,
         static_cast<uint64_t>(params_.slice_timeout_ms) * 1'000'000ULL);
+    // F6c stage 4: an in-flight attempt must honour the earlier of the two
+    // deadlines. When the request deadline wins, the timeout fence (F6a) is
+    // what enforces it, so no extra timer is needed.
+    const uint64_t request_deadline = requestDeadlineNs(pending);
+    if (request_deadline != 0 && request_deadline < slice_deadline) {
+        record->deadline_ns = request_deadline;
+        record->deadline_from_request = true;
+    } else {
+        record->deadline_ns = slice_deadline;
+    }
     return record;
 }
 
@@ -2121,6 +2280,13 @@ void UbWorkers::processPending(const PendingSlice& pending,
     if (!pending.slice) return;
     if (pending.slice->cancellationRequested()) {
         pending.slice->requestCancellation();
+        return;
+    }
+    // F6c stage 1: the request was already past its deadline while it sat in a
+    // ready queue. Terminate it here, before any route/lease/quota is touched,
+    // and without charging backpressure.
+    if (requestExpired(pending, steadyNowNs())) {
+        expirePending(pending, expired_in_queue_);
         return;
     }
     // Sample every availability epoch before evaluating anything: a bump that
@@ -2205,6 +2371,15 @@ void UbWorkers::processPending(const PendingSlice& pending,
     }
     const uint64_t segments_ready_ns = traced ? steadyNowNs() : 0;
 
+    // F6c stage 3: route resolution and segment import can consume the whole
+    // remaining budget. Do not burn a lease/quota/K slot on a request that is
+    // already late.
+    if (requestExpired(pending, steadyNowNs())) {
+        (void)quota_->release(reservation);
+        expirePending(pending, expired_pre_post_);
+        return;
+    }
+
     if (!endpoint->tryAcquireOutstanding(pending.slice->spec().length)) {
         (void)quota_->release(reservation);
         // Outstanding pressure is released together with the quota in onOwners,
@@ -2283,7 +2458,17 @@ void UbWorkers::postLegacy(const PendingSlice& pending, size_t worker_index,
             std::lock_guard<std::mutex> lock(records_mutex_);
             records_.emplace(record->core.token, record);
             if (record->pool && record->pooled_lane.lane_generation != 0) {
-                ++pooled_lane_refs_[record->pooled_lane.lane_generation];
+                // D5: a zero incarnation would create a key shared by every
+                // Context. It is unreachable for a pooled record (the endpoint
+                // always owns a Context), so count it rather than alias it.
+                if (record->context_incarnation == 0) {
+                    pooled_lane_ref_unmapped_.fetch_add(
+                        1, std::memory_order_relaxed);
+                } else {
+                    ++pooled_lane_refs_[LaneRefKey{
+                        record->context_incarnation,
+                        record->pooled_lane.lane_generation}];
+                }
             }
         }
         gate_ctx_.stats.record_published.fetch_add(1,
@@ -2302,8 +2487,7 @@ void UbWorkers::postLegacy(const PendingSlice& pending, size_t worker_index,
             // Anchor the pollers' idle-spin window (yuanhao-1113).
             last_post_ns_.store(record->posted_ns, std::memory_order_relaxed);
             status = adapter_->post(jetty, {work}, posted_count, acceptance);
-            if (record->pending.task &&
-                record->pending.task->traceEnabled()) {
+            if (record->pending.task && record->pending.task->traceEnabled()) {
                 record->pending.slice->notePostReturned(steadyNowNs());
             }
         }
@@ -2517,7 +2701,17 @@ void UbWorkers::processPendingPooled(
             std::lock_guard<std::mutex> lock(records_mutex_);
             records_.emplace(record->core.token, record);
             if (record->pool && record->pooled_lane.lane_generation != 0) {
-                ++pooled_lane_refs_[record->pooled_lane.lane_generation];
+                // D5: a zero incarnation would create a key shared by every
+                // Context. It is unreachable for a pooled record (the endpoint
+                // always owns a Context), so count it rather than alias it.
+                if (record->context_incarnation == 0) {
+                    pooled_lane_ref_unmapped_.fetch_add(
+                        1, std::memory_order_relaxed);
+                } else {
+                    ++pooled_lane_refs_[LaneRefKey{
+                        record->context_incarnation,
+                        record->pooled_lane.lane_generation}];
+                }
             }
         }
         gate_ctx_.stats.record_published.fetch_add(1,
@@ -2593,6 +2787,182 @@ void UbWorkers::processPendingPooled(
     }
 }
 
+void UbWorkers::setControlExecutor(std::shared_ptr<ControlExecutor> executor) {
+    control_executor_ = std::move(executor);
+    control_executor_owned_ = false;
+}
+
+void UbWorkers::startControlExecutor() {
+    if (control_executor_) return;
+    // Dedicated executor: draining a Jetty is a long-tail operation, so sharing
+    // the queue with the drain chain would let a burst of drains starve the
+    // deadline fences (and vice versa).
+    auto executor =
+        std::make_shared<ThreadedControlExecutor>("ub-control-latency", 4096);
+    if (!executor->start()) {
+        LOG(WARNING) << "UB cannot start the deadline-fence control executor; "
+                        "fences will run on the poller";
+        return;
+    }
+    control_executor_ = std::move(executor);
+    control_executor_owned_ = true;
+}
+
+void UbWorkers::stopControlExecutor() {
+    if (!control_executor_ || !control_executor_owned_) return;
+    if (auto threaded = std::dynamic_pointer_cast<ThreadedControlExecutor>(
+            control_executor_)) {
+        threaded->stop();
+    }
+    control_executor_.reset();
+    control_executor_owned_ = false;
+}
+
+void UbWorkers::noteControlJobFinished() {
+    {
+        std::lock_guard<std::mutex> lock(control_jobs_mutex_);
+        if (control_jobs_pending_ != 0) --control_jobs_pending_;
+    }
+    control_jobs_cv_.notify_all();
+}
+
+void UbWorkers::drainPendingControlJobs() {
+    std::unique_lock<std::mutex> lock(control_jobs_mutex_);
+    // Not an unbounded silent wait: a provider quiesce that overruns its own
+    // timeout must be visible in the log. The wait itself is deliberately not
+    // abandoned on timeout: proceeding would let a queued fence run natively
+    // while stop() is already tearing the same endpoints down, which the drain
+    // contract (and INV-1's ordering) forbids. So: warn periodically, keep the
+    // safety ordering.
+    while (control_jobs_pending_ != 0) {
+        const uint64_t pending = control_jobs_pending_;
+        if (!control_jobs_cv_.wait_for(lock, std::chrono::seconds(5), [this] {
+                return control_jobs_pending_ == 0;
+            })) {
+            LOG(WARNING) << "UB shutdown is waiting for " << pending
+                         << " control job(s) (timeout fence / device retire); "
+                            "a provider call is overrunning its timeout";
+        }
+    }
+}
+
+uint64_t UbWorkers::requestDeadlineNs(const PendingSlice& pending) const {
+    if (!params_.honor_request_deadline || !pending.task) return 0;
+    // Contract (tent/common/types.h): absolute steady_clock timestamp, 0 means
+    // "no deadline"; both the engine and this file use steadyNowNs().
+    return pending.task->request().deadline_ns;
+}
+
+bool UbWorkers::requestExpired(const PendingSlice& pending,
+                               uint64_t now_ns) const {
+    const uint64_t deadline = requestDeadlineNs(pending);
+    return deadline != 0 && now_ns >= deadline;
+}
+
+void UbWorkers::expirePending(const PendingSlice& pending,
+                              std::atomic<uint64_t>& counter) {
+    if (!pending.slice) return;
+    // Resolve as TIMEOUT without a cancellation request: requestCancellation()
+    // would terminalize the slice as CANCELED, losing why it was dropped.
+    if (pending.slice->tryResolveBeforePost(TIMEOUT)) {
+        counter.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void UbWorkers::enqueueTimeoutFence(
+    const std::shared_ptr<BusinessRecord>& record) {
+    if (!record) return;
+    TimeoutFenceJob job{record->core.token, record, record->attempt.attempt};
+    if (!control_executor_) {
+        // Degraded path (no control thread). The only caller is scanTimeouts(),
+        // which already holds endpoint_drain_mutex_ for its claim+enqueue
+        // section, so this MUST use the locked variant: taking the mutex here
+        // would re-enter a non-recursive std::mutex on the poller thread and
+        // deadlock the first deadline timeout (exactly the legacy inline shape,
+        // which had one lock for both steps).
+        runTimeoutFenceLocked(job);
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(control_jobs_mutex_);
+        ++control_jobs_pending_;
+    }
+    const Status submitted = control_executor_->submit([this, job] {
+        runTimeoutFence(job);
+        noteControlJobFinished();
+    });
+    if (!submitted.ok()) {
+        noteControlJobFinished();
+        timeout_fence_rejected_.fetch_add(1, std::memory_order_relaxed);
+        // The record stays registered, but the provisional timeout mark must
+        // be revoked or the next scan would skip it forever (the scan filters
+        // timed_out): a scheduling failure is not fence evidence.
+        bool still_registered = false;
+        {
+            std::lock_guard<std::mutex> lock(records_mutex_);
+            auto it = records_.find(record->core.token);
+            still_registered = it != records_.end() && it->second == record;
+        }
+        if (still_registered) gate::onFenceFailed(record->core);
+        LOG_EVERY_N(WARNING, 100)
+            << "UB timeout fence was not scheduled (" << submitted.ToString()
+            << "); the record keeps its responsibility for the next scan";
+        return;
+    }
+    timeout_fence_submitted_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void UbWorkers::enqueueDeviceRetire(const UbContextPtr& context) {
+    if (!context || !local_device_failure_handler_) return;
+    // Only a genuinely failed context whose barrier has not run yet needs the
+    // native cleanup. Without this guard the success-path call would enqueue
+    // one job per successful poll (during the recovery cooldown as well).
+    if (context->state() != UbContext::State::kFailed ||
+        context->failureCleanupComplete()) {
+        return;
+    }
+    const Topology::NicID local_nic = context->topologyId();
+    {
+        std::lock_guard<std::mutex> lock(device_retire_mutex_);
+        // The poller observes a failed context on every poll; queueing one job
+        // per observation would flood the executor.
+        if (!device_retire_queued_.insert(local_nic).second) return;
+    }
+    auto finish = [this, local_nic] {
+        {
+            std::lock_guard<std::mutex> lock(device_retire_mutex_);
+            device_retire_queued_.erase(local_nic);
+        }
+        noteControlJobFinished();
+    };
+    if (!control_executor_) {
+        progressLocalDeviceFailure(context);
+        finish();
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(control_jobs_mutex_);
+        ++control_jobs_pending_;
+    }
+    const Status submitted = control_executor_->submit([this, context, finish] {
+        progressLocalDeviceFailure(context);
+        finish();
+    });
+    if (!submitted.ok()) {
+        device_retire_rejected_.fetch_add(1, std::memory_order_relaxed);
+        // Let a later poll try again instead of leaving the context failed
+        // forever behind a dedupe entry.
+        {
+            std::lock_guard<std::mutex> lock(device_retire_mutex_);
+            device_retire_queued_.erase(local_nic);
+        }
+        noteControlJobFinished();
+        LOG_EVERY_N(WARNING, 100)
+            << "UB device retirement was not scheduled ("
+            << submitted.ToString() << "); the next poll retries it";
+    }
+}
+
 void UbWorkers::handleLocalDeviceFailure(const UbContextPtr& context) {
     if (!context) return;
     const bool newly_failed = context->markUnavailable();
@@ -2610,7 +2980,10 @@ void UbWorkers::handleLocalDeviceFailure(const UbContextPtr& context) {
                         "reactivation is disabled";
         return;
     }
-    progressLocalDeviceFailure(context);
+    // F6a2: only the native endpoint barrier moves off the poller. The state
+    // transition and the PLM notification above stay synchronous so no new
+    // post can target the failed device.
+    enqueueDeviceRetire(context);
 }
 
 void UbWorkers::progressLocalDeviceFailure(const UbContextPtr& context) {
@@ -2723,7 +3096,22 @@ void UbWorkers::onFault(CompletionRecord& record, FaultKind kind) {
         // Deadline evidence without a placeable completion. A late completion
         // resolves the same one-shot, so the rail sees exactly one timeout.
         business_deadline_timeouts_.fetch_add(1, std::memory_order_relaxed);
+        if (business->deadline_from_request) {
+            expired_inflight_.fetch_add(1, std::memory_order_relaxed);
+        }
         rail_monitor_->recordTimeout(business->path, now);
+        // A deadline timeout is the strongest path-fault evidence there is:
+        // nothing completed and there is no native error code to attribute.
+        // Feed the same isolation/probe chain as an adapter-level TIMEOUT,
+        // otherwise "suspended with no CQE" - the one case that most needs
+        // probe recovery - would never start a probe campaign.
+        //
+        // Deliberately NOT `endpoint_retirer_`: unlike the adapter-level
+        // TIMEOUT, the timeout fence already fenced this specific Jetty, so
+        // retiring the whole endpoint would amplify one budget overrun to a
+        // device-wide retirement. Keep that difference instead of "aligning"
+        // the two paths.
+        report_error(BusinessErrorKind::kPathFault);
         const uint64_t age_us = now > business->posted_ns
                                     ? (now - business->posted_ns) / 1000ULL
                                     : 0ULL;
@@ -2945,6 +3333,11 @@ void UbWorkers::onDuplicate(CompletionRecord& record) {
 }
 
 void UbWorkers::scanTimeouts() {
+    // F6a: this function runs on a JFC poller, so it must never call into the
+    // provider. It snapshots, claims once and enqueues; runTimeoutFence() does
+    // the native fence on the control executor. The drain mutex is still held
+    // for the claim+enqueue section so stop()'s barrier proves no fence job can
+    // appear after it.
     std::lock_guard<std::mutex> drain_lock(endpoint_drain_mutex_);
     if (!timeout_scans_enabled_.load(std::memory_order_acquire)) return;
     const uint64_t now = steadyNowNs();
@@ -2970,67 +3363,79 @@ void UbWorkers::scanTimeouts() {
         // One-shot mark. The fault side effects stay unclaimed until there is
         // evidence: a revoked timeout must not swallow the real fault (IN-11).
         if (!gate::onTimeout(record->core)) continue;
-        std::vector<Completion> drained;
-        Status status;
-        JettyPtr pooled_jetty;
-        if (record->pool && record->lease.valid()) {
-            // D-14 / W3-IN-10: in pooled mode the fence target is the leased
-            // member's Jetty. `endpoint->jetty(worker_index)` belongs to
-            // another, unused Jetty set and fencing it would prove nothing.
-            const auto member = record->lease.member();
-            pooled_jetty = member ? member->jetty : nullptr;
-        }
-        if (pooled_jetty) {
-            status = adapter_->quiesceJetty(pooled_jetty,
-                                            params_.slice_timeout_ms, drained);
-        } else if (record->pool) {
-            status = Status::InvalidArgument(
-                "Timed-out pooled UB WR has no leased Jetty" LOC_MARK);
-        } else {
-            status = record->endpoint
-                         ? record->endpoint->quiesce(params_.slice_timeout_ms,
-                                                     drained)
-                         : Status::InvalidArgument(
-                               "Timed-out UB WR has no endpoint" LOC_MARK);
-        }
-        // Even a partial/failed fence may have returned valid WR completions;
-        // they must never be lost and must be settled by the same dispatcher.
-        for (const auto& completion : drained) {
-            dispatchCompletion(completion, record->core.path.local_nic);
-        }
-        if (!status.ok()) {
-            // The pooled path keeps the endpoint alive: the member is the only
-            // resource that can be at fault, and the record stays registered so
-            // a later scan retries the fence.
-            if (!record->pool) rememberEndpointDrain(record->endpoint);
-            LOG_EVERY_N(ERROR, 100)
-                << "Cannot establish UB timeout drain fence: "
-                << status.ToString();
-            // Leave the token and all resource references alive. A natural
-            // completion can still resolve it safely; otherwise a later scan
-            // retries the native fence.
-            bool still_registered = false;
-            {
-                std::lock_guard<std::mutex> lock(records_mutex_);
-                auto it = records_.find(record->core.token);
-                still_registered = it != records_.end() && it->second == record;
-            }
-            if (still_registered) gate::onFenceFailed(record->core);
-            continue;
-        }
-        if (!record->pool) {
-            forgetEndpointDrain(record->endpoint);
-            if (endpoint_retirer_) endpoint_retirer_(record->endpoint);
-        }
-        // The erase and the "is this record still mine?" check happen in one
-        // critical section: if a drained completion already claimed and
-        // disposed of the record, the scan must not release the owners again
-        // (IN-4).
-        eraseRecord(record->core.token, record.get());
-        // quiesce() is the proof that retry cannot overlap old DMA. The fence
-        // evidence then settles TIMEOUT and finalizes once (§6.7).
-        gate::onFenceProven(record->core, *this, gate_ctx_);
+        enqueueTimeoutFence(record);
     }
+}
+
+void UbWorkers::runTimeoutFence(const TimeoutFenceJob& job) {
+    std::lock_guard<std::mutex> drain_lock(endpoint_drain_mutex_);
+    runTimeoutFenceLocked(job);
+}
+
+void UbWorkers::runTimeoutFenceLocked(const TimeoutFenceJob& job) {
+    // Precondition: endpoint_drain_mutex_ is held by the caller (either the
+    // control executor's runTimeoutFence wrapper or scanTimeouts' inline
+    // degraded path).
+    const std::shared_ptr<BusinessRecord>& record = job.record;
+    if (!record) return;
+    std::vector<Completion> drained;
+    Status status;
+    JettyPtr pooled_jetty;
+    if (record->pool && record->lease.valid()) {
+        // D-14 / W3-IN-10: in pooled mode the fence target is the leased
+        // member's Jetty. `endpoint->jetty(worker_index)` belongs to another,
+        // unused Jetty set and fencing it would prove nothing.
+        const auto member = record->lease.member();
+        pooled_jetty = member ? member->jetty : nullptr;
+    }
+    if (pooled_jetty) {
+        status = adapter_->quiesceJetty(pooled_jetty, params_.slice_timeout_ms,
+                                        drained);
+    } else if (record->pool) {
+        status = Status::InvalidArgument(
+            "Timed-out pooled UB WR has no leased Jetty" LOC_MARK);
+    } else {
+        status =
+            record->endpoint
+                ? record->endpoint->quiesce(params_.slice_timeout_ms, drained)
+                : Status::InvalidArgument(
+                      "Timed-out UB WR has no endpoint" LOC_MARK);
+    }
+    // Even a partial/failed fence may have returned valid WR completions; they
+    // must never be lost and must be settled by the same dispatcher.
+    for (const auto& completion : drained) {
+        dispatchCompletion(completion, record->core.path.local_nic);
+    }
+    if (!status.ok()) {
+        // The pooled path keeps the endpoint alive: the member is the only
+        // resource that can be at fault, and the record stays registered so a
+        // later scan retries the fence.
+        if (!record->pool) rememberEndpointDrain(record->endpoint);
+        LOG_EVERY_N(ERROR, 100)
+            << "Cannot establish UB timeout drain fence: " << status.ToString();
+        // Leave the token and all resource references alive. A natural
+        // completion can still resolve it safely; otherwise a later scan
+        // retries the native fence.
+        bool still_registered = false;
+        {
+            std::lock_guard<std::mutex> lock(records_mutex_);
+            auto it = records_.find(record->core.token);
+            still_registered = it != records_.end() && it->second == record;
+        }
+        if (still_registered) gate::onFenceFailed(record->core);
+        return;
+    }
+    if (!record->pool) {
+        forgetEndpointDrain(record->endpoint);
+        if (endpoint_retirer_) endpoint_retirer_(record->endpoint);
+    }
+    // The erase and the "is this record still mine?" check happen in one
+    // critical section: if a drained completion already claimed and disposed of
+    // the record, this fence must not release the owners again (IN-4).
+    eraseRecord(record->core.token, record.get());
+    // quiesce() is the proof that retry cannot overlap old DMA. The fence
+    // evidence then settles TIMEOUT and finalizes once (§6.7).
+    gate::onFenceProven(record->core, *this, gate_ctx_);
 }
 
 bool UbWorkers::settleDrainedWr(const Completion& completion,
@@ -3059,10 +3464,10 @@ bool UbWorkers::settleDrainedWr(const Completion& completion,
     return true;
 }
 
-bool UbWorkers::pooledLaneConverged(const PoolLaneKey& lane) const {
+bool UbWorkers::pooledLaneConverged(const LaneRefKey& lane) const {
     if (lane.lane_generation == 0) return true;
     std::lock_guard<std::mutex> lock(records_mutex_);
-    auto refs = pooled_lane_refs_.find(lane.lane_generation);
+    auto refs = pooled_lane_refs_.find(lane);
     return refs == pooled_lane_refs_.end() || refs->second == 0;
 }
 
@@ -3157,8 +3562,9 @@ void UbWorkers::eraseRecord(uint64_t token, const BusinessRecord* record) {
         if (it != records_.end() && it->second.get() == record) {
             records_.erase(it);
             const uint64_t generation = record->pooled_lane.lane_generation;
-            if (generation != 0) {
-                auto refs = pooled_lane_refs_.find(generation);
+            if (generation != 0 && record->context_incarnation != 0) {
+                auto refs = pooled_lane_refs_.find(
+                    LaneRefKey{record->context_incarnation, generation});
                 if (refs != pooled_lane_refs_.end()) {
                     if (refs->second <= 1) {
                         pooled_lane_refs_.erase(refs);

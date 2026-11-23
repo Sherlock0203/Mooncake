@@ -279,6 +279,11 @@ void UbContext::completeFailureCleanup() noexcept {
     }
 }
 
+bool UbContext::failureCleanupComplete() const noexcept {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    return failure_cleanup_complete_;
+}
+
 bool UbContext::recordPollSuccess(size_t jfc_index,
                                   uint64_t cooldown_ns) noexcept {
     std::lock_guard<std::mutex> lock(lifecycle_mutex_);

@@ -276,6 +276,27 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         auto fake_jfc = std::dynamic_pointer_cast<FakeJfc>(jfc);
         if (!fake_jfc) return Status::InvalidArgument("bad JFC");
         last_jetty_transport_mode_ = options.transport_mode;
+        // Deterministic stop-while-creating hook: the first createJetty after
+        // holdNextCreateJetty() waits until releaseCreateJetty().
+        if (create_gate_.exchange(false, std::memory_order_acq_rel)) {
+            create_waiting_.store(true, std::memory_order_release);
+            std::unique_lock<std::mutex> gate_lock(create_gate_mutex_);
+            create_gate_cv_.wait(gate_lock, [this] {
+                return !create_waiting_.load(std::memory_order_acquire);
+            });
+        }
+        // Provider contract under test: a failed create may still hand back a
+        // partially allocated handle, which the caller must clean up through
+        // its single retirement path.
+        if (create_jetty_failure_with_handle_.exchange(
+                false, std::memory_order_acq_rel)) {
+            auto created =
+                std::make_shared<FakeJetty>(next_jetty_id_++, fake_jfc);
+            jetty = std::move(created);
+            live_jetties_.fetch_add(1, std::memory_order_relaxed);
+            return Status::InternalError(
+                "injected createJetty failure with a partial handle");
+        }
         if (create_jetty_failures_.load(std::memory_order_acquire) != 0 &&
             create_jetty_failures_.fetch_sub(1, std::memory_order_acq_rel) >
                 0) {
@@ -531,6 +552,32 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         }
         return Status::OK();
     }
+    // F5: lets a test say "the provider failed without naming the failing WR",
+    // which the (status, posted_count) pair cannot express on its own.
+    void setNextPostEvidence(PostEvidence evidence) {
+        next_post_evidence_.store(evidence, std::memory_order_release);
+    }
+
+    ::mooncake::tent::ub::PostOutcome postDetailed(
+        const JettyPtr& jetty,
+        const std::vector<WorkRequest>& requests) override {
+        ::mooncake::tent::ub::PostOutcome outcome;
+        outcome.request_count = requests.size();
+        outcome.status = post(jetty, requests, outcome.posted_count);
+        outcome.evidence = takePostEvidence();
+        return outcome;
+    }
+
+    ::mooncake::tent::ub::PostOutcome postDetailed(
+        const JettyPtr& jetty, const RemoteJettyInfo& target,
+        const WorkRequest& request) override {
+        ::mooncake::tent::ub::PostOutcome outcome;
+        outcome.request_count = 1;
+        outcome.status = post(jetty, target, request, outcome.posted_count);
+        outcome.evidence = takePostEvidence();
+        return outcome;
+    }
+
     Status post(const JettyPtr& jetty, const RemoteJettyInfo& target,
                 const WorkRequest& request, size_t& posted) override {
         auto fake = std::dynamic_pointer_cast<FakeJetty>(jetty);
@@ -571,6 +618,7 @@ class FakeUrmaAdapter final : public UrmaAdapter {
 
     Status poll(const JfcPtr& jfc, size_t maximum,
                 std::vector<Completion>& completions) override {
+        poll_calls_.fetch_add(1, std::memory_order_relaxed);
         completions.clear();
         if (fail_next_poll_.exchange(false, std::memory_order_acq_rel)) {
             return Status::InternalError("injected JFC poll failure");
@@ -634,7 +682,7 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     //   Unknown:     status ok with 0 posted, or !ok with a posted WR
     void setNextPostOutcome(Status status, size_t posted_count) {
         std::lock_guard<std::mutex> lock(hook_mutex_);
-        forced_post_outcome_ = PostOutcome{std::move(status), posted_count};
+        forced_post_outcome_ = ForcedPost{std::move(status), posted_count};
     }
     // Releases every held completion as a SUCCESS (late-CQE injection).
     size_t completePending() {
@@ -652,6 +700,26 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     }
     void failNextCreateJetty() {
         create_jetty_failures_.fetch_add(1, std::memory_order_acq_rel);
+    }
+    // Fails the next createJetty() but still hands back a partially allocated
+    // handle (the provider contract the pool must retire safely).
+    void failNextCreateJettyWithHandle() {
+        create_jetty_failure_with_handle_.store(true,
+                                                std::memory_order_release);
+    }
+    void holdNextCreateJetty() {
+        create_gate_.store(true, std::memory_order_release);
+    }
+    void releaseCreateJetty() {
+        create_gate_.store(false, std::memory_order_release);
+        create_waiting_.store(false, std::memory_order_release);
+        create_gate_cv_.notify_all();
+    }
+    uint64_t pollCalls() const {
+        return poll_calls_.load(std::memory_order_relaxed);
+    }
+    bool createGateWaiting() const {
+        return create_waiting_.load(std::memory_order_acquire);
     }
     // Fails the next `count` deleteJetty() calls. Two consecutive failures are
     // needed to observe a quarantined member, because shutdown retries once.
@@ -837,7 +905,10 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         WorkRequest request;
     };
 
-    struct PostOutcome {
+    // Forced post result. Distinct from the adapter-boundary PostOutcome: the
+    // evidence channel is injected separately so existing tests that force
+    // (status, posted_count) keep the provider-reported default.
+    struct ForcedPost {
         Status status = Status::OK();
         size_t posted_count = 0;
     };
@@ -849,11 +920,16 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     }
 
     // Returns the forced outcome when one was installed, consuming it.
-    std::optional<PostOutcome> takeForcedPostOutcome(size_t request_count) {
+    PostEvidence takePostEvidence() {
+        return next_post_evidence_.exchange(PostEvidence::kProviderReported,
+                                            std::memory_order_acq_rel);
+    }
+
+    std::optional<ForcedPost> takeForcedPostOutcome(size_t request_count) {
         (void)request_count;
         std::lock_guard<std::mutex> lock(hook_mutex_);
         if (!forced_post_outcome_.has_value()) return std::nullopt;
-        PostOutcome outcome = std::move(*forced_post_outcome_);
+        ForcedPost outcome = std::move(*forced_post_outcome_);
         forced_post_outcome_.reset();
         return outcome;
     }
@@ -904,9 +980,17 @@ class FakeUrmaAdapter final : public UrmaAdapter {
     std::atomic<bool> auto_bind_created_jetties_{false};
     std::atomic<bool> rm_post_delivers_completion_{false};
     std::atomic<size_t> create_jetty_failures_{0};
+    std::atomic<bool> create_jetty_failure_with_handle_{false};
+    std::atomic<uint64_t> poll_calls_{0};
+    std::atomic<bool> create_gate_{false};
+    std::atomic<bool> create_waiting_{false};
+    std::mutex create_gate_mutex_;
+    std::condition_variable create_gate_cv_;
     std::atomic<size_t> delete_jetty_failures_{0};
     std::atomic<uint32_t> last_quiesced_jetty_id_{0};
-    std::optional<PostOutcome> forced_post_outcome_;
+    std::optional<ForcedPost> forced_post_outcome_;
+    std::atomic<PostEvidence> next_post_evidence_{
+        PostEvidence::kProviderReported};
     mutable std::mutex sequence_mutex_;
     std::vector<uint32_t> post_jetty_ids_;
     std::vector<uint32_t> post_target_ids_;

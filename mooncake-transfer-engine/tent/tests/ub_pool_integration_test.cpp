@@ -16,7 +16,9 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -37,9 +39,104 @@
 #include "ub_fake_urma.h"
 
 namespace mooncake::tent::ub {
+
+// Declared as a friend by UbWorkers so the test can arm the thread-local
+// enqueue-failure hook without a production setter.
+class UbWorkersTestPeer {
+   public:
+    static void failSecondEnqueue() {
+        UbWorkers::fail_second_enqueue_for_test_ = true;
+    }
+    // Forces the degraded fence path: no control executor, so scanTimeouts
+    // executes the fence inline while it holds endpoint_drain_mutex_.
+    static void dropControlExecutor(UbWorkers& workers) {
+        workers.stopControlExecutor();
+    }
+    // The claim verdict is private, so exercise it through the friend rather
+    // than widening the production API just for a test.
+    static bool claimedWithEpochChange(bool path_epoch_changed) {
+        UbWorkers::ClaimDecision decision;
+        decision.closed = ClaimClosed::kNone;
+        decision.path_epoch_changed = path_epoch_changed;
+        return decision.claimed();
+    }
+};
+
 namespace {
 
 using namespace fake;
+
+uint64_t steadyNow() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+
+// Deterministic control executor: the test decides when a queued fence or
+// device-retirement job runs, so "the poller did not block" and "a refused job
+// keeps its responsibility" are observable without racing a real thread.
+class ManualControlExecutor final : public ControlExecutor {
+   public:
+    explicit ManualControlExecutor(size_t capacity = 64)
+        : capacity_(capacity) {}
+
+    Status submit(Task task) override {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (tasks_.size() >= capacity_) {
+                return Status::TooManyRequests("manual control queue is full");
+            }
+            tasks_.push_back(std::move(task));
+        }
+        cv_.notify_all();
+        return Status::OK();
+    }
+
+    Status scheduleAfter(uint64_t, Task task) override {
+        return submit(std::move(task));
+    }
+
+    [[nodiscard]] bool running() const override { return true; }
+
+    [[nodiscard]] size_t pending() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return tasks_.size();
+    }
+
+    bool waitPending(size_t at_least, uint32_t timeout_ms = 3000) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                            [&] { return tasks_.size() >= at_least; });
+    }
+
+    size_t runAll() {
+        size_t ran = 0;
+        for (;;) {
+            Task task;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (tasks_.empty()) break;
+                task = std::move(tasks_.front());
+                tasks_.pop_front();
+            }
+            if (task) task();
+            ++ran;
+        }
+        return ran;
+    }
+
+    void setCapacity(size_t capacity) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        capacity_ = capacity;
+    }
+
+   private:
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+    std::deque<Task> tasks_;
+    size_t capacity_;
+};
 
 // The fake device's budget ledger key (see installPooledSendPools()).
 constexpr const char* kDeviceKey = "fake0:/fake/fake0:eid0";
@@ -50,11 +147,13 @@ constexpr const char* kDeviceKey = "fake0:/fake/fake0:eid0";
 // UbTransport::install does for runtime_profile=rm_pool.
 class PooledDataPath {
    public:
-    explicit PooledDataPath(uint32_t slice_timeout_ms = 5000,
-                            size_t desired_serving = 2,
-                            uint64_t credit_capacity = 8, bool rm_mode = false,
-                            uint32_t task_k = 2, uint64_t queue_budget = 65536,
-                            size_t jfc_count = 1, size_t jetty_per_endpoint = 1)
+    explicit PooledDataPath(
+        uint32_t slice_timeout_ms = 5000, size_t desired_serving = 2,
+        uint64_t credit_capacity = 8, bool rm_mode = false, uint32_t task_k = 2,
+        uint64_t queue_budget = 65536, size_t jfc_count = 1,
+        size_t jetty_per_endpoint = 1,
+        std::shared_ptr<ControlExecutor> control_executor = nullptr,
+        LocalDeviceFailureHandler device_failure_handler = {})
         : adapter_(std::make_shared<FakeUrmaAdapter>(fakeDevice())),
           context_(std::make_shared<UbContext>(0, fakeDevice(), adapter_)),
           slice_timeout_ms_(slice_timeout_ms),
@@ -64,7 +163,9 @@ class PooledDataPath {
           task_k_(task_k),
           queue_budget_(queue_budget),
           jfc_count_(jfc_count),
-          jetty_per_endpoint_(jetty_per_endpoint) {
+          jetty_per_endpoint_(jetty_per_endpoint),
+          control_executor_(std::move(control_executor)),
+          device_failure_handler_(std::move(device_failure_handler)) {
         (void)adapter_->initialize();
         adapter_->setAutoBindCreatedJetties(true);
 
@@ -192,7 +293,10 @@ class PooledDataPath {
             rails_.get(), quota_.get(), params, std::move(resolver),
             [this](const std::shared_ptr<UbEndpoint>& endpoint) {
                 (void)endpoints_->retire(endpoint);
-            });
+            },
+            device_failure_handler_, /*probe_manager=*/nullptr,
+            std::vector<ProbeJfcSlot>{}, /*tombstones=*/nullptr,
+            /*probe_topology=*/nullptr, control_executor_);
         return workers_->start().ok();
     }
 
@@ -211,13 +315,15 @@ class PooledDataPath {
         return ok;
     }
 
-    UbTask::Ptr makeTask(size_t slice_count = 1, uint32_t max_retries = 0) {
+    UbTask::Ptr makeTask(size_t slice_count = 1, uint32_t max_retries = 0,
+                         uint64_t deadline_ns = 0) {
         Request request{};
         request.opcode = Request::WRITE;
         request.source = source_.data();
         request.target_id = LOCAL_SEGMENT_ID;
         request.target_offset = reinterpret_cast<uint64_t>(target_.data());
         request.length = 16 * slice_count;
+        request.deadline_ns = deadline_ns;
         auto task = UbTask::create(request, {}, 0, task_k_);
         for (size_t i = 0; i < slice_count; ++i) {
             // max_retries = 0: the slice budget is per slice, so the transport
@@ -255,6 +361,9 @@ class PooledDataPath {
                                         : context_->jfcs().front()->handle();
     }
     [[nodiscard]] bool rmMode() const { return rm_mode_; }
+    [[nodiscard]] uint64_t contextIncarnation() const {
+        return context_->incarnation();
+    }
 
    private:
     std::shared_ptr<FakeUrmaAdapter> adapter_;
@@ -270,6 +379,9 @@ class PooledDataPath {
     std::shared_ptr<JfcCreditLedger> credits_;
     std::shared_ptr<NativeBudget> budget_;
     std::shared_ptr<SendJettyPool> pool_;
+
+    std::shared_ptr<ControlExecutor> control_executor_;
+    LocalDeviceFailureHandler device_failure_handler_;
 
     uint32_t slice_timeout_ms_{5000};
     size_t desired_serving_{2};
@@ -591,6 +703,42 @@ TEST(UbPoolIntegrationTest, NotAcceptedRollsBackAndReturnsTheMember) {
     EXPECT_TRUE(path.stop());
 }
 
+// F5/INV-POST-1: a provider error that does not say where it stopped is not a
+// definite zero acceptance. The record must stay owned and settle through the
+// fence instead of rolling back and handing the member straight back.
+TEST(UbPoolIntegrationTest, ErrorWithoutFailingWrIsUnknownNotRolledBack) {
+    PooledDataPath path(/*slice_timeout_ms=*/20);
+    ASSERT_TRUE(path.start());
+    path.adapter()->setNextPostOutcome(
+        Status::RdmaError("injected post failure without a bad_wr"), 0);
+    path.adapter()->setNextPostEvidence(PostEvidence::kNoFailingWr);
+
+    auto task = path.makeTask(/*slice_count=*/1, /*max_retries=*/0);
+    ASSERT_TRUE(path.workers().submit(task).ok());
+    // The WR may still be in flight: make the record's post return first, then
+    // deliver a completion so the acceptance block is observable.
+    ASSERT_TRUE(PooledDataPath::waitFor(
+        [&] { return path.workers().inflightCount() == 1; }));
+    path.adapter()->injectCompletion(path.businessJfc(), /*token=*/1,
+                                     CompletionCategory::SUCCESS,
+                                     /*completed_bytes=*/16);
+    ASSERT_TRUE(PooledDataPath::waitFor(
+        [&] { return task->transferStatus().s != PENDING; }));
+
+    const auto completion = path.workers().completionStats();
+    EXPECT_EQ(completion.record_rejected, 0U);
+    EXPECT_GE(completion.gate_blocked_by_acceptance, 1U);
+    EXPECT_EQ(completion.not_accepted_with_completion, 0U);
+    ASSERT_TRUE(PooledDataPath::waitFor(
+        [&] { return path.pool().stats().total_returns == 1; }));
+    // The member was retired by the fence, never handed back as "clean".
+    EXPECT_EQ(path.workers().businessStats().pooled_return, 0U);
+    EXPECT_EQ(path.workers().businessStats().pooled_retire, 1U);
+    EXPECT_EQ(path.pool().stats().in_use_members, 0U);
+    EXPECT_EQ(path.credits().outstanding(0), 0U);
+    EXPECT_TRUE(path.stop());
+}
+
 // §9.2 "Unknown" row: a contradictory post result must neither be replayed nor
 // rolled back. The record drains until the timeout fence, then finalizes and
 // retires the member.
@@ -654,6 +802,272 @@ TEST(UbPoolIntegrationTest, RmModePostsThroughThePooledMember) {
     EXPECT_EQ(path.pool().stats().idle_members, 1U);
     EXPECT_EQ(path.credits().outstanding(0), 0U);
     EXPECT_EQ(task->inflightAttempts(), 0U);
+    EXPECT_TRUE(path.stop());
+}
+
+// F2/INV-ID-3: the cross-Context lane ledger must not alias pool-local lane
+// generations. Every pool starts its generation sequence at 1, so a bare
+// generation makes another Context's in-flight record look like this lane's
+// convergence (and lets the drain delete a Jetty whose WR is still live).
+TEST(UbPoolIntegrationTest, LaneConvergenceIsScopedByContextIncarnation) {
+    PooledDataPath path(/*slice_timeout_ms=*/5000, /*desired_serving=*/1);
+    ASSERT_TRUE(path.start());
+    path.adapter()->holdNextCompletion();
+
+    auto task = path.makeTask(/*slice_count=*/1);
+    ASSERT_TRUE(path.workers().submit(task).ok());
+    ASSERT_TRUE(PooledDataPath::waitFor(
+        [&] { return path.pool().stats().in_use_members == 1; }));
+
+    const uint64_t context = path.contextIncarnation();
+    // The first lane of a fresh pool has generation 1.
+    EXPECT_FALSE(path.workers().pooledLaneConverged(LaneRefKey{context, 1}));
+    // The same numeric generation under another incarnation owns no record:
+    // it converges immediately instead of borrowing this Context's count.
+    EXPECT_TRUE(path.workers().pooledLaneConverged(
+        LaneRefKey{context + (1ULL << 40), 1}));
+    EXPECT_TRUE(
+        path.workers().pooledLaneConverged(LaneRefKey{context, 987654}));
+
+    ASSERT_TRUE(path.stop());
+    EXPECT_TRUE(PooledDataPath::waitFor(
+        [&] { return task->transferStatus().s != PENDING; }));
+}
+
+// D1 regression: when no control executor exists, scanTimeouts holds
+// endpoint_drain_mutex_ and the fence must reuse that lock, not take it again.
+// A non-recursive std::mutex re-entry would deadlock the poller on the first
+// deadline timeout (the pre-F6a code had one lock for both steps).
+TEST(UbPoolIntegrationTest, DegradedFencePathDoesNotSelfDeadlock) {
+    PooledDataPath path(/*slice_timeout_ms=*/20, /*desired_serving=*/1);
+    ASSERT_TRUE(path.start());
+    path.adapter()->holdNextCompletion();
+
+    UbWorkersTestPeer::dropControlExecutor(path.workers());
+
+    auto task = path.makeTask(/*slice_count=*/1);
+    ASSERT_TRUE(path.workers().submit(task).ok());
+    ASSERT_TRUE(PooledDataPath::waitFor(
+        [&] { return task->transferStatus().s != PENDING; },
+        std::chrono::seconds(5)));
+    EXPECT_EQ(task->transferStatus().s, TIMEOUT);
+    // No job was ever submitted: the fence ran inline.
+    EXPECT_EQ(path.workers().businessStats().timeout_fence_submitted, 0U);
+    EXPECT_EQ(path.workers().businessStats().timeout_fence_rejected, 0U);
+    EXPECT_TRUE(path.stop());
+}
+
+// ---- F6a/F6a2/F6c: timeout fences, device retirement, request deadlines ----
+
+// F6c stage 1: a request whose deadline already passed must be terminated
+// before it consumes any post. It is a timeout, not backpressure.
+TEST(UbPoolIntegrationTest, DeadlineExpiredInQueueIsNotPosted) {
+    PooledDataPath path;
+    ASSERT_TRUE(path.start());
+    auto task = path.makeTask(/*slice_count=*/1, /*max_retries=*/0,
+                              /*deadline_ns=*/steadyNow() - 1'000'000ULL);
+    ASSERT_TRUE(path.workers().submit(task).ok());
+    ASSERT_TRUE(PooledDataPath::waitFor(
+        [&] { return task->transferStatus().s != PENDING; }));
+
+    EXPECT_EQ(task->transferStatus().s, TIMEOUT);
+    EXPECT_TRUE(path.adapter()->postJettyIds().empty());
+    const auto business = path.workers().businessStats();
+    EXPECT_EQ(business.expired_in_queue, 1U);
+    EXPECT_EQ(business.expired_pre_post, 0U);
+    EXPECT_EQ(business.submit_backpressure, 0U);
+    EXPECT_TRUE(path.stop());
+}
+
+// F6c stage 2: a parked slice that expires must be cancelled by the reflow, not
+// parked again forever.
+TEST(UbPoolIntegrationTest, DeadlineExpiredWhileParkedIsCancelled) {
+    PooledDataPath path(/*slice_timeout_ms=*/5000, /*desired_serving=*/1,
+                        /*credit_capacity=*/8, /*rm_mode=*/false,
+                        /*task_k=*/1);
+    ASSERT_TRUE(path.start());
+    path.adapter()->holdNextCompletion();
+
+    auto first = path.makeTask(/*slice_count=*/1);
+    ASSERT_TRUE(path.workers().submit(first).ok());
+    ASSERT_TRUE(PooledDataPath::waitFor(
+        [&] { return path.pool().stats().in_use_members == 1; }));
+
+    // The K slot is taken: this slice parks, and its deadline is 30ms away.
+    auto parked = path.makeTask(/*slice_count=*/1, /*max_retries=*/0,
+                                /*deadline_ns=*/steadyNow() + 30'000'000ULL);
+    ASSERT_TRUE(path.workers().submit(parked).ok());
+    ASSERT_TRUE(PooledDataPath::waitFor(
+        [&] { return path.workers().parkedCount() >= 1; }));
+
+    ASSERT_TRUE(PooledDataPath::waitFor(
+        [&] { return parked->transferStatus().s != PENDING; }));
+    EXPECT_EQ(parked->transferStatus().s, TIMEOUT);
+    EXPECT_GE(path.workers().businessStats().expired_parked, 1U);
+    // Only the first task ever reached the provider.
+    EXPECT_EQ(path.adapter()->postJettyIds().size(), 1U);
+    EXPECT_TRUE(path.stop());
+}
+
+// F6c stage 4: in flight, the earlier of (posted + slice_timeout, request
+// deadline) wins, so the F6a fence enforces the request deadline.
+TEST(UbPoolIntegrationTest, InflightDeadlineUsesTheEarlierOfTwo) {
+    PooledDataPath path(/*slice_timeout_ms=*/5000, /*desired_serving=*/1);
+    ASSERT_TRUE(path.start());
+    path.adapter()->holdNextCompletion();
+
+    auto task = path.makeTask(/*slice_count=*/1, /*max_retries=*/0,
+                              /*deadline_ns=*/steadyNow() + 30'000'000ULL);
+    const uint64_t started = steadyNow();
+    ASSERT_TRUE(path.workers().submit(task).ok());
+    ASSERT_TRUE(PooledDataPath::waitFor(
+        [&] { return task->transferStatus().s != PENDING; }));
+    const uint64_t elapsed = steadyNow() - started;
+
+    EXPECT_EQ(task->transferStatus().s, TIMEOUT);
+    EXPECT_EQ(path.workers().businessStats().expired_inflight, 1U);
+    // The 5s WR budget must not be what fired.
+    EXPECT_LT(elapsed, 2'000'000'000ULL);
+    EXPECT_TRUE(path.stop());
+}
+
+// F6c: deadline_ns == 0 keeps the legacy behavior bit for bit.
+TEST(UbPoolIntegrationTest, ZeroDeadlineKeepsLegacyBehaviour) {
+    PooledDataPath path;
+    ASSERT_TRUE(path.start());
+    auto task = path.makeTask(/*slice_count=*/1, /*max_retries=*/0);
+    ASSERT_TRUE(path.workers().submit(task).ok());
+    ASSERT_TRUE(PooledDataPath::waitFor(
+        [&] { return task->transferStatus().s == COMPLETED; }));
+    const auto business = path.workers().businessStats();
+    EXPECT_EQ(business.expired_in_queue, 0U);
+    EXPECT_EQ(business.expired_parked, 0U);
+    EXPECT_EQ(business.expired_pre_post, 0U);
+    EXPECT_EQ(business.expired_inflight, 0U);
+    EXPECT_TRUE(path.stop());
+}
+
+// F6a: the poller only discovers and enqueues. While the fence sits in the
+// control queue, completions keep being polled and settled.
+TEST(UbPoolIntegrationTest, TimeoutFenceRunsOffThePoller) {
+    auto executor = std::make_shared<ManualControlExecutor>();
+    PooledDataPath path(/*slice_timeout_ms=*/20, /*desired_serving=*/2,
+                        /*credit_capacity=*/8, /*rm_mode=*/false,
+                        /*task_k=*/2, /*queue_budget=*/65536,
+                        /*jfc_count=*/1, /*jetty_per_endpoint=*/1, executor);
+    ASSERT_TRUE(path.start());
+    path.adapter()->holdNextCompletion();
+
+    auto fenced = path.makeTask(/*slice_count=*/1);
+    ASSERT_TRUE(path.workers().submit(fenced).ok());
+    // The scan claimed the timeout and queued the native fence, without
+    // running it yet.
+    ASSERT_TRUE(executor->waitPending(1));
+    EXPECT_EQ(path.workers().businessStats().timeout_fence_submitted, 1U);
+    EXPECT_EQ(fenced->transferStatus().s, PENDING);
+
+    // The poller is still serving: a second WR completes while the fence waits.
+    auto healthy = path.makeTask(/*slice_count=*/1);
+    ASSERT_TRUE(path.workers().submit(healthy).ok());
+    ASSERT_TRUE(PooledDataPath::waitFor(
+        [&] { return healthy->transferStatus().s == COMPLETED; }));
+    EXPECT_EQ(fenced->transferStatus().s, PENDING);
+
+    EXPECT_GT(executor->runAll(), 0U);
+    ASSERT_TRUE(PooledDataPath::waitFor(
+        [&] { return fenced->transferStatus().s != PENDING; }));
+    EXPECT_EQ(fenced->transferStatus().s, TIMEOUT);
+    EXPECT_TRUE(path.stop());
+}
+
+// F6a failure policy: a refused fence submit must keep the record registered
+// and let the next scan retry instead of dropping the obligation.
+TEST(UbPoolIntegrationTest, RejectedTimeoutFenceKeepsTheRecord) {
+    auto executor = std::make_shared<ManualControlExecutor>(/*capacity=*/0);
+    PooledDataPath path(/*slice_timeout_ms=*/20, /*desired_serving=*/1,
+                        /*credit_capacity=*/8, /*rm_mode=*/false,
+                        /*task_k=*/1, /*queue_budget=*/65536,
+                        /*jfc_count=*/1, /*jetty_per_endpoint=*/1, executor);
+    ASSERT_TRUE(path.start());
+    path.adapter()->holdNextCompletion();
+
+    auto task = path.makeTask(/*slice_count=*/1);
+    ASSERT_TRUE(path.workers().submit(task).ok());
+    ASSERT_TRUE(PooledDataPath::waitFor([&] {
+        return path.workers().businessStats().timeout_fence_rejected >= 1;
+    }));
+    EXPECT_EQ(path.workers().inflightCount(), 1U);
+    EXPECT_EQ(task->transferStatus().s, PENDING);
+
+    // Capacity returns: the next scan retries and the queued fence settles it.
+    executor->setCapacity(64);
+    ASSERT_TRUE(executor->waitPending(1));
+    EXPECT_GT(executor->runAll(), 0U);
+    ASSERT_TRUE(PooledDataPath::waitFor(
+        [&] { return task->transferStatus().s != PENDING; }));
+    EXPECT_EQ(task->transferStatus().s, TIMEOUT);
+    EXPECT_TRUE(path.stop());
+}
+
+// F6a2: the native endpoint barrier runs on the control executor; the poller
+// keeps polling and the context state transition already happened.
+TEST(UbPoolIntegrationTest, DeviceRetireRunsOffThePoller) {
+    std::atomic<uint64_t> handler_calls{0};
+    LocalDeviceFailureHandler handler = [&handler_calls](Topology::NicID) {
+        handler_calls.fetch_add(1, std::memory_order_relaxed);
+        return Status::OK();
+    };
+    auto executor = std::make_shared<ManualControlExecutor>();
+    PooledDataPath path(/*slice_timeout_ms=*/5000, /*desired_serving=*/2,
+                        /*credit_capacity=*/8, /*rm_mode=*/false,
+                        /*task_k=*/2, /*queue_budget=*/65536,
+                        /*jfc_count=*/1, /*jetty_per_endpoint=*/1, executor,
+                        handler);
+    ASSERT_TRUE(path.start());
+
+    path.adapter()->failNextPoll();
+    ASSERT_TRUE(executor->waitPending(1));
+    // The native barrier has not run on the poller.
+    EXPECT_EQ(handler_calls.load(), 0U);
+    const uint64_t polls_before = path.adapter()->pollCalls();
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    EXPECT_GT(path.adapter()->pollCalls(), polls_before);
+
+    EXPECT_GT(executor->runAll(), 0U);
+    EXPECT_GE(handler_calls.load(), 1U);
+    EXPECT_EQ(path.workers().businessStats().device_retire_rejected, 0U);
+    EXPECT_TRUE(path.stop());
+}
+
+// Design reverted-item lock-in (D4): the PLM fault epoch is part of the claim
+// decision, not an observation. ClaimAnchorMovesOnlyOnIsolation() proves the
+// epoch moves; this pins the other half - a moved epoch must reject the claim.
+// Deleting `!path_epoch_changed` from claimed() makes this test fail.
+TEST(UbPoolIntegrationTest, PathEpochChangeRejectsTheClaim) {
+    EXPECT_TRUE(UbWorkersTestPeer::claimedWithEpochChange(false));
+    EXPECT_FALSE(UbWorkersTestPeer::claimedWithEpochChange(true));
+}
+
+// §6.1 exception path: an enqueue failure after part of the batch was marked
+// must roll the queues back and cancel every slice of the batch, so nothing is
+// left kQueued behind the failure.
+TEST(UbPoolIntegrationTest, BatchEnqueueExceptionRollsBackAndCancels) {
+    PooledDataPath path;
+    ASSERT_TRUE(path.start());
+    auto task = path.makeTask(/*slice_count=*/2);
+    UbWorkersTestPeer::failSecondEnqueue();
+    const Status status = path.workers().submit(task);
+    EXPECT_TRUE(status.IsInternalError());
+    EXPECT_EQ(path.workers().queuedCount(), 0U);
+    EXPECT_EQ(path.workers().businessStats().queue_depth, 0U);
+    for (const auto& slice : task->slices()) {
+        EXPECT_EQ(slice->snapshot().state, UbSliceState::kCanceled);
+    }
+    // The failure did not poison the workers: a later submission still works.
+    auto retry = path.makeTask(/*slice_count=*/1);
+    ASSERT_TRUE(path.workers().submit(retry).ok());
+    ASSERT_TRUE(PooledDataPath::waitFor(
+        [&] { return retry->transferStatus().s == COMPLETED; }));
     EXPECT_TRUE(path.stop());
 }
 
@@ -792,7 +1206,7 @@ TEST(UbPoolIntegrationTest, BootstrapAdvertisesTransportModeAndBindRoundTrips) {
     ASSERT_TRUE(endpoint->bind(desc).ok());
     EXPECT_TRUE(endpoint->ready());
     EXPECT_TRUE(endpoint->rmMode());
-    EXPECT_EQ(endpoint->rmTarget(0).id, desc.jetty_ids[0]);
+    EXPECT_EQ(endpoint->rmTarget(0)->id(), desc.jetty_ids[0]);
 
     // An RC peer must still be rejected by an RM endpoint (fail-closed).
     auto other = make_endpoint("peer2@ub:fake0:eid0");

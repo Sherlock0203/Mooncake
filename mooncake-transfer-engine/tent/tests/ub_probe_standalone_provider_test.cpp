@@ -383,6 +383,13 @@ TEST(UbProbeStandaloneProviderTest, RebuildPushesTheNewPublicationEpoch) {
     ASSERT_TRUE(provider.waitForRebuilds(2000));
     EXPECT_GT(provider.publicationEpoch(), 1U);
     EXPECT_EQ(pushed_epoch, provider.publicationEpoch());
+    // F12: the replacement event carries the drain receipt for generation 1.
+    ASSERT_FALSE(sink.events.empty());
+    const ProbeEvent& replaced = sink.events.back();
+    ASSERT_EQ(replaced.kind, ProbeEventKind::kProbeHandleReplaced);
+    ASSERT_TRUE(replaced.port.has_value());
+    EXPECT_EQ(replaced.port->previous_generation, 1U);
+    EXPECT_TRUE(replaced.port->previous_drained);
 
     ASSERT_TRUE(provider.shutdown().ok());
     EXPECT_TRUE(adapter->closeContext(context).ok());
@@ -450,6 +457,169 @@ TEST(UbProbeStandaloneProviderTest, DeclaredModeRequiresBindPorts) {
     EXPECT_TRUE(provider.discover().IsInvalidArgument());
 
     EXPECT_TRUE(provider.shutdown().ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
+// F1: close safety. A failed native release must keep the page and the
+// handles, count the orphan and let a later shutdown() finish the job.
+class ProbeCloseTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        adapter_ = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+        EXPECT_TRUE(adapter_->initialize().ok());
+        EXPECT_TRUE(adapter_->openContext(fakeDevice(), context_).ok());
+    }
+
+    std::unique_ptr<StandaloneProbeResourceProvider> makeProvider(
+        StubPeerDirectory* directory, uint64_t generation = 1) {
+        return std::make_unique<StandaloneProbeResourceProvider>(
+            adapter_, makeProbeParams(),
+            std::vector<ProbeLocalPortConfig>{
+                ProbeLocalPortConfig{0, context_, nullptr, generation}},
+            directory);
+    }
+
+    std::shared_ptr<FakeUrmaAdapter> adapter_;
+    ContextPtr context_;
+};
+
+TEST_F(ProbeCloseTest, ResetFailureKeepsPageAndRetries) {
+    StubPeerDirectory directory({makeEdge(0, 42, 0)});
+    auto provider = makeProvider(&directory);
+    ProbeGraph graph;
+    ASSERT_TRUE(provider->snapshot(graph).ok());
+
+    adapter_->failResets();
+    const Status first = provider->shutdown();
+    EXPECT_FALSE(first.ok());
+
+    const auto stats = provider->closeStats();
+    EXPECT_TRUE(stats.shutdown_incomplete);
+    EXPECT_EQ(stats.orphaned_ports, 1U);
+    // Source page and local area page both stay mapped.
+    EXPECT_EQ(stats.orphaned_pages, 2U);
+    // INV-1: no delete and no free without the reset proof.
+    EXPECT_EQ(adapter_->liveJettyCount(), 1U);
+    EXPECT_EQ(adapter_->liveLocalSegmentCount(), 2U);
+    EXPECT_EQ(adapter_->liveJfcCount(), 1U);
+    EXPECT_EQ(provider->portViews().size(), 0U);
+
+    // The retry must be able to finish from the retained state.
+    adapter_->allowResets();
+    ASSERT_TRUE(provider->shutdown().ok());
+    const auto retried = provider->closeStats();
+    EXPECT_FALSE(retried.shutdown_incomplete);
+    EXPECT_EQ(retried.orphaned_ports, 0U);
+    EXPECT_EQ(retried.orphaned_pages, 0U);
+    EXPECT_EQ(adapter_->liveJettyCount(), 0U);
+    EXPECT_EQ(adapter_->liveJfcCount(), 0U);
+    EXPECT_EQ(adapter_->liveLocalSegmentCount(), 0U);
+    EXPECT_TRUE(provider->portViews().empty());
+}
+
+TEST_F(ProbeCloseTest, DeleteFailureKeepsPageAndRetries) {
+    StubPeerDirectory directory({makeEdge(0, 42, 0)});
+    auto provider = makeProvider(&directory);
+    ProbeGraph graph;
+    ASSERT_TRUE(provider->snapshot(graph).ok());
+
+    adapter_->failNextDeleteJetty();
+    EXPECT_FALSE(provider->shutdown().ok());
+
+    auto stats = provider->closeStats();
+    EXPECT_EQ(stats.orphaned_ports, 1U);
+    EXPECT_EQ(stats.orphaned_pages, 2U);
+    // The Jetty survived the failed delete, so its handle is retained.
+    EXPECT_EQ(adapter_->liveJettyCount(), 1U);
+    EXPECT_EQ(adapter_->liveLocalSegmentCount(), 2U);
+
+    ASSERT_TRUE(provider->shutdown().ok());
+    stats = provider->closeStats();
+    EXPECT_EQ(stats.orphaned_ports, 0U);
+    EXPECT_EQ(adapter_->liveJettyCount(), 0U);
+    EXPECT_EQ(adapter_->liveLocalSegmentCount(), 0U);
+}
+
+TEST_F(ProbeCloseTest, QuarantineIsOnlyReleasedWithProof) {
+    StubPeerDirectory directory({makeEdge(0, 42, 0)});
+    auto provider = makeProvider(&directory);
+    ProbeGraph graph;
+    ASSERT_TRUE(provider->snapshot(graph).ok());
+
+    ProbeHandoff handoff;
+    handoff.token = 7;
+    handoff.lane = LaneKey{0, 99, 1};
+    handoff.orphan_reason = OrphanReason::kGenerationRetired;
+    provider->handoffUnproven(handoff);
+    ASSERT_EQ(provider->quarantineCount(), 1U);
+
+    adapter_->failResets();
+    EXPECT_FALSE(provider->shutdown().ok());
+    // INV-CLOSE-4: the port is unproven, so the reference stays.
+    EXPECT_EQ(provider->quarantineCount(), 1U);
+
+    adapter_->allowResets();
+    ASSERT_TRUE(provider->shutdown().ok());
+    EXPECT_EQ(provider->quarantineCount(), 0U);
+}
+
+TEST_F(ProbeCloseTest, ShutdownIsRepeatableWithoutDoubleFree) {
+    StubPeerDirectory directory({makeEdge(0, 42, 0)});
+    auto provider = makeProvider(&directory);
+    ProbeGraph graph;
+    ASSERT_TRUE(provider->snapshot(graph).ok());
+
+    ASSERT_TRUE(provider->shutdown().ok());
+    const auto first = provider->closeStats();
+    EXPECT_FALSE(first.shutdown_incomplete);
+    EXPECT_EQ(first.orphaned_pages, 0U);
+    EXPECT_EQ(adapter_->liveLocalSegmentCount(), 0U);
+
+    // Nothing left to release: a second call is a no-op, not a second free.
+    ASSERT_TRUE(provider->shutdown().ok());
+    const auto second = provider->closeStats();
+    EXPECT_EQ(second.orphaned_pages, 0U);
+    EXPECT_EQ(second.orphaned_ports, 0U);
+    EXPECT_EQ(adapter_->liveJettyCount(), 0U);
+    EXPECT_EQ(adapter_->liveLocalSegmentCount(), 0U);
+}
+
+// D3: a port orphaned by a failed rollback teardown must be retried on the
+// next resource creation instead of silently leaving the probe graph forever.
+TEST(UbProbeStandaloneProviderTest, OrphanedPortIsRecoveredOnRetry) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+    ContextPtr context;
+    ASSERT_TRUE(adapter->openContext(fakeDevice(), context).ok());
+
+    // An invalid edge makes snapshot() fail *after* the local resources were
+    // created, which drives the rollback path.
+    StubPeerDirectory directory({ProbeEdgeSupply{}});
+    StandaloneProbeResourceProvider provider(
+        adapter, makeProbeParams(),
+        {ProbeLocalPortConfig{0, context, nullptr, 1}}, &directory);
+
+    // The rollback teardown cannot prove destruction: reset fails.
+    adapter->failResets();
+    ProbeGraph failed;
+    EXPECT_FALSE(provider.snapshot(failed).ok());
+    auto stats = provider.closeStats();
+    EXPECT_EQ(stats.orphaned_ports, 1U);
+    EXPECT_EQ(stats.recovered_ports, 0U);
+
+    // Provider recovers and the graph becomes valid: the retry must first
+    // destroy the orphan, then re-create the port.
+    adapter->allowResets();
+    directory.set({makeEdge(0, 42, 0)});
+    ProbeGraph graph;
+    ASSERT_TRUE(provider.snapshot(graph).ok());
+    ASSERT_EQ(graph.ports.size(), 1U);
+    stats = provider.closeStats();
+    EXPECT_EQ(stats.orphaned_ports, 0U);
+    EXPECT_EQ(stats.recovered_ports, 1U);
+
+    ASSERT_TRUE(provider.shutdown().ok());
+    EXPECT_TRUE(adapter->closeContext(context).ok());
     EXPECT_TRUE(adapter->shutdown().ok());
 }
 

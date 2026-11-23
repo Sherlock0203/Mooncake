@@ -60,6 +60,8 @@ TEST(UbProbeCampaignTest, ConvergesThroughGateBlockedRecovery) {
     ASSERT_TRUE(first_probe.has_value());
     ASSERT_EQ(first_probe->record->key.version, first);
     // Permanent gate failure: the path proves liveness but stays RECOVERING.
+    plm.onPostResult(first_probe->record, ProbePostOutcome::kAccepted,
+                     clock.now());
     ASSERT_TRUE(
         plm.onProbeCompletion(makeCompletion(first_probe->token), clock.now()));
     EXPECT_EQ(healthOf(plm, first).health, LinkHealth::kRecovering);
@@ -67,6 +69,8 @@ TEST(UbProbeCampaignTest, ConvergesThroughGateBlockedRecovery) {
     auto second_probe = postNext(plm, token_seq, clock.now());
     ASSERT_TRUE(second_probe.has_value());
     ASSERT_EQ(second_probe->record->key.version, second);
+    plm.onPostResult(second_probe->record, ProbePostOutcome::kAccepted,
+                     clock.now());
     ASSERT_TRUE(plm.onProbeCompletion(makeCompletion(second_probe->token),
                                       clock.now()));
     EXPECT_EQ(healthOf(plm, second).health, LinkHealth::kRecovering);
@@ -120,6 +124,8 @@ TEST(UbProbeCampaignTest, MergeRequeuesNonInflightEntriesAtNewEpoch) {
               EntryState::kQueued);
     EXPECT_EQ(campaignEntryOf(campaigns[0], second)->entry_epoch, 2U);
 
+    plm.onPostResult(in_flight->record, ProbePostOutcome::kAccepted,
+                     clock.now());
     ASSERT_TRUE(
         plm.onProbeCompletion(makeCompletion(in_flight->token), clock.now()));
     EXPECT_EQ(healthOf(plm, first).health, LinkHealth::kHealthy);
@@ -131,6 +137,8 @@ TEST(UbProbeCampaignTest, MergeRequeuesNonInflightEntriesAtNewEpoch) {
     ASSERT_TRUE(second_probe.has_value());
     ASSERT_EQ(second_probe->record->key.version, second);
     ASSERT_EQ(second_probe->record->key.campaign_epoch, 2U);
+    plm.onPostResult(second_probe->record, ProbePostOutcome::kAccepted,
+                     clock.now());
     ASSERT_TRUE(plm.onProbeCompletion(makeCompletion(second_probe->token),
                                       clock.now()));
     EXPECT_EQ(healthOf(plm, second).health, LinkHealth::kHealthy);
@@ -183,6 +191,7 @@ TEST(UbProbeCampaignTest, RemovedEdgeCancelsQueuedEntry) {
     auto probe = postNext(plm, token_seq, clock.now());
     ASSERT_TRUE(probe.has_value());
     EXPECT_EQ(probe->record->key.version, first);
+    plm.onPostResult(probe->record, ProbePostOutcome::kAccepted, clock.now());
     ASSERT_TRUE(
         plm.onProbeCompletion(makeCompletion(probe->token), clock.now()));
     EXPECT_TRUE(plm.campaignView().empty());
@@ -221,6 +230,8 @@ TEST(UbProbeCampaignTest, TargetEpochChangeReplacesVersionAndStalesInflight) {
     EXPECT_EQ(plm.inflightCount(), 1U);
     EXPECT_EQ(plm.stats().campaign_entry_canceled, 1U);
 
+    plm.onPostResult(old_probe->record, ProbePostOutcome::kAccepted,
+                     clock.now());
     ASSERT_TRUE(
         plm.onProbeCompletion(makeCompletion(old_probe->token), clock.now()));
     EXPECT_EQ(plm.stats().probe_stale, 1U);
@@ -269,6 +280,7 @@ TEST(UbProbeCampaignTest, PostRejectionRollsEntryBackToQueued) {
                             BusinessErrorKind::kPathFault, clock.now());
     auto retry = postNext(plm, token_seq, clock.now());
     ASSERT_TRUE(retry.has_value());
+    plm.onPostResult(retry->record, ProbePostOutcome::kAccepted, clock.now());
     ASSERT_TRUE(
         plm.onProbeCompletion(makeCompletion(retry->token), clock.now()));
     EXPECT_EQ(healthOf(plm, version).health, LinkHealth::kHealthy);
@@ -465,6 +477,7 @@ TEST(UbProbeCampaignTest, RetiredHandleCompletionCannotPublishHealth) {
     revoked.kind = ProbeEventKind::kPortRevoked;
     revoked.local_nic = 0;
     ASSERT_TRUE(events.send(revoked).ok());
+    plm.onPostResult(probe->record, ProbePostOutcome::kAccepted, clock.now());
     ASSERT_TRUE(
         plm.onProbeCompletion(makeCompletion(probe->token), clock.now()));
 
@@ -499,6 +512,8 @@ TEST(UbProbeCampaignTest, RoundRobinDoesNotStarveOtherPeers) {
     // One in-flight probe per port: the second peer waits for the slot.
     EXPECT_TRUE(plm.pendingActions(clock.now()).empty());
     clock.advance(1);
+    plm.onPostResult(first_probe->record, ProbePostOutcome::kAccepted,
+                     clock.now());
     ASSERT_TRUE(
         plm.onProbeCompletion(makeCompletion(first_probe->token), clock.now()));
     auto second_probe = postNext(plm, token_seq, clock.now());
@@ -506,6 +521,8 @@ TEST(UbProbeCampaignTest, RoundRobinDoesNotStarveOtherPeers) {
     EXPECT_EQ(second_probe->record->key.version, second);
 
     clock.advance(1);
+    plm.onPostResult(second_probe->record, ProbePostOutcome::kAccepted,
+                     clock.now());
     ASSERT_TRUE(plm.onProbeCompletion(makeCompletion(second_probe->token),
                                       clock.now()));
     // RECOVERING paths re-probe on their interval; the round-robin cursor

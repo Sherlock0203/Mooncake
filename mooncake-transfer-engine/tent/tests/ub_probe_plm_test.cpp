@@ -236,18 +236,21 @@ TEST(UbProbeLinkManagerTest, CompletionBeforePostReturnIsSettledOnce) {
     auto probe = postNext(plm, token_seq, clock.now());
     ASSERT_TRUE(probe.has_value());
 
-    // The CQE may legally beat the post call's return (invariant 4). The
-    // record must be settleable already, and the late "accepted" result must
-    // not settle it a second time.
+    // F11: the CQE may legally beat the post call's return (invariant 4), but
+    // the record must NOT settle before the post returns: the port slot and
+    // peer budget encode "only one in-flight probe on this port", and the
+    // provider call is still inside that window.
     ASSERT_TRUE(
         plm.onProbeCompletion(makeCompletion(probe->token), clock.now()));
-    EXPECT_EQ(healthOf(plm, version).health, LinkHealth::kHealthy);
-    EXPECT_EQ(plm.inflightCount(), 0U);
+    EXPECT_EQ(plm.inflightCount(), 1U);
+    EXPECT_NE(healthOf(plm, version).health, LinkHealth::kHealthy);
 
+    // The post result lands: now (and only now) the record settles once.
     plm.onPostResult(probe->record, ProbePostOutcome::kAccepted, clock.now());
+    EXPECT_EQ(plm.inflightCount(), 0U);
+    EXPECT_EQ(healthOf(plm, version).health, LinkHealth::kHealthy);
     EXPECT_EQ(plm.stats().probe_posted, 1U);
     EXPECT_EQ(plm.stats().probe_post_conflict, 0U);
-    EXPECT_EQ(healthOf(plm, version).health, LinkHealth::kHealthy);
 }
 
 TEST(UbProbeLinkManagerTest, ParameterAndLaneBusinessErrorsNeverIsolate) {
@@ -339,6 +342,7 @@ TEST(UbProbeLinkManagerTest, ProbeSuccessRecoversOnlyWhenGatesPass) {
     uint64_t token_seq = 0;
     auto posted = postNext(plm, token_seq, clock.now());
     ASSERT_TRUE(posted.has_value());
+    plm.onPostResult(posted->record, ProbePostOutcome::kAccepted, clock.now());
     EXPECT_TRUE(
         plm.onProbeCompletion(makeCompletion(posted->token), clock.now()));
 
@@ -383,6 +387,7 @@ TEST(UbProbeLinkManagerTest, LaneErrorRetiresLaneOnceAndMarksPortPending) {
     ASSERT_TRUE(posted.has_value());
     ASSERT_EQ(posted->record->key.version, first);
 
+    plm.onPostResult(posted->record, ProbePostOutcome::kAccepted, clock.now());
     ASSERT_TRUE(plm.onProbeCompletion(
         makeCompletion(posted->token, CompletionCategory::ENDPOINT_ERROR),
         clock.now()));
@@ -451,6 +456,89 @@ TEST(UbProbeLinkManagerTest, ContextUnavailableDisablesPortAndCancelsCampaign) {
     EXPECT_TRUE(plm.campaignView().empty());
 }
 
+// F7: the availability edge is the dual of onContextUnavailable(). It must
+// revive exactly the paths the context failure disabled, and only into
+// RECOVERING: HEALTHY is still earned by a real probe.
+TEST(UbProbeLinkManagerTest, ContextAvailableRevivesContextDisabledPaths) {
+    TestClock clock;
+    ProbeLinkManager plm(defaultParams(), clock.clock());
+    auto graph = makeGraph({makePortSupply(0, 1)}, {makeEdgeSupply(0, 10, 0),
+                                                    makeEdgeSupply(0, 10, 1)});
+    ASSERT_TRUE(plm.initialize(graph).ok());
+
+    plm.onContextUnavailable(0, clock.now());
+    ASSERT_EQ(plm.stats().path_state_disabled, 2U);
+    ASSERT_TRUE(plm.pendingActions(clock.now()).empty());
+
+    ASSERT_TRUE(plm.onContextAvailable(0, clock.now()).ok());
+    EXPECT_EQ(plm.stats().path_revived_on_context_available, 2U);
+    for (const auto& entry : plm.healthView()) {
+        EXPECT_EQ(entry.health, LinkHealth::kRecovering);
+        EXPECT_FALSE(entry.pending);
+        EXPECT_EQ(entry.pending_reason, PendingReason::kNone);
+        EXPECT_EQ(entry.task, TaskState::kIdle);
+    }
+    // INV-REC-2: never HEALTHY without evidence.
+    EXPECT_NE(healthOf(plm, PathVersion{ProbePathKey{0, 10, 0}, 1, 1}).health,
+              LinkHealth::kHealthy);
+    // The revived paths are immediately schedulable for verification.
+    EXPECT_FALSE(plm.pendingActions(clock.now()).empty());
+}
+
+TEST(UbProbeLinkManagerTest, ContextAvailableRecoveryNeedsAProbeToBeHealthy) {
+    TestClock clock;
+    ProbeLinkManager plm(defaultParams(), clock.clock());
+    auto graph = makeGraph({makePortSupply(0, 1)}, {makeEdgeSupply(0, 10, 0)});
+    ASSERT_TRUE(plm.initialize(graph).ok());
+    const PathVersion version{ProbePathKey{0, 10, 0}, 1, 1};
+
+    plm.onContextUnavailable(0, clock.now());
+    ASSERT_TRUE(plm.onContextAvailable(0, clock.now()).ok());
+    ASSERT_EQ(healthOf(plm, version).health, LinkHealth::kRecovering);
+
+    uint64_t token_seq = 0;
+    auto posted = postNext(plm, token_seq, clock.now());
+    ASSERT_TRUE(posted.has_value());
+    plm.onPostResult(posted->record, ProbePostOutcome::kAccepted, clock.now());
+    ASSERT_TRUE(
+        plm.onProbeCompletion(makeCompletion(posted->token), clock.now()));
+    EXPECT_EQ(healthOf(plm, version).health, LinkHealth::kHealthy);
+}
+
+TEST(UbProbeLinkManagerTest, ContextAvailableNeverResurrectsARemovedPath) {
+    TestClock clock;
+    ProbeLinkManager plm(defaultParams(), clock.clock());
+    auto graph = makeGraph({makePortSupply(0, 1)}, {makeEdgeSupply(0, 10, 0),
+                                                    makeEdgeSupply(0, 10, 1)});
+    ASSERT_TRUE(plm.initialize(graph).ok());
+    const PathVersion kept{ProbePathKey{0, 10, 0}, 1, 1};
+    const PathVersion removed{ProbePathKey{0, 10, 1}, 1, 1};
+
+    plm.onContextUnavailable(0, clock.now());
+    ProbeEvent removal;
+    removal.kind = ProbeEventKind::kEdgeRemoved;
+    removal.graph_epoch = 1;
+    removal.event_seq = 1;
+    removal.version = removed;
+    ASSERT_TRUE(plm.onPoolAvailabilityChange(removal).ok());
+    ASSERT_FALSE(hasHealth(plm, removed));
+
+    ASSERT_TRUE(plm.onContextAvailable(0, clock.now()).ok());
+    EXPECT_EQ(plm.pathCount(), 1U);
+    EXPECT_EQ(plm.stats().path_revived_on_context_available, 1U);
+    EXPECT_EQ(healthOf(plm, kept).health, LinkHealth::kRecovering);
+    EXPECT_FALSE(hasHealth(plm, removed));
+}
+
+TEST(UbProbeLinkManagerTest, ContextAvailableOnAnUnknownPortIsRejected) {
+    TestClock clock;
+    ProbeLinkManager plm(defaultParams(), clock.clock());
+    auto graph = makeGraph({makePortSupply(0, 1)}, {makeEdgeSupply(0, 10, 0)});
+    ASSERT_TRUE(plm.initialize(graph).ok());
+    EXPECT_TRUE(plm.onContextAvailable(7, clock.now()).IsInvalidArgument());
+    EXPECT_EQ(plm.stats().path_revived_on_context_available, 0U);
+}
+
 TEST(UbProbeLinkManagerTest, StaleCompletionReleasesSlotWithoutChangingHealth) {
     TestClock clock;
     ProbeLinkManager plm(defaultParams(), clock.clock());
@@ -482,6 +570,8 @@ TEST(UbProbeLinkManagerTest, StaleCompletionReleasesSlotWithoutChangingHealth) {
               EntryState::kInflight);
     EXPECT_EQ(campaignEntryOf(campaigns[0], first)->entry_epoch, 1U);
 
+    plm.onPostResult(in_flight->record, ProbePostOutcome::kAccepted,
+                     clock.now());
     ASSERT_TRUE(
         plm.onProbeCompletion(makeCompletion(in_flight->token), clock.now()));
     EXPECT_EQ(plm.stats().probe_stale, 1U);
@@ -504,6 +594,7 @@ TEST(UbProbeLinkManagerTest, StaleCompletionReleasesSlotWithoutChangingHealth) {
     auto next = postNext(plm, token_seq, clock.now());
     ASSERT_TRUE(next.has_value());
     EXPECT_EQ(next->record->key.version, second);
+    plm.onPostResult(next->record, ProbePostOutcome::kAccepted, clock.now());
     ASSERT_TRUE(
         plm.onProbeCompletion(makeCompletion(next->token), clock.now()));
     EXPECT_EQ(healthOf(plm, second).health, LinkHealth::kHealthy);
@@ -553,6 +644,8 @@ TEST(UbProbeLinkManagerTest,
 
     // A late completion of the old generation only settles the orphan; it must
     // not disturb the new generation's slot or health.
+    plm.onPostResult(old_probe->record, ProbePostOutcome::kAccepted,
+                     clock.now());
     ASSERT_TRUE(
         plm.onProbeCompletion(makeCompletion(old_probe->token), clock.now()));
     EXPECT_EQ(plm.orphanCount(), 0U);
@@ -560,6 +653,8 @@ TEST(UbProbeLinkManagerTest,
     EXPECT_EQ(plm.inflightCount(), 1U);
     EXPECT_EQ(healthOf(plm, version).health, LinkHealth::kIsolated);
 
+    plm.onPostResult(new_probe->record, ProbePostOutcome::kAccepted,
+                     clock.now());
     ASSERT_TRUE(
         plm.onProbeCompletion(makeCompletion(new_probe->token), clock.now()));
     EXPECT_EQ(healthOf(plm, version).health, LinkHealth::kHealthy);
@@ -596,6 +691,7 @@ TEST(UbProbeLinkManagerTest, PeerBudgetGatesCrossPortScheduling) {
 
     // A lane error cancels the first entry and frees the budget; the second
     // path is then schedulable and can recover.
+    plm.onPostResult(first_probe, ProbePostOutcome::kAccepted, clock.now());
     ASSERT_TRUE(plm.onProbeCompletion(
         makeCompletion(first_probe->core.token,
                        CompletionCategory::ENDPOINT_ERROR),
@@ -603,6 +699,7 @@ TEST(UbProbeLinkManagerTest, PeerBudgetGatesCrossPortScheduling) {
     auto retry = postNext(plm, token_seq, clock.now());
     ASSERT_TRUE(retry.has_value());
     EXPECT_EQ(retry->record->key.version, second);
+    plm.onPostResult(retry->record, ProbePostOutcome::kAccepted, clock.now());
     ASSERT_TRUE(
         plm.onProbeCompletion(makeCompletion(retry->token), clock.now()));
     EXPECT_EQ(healthOf(plm, second).health, LinkHealth::kHealthy);
@@ -625,6 +722,7 @@ TEST(UbProbeLinkManagerTest, LocalAccessErrorIsolatesAndRetiresLaneOnce) {
     uint64_t token_seq = 0;
     auto probe = postNext(plm, token_seq, clock.now());
     ASSERT_TRUE(probe.has_value());
+    plm.onPostResult(probe->record, ProbePostOutcome::kAccepted, clock.now());
     ASSERT_TRUE(plm.onProbeCompletion(
         makeCompletion(probe->token, CompletionCategory::LOCAL_ACCESS_ERROR),
         clock.now()));
@@ -650,6 +748,7 @@ TEST(UbProbeLinkManagerTest, HandleReplacedPreservesBackoff) {
     uint64_t token_seq = 0;
     auto probe = postNext(plm, token_seq, now);
     ASSERT_TRUE(probe.has_value());
+    plm.onPostResult(probe->record, ProbePostOutcome::kAccepted, clock.now());
     ASSERT_TRUE(plm.onProbeCompletion(
         makeCompletion(probe->token, CompletionCategory::REMOTE_PATH_ERROR),
         now));
@@ -669,6 +768,314 @@ TEST(UbProbeLinkManagerTest, HandleReplacedPreservesBackoff) {
     EXPECT_TRUE(plm.pendingActions(now).empty());
     clock.advance(1000ULL * 1000 * 1000);
     EXPECT_FALSE(plm.pendingActions(clock.now()).empty());
+}
+
+// F8: a retryable (capacity/not-ready) post rejection must keep the campaign's
+// verification obligation for that path. Cancelling the entry would leave a
+// HEALTHY sibling path with no reason to ever be verified again
+// (timeEligibleLocked never probes HEALTHY paths).
+TEST(UbProbeLinkManagerTest, RetryablePostRejectionKeepsTheVerificationTodo) {
+    TestClock clock;
+    ProbeLinkManager plm(defaultParams(), clock.clock());
+    auto graph = makeGraph({makePortSupply(0, 1)}, {makeEdgeSupply(0, 10, 0),
+                                                    makeEdgeSupply(0, 10, 1)});
+    ASSERT_TRUE(plm.initialize(graph).ok());
+    const PathVersion healthy{ProbePathKey{0, 10, 0}, 1, 1};
+    const PathVersion faulty{ProbePathKey{0, 10, 1}, 1, 1};
+
+    // The faulty sibling starts a campaign that verifies both paths: the
+    // healthy one is only probed because of this obligation.
+    plm.onBusinessPathError(makeEvidence(0, 10, 1),
+                            BusinessErrorKind::kPathFault, clock.now());
+    ASSERT_FALSE(plm.campaignView().empty());
+
+    uint64_t token_seq = 0;
+    auto posted = postNext(plm, token_seq, clock.now());
+    ASSERT_TRUE(posted.has_value());
+    ASSERT_EQ(posted->record->key.version, healthy);
+    // The provider rejected for a retryable reason.
+    plm.onPostResult(posted->record, ProbePostOutcome::kRejectedRetryable,
+                     clock.now());
+
+    EXPECT_EQ(plm.inflightCount(), 0U);
+    EXPECT_EQ(plm.stats().probe_post_rejected_retryable, 1U);
+    EXPECT_EQ(plm.stats().probe_post_rejected, 0U);
+    EXPECT_EQ(plm.stats().probe_verification_abandoned, 0U);
+    // The entry is still queued: the obligation was not dropped.
+    EXPECT_EQ(healthOf(plm, healthy).task, TaskState::kQueued);
+
+    // Once the backoff expires the same path is scheduled again.
+    const uint64_t retry_ns = plm.params().intervalNs() << 1;
+    clock.advance(retry_ns + 1);
+    // pendingActions() returns at most one probe per port, so drain the
+    // currently eligible sibling before checking that the retained path comes
+    // back. Every rejection is retryable, so this also proves the obligation
+    // survives more than one rejection.
+    bool scheduled = false;
+    for (int round = 0; round < 3 && !scheduled; ++round) {
+        auto next = postNext(plm, token_seq, clock.now());
+        if (!next.has_value()) break;
+        if (next->record->key.version == healthy) {
+            scheduled = true;
+            break;
+        }
+        plm.onPostResult(next->record, ProbePostOutcome::kRejectedRetryable,
+                         clock.now());
+        clock.advance(retry_ns + 1);
+    }
+    EXPECT_TRUE(scheduled);
+}
+
+// F8: a terminal rejection (revoked/superseded/invalid request) still cancels
+// the obligation, and that give-up is not counted as an abandoned retry.
+TEST(UbProbeLinkManagerTest, TerminalPostRejectionCancelsTheVerificationTodo) {
+    TestClock clock;
+    ProbeLinkManager plm(defaultParams(), clock.clock());
+    auto graph = makeGraph({makePortSupply(0, 1)}, {makeEdgeSupply(0, 10, 0),
+                                                    makeEdgeSupply(0, 10, 1)});
+    ASSERT_TRUE(plm.initialize(graph).ok());
+    const PathVersion healthy{ProbePathKey{0, 10, 0}, 1, 1};
+
+    plm.onBusinessPathError(makeEvidence(0, 10, 1),
+                            BusinessErrorKind::kPathFault, clock.now());
+    uint64_t token_seq = 0;
+    auto posted = postNext(plm, token_seq, clock.now());
+    ASSERT_TRUE(posted.has_value());
+    ASSERT_EQ(posted->record->key.version, healthy);
+    plm.onPostResult(posted->record, ProbePostOutcome::kRejected, clock.now());
+
+    EXPECT_EQ(plm.inflightCount(), 0U);
+    EXPECT_EQ(plm.stats().probe_post_rejected, 1U);
+    EXPECT_EQ(plm.stats().probe_post_rejected_retryable, 0U);
+    EXPECT_EQ(plm.stats().probe_verification_abandoned, 0U);
+    // This path's entry is closed rather than retried. The campaign may still
+    // be alive for the other (faulty) sibling, which is the point: only the
+    // terminal rejection's own obligation is dropped.
+    EXPECT_EQ(healthOf(plm, healthy).task, TaskState::kIdle);
+}
+
+// F8: persistent retryable rejections are bounded. After the cap the retry
+// obligation is abandoned explicitly and counted, so it no longer looks like a
+// silent drop.
+TEST(UbProbeLinkManagerTest, RetryableRejectionCapAbandonsAndCounts) {
+    TestClock clock;
+    auto params = defaultParams();
+    params.post_rejection_cap = 3;
+    ProbeLinkManager plm(params, clock.clock());
+    auto graph = makeGraph({makePortSupply(0, 1)}, {makeEdgeSupply(0, 10, 0)});
+    ASSERT_TRUE(plm.initialize(graph).ok());
+
+    plm.onBusinessPathError(makeEvidence(0, 10, 0),
+                            BusinessErrorKind::kPathFault, clock.now());
+    uint64_t token_seq = 0;
+    const uint32_t attempts = params.post_rejection_cap + 1;
+    for (uint32_t i = 0; i < attempts; ++i) {
+        clock.advance((plm.params().intervalNs() << 4) + 1);
+        auto posted = postNext(plm, token_seq, clock.now());
+        ASSERT_TRUE(posted.has_value()) << "attempt " << i;
+        plm.onPostResult(posted->record, ProbePostOutcome::kRejectedRetryable,
+                         clock.now());
+        EXPECT_EQ(plm.inflightCount(), 0U);
+    }
+    EXPECT_EQ(plm.stats().probe_post_rejected_retryable, attempts);
+    EXPECT_EQ(plm.stats().probe_verification_abandoned, 1U);
+    EXPECT_TRUE(plm.campaignView().empty());
+}
+
+// F11: the completion may arrive before the post returns, but the record must
+// not settle until both are known. The slot encodes "one in-flight probe per
+// port", so releasing it early would start a second probe while the first is
+// still inside the provider call.
+TEST(UbProbeLinkManagerTest, ProbeGateHoldsTheSlotUntilPostReturns) {
+    TestClock clock;
+    ProbeLinkManager plm(defaultParams(), clock.clock());
+    auto graph = makeGraph({makePortSupply(0, 1)}, {makeEdgeSupply(0, 10, 0)});
+    ASSERT_TRUE(plm.initialize(graph).ok());
+    const PathVersion version{ProbePathKey{0, 10, 0}, 1, 1};
+
+    plm.onBusinessPathError(makeEvidence(0, 10, 0),
+                            BusinessErrorKind::kPathFault, clock.now());
+    uint64_t token_seq = 0;
+    auto probe = postNext(plm, token_seq, clock.now());
+    ASSERT_TRUE(probe.has_value());
+
+    ASSERT_TRUE(
+        plm.onProbeCompletion(makeCompletion(probe->token), clock.now()));
+    EXPECT_EQ(plm.inflightCount(), 1U);
+    EXPECT_NE(healthOf(plm, version).health, LinkHealth::kHealthy);
+
+    // No second probe may be claimed on this port while the post is in flight:
+    // the runtime stays kInflight, so the port offers no action at all.
+    for (const auto& action : plm.pendingActions(clock.now())) {
+        EXPECT_EQ(
+            plm.beginPost(action, makeProbeToken(++token_seq), clock.now()),
+            nullptr);
+    }
+    EXPECT_TRUE(plm.pendingActions(clock.now()).empty());
+
+    // The post result is the other half of the evidence: settle exactly once.
+    plm.onPostResult(probe->record, ProbePostOutcome::kAccepted, clock.now());
+    EXPECT_EQ(plm.inflightCount(), 0U);
+    EXPECT_EQ(healthOf(plm, version).health, LinkHealth::kHealthy);
+    EXPECT_EQ(plm.stats().probe_posted, 1U);
+    EXPECT_EQ(plm.stats().probe_post_conflict, 0U);
+}
+
+TEST(UbProbeLinkManagerTest, ProbeGateCompletionOnlyNeverSettles) {
+    TestClock clock;
+    ProbeLinkManager plm(defaultParams(), clock.clock());
+    auto graph = makeGraph({makePortSupply(0, 1)}, {makeEdgeSupply(0, 10, 0)});
+    ASSERT_TRUE(plm.initialize(graph).ok());
+    plm.onBusinessPathError(makeEvidence(0, 10, 0),
+                            BusinessErrorKind::kPathFault, clock.now());
+    uint64_t token_seq = 0;
+    auto probe = postNext(plm, token_seq, clock.now());
+    ASSERT_TRUE(probe.has_value());
+    ASSERT_TRUE(
+        plm.onProbeCompletion(makeCompletion(probe->token), clock.now()));
+    // No post result ever arrives: only the timeout/shutdown path may take
+    // this record over; the CQE alone is not permission to settle.
+    EXPECT_EQ(plm.inflightCount(), 1U);
+    // D2: the scanner must not fence a record whose post is still inside the
+    // provider, so even past its deadline it stays inflight (and pinned).
+    clock.advance(plm.params().timeoutNs() + 1);
+    plm.scanTimeouts(clock.now());
+    EXPECT_EQ(plm.inflightCount(), 1U);
+    EXPECT_EQ(plm.stats().probe_timeout_unknown, 0U);
+
+    // Shutdown is the owner of last resort: it hands the unproven record off
+    // without ever fencing the in-flight post.
+    plm.stopPosting();
+    const auto drained = plm.drainBeforePollStop(clock.now());
+    EXPECT_EQ(drained.unproven, 1U);
+    EXPECT_EQ(plm.inflightCount(), 0U);
+}
+
+// F11: a CQE that arrived first and a later terminal reject are contradictory.
+// The conflict is counted once and the resources are released once.
+TEST(UbProbeLinkManagerTest, ProbeGateRejectedAfterCompletionSettlesOnce) {
+    TestClock clock;
+    ProbeLinkManager plm(defaultParams(), clock.clock());
+    auto graph = makeGraph({makePortSupply(0, 1)}, {makeEdgeSupply(0, 10, 0)});
+    ASSERT_TRUE(plm.initialize(graph).ok());
+    const PathVersion version{ProbePathKey{0, 10, 0}, 1, 1};
+
+    plm.onBusinessPathError(makeEvidence(0, 10, 0),
+                            BusinessErrorKind::kPathFault, clock.now());
+    uint64_t token_seq = 0;
+    auto probe = postNext(plm, token_seq, clock.now());
+    ASSERT_TRUE(probe.has_value());
+    ASSERT_TRUE(
+        plm.onProbeCompletion(makeCompletion(probe->token), clock.now()));
+    ASSERT_EQ(plm.inflightCount(), 1U);
+
+    plm.onPostResult(probe->record, ProbePostOutcome::kRejected, clock.now());
+    EXPECT_EQ(plm.stats().probe_post_conflict, 1U);
+    EXPECT_EQ(plm.stats().probe_post_rejected, 0U);
+    EXPECT_EQ(plm.inflightCount(), 0U);
+    EXPECT_EQ(plm.stats().probe_slot_anomaly, 0U);
+    // The completion was real evidence; health follows it, not the reject.
+    EXPECT_EQ(healthOf(plm, version).health, LinkHealth::kHealthy);
+}
+
+// F12: a replacement event without a drain receipt for the previous generation
+// must fail closed: the port stays unusable instead of publishing a new handle
+// whose predecessor may still have WRs in flight.
+TEST(UbProbeLinkManagerTest, ReplacementWithoutDrainReceiptKeepsPortBroken) {
+    TestClock clock;
+    ProbeLinkManager plm(defaultParams(), clock.clock());
+    auto graph = makeGraph({makePortSupply(0, 1)}, {makeEdgeSupply(0, 10, 0)});
+    ASSERT_TRUE(plm.initialize(graph).ok());
+
+    ProbeEvent event;
+    event.kind = ProbeEventKind::kProbeHandleReplaced;
+    event.graph_epoch = 1;
+    event.event_seq = 1;
+    ProbePortSupply replacement = makePortSupply(0, 2);
+    replacement.previous_generation = 1;
+    replacement.previous_drained = false;
+    event.port = replacement;
+    EXPECT_TRUE(plm.onPoolAvailabilityChange(event).IsInternalError());
+    EXPECT_EQ(plm.stats().probe_replacement_unproven, 1U);
+    for (const auto& entry : plm.healthView()) {
+        EXPECT_TRUE(entry.pending);
+        EXPECT_EQ(entry.pending_reason, PendingReason::kReplacementUnproven);
+    }
+    EXPECT_TRUE(plm.pendingActions(clock.now()).empty());
+}
+
+TEST(UbProbeLinkManagerTest, ReplacementWithDrainReceiptAdvances) {
+    TestClock clock;
+    ProbeLinkManager plm(defaultParams(), clock.clock());
+    auto graph = makeGraph({makePortSupply(0, 1)}, {makeEdgeSupply(0, 10, 0)});
+    ASSERT_TRUE(plm.initialize(graph).ok());
+    const PathVersion version{ProbePathKey{0, 10, 0}, 1, 1};
+
+    ProbeEvent event;
+    event.kind = ProbeEventKind::kProbeHandleReplaced;
+    event.graph_epoch = 1;
+    event.event_seq = 1;
+    ProbePortSupply replacement = makePortSupply(0, 2);
+    replacement.previous_generation = 1;
+    replacement.previous_drained = true;
+    event.port = replacement;
+    ASSERT_TRUE(plm.onPoolAvailabilityChange(event).ok());
+    EXPECT_EQ(plm.stats().probe_replacement_unproven, 0U);
+    // The new generation is usable; the path is not left pending.
+    EXPECT_FALSE(healthOf(plm, version).pending);
+}
+
+TEST(UbProbeLinkManagerTest, FirstPublicationNeedsNoDrainReceipt) {
+    TestClock clock;
+    ProbeLinkManager plm(defaultParams(), clock.clock());
+    auto graph = makeGraph({makePortSupply(0, 1)}, {makeEdgeSupply(0, 10, 0)});
+    ASSERT_TRUE(plm.initialize(graph).ok());
+
+    ProbeEvent event;
+    event.kind = ProbeEventKind::kProbeHandleReplaced;
+    event.graph_epoch = 1;
+    event.event_seq = 1;
+    ProbePortSupply replacement = makePortSupply(0, 2);
+    replacement.previous_generation = 0;  // first publication
+    replacement.previous_drained = false;
+    event.port = replacement;
+    ASSERT_TRUE(plm.onPoolAvailabilityChange(event).ok());
+    EXPECT_EQ(plm.stats().probe_replacement_unproven, 0U);
+}
+
+// D2/F11: the probe deadline is armed in beginPost(), i.e. before the provider
+// call. If the native post overruns probe/timeout_ms, the scan must NOT retire
+// the lane and hand the Jetty still inside adapter post() to quiesce/delete.
+TEST(UbProbeLinkManagerTest, TimeoutScanWaitsForThePostToReturn) {
+    TestClock clock;
+    ProbeLinkManager plm(defaultParams(), clock.clock());
+    RecordingReportSink reports;
+    plm.setReportSink(&reports);
+    auto graph = makeGraph({makePortSupply(0, 1)}, {makeEdgeSupply(0, 10, 0)});
+    ASSERT_TRUE(plm.initialize(graph).ok());
+
+    plm.onBusinessPathError(makeEvidence(0, 10, 0),
+                            BusinessErrorKind::kPathFault, clock.now());
+    uint64_t token_seq = 0;
+    auto probe = postNext(plm, token_seq, clock.now());
+    ASSERT_TRUE(probe.has_value());
+
+    // The post is still inside the provider; the deadline has passed.
+    clock.advance(plm.params().timeoutNs() + 1);
+    plm.scanTimeouts(clock.now());
+    EXPECT_EQ(plm.inflightCount(), 1U);
+    EXPECT_EQ(plm.stats().probe_timeout_unknown, 0U);
+    // The port is silently pinned by the stuck post; make that observable.
+    EXPECT_EQ(plm.stats().probe_timeout_deferred_by_post_return, 1U);
+    EXPECT_TRUE(reports.retire_calls.empty());
+
+    // The post returns, its deadline is re-armed, and only then may the scan
+    // take the record over.
+    plm.onPostResult(probe->record, ProbePostOutcome::kAccepted, clock.now());
+    clock.advance(plm.params().timeoutNs() + 1);
+    plm.scanTimeouts(clock.now());
+    EXPECT_EQ(plm.inflightCount(), 0U);
+    EXPECT_EQ(plm.stats().probe_timeout_unknown, 1U);
 }
 
 }  // namespace

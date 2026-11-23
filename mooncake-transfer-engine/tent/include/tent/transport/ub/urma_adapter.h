@@ -384,19 +384,57 @@ enum class Operation : uint8_t {
 //       Contradictory provider result (success with a short count, partial
 //       acceptance, more accepted WRs than submitted). Never replay, never
 //       roll back: drain until a CQE or the timeout fence settles it.
+//
+// F5: what the provider actually proved about the post. `posted_count` stays
+// the honest "WRs that crossed the native boundary" number (segment ownership
+// depends on it), so the acceptance decision needs its own evidence channel:
+// an error without a failing-WR position does NOT prove zero acceptance.
+enum class PostEvidence : uint8_t {
+    // The provider gave a definite answer: success, or a bad_wr position.
+    kProviderReported = 0,
+    // The call failed but the provider did not say where it stopped. The
+    // accepted prefix is unknown, so the outcome must be fail-closed.
+    kNoFailingWr = 1,
+};
+
+struct PostOutcome {
+    Status status;
+    // WRs that crossed the native boundary. Only for segment accounting.
+    size_t posted_count = 0;
+    PostEvidence evidence = PostEvidence::kProviderReported;
+    size_t request_count = 0;
+};
+
+// INV-POST-1: kNotAccepted requires a provider-reported failure position with
+// posted_count == 0. Missing evidence is never "definitely not accepted".
 [[nodiscard]] inline PostAcceptance classifyPostAcceptance(
-    const Status& post_status, size_t posted_count,
-    size_t request_count) noexcept {
-    if (posted_count == request_count) {
+    const PostOutcome& outcome) noexcept {
+    if (outcome.evidence == PostEvidence::kNoFailingWr) {
+        return PostAcceptance::kUnknown;
+    }
+    if (outcome.posted_count == outcome.request_count) {
         // Includes the empty batch: nothing was requested and nothing was
         // posted, so there is nothing to wait for. (`!ok` with an empty batch
         // also lands here; the caller owns no WR either way.)
         return PostAcceptance::kAccepted;
     }
-    if (!post_status.ok() && posted_count == 0) {
+    if (!outcome.status.ok() && outcome.posted_count == 0) {
         return PostAcceptance::kNotAccepted;
     }
     return PostAcceptance::kUnknown;
+}
+
+// Compatibility overload for callers that only have the legacy triple: an
+// explicit count is treated as provider-reported (the pre-F5 contract).
+[[nodiscard]] inline PostAcceptance classifyPostAcceptance(
+    const Status& post_status, size_t posted_count,
+    size_t request_count) noexcept {
+    PostOutcome outcome;
+    outcome.status = post_status;
+    outcome.posted_count = posted_count;
+    outcome.request_count = request_count;
+    outcome.evidence = PostEvidence::kProviderReported;
+    return classifyPostAcceptance(outcome);
 }
 
 struct WorkRequest {
@@ -699,17 +737,38 @@ class UrmaAdapter {
             "per-WR remote target is not supported by this adapter");
     }
 
+    // F5: adapter boundary result including the evidence behind posted_count.
+    // The default preserves the legacy contract for adapters (and fakes) that
+    // only implement post(): their failure without a position is still
+    // reported as provider-reported, exactly as before. Adapters with a native
+    // bad_wr channel override this so a missing position becomes kNoFailingWr.
+    virtual PostOutcome postDetailed(const JettyPtr& jetty,
+                                     const std::vector<WorkRequest>& requests) {
+        PostOutcome outcome;
+        outcome.request_count = requests.size();
+        outcome.status = post(jetty, requests, outcome.posted_count);
+        return outcome;
+    }
+
+    virtual PostOutcome postDetailed(const JettyPtr& jetty,
+                                     const RemoteJettyInfo& target,
+                                     const WorkRequest& request) {
+        PostOutcome outcome;
+        outcome.request_count = 1;
+        outcome.status = post(jetty, target, request, outcome.posted_count);
+        return outcome;
+    }
+
     // RM Legacy post with explicit acceptance classification. The default
-    // implementation derives the classification from the legacy post contract
-    // so RC-oriented adapters keep their exact behavior; adapters with native
-    // RM acceptance semantics override it.
+    // derives it from postDetailed(), so every adapter that implements only
+    // post() keeps its exact behavior.
     virtual Status post(const JettyPtr& jetty,
                         const std::vector<WorkRequest>& requests,
                         size_t& posted_count, PostAcceptance& acceptance) {
-        auto status = post(jetty, requests, posted_count);
-        acceptance =
-            classifyPostAcceptance(status, posted_count, requests.size());
-        return status;
+        const PostOutcome outcome = postDetailed(jetty, requests);
+        posted_count = outcome.posted_count;
+        acceptance = classifyPostAcceptance(outcome);
+        return outcome.status;
     }
 
     // RM variant of the tristate post, used by the pooled data path when the
@@ -718,7 +777,9 @@ class UrmaAdapter {
     virtual Status post(const JettyPtr& jetty, const RemoteJettyInfo& target,
                         const WorkRequest& request, size_t& posted_count,
                         PostAcceptance& acceptance) {
-        const Status status = post(jetty, target, request, posted_count);
+        const PostOutcome outcome = postDetailed(jetty, target, request);
+        posted_count = outcome.posted_count;
+        const Status& status = outcome.status;
         if (status.IsNotImplemented()) {
             // The adapter has no RM path at all: nothing was posted, but this
             // is a hard configuration error, not a business rejection.
@@ -729,7 +790,7 @@ class UrmaAdapter {
             acceptance = PostAcceptance::kUnknown;
             return status;
         }
-        acceptance = classifyPostAcceptance(status, posted_count, 1);
+        acceptance = classifyPostAcceptance(outcome);
         return status;
     }
 

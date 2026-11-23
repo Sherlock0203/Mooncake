@@ -37,6 +37,13 @@ size_t probePageSize() {
     return page > 0 ? static_cast<size_t>(page) : 4096;
 }
 
+uint64_t steadyNowNs() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+
 // Token the peer must use when importing our probe area. P2 publishes it to
 // peers through the handshake; the value is a placeholder until the bootstrap
 // contract freezes the probe-area token.
@@ -85,7 +92,7 @@ Status StandaloneProbeResourceProvider::discover() {
 Status StandaloneProbeResourceProvider::bindPorts(
     const std::vector<ProbePortSpec>& specs) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (shut_down_) {
+    if (shut_down_ || !accepting_) {
         return Status::InvalidArgument(
             "standalone probe provider is shut down");
     }
@@ -183,7 +190,8 @@ ProbeLocalPublication StandaloneProbeResourceProvider::publication() const {
     result.topology_epoch = publication_topology_epoch_;
     result.publication_epoch = publication_epoch_;
     for (const auto& port : ports_) {
-        if (!port.available || !port.probe_jetty || !port.area_segment) {
+        if (port.lifecycle != PortLifecycle::kActive || !port.probe_jetty ||
+            !port.area_segment) {
             continue;
         }
         ProbeLocalPortPublication published;
@@ -202,7 +210,7 @@ ProbeLocalPublication StandaloneProbeResourceProvider::publication() const {
         published.area_length = port.area_size;
         published.area_epoch = port.area_epoch;
         published.area_token = kProbeAreaToken;
-        published.node_gate_ok = !shut_down_;
+        published.node_gate_ok = !shut_down_ && accepting_;
         published.port_gate_ok = true;
         const auto& device = port.config.context->deviceInfo();
         const uint16_t modes = device.capabilities.transport_modes;
@@ -254,7 +262,7 @@ bool matchesProbeFilter(const DeviceInfo& device,
 }  // namespace
 
 Status StandaloneProbeResourceProvider::discoverLocked() {
-    if (shut_down_) {
+    if (shut_down_ || !accepting_) {
         return Status::InvalidArgument(
             "standalone probe provider is shut down");
     }
@@ -326,7 +334,10 @@ Status StandaloneProbeResourceProvider::discoverLocked() {
         ContextPtr context;
         status = adapter_->openContext(physical[index], context);
         if (!status.ok() || !context || !context->valid()) {
-            port.available = false;
+            // Nothing was created for this port, so "destroyed" is vacuously
+            // proven; kActive would make shutdown() try to release resources
+            // that never existed.
+            port.lifecycle = PortLifecycle::kDestroyed;
             LOG(WARNING) << "UB probe: cannot open probe context for "
                          << physical[index].native_device_name
                          << " status=" << status.ToString();
@@ -366,7 +377,8 @@ StandaloneProbeResourceProvider::contexts() const {
     std::lock_guard<std::mutex> lock(mutex_);
     std::map<Topology::NicID, ContextPtr> result;
     for (const auto& port : ports_) {
-        if (!port.available || !port.config.context) continue;
+        if (port.lifecycle != PortLifecycle::kActive || !port.config.context)
+            continue;
         result.emplace(port.config.local_nic, port.config.context);
     }
     return result;
@@ -559,62 +571,176 @@ Status StandaloneProbeResourceProvider::createPortLocked(PortState& port) {
 }
 
 Status StandaloneProbeResourceProvider::destroyPortLocked(PortState& port) {
-    Status first_error = Status::OK();
-    if (!port.available) return first_error;
-    if (adapter_ && port.probe_jetty) {
+    if (port.lifecycle == PortLifecycle::kDestroyed) return Status::OK();
+    port.lifecycle = PortLifecycle::kClosing;
+
+    // A missing handle is its own proof: no native object exists that could
+    // still reach the pages, so the corresponding stage is vacuous.
+    if (!port.probe_jetty) port.jetty_destroyed = true;
+    if (!port.source_segment) port.source_seg_unregistered = true;
+    if (!port.area_segment) port.area_seg_unregistered = true;
+    if (!port.owns_jfc || !port.probe_jfc) port.jfc_destroyed = true;
+
+    const bool has_resources = port.probe_jetty || port.probe_jfc ||
+                               port.source_segment || port.area_segment ||
+                               port.source_memory != nullptr ||
+                               port.area_memory != nullptr;
+    if (!adapter_) {
+        if (!has_resources) {
+            port.lifecycle = PortLifecycle::kDestroyed;
+            return Status::OK();
+        }
+        return orphanLocked(port, "adapter",
+                            Status::InternalError(
+                                "no URMA adapter to release probe resources"));
+    }
+
+    // Stage 1: fence the Jetty. If it cannot be proven gone, delete is not
+    // attempted and the pages are not touched (INV-1).
+    if (!port.jetty_destroyed) {
         // deleteJetty requires a reset Jetty. Probe has no in-flight WRs at
         // this point: the transport drains the PLM before provider shutdown.
-        auto status = adapter_->resetJetty(port.probe_jetty);
-        if (first_error.ok() && !status.ok()) first_error = status;
-        status = adapter_->deleteJetty(port.probe_jetty);
-        if (first_error.ok() && !status.ok()) first_error = status;
+        const Status reset = adapter_->resetJetty(port.probe_jetty);
+        if (!reset.ok()) return orphanLocked(port, "resetJetty", reset);
+        const Status del = adapter_->deleteJetty(port.probe_jetty);
+        if (!del.ok()) return orphanLocked(port, "deleteJetty", del);
+        port.jetty_destroyed = true;
+        port.probe_jetty.reset();
     }
-    if (adapter_ && port.owns_jfc && port.probe_jfc) {
-        auto status = adapter_->deleteJfc(port.probe_jfc);
-        if (first_error.ok() && !status.ok()) first_error = status;
+
+    // Stage 2: JFC and local segments. These are independent of the Jetty's
+    // DMA reachability, so each can be retried on its own.
+    if (!port.jfc_destroyed) {
+        const Status status = adapter_->deleteJfc(port.probe_jfc);
+        if (!status.ok()) return orphanLocked(port, "deleteJfc", status);
+        port.jfc_destroyed = true;
+        port.probe_jfc.reset();
     }
-    if (adapter_ && port.source_segment) {
-        auto status = adapter_->unregisterLocalSegment(port.source_segment);
-        if (first_error.ok() && !status.ok()) first_error = status;
+    if (!port.source_seg_unregistered) {
+        const Status status =
+            adapter_->unregisterLocalSegment(port.source_segment);
+        if (!status.ok()) {
+            return orphanLocked(port, "unregisterSource", status);
+        }
+        port.source_seg_unregistered = true;
+        port.source_segment.reset();
     }
-    if (adapter_ && port.area_segment) {
-        auto status = adapter_->unregisterLocalSegment(port.area_segment);
-        if (first_error.ok() && !status.ok()) first_error = status;
+    if (!port.area_seg_unregistered) {
+        const Status status =
+            adapter_->unregisterLocalSegment(port.area_segment);
+        if (!status.ok()) {
+            return orphanLocked(port, "unregisterArea", status);
+        }
+        port.area_seg_unregistered = true;
+        port.area_segment.reset();
     }
+
+    // Stage 3 (INV-CLOSE-1): free a page only when this attempt holds both
+    // proofs for it. Anything unproven keeps its memory and orphan the port.
     if (port.source_memory != nullptr) {
+        if (!(port.jetty_destroyed && port.source_seg_unregistered)) {
+            return orphanLocked(
+                port, "source_page",
+                Status::InternalError(
+                    "probe source page free attempted without proof"));
+        }
         std::free(port.source_memory);
         port.source_memory = nullptr;
     }
     if (port.area_memory != nullptr) {
+        if (!(port.jetty_destroyed && port.area_seg_unregistered)) {
+            return orphanLocked(
+                port, "area_page",
+                Status::InternalError(
+                    "probe area page free attempted without proof"));
+        }
         std::free(port.area_memory);
         port.area_memory = nullptr;
     }
+
     port.probe_jfc.reset();
     port.owns_jfc = false;
-    port.probe_jetty.reset();
-    port.source_segment.reset();
     port.source_size = 0;
     port.source_generation = 0;
-    port.area_segment.reset();
     port.area_size = 0;
     port.area_epoch = 0;
-    return first_error;
+    port.lifecycle = PortLifecycle::kDestroyed;
+    return Status::OK();
+}
+
+Status StandaloneProbeResourceProvider::orphanLocked(PortState& port,
+                                                     const char* stage,
+                                                     const Status& cause) {
+    port.lifecycle = PortLifecycle::kOrphaned;
+    if (port.orphan_since_ns == 0) port.orphan_since_ns = steadyNowNs();
+    LOG_EVERY_N(WARNING, 10)
+        << "UB probe port " << port.config.local_nic << " orphaned at stage "
+        << stage << ": " << cause.ToString()
+        << "; keeping Jetty/JFC/segments/pages for a shutdown() retry";
+    return cause;
+}
+
+void StandaloneProbeResourceProvider::reArmPortLocked(PortState& port) {
+    // A port whose resources are proven released may be created again by a
+    // later snapshot(). Only a port that actually has a usable Context is
+    // re-armed: a discovery-time context-open failure stays destroyed.
+    if (!port.config.context || !port.config.context->valid()) return;
+    port.lifecycle = PortLifecycle::kActive;
+    port.jetty_destroyed = false;
+    port.jfc_destroyed = false;
+    port.source_seg_unregistered = false;
+    port.area_seg_unregistered = false;
+    port.orphan_since_ns = 0;
 }
 
 void StandaloneProbeResourceProvider::rollbackPortsLocked() {
+    // A rollback always leaves the provider without a usable local resource
+    // set, even if a port survives as kOrphaned. Without this the next
+    // snapshot() would skip creation entirely (resources_ready_ still true)
+    // and publish an empty graph.
+    resources_ready_ = false;
     for (auto& port : ports_) {
-        if (port.available) (void)destroyPortLocked(port);
+        if (port.lifecycle == PortLifecycle::kDestroyed) continue;
+        const Status status = destroyPortLocked(port);
+        if (!status.ok()) {
+            // Orphaned: kept in ports_ so a later retry can finish.
+            continue;
+        }
+        reArmPortLocked(port);
     }
 }
 
-void StandaloneProbeResourceProvider::releaseQuarantineLocked() {
+bool StandaloneProbeResourceProvider::portDestroyedLocked(
+    Topology::NicID local_nic) const {
+    for (const auto& port : ports_) {
+        if (port.config.local_nic != local_nic) continue;
+        return port.lifecycle == PortLifecycle::kDestroyed;
+    }
+    // No owning port is left, so no native handle can still reach the entry.
+    return true;
+}
+
+void StandaloneProbeResourceProvider::releaseProvenQuarantineLocked() {
     if (quarantine_.empty()) return;
-    // P1 keeps the references alive until shutdown. P4 turns this into a real
-    // quarantine with per-generation source-page reclamation.
-    LOG(INFO) << "UB standalone probe provider: releasing "
-              << quarantine_.size()
-              << " quarantined probe handoff(s) at shutdown";
-    quarantine_.clear();
+    std::vector<ProbeHandoff> retained;
+    retained.reserve(quarantine_.size());
+    for (auto& handoff : quarantine_) {
+        if (portDestroyedLocked(handoff.lane.local_nic)) continue;
+        retained.push_back(std::move(handoff));
+    }
+    const size_t released = quarantine_.size() - retained.size();
+    if (released != 0) {
+        LOG(INFO) << "UB standalone probe provider: released " << released
+                  << " quarantined probe handoff(s) whose port is proven "
+                     "destroyed";
+    }
+    if (!retained.empty()) {
+        LOG(WARNING) << "UB standalone probe provider: retaining "
+                     << retained.size()
+                     << " quarantined probe handoff(s) whose port is not "
+                        "proven destroyed";
+    }
+    quarantine_ = std::move(retained);
 }
 
 ProbePortSupply StandaloneProbeResourceProvider::makePortSupplyLocked(
@@ -624,6 +750,8 @@ ProbePortSupply StandaloneProbeResourceProvider::makePortSupplyLocked(
     supply.context = port.config.context;
     supply.probe_jetty = port.probe_jetty;
     supply.jetty_generation = port.config.generation;
+    supply.previous_generation = port.previous_generation;
+    supply.previous_drained = port.previous_drained;
     supply.probe_jfc = port.owns_jfc ? port.probe_jfc : nullptr;
     supply.source_segment = port.source_segment;
     supply.source_address = reinterpret_cast<uint64_t>(port.source_memory);
@@ -647,7 +775,8 @@ Status StandaloneProbeResourceProvider::buildGraphLocked(ProbeGraph& graph) {
     std::set<Topology::NicID> known_ports;
     for (const auto& port : ports_) {
         known_ports.insert(port.config.local_nic);
-        if (port.available) available_ports.insert(port.config.local_nic);
+        if (port.lifecycle == PortLifecycle::kActive)
+            available_ports.insert(port.config.local_nic);
     }
 
     std::vector<ProbeEdgeSupply> kept_edges;
@@ -694,7 +823,8 @@ Status StandaloneProbeResourceProvider::buildGraphLocked(ProbeGraph& graph) {
     built.graph_epoch = next_graph_epoch_;
     built.ports.reserve(available_ports.size());
     for (const auto& port : ports_) {
-        if (port.available) built.ports.push_back(makePortSupplyLocked(port));
+        if (port.lifecycle == PortLifecycle::kActive)
+            built.ports.push_back(makePortSupplyLocked(port));
     }
     built.edges = std::move(kept_edges);
     graph = std::move(built);
@@ -707,7 +837,7 @@ Status StandaloneProbeResourceProvider::prepareLocal() {
         if (!status.ok()) return status;
     }
     std::lock_guard<std::mutex> lock(mutex_);
-    if (shut_down_) {
+    if (shut_down_ || !accepting_) {
         return Status::InvalidArgument(
             "standalone probe provider is shut down");
     }
@@ -723,10 +853,23 @@ Status StandaloneProbeResourceProvider::createLocalResourcesLocked() {
     auto page_status = validatePageSizeLocked();
     if (!page_status.ok()) return page_status;
 
+    // D3: a port orphaned by an earlier failed teardown (a rollback or
+    // snapshot whose destroy could not be proven) must get another chance
+    // here instead of silently leaving the probe graph forever. Retry the
+    // destroy; on success its resources are proven gone, so re-arm it.
+    for (auto& port : ports_) {
+        if (port.lifecycle != PortLifecycle::kOrphaned) continue;
+        if (!destroyPortLocked(port).ok()) continue;
+        reArmPortLocked(port);
+        ++recovered_orphaned_ports_;
+        LOG(INFO) << "UB probe port " << port.config.local_nic
+                  << " recovered from orphaned state on resource creation";
+    }
+
     std::set<Topology::NicID> local_nics;
     size_t available = 0;
     for (const auto& port : ports_) {
-        if (!port.available) continue;
+        if (port.lifecycle != PortLifecycle::kActive) continue;
         if (port.config.local_nic < 0 ||
             !local_nics.insert(port.config.local_nic).second ||
             port.config.generation == 0 || !port.config.context ||
@@ -741,7 +884,7 @@ Status StandaloneProbeResourceProvider::createLocalResourcesLocked() {
     }
 
     for (auto& port : ports_) {
-        if (!port.available) continue;
+        if (port.lifecycle != PortLifecycle::kActive) continue;
         auto status = createPortLocked(port);
         if (!status.ok()) {
             rollbackPortsLocked();
@@ -758,7 +901,7 @@ Status StandaloneProbeResourceProvider::snapshot(ProbeGraph& graph) {
         if (!status.ok()) return status;
     }
     std::lock_guard<std::mutex> lock(mutex_);
-    if (shut_down_) {
+    if (shut_down_ || !accepting_) {
         return Status::InvalidArgument(
             "standalone probe provider is shut down");
     }
@@ -781,7 +924,7 @@ Status StandaloneProbeResourceProvider::snapshot(ProbeGraph& graph) {
     }
     size_t available = 0;
     for (const auto& port : ports_) {
-        if (port.available) ++available;
+        if (port.lifecycle == PortLifecycle::kActive) ++available;
     }
 
     ProbeGraph built;
@@ -806,7 +949,7 @@ Status StandaloneProbeResourceProvider::snapshot(ProbeGraph& graph) {
 
 Status StandaloneProbeResourceProvider::refreshPeerEdges() {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (shut_down_) return Status::OK();
+    if (shut_down_ || !accepting_) return Status::OK();
     if (!initialized_ || graph_epoch_ == 0) {
         return Status::InvalidArgument("probe graph is not initialized");
     }
@@ -1207,6 +1350,14 @@ Status StandaloneProbeResourceProvider::rebuildPortLocked(
     next.source_size = page;
     next.config.generation = next_generation;
     next.source_generation = next_generation;
+    // F12: the quiesce above already succeeded, so the replacement is proven.
+    // These two fields MUST be written together: the LM treats "previous_
+    // generation names my live generation" as the replacement signal and only
+    // then requires previous_drained. Writing the generation without the
+    // receipt (or resetting the receipt alone) would flip an ordinary
+    // republication into a fail-closed replacement.
+    next.previous_generation = old_generation;
+    next.previous_drained = true;
     // next.area_* deliberately unchanged: peer descriptors stay valid.
 
     // Publish only after the new source page and generation are ready. If the
@@ -1220,9 +1371,9 @@ Status StandaloneProbeResourceProvider::rebuildPortLocked(
         return status;
     }
 
-    retired_pages_.push_back(RetiredPage{std::move(port.source_segment),
-                                         port.source_memory, port.source_size,
-                                         old_generation});
+    retired_pages_.push_back(
+        RetiredPage{std::move(port.source_segment), port.source_memory,
+                    port.source_size, old_generation, port.config.local_nic});
     port.source_memory = nullptr;
     port.source_size = 0;
     port.probe_jetty = std::move(new_jetty);
@@ -1231,6 +1382,8 @@ Status StandaloneProbeResourceProvider::rebuildPortLocked(
     port.source_size = page;
     port.config.generation = next_generation;
     port.source_generation = next_generation;
+    port.previous_generation = old_generation;
+    port.previous_drained = true;
     // A probe Jetty rebuild changes target_epoch: peers must refresh quickly
     // instead of waiting for the periodic handshake (design §6.6).
     bumpPublicationEpochLocked();
@@ -1262,14 +1415,29 @@ Status StandaloneProbeResourceProvider::emitHandleReplacedLocked(
     return status;
 }
 
-void StandaloneProbeResourceProvider::releaseRetiredPagesLocked() {
+void StandaloneProbeResourceProvider::releaseProvenRetiredPagesLocked() {
+    if (retired_pages_.empty()) return;
+    std::vector<RetiredPage> retained;
+    retained.reserve(retired_pages_.size());
     for (auto& page : retired_pages_) {
+        // A retired generation is only unreachable once its port is proven
+        // destroyed: the replacement Jetty delete of a rebuild may have failed.
+        if (!portDestroyedLocked(page.local_nic)) {
+            retained.push_back(std::move(page));
+            continue;
+        }
         if (page.segment) {
             (void)adapter_->unregisterLocalSegment(page.segment);
         }
         if (page.memory != nullptr) std::free(page.memory);
     }
-    retired_pages_.clear();
+    if (!retained.empty()) {
+        LOG(WARNING) << "UB standalone probe provider: retaining "
+                     << retained.size()
+                     << " retired probe page(s) whose port is not proven "
+                        "destroyed";
+    }
+    retired_pages_ = std::move(retained);
 }
 
 size_t StandaloneProbeResourceProvider::retiredPageCount() const {
@@ -1288,15 +1456,37 @@ Status StandaloneProbeResourceProvider::shutdown() {
 
     std::lock_guard<std::mutex> lock(mutex_);
     if (shut_down_) return Status::OK();
+    // "Stop taking work" is independent of "resources are released": a failed
+    // cleanup keeps shut_down_ false so this call can be retried, while
+    // accepting_ already blocks new probe graph work.
+    accepting_ = false;
+
     Status first_error = Status::OK();
-    // Drop handoff references first: they may still point at older-generation
-    // source pages that the current port state does not own.
-    releaseQuarantineLocked();
-    releaseRetiredPagesLocked();
+    size_t orphaned = 0;
     for (auto& port : ports_) {
-        auto status = destroyPortLocked(port);
-        if (first_error.ok() && !status.ok()) first_error = status;
+        const Status status = destroyPortLocked(port);
+        if (!status.ok()) {
+            if (first_error.ok()) first_error = status;
+            ++orphaned;
+        }
     }
+
+    // INV-CLOSE-3: state may only disappear once every port is proven
+    // destroyed. On failure this is an explicit "leaks but stays safe" choice:
+    // ports, contexts and pages are retained for a later shutdown() retry.
+    if (orphaned != 0) {
+        shutdown_incomplete_ = true;
+        resources_ready_ = false;
+        initialized_ = false;
+        LOG(ERROR) << "UB probe provider shutdown incomplete: " << orphaned
+                   << " port(s) orphaned; resources retained for a retry";
+        return first_error;
+    }
+
+    // Every port is proven destroyed, so no native handle can still reach a
+    // quarantined or retired generation: release both under that proof.
+    releaseProvenQuarantineLocked();
+    releaseProvenRetiredPagesLocked();
     if (owns_contexts_) {
         for (auto& port : ports_) {
             if (!port.config.context) continue;
@@ -1307,9 +1497,25 @@ Status StandaloneProbeResourceProvider::shutdown() {
     }
     resources_ready_ = false;
     initialized_ = false;
+    shutdown_incomplete_ = false;
     shut_down_ = true;
     LOG(INFO) << "UB standalone probe provider shut down";
     return first_error;
+}
+
+StandaloneProbeResourceProvider::CloseStats
+StandaloneProbeResourceProvider::closeStats() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    CloseStats stats;
+    stats.shutdown_incomplete = shutdown_incomplete_;
+    stats.recovered_ports = recovered_orphaned_ports_;
+    for (const auto& port : ports_) {
+        if (port.lifecycle != PortLifecycle::kOrphaned) continue;
+        ++stats.orphaned_ports;
+        if (port.source_memory != nullptr) ++stats.orphaned_pages;
+        if (port.area_memory != nullptr) ++stats.orphaned_pages;
+    }
+    return stats;
 }
 
 std::vector<StandaloneProbeResourceProvider::PortView>
@@ -1318,7 +1524,8 @@ StandaloneProbeResourceProvider::portViews() const {
     std::vector<PortView> views;
     views.reserve(ports_.size());
     for (const auto& port : ports_) {
-        if (!port.available || !port.probe_jetty) continue;
+        if (port.lifecycle != PortLifecycle::kActive || !port.probe_jetty)
+            continue;
         views.push_back(PortView{
             port.config.local_nic, port.config.generation,
             port.probe_jetty->id(),
@@ -1337,7 +1544,8 @@ StandaloneProbeResourceProvider::localAreaViews() const {
     std::vector<LocalAreaView> views;
     views.reserve(ports_.size());
     for (const auto& port : ports_) {
-        if (!port.available || !port.area_segment) continue;
+        if (port.lifecycle != PortLifecycle::kActive || !port.area_segment)
+            continue;
         LocalAreaView view;
         view.local_nic = port.config.local_nic;
         view.generation = port.config.generation;

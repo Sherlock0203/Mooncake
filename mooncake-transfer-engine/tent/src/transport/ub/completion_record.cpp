@@ -97,15 +97,27 @@ BlockReason blockReasonOf(const CompletionRecord& record) {
     return BlockReason::kHandlerRefs;
 }
 
-// Retryability of the delivered logical result. Mirrors the baseline
-// `retryableStatus()` classification per completion category.
-bool logicalRetryable(const CompletionRecord& record, LogicalOutcome outcome) {
+void decideAndPublish(CompletionRecord& record, GateContext& context) {
+    const LogicalOutcome outcome = gate::decideLogicalOutcome(record);
+    record.logical_outcome = outcome;
+    record.logical_retryable =
+        gate::logicalRetryable(record, outcome, context.retry_timeout_write);
+}
+
+}  // namespace
+
+namespace gate {
+
+bool logicalRetryable(const CompletionRecord& record, LogicalOutcome outcome,
+                      bool retry_timeout_write) {
     switch (outcome) {
         case LogicalOutcome::kCompleted:
             return false;
         case LogicalOutcome::kTimeout:
-            // Baseline resolves every timeout as retryable.
-            return true;
+            // Baseline resolves every timeout as retryable. F6d makes the one
+            // non-obvious case explicit: WRITE replay is only allowed while the
+            // deployment keeps write replay enabled.
+            return !(record.write_opcode && !retry_timeout_write);
         case LogicalOutcome::kCanceled:
             // A post that provably did not cross the native boundary may be
             // retried as the legacy rollback allowed.
@@ -130,13 +142,7 @@ bool logicalRetryable(const CompletionRecord& record, LogicalOutcome outcome) {
     return false;
 }
 
-void decideAndPublish(CompletionRecord& record) {
-    const LogicalOutcome outcome = gate::decideLogicalOutcome(record);
-    record.logical_outcome = outcome;
-    record.logical_retryable = logicalRetryable(record, outcome);
-}
-
-}  // namespace
+}  // namespace gate
 
 const char* recordKindName(RecordKind kind) {
     switch (kind) {
@@ -515,7 +521,7 @@ void advance(CompletionRecord& record, Sink& sink, GateContext& context) {
 
     // ---- stage one: the logical verdict, decided exactly once --------------
     if (!record.settle_claimed.exchange(true, std::memory_order_acq_rel)) {
-        decideAndPublish(record);
+        decideAndPublish(record, context);
         bump(context.stats.record_settled);
         sink.onSettle(record, record.logical_outcome);
     }

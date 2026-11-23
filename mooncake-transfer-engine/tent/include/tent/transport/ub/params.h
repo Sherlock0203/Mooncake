@@ -291,6 +291,28 @@ struct UbParams {
     uint32_t task_max_inflight_attempts = 4;
     // Bound on how many parked slices one reflow pass moves back to the queue.
     uint32_t defer_reflow_batch = 256;
+    // F9.1: while the ready queues stay non-empty a parked slice would never be
+    // reflowed (kReflow is only reachable on an empty pop). Force a reflow at
+    // least this often. 0 disables the cadence (legacy behavior).
+    uint32_t defer_reflow_max_gap_ms = 10;
+    // A local device may only pair with a remote device in the same EID
+    // reachability scope (df00 <-> df00, df04 <-> df04). Cross-scope WRs come
+    // back as URMA_CR_LOC_ACCESS_ERR, which surfaces as a retryable path fault
+    // and collapses the transfer onto a single rail. Declared adjacency has
+    // its own probe/adjacency_policy/require_same_eid_scope; this switch
+    // covers the legacy local x remote combination path.
+    bool require_same_eid_scope = true;
+    // F6d: allow replaying a timed-out WRITE. Fixed-length byte moves are
+    // idempotent while the source is not concurrently rewritten, which is an
+    // existing assumption of the whole design; this switch lets a deployment
+    // that needs strict write-once semantics forbid it. READ replay stays
+    // allowed either way.
+    bool retry_timeout_write = true;
+    // F6c: honor Request::deadline_ns (absolute steady_clock, 0 = none) at
+    // every stage. UB does no predictive cancellation (that is the admission
+    // queue's job); it only terminates requests whose deadline already passed.
+    // false restores byte-for-byte legacy behavior for A/B runs.
+    bool honor_request_deadline = true;
 
     // Probe-link parameters, read from transports/ub/probe/* below.
     ProbeParams probe;
@@ -553,12 +575,27 @@ struct UbParams {
         CHECK_STATUS(readPositive(config, "transports/ub/defer_reflow_batch",
                                   parsed.defer_reflow_batch,
                                   parsed.defer_reflow_batch));
+        CHECK_STATUS(readNonNegative(
+            config, "transports/ub/defer_reflow_max_gap_ms",
+            parsed.defer_reflow_max_gap_ms, parsed.defer_reflow_max_gap_ms));
+        CHECK_STATUS(readBool(config, "transports/ub/require_same_eid_scope",
+                              parsed.require_same_eid_scope,
+                              parsed.require_same_eid_scope));
+        CHECK_STATUS(readBool(config, "transports/ub/retry_timeout_write",
+                              parsed.retry_timeout_write,
+                              parsed.retry_timeout_write));
+        CHECK_STATUS(readBool(config, "transports/ub/honor_request_deadline",
+                              parsed.honor_request_deadline,
+                              parsed.honor_request_deadline));
 
         CHECK_STATUS(readBool(config, "transports/ub/probe/enabled",
                               parsed.probe.enabled, parsed.probe.enabled));
         CHECK_STATUS(readPositive(config, "transports/ub/probe/interval_ms",
                                   parsed.probe.interval_ms,
                                   parsed.probe.interval_ms));
+        CHECK_STATUS(readPositive(
+            config, "transports/ub/probe/post_rejection_cap",
+            parsed.probe.post_rejection_cap, parsed.probe.post_rejection_cap));
         CHECK_STATUS(readPositive(config, "transports/ub/probe/backoff_max_ms",
                                   parsed.probe.backoff_max_ms,
                                   parsed.probe.backoff_max_ms));

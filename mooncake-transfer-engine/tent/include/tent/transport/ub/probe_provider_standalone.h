@@ -225,7 +225,33 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
     [[nodiscard]] uint64_t retireCalls() const;
     [[nodiscard]] bool initialized() const;
 
+    // F1 close accounting. These are *current* values: a resource retained by
+    // an incomplete shutdown is counted until a retry proves it released, so a
+    // failed-then-successful retry ends at zero instead of inflating.
+    struct CloseStats {
+        uint64_t orphaned_ports{0};  // ports currently retained unproven
+        uint64_t orphaned_pages{0};  // pages currently retained unproven
+        // Ports that were orphaned and later re-armed by a successful destroy
+        // retry (D3). Cumulative.
+        uint64_t recovered_ports{0};
+        bool shutdown_incomplete{false};
+    };
+    [[nodiscard]] CloseStats closeStats() const;
+
    private:
+    // Explicit port lifecycle (F1). `kDestroyed` is the only state in which the
+    // port provably holds no native resource, so it is the only state that
+    // permits the owning pages to be freed or `ports_` to be cleared.
+    // `kOrphaned` means at least one native object could not be proven
+    // destroyed: every handle and page is kept so a later shutdown() retry can
+    // finish, instead of turning a failed cleanup into a silently lost state.
+    enum class PortLifecycle : uint8_t {
+        kActive = 0,
+        kClosing = 1,
+        kDestroyed = 2,
+        kOrphaned = 3,
+    };
+
     struct PortState {
         ProbeLocalPortConfig config;
         std::string port_id;
@@ -234,7 +260,19 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
         std::string native_device_name;
         DeviceInfo pending_device;
         bool has_pending_device{false};
-        bool available{true};
+        PortLifecycle lifecycle{PortLifecycle::kActive};
+        // Per-resource destruction proofs (INV-1). A page is released only
+        // when the Jetty that could still write through it is proven gone and
+        // the segment that maps it is proven unregistered.
+        bool jetty_destroyed{false};
+        bool jfc_destroyed{false};
+        bool source_seg_unregistered{false};
+        bool area_seg_unregistered{false};
+        uint64_t orphan_since_ns{0};
+        // F12: what the next kProbeHandleReplaced publication must claim about
+        // the generation it replaces.
+        uint64_t previous_generation{0};
+        bool previous_drained{false};
         JfcPtr probe_jfc;
         bool owns_jfc{false};
         JettyPtr probe_jetty;
@@ -261,6 +299,7 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
         void* memory{nullptr};
         size_t size{0};
         uint64_t generation{0};
+        Topology::NicID local_nic{-1};
     };
 
     void maintenanceLoop();
@@ -273,11 +312,22 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
 
     Status createPortLocked(PortState& port);
     Status destroyPortLocked(PortState& port);
+    // Re-arms a port whose resources are proven released so a later creation
+    // attempt can use it again.
+    void reArmPortLocked(PortState& port);
+    // Downgrades the port to kOrphaned, keeps every handle and page, and
+    // returns the causing status. Counters are bumped only on the transition.
+    Status orphanLocked(PortState& port, const char* stage,
+                        const Status& cause);
     void rollbackPortsLocked();
     void bumpPublicationEpochLocked();
     Status ensureBoundContextsLocked();
-    void releaseQuarantineLocked();
-    void releaseRetiredPagesLocked();
+    // Proof-gated release (INV-1/INV-CLOSE-4): entries are dropped only when
+    // the port they belong to is kDestroyed, i.e. no native object left alive
+    // can still reach the memory they keep registered.
+    void releaseProvenQuarantineLocked();
+    void releaseProvenRetiredPagesLocked();
+    bool portDestroyedLocked(Topology::NicID local_nic) const;
     Status buildGraphLocked(ProbeGraph& graph);
     ProbePortSupply makePortSupplyLocked(const PortState& port) const;
     Status rebuildPortLocked(PortState& port, uint64_t error_epoch,
@@ -320,7 +370,13 @@ class StandaloneProbeResourceProvider final : public ProbeResourceProvider {
     uint64_t next_graph_epoch_{1};
     bool resources_ready_{false};
     bool initialized_{false};
+    // `shut_down_` means "every native resource is released" (the only
+    // condition under which ports_ may be cleared). `accepting_` is the
+    // independent "may I take new probe work?" edge used by shutdown().
     bool shut_down_{false};
+    bool accepting_{true};
+    bool shutdown_incomplete_{false};
+    uint64_t recovered_orphaned_ports_{0};
 };
 
 }  // namespace ub

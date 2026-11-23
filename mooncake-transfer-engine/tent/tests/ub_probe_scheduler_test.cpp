@@ -212,6 +212,9 @@ TEST(UbProbeSchedulerTest, TimeoutRetiresLaneKeepsSlotAndRecoversOnNewHandle) {
     uint64_t token_seq = 0;
     auto probe = postNext(plm, token_seq, clock.now());
     ASSERT_TRUE(probe.has_value());
+    // D2: a timeout only exists once the post returned; a record still inside
+    // the provider must be skipped by the scan.
+    plm.onPostResult(probe->record, ProbePostOutcome::kAccepted, clock.now());
 
     clock.set(clock.now() + plm.params().timeoutNs());
     plm.scanTimeouts(clock.now());
@@ -231,6 +234,7 @@ TEST(UbProbeSchedulerTest, TimeoutRetiresLaneKeepsSlotAndRecoversOnNewHandle) {
     EXPECT_EQ(reports.retire_calls.size(), 1U);
 
     // A late success for the timed-out probe is not evidence.
+    plm.onPostResult(probe->record, ProbePostOutcome::kAccepted, clock.now());
     ASSERT_TRUE(
         plm.onProbeCompletion(makeCompletion(probe->token), clock.now()));
     EXPECT_EQ(plm.orphanCount(), 0U);
@@ -249,6 +253,7 @@ TEST(UbProbeSchedulerTest, TimeoutRetiresLaneKeepsSlotAndRecoversOnNewHandle) {
 
     auto retry = postNext(plm, token_seq, clock.now());
     ASSERT_TRUE(retry.has_value());
+    plm.onPostResult(retry->record, ProbePostOutcome::kAccepted, clock.now());
     ASSERT_TRUE(
         plm.onProbeCompletion(makeCompletion(retry->token), clock.now()));
     EXPECT_EQ(healthOf(plm, version).health, LinkHealth::kHealthy);
@@ -280,6 +285,7 @@ TEST(UbProbeSchedulerTest, BackoffGrowsCapsAndResetsOnSuccess) {
     // interval = 1000ms, backoff_max = 4000ms.
     auto probe = postNext(plm, token_seq, clock.now());
     ASSERT_TRUE(probe.has_value());
+    plm.onPostResult(probe->record, ProbePostOutcome::kAccepted, clock.now());
     ASSERT_TRUE(plm.onProbeCompletion(
         makeCompletion(probe->token, CompletionCategory::REMOTE_PATH_ERROR),
         clock.now()));
@@ -294,6 +300,7 @@ TEST(UbProbeSchedulerTest, BackoffGrowsCapsAndResetsOnSuccess) {
     ASSERT_TRUE(probe.has_value());
     // An ACK timeout carries a completion; it is a path fault too, but is
     // counted separately.
+    plm.onPostResult(probe->record, ProbePostOutcome::kAccepted, clock.now());
     ASSERT_TRUE(plm.onProbeCompletion(
         makeCompletion(probe->token, CompletionCategory::TIMEOUT),
         clock.now()));
@@ -306,6 +313,7 @@ TEST(UbProbeSchedulerTest, BackoffGrowsCapsAndResetsOnSuccess) {
     clock.advance(2 * kIntervalNs);
     probe = postNext(plm, token_seq, clock.now());
     ASSERT_TRUE(probe.has_value());
+    plm.onPostResult(probe->record, ProbePostOutcome::kAccepted, clock.now());
     ASSERT_TRUE(plm.onProbeCompletion(
         makeCompletion(probe->token, CompletionCategory::REMOTE_PATH_ERROR),
         clock.now()));
@@ -318,6 +326,7 @@ TEST(UbProbeSchedulerTest, BackoffGrowsCapsAndResetsOnSuccess) {
     clock.advance(4 * kIntervalNs);
     probe = postNext(plm, token_seq, clock.now());
     ASSERT_TRUE(probe.has_value());
+    plm.onPostResult(probe->record, ProbePostOutcome::kAccepted, clock.now());
     ASSERT_TRUE(plm.onProbeCompletion(
         makeCompletion(probe->token, CompletionCategory::REMOTE_PATH_ERROR),
         clock.now()));
@@ -331,6 +340,7 @@ TEST(UbProbeSchedulerTest, BackoffGrowsCapsAndResetsOnSuccess) {
     clock.advance(4 * kIntervalNs);
     probe = postNext(plm, token_seq, clock.now());
     ASSERT_TRUE(probe.has_value());
+    plm.onPostResult(probe->record, ProbePostOutcome::kAccepted, clock.now());
     ASSERT_TRUE(
         plm.onProbeCompletion(makeCompletion(probe->token), clock.now()));
     health = healthOf(plm, version);
@@ -360,6 +370,7 @@ TEST(UbProbeSchedulerTest, StaleAreaEvidenceBlocksRecovery) {
     area.local_nic = 0;
     area.edge = makeEdgeSupply(0, 10, 0, 1, 1, /*area_epoch=*/2);
     ASSERT_TRUE(events.send(area).ok());
+    plm.onPostResult(probe->record, ProbePostOutcome::kAccepted, clock.now());
     ASSERT_TRUE(
         plm.onProbeCompletion(makeCompletion(probe->token), clock.now()));
 
@@ -377,6 +388,7 @@ TEST(UbProbeSchedulerTest, StaleAreaEvidenceBlocksRecovery) {
     probe = postNext(plm, token_seq, clock.now());
     ASSERT_TRUE(probe.has_value());
     EXPECT_EQ(probe->record->key.area_epoch, 2U);
+    plm.onPostResult(probe->record, ProbePostOutcome::kAccepted, clock.now());
     ASSERT_TRUE(
         plm.onProbeCompletion(makeCompletion(probe->token), clock.now()));
     EXPECT_EQ(healthOf(plm, version).health, LinkHealth::kHealthy);
@@ -401,6 +413,7 @@ TEST(UbProbeSchedulerTest, NextDeadlineCoversInflightAndDelayedProbes) {
 
     // A gate-blocked success leaves RECOVERING with a future periodic probe;
     // nextDeadline must still schedule that wake-up, not report "idle".
+    plm.onPostResult(probe->record, ProbePostOutcome::kAccepted, clock.now());
     ASSERT_TRUE(
         plm.onProbeCompletion(makeCompletion(probe->token), clock.now()));
     ASSERT_EQ(healthOf(plm, version).health, LinkHealth::kRecovering);
@@ -446,6 +459,7 @@ TEST(UbProbeSchedulerTest, ShutdownDrainHandsOffUnprovenRecords) {
 
     // A completion after handoff has no local record any more; it is only an
     // unknown token and must not double-release anything.
+    plm.onPostResult(probe->record, ProbePostOutcome::kAccepted, clock.now());
     ASSERT_TRUE(
         plm.onProbeCompletion(makeCompletion(probe->token), clock.now()));
     EXPECT_EQ(plm.stats().probe_unknown_token, 1U);
@@ -474,6 +488,8 @@ TEST(UbProbeSchedulerTest, ShutdownDrainIncludesExistingTimeouts) {
     uint64_t token_seq = 0;
     auto probe = postNext(plm, token_seq, clock.now());
     ASSERT_TRUE(probe.has_value());
+    // D2: the post must have returned before the scan may call it a timeout.
+    plm.onPostResult(probe->record, ProbePostOutcome::kAccepted, clock.now());
     clock.set(clock.now() + plm.params().timeoutNs());
     plm.scanTimeouts(clock.now());
     ASSERT_EQ(plm.orphanCount(), 1U);
@@ -505,6 +521,8 @@ TEST(UbProbeSchedulerTest, ShutdownDrainWaitsForCompletionBeforeHandoff) {
     // The poller keeps running during the drain and settles the record.
     std::thread completer([&] {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        plm.onPostResult(probe->record, ProbePostOutcome::kAccepted,
+                         clock.now());
         const bool settled =
             plm.onProbeCompletion(makeCompletion(probe->token), clock.now());
         EXPECT_TRUE(settled);

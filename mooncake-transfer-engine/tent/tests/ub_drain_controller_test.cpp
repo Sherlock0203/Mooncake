@@ -232,7 +232,7 @@ class DrainHarness {
             settled_tokens_.push_back(completion.token);
             return settle_returns_;
         };
-        callbacks.responsibilityConverged = [this](const PoolLaneKey&) {
+        callbacks.responsibilityConverged = [this](const LaneRefKey&) {
             return converged_;
         };
         controller_ = std::make_shared<JettyDrainController>(

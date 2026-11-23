@@ -80,6 +80,18 @@ class StaticSegmentRegistry final : public SegmentRegistry {
     SegmentDescRef desc_;
 };
 
+// Remote metadata shapes used by the EID-scope selection tests.
+enum class RemoteScopeScenario {
+    kSingle,         // one remote device, same scope as the local one
+    kSamePlusCross,  // remote devices 0 (same) and 1 (different scope)
+    kAllCross,       // both remote devices are in a different scope
+};
+
+// Second local/remote device EID used by the scope tests. Its reachability
+// prefix (first seven groups) differs from fakeDevice()'s "0001:...".
+constexpr const char* kOtherScopeEid =
+    "0002:0000:0000:0000:0000:0000:0000:4500";
+
 // Owns one fake URMA data path plus a ProbeLinkManager wired into UbWorkers.
 struct ProbeWorkersEnv {
     std::shared_ptr<FakeUrmaAdapter> adapter =
@@ -105,7 +117,9 @@ struct ProbeWorkersEnv {
 
     ~ProbeWorkersEnv() { shutdown(); }
 
-    bool initialize(bool dedicated_probe_jfc = true) {
+    bool initialize(
+        bool dedicated_probe_jfc = true,
+        RemoteScopeScenario scope_scenario = RemoteScopeScenario::kSingle) {
         for (size_t i = 0; i < source.size(); ++i) {
             source[i] = static_cast<char>(i + 1);
         }
@@ -135,6 +149,39 @@ struct ProbeWorkersEnv {
         remote->type = SegmentType::Memory;
         MemorySegmentDesc remote_memory;
         remote_memory.topology = *topology;
+        if (scope_scenario != RemoteScopeScenario::kSingle) {
+            // Advertise a second remote UB device with a different EID scope,
+            // and rewrite the target's UB metadata so the peer publishes one
+            // segment per remote device.
+            Topology::NicEntry nic1{.name = "ub:fake1:eid0",
+                                    .pci_bus_id = "0000:00:01.0",
+                                    .type = Topology::NIC_UB,
+                                    .numa_node = 0};
+            remote_memory.topology.nic_list_.push_back(std::move(nic1));
+            remote_memory.topology.mem_list_[0].device_list[0].push_back(1);
+
+            UbBufferMetadata metadata;
+            metadata.generation = 1;
+            metadata.base = target_desc.addr;
+            metadata.length = target_desc.length;
+            metadata.location = kWildcardLocation;
+            metadata.permission = kGlobalReadWrite;
+            const std::string scope_eid =
+                scope_scenario == RemoteScopeScenario::kAllCross
+                    ? std::string(kOtherScopeEid)
+                    : fakeDevice().eid;
+            metadata.segments.push_back(UbBufferSegmentMetadata{
+                0, "fake0", scope_eid, 0,
+                makeDescriptor(target_desc.addr, target_desc.length)});
+            metadata.segments.push_back(UbBufferSegmentMetadata{
+                1, "fake1", kOtherScopeEid, 0,
+                makeDescriptor(target_desc.addr, target_desc.length)});
+            if (!encodeBufferMetadata(
+                     metadata, target_desc.transport_attrs[TransportType::UB])
+                     .ok()) {
+                return false;
+            }
+        }
         remote_memory.buffers = {target_desc};
         remote->detail = std::move(remote_memory);
 
@@ -153,6 +200,10 @@ struct ProbeWorkersEnv {
                  .ok()) {
             return false;
         }
+        // Self transfers target the local segment (id 0) by default; the
+        // scope scenarios need the advertised remote segment, so use a
+        // non-local id for them.
+        if (scope_scenario != RemoteScopeScenario::kSingle) remote_id = 11;
         if (!manager->openRemote(remote_id, "remote").ok()) return false;
         endpoints = std::make_unique<EndpointStore>(adapter, 16, 1);
 
@@ -322,6 +373,8 @@ TEST(UbProbeIntegrationTest,
     ASSERT_FALSE(actions.empty());
     auto record = env.plm->beginPost(actions.front(), makeProbeToken(1), now);
     ASSERT_NE(record, nullptr);
+    // The poster's synchronous return, then the CQE (F11: both are needed).
+    env.plm->onPostResult(record, ProbePostOutcome::kAccepted, now);
     env.probe_jfc->push(Completion{CompletionCategory::SUCCESS, 0,
                                    record->core.token, 1,
                                    env.probe_jetty->id()});
@@ -354,6 +407,7 @@ TEST(UbProbeIntegrationTest, SharedModeRoutesProbeCompletionOnBusinessJfc) {
     ASSERT_FALSE(actions.empty());
     auto record = env.plm->beginPost(actions.front(), makeProbeToken(1), now);
     ASSERT_NE(record, nullptr);
+    env.plm->onPostResult(record, ProbePostOutcome::kAccepted, now);
     auto business_jfc =
         std::dynamic_pointer_cast<FakeJfc>(env.context->jfc(0)->handle());
     ASSERT_NE(business_jfc, nullptr);
@@ -381,6 +435,70 @@ TEST(UbProbeIntegrationTest, ProbeJfcPollFailureDisablesProbePaths) {
     }));
     EXPECT_TRUE(pt::healthOf(*env.plm, env.version).pending);
     EXPECT_EQ(env.plm->stats().path_state_disabled, 1U);
+    env.shutdown();
+}
+
+// EID scope (stress_cluster_bench regression): legacy selection must never
+// pair a local device with a remote device in a different reachability scope.
+// Remote devices 0 (same scope) and 1 (different scope) yield exactly one
+// legal pair; the transfer still completes on that rail.
+TEST(UbProbeIntegrationTest, LegacySelectionPairsOnlySameEidScope) {
+    ProbeWorkersEnv env;
+    ASSERT_TRUE(env.initialize(/*dedicated_probe_jfc=*/true,
+                               RemoteScopeScenario::kSamePlusCross));
+    ASSERT_TRUE(env.workers->start().ok());
+
+    auto task = env.submitWrite();
+    ASSERT_TRUE(task != nullptr);
+    ASSERT_TRUE(
+        pt::waitUntil([&] { return task->transferStatus().s != PENDING; }));
+    EXPECT_EQ(task->transferStatus().s, COMPLETED);
+    // 2 local x remote combinations, exactly one crosses scopes.
+    EXPECT_EQ(env.workers->businessStats().eid_scope_denied, 1U);
+    env.shutdown();
+}
+
+// EID scope: when every pair crosses scopes the selection fails closed with a
+// configuration error instead of retrying into LOCAL_ACCESS_ERROR and the
+// endpoint-generation churn it causes.
+TEST(UbProbeIntegrationTest, LegacySelectionAllCrossScopeFailsClosed) {
+    ProbeWorkersEnv env;
+    ASSERT_TRUE(env.initialize(/*dedicated_probe_jfc=*/true,
+                               RemoteScopeScenario::kAllCross));
+    ASSERT_TRUE(env.workers->start().ok());
+
+    auto task = env.submitWrite();
+    ASSERT_TRUE(task != nullptr);
+    ASSERT_TRUE(
+        pt::waitUntil([&] { return task->transferStatus().s != PENDING; }));
+    EXPECT_EQ(task->transferStatus().s, FAILED);
+    EXPECT_EQ(env.workers->businessStats().eid_scope_denied, 2U);
+    env.shutdown();
+}
+
+// F6b: a deadline timeout is the strongest path-fault evidence (nothing
+// completed, no native error code). It must feed the same PLM isolation and
+// probe-campaign chain as an adapter-level TIMEOUT, otherwise a suspended path
+// with no CQE would never start recovery.
+TEST(UbProbeIntegrationTest, DeadlineTimeoutIsolatesThePathAndStartsCampaign) {
+    ProbeWorkersEnv env;
+    ASSERT_TRUE(env.initialize());
+    ASSERT_TRUE(env.workers->start().ok());
+
+    const ProbePathKey key = env.version.path;
+    const uint64_t epoch_before = env.plm->businessFaultEpoch(key);
+    // The provider never completes: only the deadline fence can settle it.
+    env.adapter->holdNextCompletion();
+    auto task = env.submitWrite();
+    ASSERT_TRUE(task != nullptr);
+
+    ASSERT_TRUE(
+        pt::waitUntil([&] { return task->transferStatus().s != PENDING; }));
+    EXPECT_EQ(task->transferStatus().s, TIMEOUT);
+    EXPECT_EQ(env.workers->businessStats().business_deadline_timeouts, 1U);
+    EXPECT_GT(env.plm->businessFaultEpoch(key), epoch_before);
+    EXPECT_EQ(env.plm->stats().path_state_isolated, 1U);
+    EXPECT_EQ(env.plm->campaignView().size(), 1U);
     env.shutdown();
 }
 

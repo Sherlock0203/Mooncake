@@ -2023,19 +2023,34 @@ class RealUrmaAdapter final : public UrmaAdapter {
         return Status::OK();
     }
 
-    Status post(const JettyPtr& jetty, const std::vector<WorkRequest>& requests,
-                size_t& posted_count) override {
-        posted_count = 0;
+    PostOutcome postDetailed(
+        const JettyPtr& jetty,
+        const std::vector<WorkRequest>& requests) override {
+        PostOutcome outcome;
+        outcome.request_count = requests.size();
+        // F5: a failure before the native call (validation, retention) proves
+        // zero acceptance because the provider was never reached.
+        auto fail = [&outcome](const Status& status) {
+            outcome.status = status;
+            outcome.posted_count = 0;
+            outcome.evidence = PostEvidence::kProviderReported;
+            return outcome;
+        };
         std::shared_ptr<RuntimeLease> runtime;
-        CHECK_STATUS(getRuntime(runtime));
+        const Status runtime_status = getRuntime(runtime);
+        if (!runtime_status.ok()) return fail(runtime_status);
         auto real_jetty = std::dynamic_pointer_cast<RealJetty>(jetty);
-        if (!real_jetty || !real_jetty->valid()) return invalidHandle("Jetty");
+        if (!real_jetty || !real_jetty->valid())
+            return fail(invalidHandle("Jetty"));
         // RM requests are accepted here with their explicit per-WR target
         // (WorkRequest::target); the loop below rejects an RM request without
         // one and an RC request with one. The provider overload that takes a
         // RemoteJettyInfo stays available for callers that only have the
         // descriptor, but the merged data path uses the target-carrying form.
-        if (requests.empty()) return Status::OK();
+        if (requests.empty()) {
+            outcome.status = Status::OK();
+            return outcome;
+        }
 
         struct NativeWorkRequest {
             urma_jfs_wr_t wr{};
@@ -2051,60 +2066,64 @@ class RealUrmaAdapter final : public UrmaAdapter {
         // completed bind.
         if (rm_mode) {
             if (!real_jetty->postable()) {
-                return Status::InvalidArgument("RM Jetty is not postable");
+                return fail(
+                    Status::InvalidArgument("RM Jetty is not postable"));
             }
         } else if (!real_jetty->postable() || real_jetty->remote() == nullptr) {
-            return Status::InvalidArgument("Jetty is not bound and postable");
+            return fail(
+                Status::InvalidArgument("Jetty is not bound and postable"));
         }
         for (size_t i = 0; i < requests.size(); ++i) {
             const WorkRequest& request = requests[i];
             if (rm_mode != (request.target != nullptr)) {
-                return Status::InvalidArgument(
+                return fail(Status::InvalidArgument(
                     rm_mode ? "RM work requests must set an explicit target"
-                            : "RC work requests must not set a target");
+                            : "RC work requests must not set a target"));
             }
             urma_target_jetty_t* request_target = nullptr;
             if (rm_mode) {
                 auto real_target =
                     std::dynamic_pointer_cast<RealRemoteTarget>(request.target);
                 if (!real_target || !real_target->valid()) {
-                    return invalidHandle("RemoteTarget");
+                    return fail(invalidHandle("RemoteTarget"));
                 }
                 if (real_target->context().get() !=
                     real_jetty->context().get()) {
-                    return Status::InvalidArgument(
-                        "RM target belongs to another Context");
+                    return fail(Status::InvalidArgument(
+                        "RM target belongs to another Context"));
                 }
                 request_target = real_target->native();
             }
             if (request.token == 0) {
-                return Status::InvalidArgument(
-                    "work request token zero is reserved");
+                return fail(Status::InvalidArgument(
+                    "work request token zero is reserved"));
             }
             if (request.length == 0 ||
                 request.length > std::numeric_limits<uint32_t>::max()) {
-                return Status::InvalidArgument("invalid work request length");
+                return fail(
+                    Status::InvalidArgument("invalid work request length"));
             }
 
             auto local = std::dynamic_pointer_cast<RealLocalSegment>(
                 request.local_segment);
             auto remote = std::dynamic_pointer_cast<RealRemoteSegment>(
                 request.remote_segment);
-            if (!local || !local->valid()) return invalidHandle("LocalSegment");
+            if (!local || !local->valid())
+                return fail(invalidHandle("LocalSegment"));
             if (!remote || !remote->valid()) {
-                return invalidHandle("RemoteSegment");
+                return fail(invalidHandle("RemoteSegment"));
             }
             if (local->context().get() != real_jetty->context().get() ||
                 remote->context().get() != real_jetty->context().get()) {
-                return Status::InvalidArgument(
-                    "work request segments belong to another Context");
+                return fail(Status::InvalidArgument(
+                    "work request segments belong to another Context"));
             }
             if (!checkedRangeContains(local->address(), local->length(),
                                       request.local_address, request.length) ||
                 !checkedRangeContains(remote->address(), remote->length(),
                                       request.remote_address, request.length)) {
-                return Status::InvalidArgument(
-                    "work request lies outside a registered segment");
+                return fail(Status::InvalidArgument(
+                    "work request lies outside a registered segment"));
             }
 
             NativeWorkRequest& native = native_requests[i];
@@ -2140,74 +2159,107 @@ class RealUrmaAdapter final : public UrmaAdapter {
         // boundary. This prevents buffer removal from unregistering memory
         // while a WR is still in flight. poll() releases the references by
         // completion token.
-        CHECK_STATUS(
-            real_jetty->jfc()->retainSegments(real_jetty->id(), requests));
+        const Status retained =
+            real_jetty->jfc()->retainSegments(real_jetty->id(), requests);
+        if (!retained.ok()) return fail(retained);
 
         urma_jfs_wr_t* bad_wr = nullptr;
         const int rc = urma_post_jetty_send_wr(
             real_jetty->native(), &native_requests.front().wr, &bad_wr);
         if (rc == URMA_SUCCESS) {
-            posted_count = requests.size();
-            return Status::OK();
+            outcome.posted_count = requests.size();
+            outcome.evidence = PostEvidence::kProviderReported;
+            return outcome;
         }
+        outcome.status = nativeError("urma_post_jetty_send_wr", rc);
+        // INV-POST-2: posted_count stays the true prefix that crossed the
+        // boundary. If the provider named a failing WR inside our chain, that
+        // index is the exact prefix; otherwise the prefix is unknown and the
+        // evidence channel (not a fabricated count) carries that fact.
+        bool position_reported = false;
         if (bad_wr != nullptr) {
             for (size_t i = 0; i < native_requests.size(); ++i) {
                 if (bad_wr == &native_requests[i].wr) {
-                    posted_count = i;
+                    outcome.posted_count = i;
+                    position_reported = true;
                     break;
                 }
             }
         }
-        for (size_t i = posted_count; i < requests.size(); ++i) {
+        outcome.evidence = position_reported ? PostEvidence::kProviderReported
+                                             : PostEvidence::kNoFailingWr;
+        if (!position_reported) outcome.posted_count = 0;
+        for (size_t i = outcome.posted_count; i < requests.size(); ++i) {
             real_jetty->jfc()->releaseSegment(requests[i].token);
         }
-        return nativeError("urma_post_jetty_send_wr", rc);
+        return outcome;
     }
 
-    Status post(const JettyPtr& jetty, const RemoteJettyInfo& target,
-                const WorkRequest& request, size_t& posted_count) override {
-        posted_count = 0;
+    Status post(const JettyPtr& jetty, const std::vector<WorkRequest>& requests,
+                size_t& posted_count) override {
+        const PostOutcome outcome = postDetailed(jetty, requests);
+        posted_count = outcome.posted_count;
+        return outcome.status;
+    }
+
+    PostOutcome postDetailed(const JettyPtr& jetty,
+                             const RemoteJettyInfo& target,
+                             const WorkRequest& request) override {
+        PostOutcome outcome;
+        outcome.request_count = 1;
+        auto fail = [&outcome](const Status& status) {
+            outcome.status = status;
+            outcome.posted_count = 0;
+            outcome.evidence = PostEvidence::kProviderReported;
+            return outcome;
+        };
         std::shared_ptr<RuntimeLease> runtime;
-        CHECK_STATUS(getRuntime(runtime));
+        const Status runtime_status = getRuntime(runtime);
+        if (!runtime_status.ok()) return fail(runtime_status);
         auto real_jetty = std::dynamic_pointer_cast<RealJetty>(jetty);
-        if (!real_jetty || !real_jetty->valid()) return invalidHandle("Jetty");
+        if (!real_jetty || !real_jetty->valid())
+            return fail(invalidHandle("Jetty"));
         if (!real_jetty->reliableMessage()) {
-            return Status::InvalidArgument(
-                "per-WR remote target requires an RM Jetty");
+            return fail(Status::InvalidArgument(
+                "per-WR remote target requires an RM Jetty"));
         }
         if (request.token == 0) {
-            return Status::InvalidArgument(
-                "work request token zero is reserved");
+            return fail(
+                Status::InvalidArgument("work request token zero is reserved"));
         }
         if (request.length == 0 ||
             request.length > std::numeric_limits<uint32_t>::max()) {
-            return Status::InvalidArgument("invalid work request length");
+            return fail(Status::InvalidArgument("invalid work request length"));
         }
         auto local =
             std::dynamic_pointer_cast<RealLocalSegment>(request.local_segment);
         auto remote = std::dynamic_pointer_cast<RealRemoteSegment>(
             request.remote_segment);
-        if (!local || !local->valid()) return invalidHandle("LocalSegment");
-        if (!remote || !remote->valid()) return invalidHandle("RemoteSegment");
+        if (!local || !local->valid())
+            return fail(invalidHandle("LocalSegment"));
+        if (!remote || !remote->valid())
+            return fail(invalidHandle("RemoteSegment"));
         if (local->context().get() != real_jetty->context().get() ||
             remote->context().get() != real_jetty->context().get()) {
-            return Status::InvalidArgument(
-                "work request segments belong to another Context");
+            return fail(Status::InvalidArgument(
+                "work request segments belong to another Context"));
         }
         if (!checkedRangeContains(local->address(), local->length(),
                                   request.local_address, request.length) ||
             !checkedRangeContains(remote->address(), remote->length(),
                                   request.remote_address, request.length)) {
-            return Status::InvalidArgument(
-                "work request lies outside a registered segment");
+            return fail(Status::InvalidArgument(
+                "work request lies outside a registered segment"));
         }
 
         std::lock_guard<std::mutex> jetty_lock(real_jetty->mutex());
         if (!real_jetty->postable()) {
-            return Status::InvalidArgument("Jetty is not postable");
+            return fail(Status::InvalidArgument("Jetty is not postable"));
         }
         urma_target_jetty_t* native_target = nullptr;
-        CHECK_STATUS(real_jetty->importTargetLocked(target, native_target));
+        const Status imported =
+            real_jetty->importTargetLocked(target, native_target);
+        if (!imported.ok()) return fail(imported);
 
         urma_sge_t local_sge{};
         local_sge.addr = request.local_address;
@@ -2236,17 +2288,35 @@ class RealUrmaAdapter final : public UrmaAdapter {
         wr.next = nullptr;
 
         std::vector<WorkRequest> retained{request};
-        CHECK_STATUS(
-            real_jetty->jfc()->retainSegments(real_jetty->id(), retained));
+        const Status retained_status =
+            real_jetty->jfc()->retainSegments(real_jetty->id(), retained);
+        if (!retained_status.ok()) return fail(retained_status);
         urma_jfs_wr_t* bad_wr = nullptr;
         const int rc =
             urma_post_jetty_send_wr(real_jetty->native(), &wr, &bad_wr);
         if (rc == URMA_SUCCESS) {
-            posted_count = 1;
-            return Status::OK();
+            outcome.posted_count = 1;
+            outcome.evidence = PostEvidence::kProviderReported;
+            return outcome;
+        }
+        outcome.status = nativeError("urma_post_jetty_send_wr", rc);
+        // A single WR: bad_wr == &wr proves it did not cross the boundary;
+        // a missing position proves nothing, so it stays Unknown (never a
+        // rollback) and the caller must wait for a fence.
+        if (bad_wr == &wr) {
+            outcome.evidence = PostEvidence::kProviderReported;
+        } else {
+            outcome.evidence = PostEvidence::kNoFailingWr;
         }
         real_jetty->jfc()->releaseSegment(request.token);
-        return nativeError("urma_post_jetty_send_wr", rc);
+        return outcome;
+    }
+
+    Status post(const JettyPtr& jetty, const RemoteJettyInfo& target,
+                const WorkRequest& request, size_t& posted_count) override {
+        const PostOutcome outcome = postDetailed(jetty, target, request);
+        posted_count = outcome.posted_count;
+        return outcome.status;
     }
 
     Status poll(const JfcPtr& jfc, size_t max_completions,

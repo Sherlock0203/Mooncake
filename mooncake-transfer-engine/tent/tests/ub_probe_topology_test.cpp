@@ -256,6 +256,46 @@ TEST(UbProbeTopologyTest, EidScopeUsesTheEidPrefix) {
     EXPECT_FALSE(eidScopeForEid("bad-eid").trusted);
 }
 
+TEST(UbProbeTopologyTest, SameEidScopeComparesTheReachabilityPrefix) {
+    constexpr const char* kDf00A = "0000:0000:0004:0200:0010:0000:df00:4500";
+    constexpr const char* kDf00B = "0000:0000:0004:0200:0010:0000:df00:c500";
+    constexpr const char* kDf04 = "0000:0000:0004:0200:0010:0000:df04:c500";
+
+    EXPECT_TRUE(sameEidScope(kDf00A, kDf00B));
+    EXPECT_FALSE(sameEidScope(kDf00A, kDf04));
+    // Case-insensitive: the scope key is normalized to lower case.
+    EXPECT_TRUE(sameEidScope("0000:0000:0004:0200:0010:0000:DF00:4500",
+                             "0000:0000:0004:0200:0010:0000:df00:c500"));
+    // An EID that cannot be parsed must not refuse the pair (compatibility with
+    // peers that do not publish it).
+    EXPECT_TRUE(sameEidScope("bad-eid", kDf04));
+    EXPECT_TRUE(sameEidScope(kDf00A, ""));
+}
+
+// Selection-level shape of the policy: a 2x2 local x remote matrix produces
+// exactly the two diagonal (same-scope) pairs.
+TEST(UbProbeTopologyTest, SameEidScopeKeepsOnlyDiagonalPairs) {
+    const std::vector<std::string> locals{
+        "0000:0000:0004:0200:0010:0000:df00:4500",
+        "0000:0000:0004:0200:0010:0000:df04:4500"};
+    const std::vector<std::string> remotes{
+        "0000:0000:0004:0200:0010:0000:df00:c500",
+        "0000:0000:0004:0200:0010:0000:df04:c500"};
+    size_t allowed = 0;
+    size_t denied = 0;
+    for (const auto& local : locals) {
+        for (const auto& remote : remotes) {
+            if (sameEidScope(local, remote)) {
+                ++allowed;
+            } else {
+                ++denied;
+            }
+        }
+    }
+    EXPECT_EQ(allowed, 2U);
+    EXPECT_EQ(denied, 2U);
+}
+
 TEST(UbProbeTopologyTest, CrossScopeEdgeFailsInstallUnlessDisabled) {
     Topology local;
     const auto device =

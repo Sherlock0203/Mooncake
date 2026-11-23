@@ -50,6 +50,10 @@ class JettyRefillWorker {
     std::condition_variable cv_;
     std::thread thread_;
     bool stop_{false};
+    // Wake edge. notify_one() alone was useless: the wait predicate only
+    // checked stop_, so the worker went back to sleep until the original
+    // interval elapsed. Every requestWake() now makes exactly one pass run.
+    bool dirty_{false};
 };
 
 }  // namespace mooncake::tent::ub

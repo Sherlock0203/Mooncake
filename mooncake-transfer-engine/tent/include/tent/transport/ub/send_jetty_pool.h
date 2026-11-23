@@ -19,6 +19,7 @@
 #ifndef TENT_TRANSPORT_UB_SEND_JETTY_POOL_H_
 #define TENT_TRANSPORT_UB_SEND_JETTY_POOL_H_
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -112,7 +113,10 @@ struct PoolMember {
     JettyPtr jetty;
     size_t jfc_index = 0;
     BudgetReservation budget{};
-    PoolMemberState state = PoolMemberState::kCreating;
+    // Written by the retire/delete path, read by memberStates()/stats() and
+    // the return path. Atomic so a delete-thread transition cannot be a torn
+    // read on the pool side (INV-3 / F9.3).
+    std::atomic<PoolMemberState> state{PoolMemberState::kCreating};
     uint64_t error_epoch = 0;
     // True once a tombstone entry records this generation's unproven
     // destruction. Native budget may only be released after that entry is
@@ -319,6 +323,12 @@ struct SendJettyPoolStats {
     uint64_t leaked_leases = 0;
     uint64_t created_members = 0;
     uint64_t create_failures = 0;
+    // Create failures whose cleanup could not prove destruction (the handle
+    // and the budget stay in quarantined_). Observability for INV-BUD-1.
+    uint64_t create_failures_unproven = 0;
+    // A proven-destruction budget release that the ledger rejected. Must stay
+    // zero; a non-zero value means the single-release invariant was violated.
+    uint64_t budget_release_anomalies = 0;
     uint64_t double_returns = 0;
     uint64_t create_backoffs = 0;
     // Completions returned by a retirement fence. A pooled member serves one
@@ -514,8 +524,6 @@ class SendJettyPool final
     };
 
     Status createAndPublish(const PoolKey& pool_key);
-    void retireUnpublished(JettyPtr jetty, BudgetReservation reservation,
-                           const PoolKey& pool_key);
     void retireMemberLocked(std::shared_ptr<PoolMember> member,
                             const std::string& reason);
     void enqueueRetirementLocked(std::shared_ptr<PoolMember> member);
@@ -538,6 +546,12 @@ class SendJettyPool final
     // True only when native budget may be released: a tombstone was recorded
     // (and is erased now) or no table is attached.
     bool eraseTombstoneForProvenDestruction(PoolMember& member);
+    // Destroys a Jetty that never published. The single cleanup point for
+    // failed/stopped creation: reset -> delete -> release only when the
+    // destruction is proven; otherwise the handle and budget stay quarantined.
+    // Returns the cause status when destruction is unproven.
+    Status retireUnpublished(JettyPtr jetty, BudgetReservation reservation,
+                             const PoolKey& pool_key);
     void refreshBackpressureLocked();
     [[nodiscard]] bool admissionBlockedLocked() const;
 
@@ -560,6 +574,12 @@ class SendJettyPool final
     std::unordered_map<PoolKey, PoolBucket, PoolKeyHash> buckets_;
     std::vector<std::shared_ptr<PoolMember>> retired_;
     std::vector<std::shared_ptr<PoolMember>> quarantined_;
+    // NOTE (INV-ID-2): every container below is *pool-private* and may keep
+    // its uint64_t lane-generation key. A generation is unique within one pool
+    // (next_lane_generation_ is monotonic here), so no ambiguity exists. Only
+    // tables shared across Contexts (TombstoneTable, the workers' lane
+    // reference ledger) must use the global ResourceIdentity/LaneRefKey; do not
+    // "simplify" those back to a bare generation.
     // Members owned by the asynchronous drain chain, keyed by lane generation.
     // The pool retains them (not the controller: an entry must not keep a
     // member alive, design §7) until markDrainDeleteReady/quarantineDrain
@@ -583,26 +603,31 @@ class SendJettyPool final
     // Null means "not attached": every retirement uses the synchronous fence.
     std::shared_ptr<JettyDrainController> drain_controller_;
 
-    // Diagnostics counters (protected by mutex_).
-    uint64_t total_leases_ = 0;
-    uint64_t total_returns_ = 0;
-    uint64_t pool_misses_ = 0;
-    uint64_t stop_rejections_ = 0;
-    uint64_t leaked_leases_ = 0;
-    uint64_t created_members_ = 0;
-    uint64_t create_failures_ = 0;
-    uint64_t double_returns_ = 0;
-    uint64_t create_backoffs_ = 0;
-    uint64_t fence_drained_completions_ = 0;
-    uint64_t drain_begin_ = 0;
-    uint64_t drain_delete_ready_ = 0;
-    uint64_t drain_quarantined_ = 0;
-    uint64_t delete_consumed_ = 0;
-    uint64_t delete_retained_ = 0;
-    uint64_t delete_unknown_ = 0;
-    uint64_t tombstone_insert_failures_ = 0;
-    uint64_t tombstone_erase_misses_ = 0;
-    uint64_t backpressure_rejections_ = 0;
+    // Diagnostics counters. Atomic rather than mutex-protected: finishDelete()
+    // increments several of them on the retire thread and must not take the
+    // pool lock for bookkeeping (nested-lock risk), while stats() may read them
+    // at any time.
+    std::atomic<uint64_t> total_leases_{0};
+    std::atomic<uint64_t> total_returns_{0};
+    std::atomic<uint64_t> pool_misses_{0};
+    std::atomic<uint64_t> stop_rejections_{0};
+    std::atomic<uint64_t> leaked_leases_{0};
+    std::atomic<uint64_t> created_members_{0};
+    std::atomic<uint64_t> create_failures_{0};
+    std::atomic<uint64_t> create_failures_unproven_{0};
+    std::atomic<uint64_t> budget_release_anomalies_{0};
+    std::atomic<uint64_t> double_returns_{0};
+    std::atomic<uint64_t> create_backoffs_{0};
+    std::atomic<uint64_t> fence_drained_completions_{0};
+    std::atomic<uint64_t> drain_begin_{0};
+    std::atomic<uint64_t> drain_delete_ready_{0};
+    std::atomic<uint64_t> drain_quarantined_{0};
+    std::atomic<uint64_t> delete_consumed_{0};
+    std::atomic<uint64_t> delete_retained_{0};
+    std::atomic<uint64_t> delete_unknown_{0};
+    std::atomic<uint64_t> tombstone_insert_failures_{0};
+    std::atomic<uint64_t> tombstone_erase_misses_{0};
+    std::atomic<uint64_t> backpressure_rejections_{0};
     bool tombstone_backpressure_ = false;
     bool quarantine_backpressure_ = false;
 };

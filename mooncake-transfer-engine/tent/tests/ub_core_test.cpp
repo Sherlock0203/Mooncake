@@ -200,6 +200,22 @@ TEST(UbParamsTest, RmLegacyResolvesToRmRuntimeMode) {
     EXPECT_EQ(resolved, UbRuntimeMode::kRmLegacy);
 }
 
+TEST(UbParamsTest, RequireSameEidScopeDefaultsOnAndRoundTrips) {
+    UbParams params;
+    Config config;
+    ASSERT_TRUE(UbParams::FromConfig(config, params).ok());
+    EXPECT_TRUE(params.require_same_eid_scope)
+        << "cross-scope pairing must be refused by default";
+
+    config.set("transports/ub/require_same_eid_scope", false);
+    ASSERT_TRUE(UbParams::FromConfig(config, params).ok());
+    EXPECT_FALSE(params.require_same_eid_scope);
+
+    config.set("transports/ub/require_same_eid_scope", true);
+    ASSERT_TRUE(UbParams::FromConfig(config, params).ok());
+    EXPECT_TRUE(params.require_same_eid_scope);
+}
+
 TEST(UbParamsTest, JettyReuseRequiresRmLegacyProfile) {
     auto evaluate = [](UbRuntimeProfile profile, UbRuntimeMode& resolved) {
         UbParams params;
@@ -254,6 +270,37 @@ TEST(UbAdapterContractTest, ClassifiesPostAcceptanceFromNativeResult) {
     EXPECT_STREQ(postAcceptanceName(PostAcceptance::kNotAccepted),
                  "not_accepted");
     EXPECT_STREQ(postAcceptanceName(PostAcceptance::kUnknown), "unknown");
+}
+
+TEST(UbAdapterContractTest, MissingFailingWrIsUnknownNotNotAccepted) {
+    // INV-POST-1: an error without a provider-reported position proves
+    // nothing about acceptance, so it must never authorize a rollback.
+    PostOutcome no_position;
+    no_position.status = Status::RdmaError("post failed, no bad_wr");
+    no_position.posted_count = 0;
+    no_position.request_count = 1;
+    no_position.evidence = PostEvidence::kNoFailingWr;
+    EXPECT_EQ(classifyPostAcceptance(no_position), PostAcceptance::kUnknown);
+
+    // The same triple with provider-reported evidence is a definite zero
+    // acceptance and may roll back.
+    PostOutcome reported = no_position;
+    reported.evidence = PostEvidence::kProviderReported;
+    EXPECT_EQ(classifyPostAcceptance(reported), PostAcceptance::kNotAccepted);
+
+    // A partial prefix is always Unknown, regardless of evidence.
+    PostOutcome partial;
+    partial.status = Status::RdmaError("third WR rejected");
+    partial.posted_count = 1;
+    partial.request_count = 3;
+    EXPECT_EQ(classifyPostAcceptance(partial), PostAcceptance::kUnknown);
+
+    // Success with a short count stays Unknown (a provider contradiction).
+    PostOutcome short_success;
+    short_success.status = Status::OK();
+    short_success.posted_count = 0;
+    short_success.request_count = 1;
+    EXPECT_EQ(classifyPostAcceptance(short_success), PostAcceptance::kUnknown);
 }
 
 TEST(UbBootstrapTest, BuildsCanonicalPhysicalDeviceIdentity) {

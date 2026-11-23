@@ -26,18 +26,29 @@ bool JettyRefillWorker::start() {
     }
 }
 
-bool JettyRefillWorker::running() const { return thread_.joinable() && !stop_; }
+bool JettyRefillWorker::running() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return thread_.joinable() && !stop_;
+}
 
-void JettyRefillWorker::requestWake() { cv_.notify_one(); }
+void JettyRefillWorker::requestWake() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        dirty_ = true;
+    }
+    cv_.notify_one();
+}
 
 void JettyRefillWorker::loop() {
     const auto interval = std::chrono::milliseconds(interval_ms_);
     for (;;) {
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait_for(lock, interval, [this] { return stop_; });
+            cv_.wait_for(lock, interval, [this] { return stop_ || dirty_; });
+            if (stop_) return;
+            // Consume the wake edge: exactly one refill pass per request.
+            dirty_ = false;
         }
-        if (stop_) return;
         if (refill_) refill_();
     }
 }

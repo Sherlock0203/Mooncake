@@ -496,7 +496,44 @@ struct UbTransport::Impl {
                 }
                 selection_log << "]";
             }
+            // EID reachability scopes among the selected devices. A mixed list
+            // is legal (a dual-plane deployment), but legacy selection pairs
+            // only same-scope devices unless require_same_eid_scope=false.
+            std::vector<std::string> scopes;
+            for (const auto& context : contexts) {
+                if (!context) continue;
+                const auto scope =
+                    ub::eidScopeForEid(context->deviceInfo().eid);
+                if (!scope.trusted) continue;
+                // The last four digits of the prefix are the reachability
+                // group (df00 vs df04); the full prefix is repetitive.
+                const std::string short_scope =
+                    scope.key.size() >= 4
+                        ? scope.key.substr(scope.key.size() - 4)
+                        : scope.key;
+                if (std::find(scopes.begin(), scopes.end(), short_scope) ==
+                    scopes.end()) {
+                    scopes.push_back(short_scope);
+                }
+            }
+            if (!scopes.empty()) {
+                selection_log << " scopes=[";
+                for (size_t i = 0; i < scopes.size(); ++i) {
+                    if (i != 0) selection_log << ", ";
+                    selection_log << scopes[i];
+                }
+                selection_log << "]";
+            }
+            selection_log << " require_same_eid_scope="
+                          << (params.require_same_eid_scope ? "true" : "false");
             LOG(INFO) << selection_log.str();
+            if (scopes.size() > 1 && !params.require_same_eid_scope) {
+                LOG(WARNING)
+                    << "UB device selection: " << scopes.size()
+                    << " EID scopes selected with "
+                       "require_same_eid_scope=false; cross-scope pairs may "
+                       "fail with LOCAL_ACCESS_ERROR";
+            }
         }
 
         if (contexts.empty()) {
@@ -739,7 +776,7 @@ struct UbTransport::Impl {
                                                             jfc_index);
                         };
                     callbacks.responsibilityConverged =
-                        [this](const ub::PoolLaneKey& lane) {
+                        [this](const ub::LaneRefKey& lane) {
                             // No workers means no record book: fail closed.
                             return workers != nullptr &&
                                    workers->pooledLaneConverged(lane);

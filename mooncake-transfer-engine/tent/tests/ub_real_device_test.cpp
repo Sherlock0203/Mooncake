@@ -352,21 +352,23 @@ TEST_F(UbRealDeviceTest,
     for (auto& jetty : first) {
         ASSERT_TRUE(adapter_->resetJetty(jetty).ok());
     }
+    // Fail-closed reuse (C02 / G-01): drained RESET members are retired, so
+    // the pool holds nothing idle and the next acquire creates fresh Jettys.
     jetty_pool->release(std::move(first), std::move(first_jfcs));
-    EXPECT_EQ(jetty_pool->idleCount(), 2U);
+    EXPECT_EQ(jetty_pool->idleCount(), 0U);
 
     std::vector<JettyPtr> second;
     std::vector<JettyPtr> second_jfcs;
     ASSERT_TRUE(jetty_pool->acquire(2, second, second_jfcs).ok());
     ASSERT_EQ(second.size(), 2U);
-    ASSERT_EQ(jetty_pool->createdCount(), 2U);
+    ASSERT_EQ(jetty_pool->createdCount(), 4U);
     ASSERT_EQ(jetty_pool->idleCount(), 0U);
 
     for (auto& jetty : second) {
         ASSERT_TRUE(adapter_->resetJetty(jetty).ok());
     }
     jetty_pool->release(std::move(second), std::move(second_jfcs));
-    EXPECT_EQ(jetty_pool->idleCount(), 2U);
+    EXPECT_EQ(jetty_pool->idleCount(), 0U);
 
     EXPECT_TRUE(context->shutdown().ok());
     EXPECT_EQ(jetty_pool->idleCount(), 0U);

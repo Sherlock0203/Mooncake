@@ -78,6 +78,15 @@ EidScope eidScopeForEid(std::string_view eid) {
     return scope;
 }
 
+bool sameEidScope(std::string_view local_eid, std::string_view remote_eid) {
+    const EidScope local = eidScopeForEid(local_eid);
+    const EidScope remote = eidScopeForEid(remote_eid);
+    // Untrusted (non-canonical / absent) EIDs are not a reason to refuse a
+    // pair: compatibility first, and the provider still owns the final word.
+    if (!local.trusted || !remote.trusted) return true;
+    return local.key == remote.key;
+}
+
 void ProbeTopology::recordAdjacency(AdjacencyDecision decision,
                                     bool unverified) const {
     size_t index = kAllowedIndex;

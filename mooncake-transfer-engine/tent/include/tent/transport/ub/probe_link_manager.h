@@ -72,11 +72,6 @@ enum class BusinessErrorKind : uint8_t {
 };
 
 // Result of ProbePoster::post() as seen by the PLM (design §8.6).
-enum class ProbePostOutcome : uint8_t {
-    kAccepted,
-    kRejected,
-    kUnknown,
-};
 
 // Probe owner of the shared completion record (design D-9 / W2 §5.5).
 //
@@ -107,6 +102,21 @@ struct ProbeRecord {
     // Periodic test-mode probe (probe/test/periodic_all): settlement can skip
     // health application and never applies exponential backoff.
     bool test_probe{false};
+
+    // ---- F11 completion gate ----------------------------------------------
+    // The native post call and its completion may arrive in either order. The
+    // record may only be settled (slot/budget released, health applied) when
+    // both facts are known: `post_returned` (post_refs dropped to zero) and
+    // `completion_seen`. Otherwise a second probe could start on the same port
+    // while the first is still inside the provider call, or the CQE could
+    // release a slot the post side is still using.
+    std::atomic<uint32_t> post_refs{0};
+    std::atomic<bool> post_returned{false};
+    std::atomic<bool> completion_seen{false};
+    // Completion facts, written under the PLM mutex by the poller before
+    // completion_seen is published and read by the post-return side.
+    Completion completion{};
+    uint64_t completion_ns{0};
 };
 
 // One schedulable probe computed by pendingActions() (design §8.1). The handles
@@ -256,6 +266,12 @@ class ProbeLinkManager final : public ProbeAvailabilitySink {
     // is not recovered by probing (design §6.2).
     void onContextUnavailable(Topology::NicID local_nic, uint64_t now_ns = 0);
 
+    // F7: the dual of onContextUnavailable(). Called when the business context
+    // is observed healthy again. It only revives paths that the context
+    // failure disabled (never graph/port-revoked ones) and moves them to
+    // kRecovering: HEALTHY is only ever published by a successful probe.
+    Status onContextAvailable(Topology::NicID local_nic, uint64_t now_ns = 0);
+
     // ---- W3 business-routing gate (design §7.1 / D-10) --------------------
     // Read-only queries used by path selection; they never mutate health and
     // never create a campaign.
@@ -329,6 +345,12 @@ class ProbeLinkManager final : public ProbeAvailabilitySink {
         bool pending{false};
         PendingReason pending_reason{PendingReason::kNone};
         uint64_t pending_since_ns{0};
+        // Why this path is DISABLED. kNone for every other health state.
+        DisableCause disable_cause{DisableCause::kNone};
+        // F8: consecutive retryable post rejections for this path. Lives on
+        // the runtime (not the record) because every attempt creates a new
+        // record; reset as soon as a post is accepted.
+        uint32_t post_rejections{0};
     };
 
     struct PortRuntime {
@@ -429,6 +451,12 @@ class ProbeLinkManager final : public ProbeAvailabilitySink {
     void releaseSlotLocked(PortRuntime& port, const ProbeRecord& record);
     void releaseBudgetLocked(const ProbePeerKey& peer);
     void releaseTaskSlotLocked(ProbeRecord& record);
+    // F11: the single settlement point once both the post result and the
+    // completion are known. Holds the mutex; returns true when it settled.
+    bool settleCompletionLocked(const std::shared_ptr<ProbeRecord>& record,
+                                uint64_t now_ns, Effects& effects,
+                                LocalSegmentPtr& source,
+                                RemoteSegmentPtr& area);
     void campaignProgressLocked(const ProbeKey& key, EntryState outcome);
     void exitFinishedCampaignsLocked();
     void applyLocked(const Completion& completion, const PathVersion& version,

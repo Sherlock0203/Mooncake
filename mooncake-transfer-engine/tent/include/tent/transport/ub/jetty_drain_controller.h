@@ -188,7 +188,9 @@ struct DrainCallbacks {
     // lane." Convergence is lane-generation scoped: a member owns exactly one
     // WR and a retired generation is never reused, so the lane is a stronger
     // identity than a token that the pool does not know at retire time.
-    std::function<bool(const PoolLaneKey&)> responsibilityConverged;
+    // The lane ledger is shared by every Context, so the query carries the
+    // Context incarnation together with the pool-local generation (INV-ID-3).
+    std::function<bool(const LaneRefKey&)> responsibilityConverged;
 };
 
 class JettyDrainController {

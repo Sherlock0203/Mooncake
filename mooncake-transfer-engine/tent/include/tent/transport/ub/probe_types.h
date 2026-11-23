@@ -219,6 +219,19 @@ enum class PendingReason : uint8_t {
     kLaneRetired,
     kPortRevoked,
     kContextFailure,
+    // F12: a replacement event arrived without a drain receipt for the
+    // previous generation, so the port must stay unusable.
+    kReplacementUnproven,
+};
+
+// Why a path was disabled. Recovery needs this: onContextAvailable() may only
+// revive paths that the context failure disabled, never a path the graph or
+// the pooling side revoked on purpose.
+enum class DisableCause : uint8_t {
+    kNone,
+    kContextFailure,
+    kPortRevoked,
+    kGraphRemoval,
 };
 
 constexpr const char* linkHealthName(LinkHealth health) {
@@ -346,6 +359,10 @@ struct ProbeParams {
     uint64_t timeout_ms{1000};
     uint32_t peer_budget{4};
     uint32_t failure_threshold{3};
+    // F8: consecutive retryable post rejections after which the verification
+    // obligation is abandoned explicitly (and counted) instead of silently
+    // dropped.
+    uint32_t post_rejection_cap{8};
     bool stop_on_recovery{true};
     uint32_t recover_success_threshold{1};
     ProbeJfcMode jfc_mode{ProbeJfcMode::kDedicated};
@@ -475,6 +492,11 @@ struct ProbeStats {
     uint64_t probe_lane_retire{0};
     uint64_t probe_lane_rebuild{0};
     uint64_t probe_timeout_unknown{0};
+    // D2: a deadline passed while the native post was still inside the
+    // provider, so the scan refused to fence that Jetty. Sustained growth
+    // means a probe port is pinned by a stuck post and has silently left the
+    // probe graph (its slot and peer budget stay held).
+    uint64_t probe_timeout_deferred_by_post_return{0};
     uint64_t probe_stale{0};
     uint64_t probe_unknown_token{0};
     uint64_t probe_evidence_unmapped{0};
@@ -498,6 +520,15 @@ struct ProbeStats {
     uint64_t path_state_isolated{0};
     uint64_t path_state_recovering{0};
     uint64_t path_state_disabled{0};
+    // F7: DISABLED paths moved back to RECOVERING by onContextAvailable().
+    uint64_t path_revived_on_context_available{0};
+    // F12: replacement events rejected because the previous generation had no
+    // drain receipt.
+    uint64_t probe_replacement_unproven{0};
+    // F8: probe posts the provider rejected for a retryable reason (capacity,
+    // not-ready, transient device error) and terminal verification give-ups.
+    uint64_t probe_post_rejected_retryable{0};
+    uint64_t probe_verification_abandoned{0};
     uint64_t probe_inflight_per_port{0};
     uint64_t probe_rr_round{0};
     uint64_t probe_drain_unproven{0};
@@ -539,6 +570,19 @@ struct ProbeStats {
 
 }  // namespace ub
 }  // namespace tent
+// Post acceptance as the probe side observes it. Lives in the leaf types
+// header so both the poster interface and the link manager can name it.
+enum class ProbePostOutcome : uint8_t {
+    kAccepted,
+    // Terminal: the version was revoked/superseded or the request itself was
+    // invalid; the verification obligation may be dropped.
+    kRejected,
+    // Retryable: capacity, not-ready, transient provider/device error. The
+    // verification obligation is kept and retried with backoff (F8).
+    kRejectedRetryable,
+    kUnknown,
+};
+
 }  // namespace mooncake
 
 #endif  // TENT_TRANSPORT_UB_PROBE_TYPES_H_

@@ -19,13 +19,31 @@
 namespace mooncake {
 namespace tent {
 namespace ub {
+namespace {
+
+// F8: capacity / not-ready / transient provider errors keep the verification
+// obligation; argument and identity errors are terminal.
+bool probeRejectionIsRetryable(const Status& status) {
+    return status.IsTooManyRequests() || status.IsDeviceNotFound() ||
+           status.IsRdmaError();
+}
+
+}  // namespace
 
 UrmaProbePoster::UrmaProbePoster(std::shared_ptr<UrmaAdapter> adapter)
     : adapter_(std::move(adapter)) {}
 
 Status UrmaProbePoster::post(const ProbePostTarget& target,
                              const ProbeWorkRequest& request, size_t& posted) {
+    ProbePostOutcome outcome = ProbePostOutcome::kUnknown;
+    return post(target, request, posted, outcome);
+}
+
+Status UrmaProbePoster::post(const ProbePostTarget& target,
+                             const ProbeWorkRequest& request, size_t& posted,
+                             ProbePostOutcome& outcome) {
     posted = 0;
+    outcome = ProbePostOutcome::kUnknown;
     if (!adapter_) {
         return Status::InvalidArgument("probe poster has no URMA adapter");
     }
@@ -56,8 +74,24 @@ Status UrmaProbePoster::post(const ProbePostTarget& target,
     write.token = request.token;
     write.local_segment = target.source_segment;
     write.remote_segment = target.area_segment;
-    return adapter_->post(target.probe_jetty, target.remote_jetty, write,
-                          posted);
+    const PostOutcome native =
+        adapter_->postDetailed(target.probe_jetty, target.remote_jetty, write);
+    posted = native.posted_count;
+    switch (classifyPostAcceptance(native)) {
+        case PostAcceptance::kAccepted:
+            outcome = ProbePostOutcome::kAccepted;
+            break;
+        case PostAcceptance::kNotAccepted:
+            outcome = probeRejectionIsRetryable(native.status)
+                          ? ProbePostOutcome::kRejectedRetryable
+                          : ProbePostOutcome::kRejected;
+            break;
+        case PostAcceptance::kUnknown:
+        default:
+            outcome = ProbePostOutcome::kUnknown;
+            break;
+    }
+    return native.status;
 }
 
 }  // namespace ub

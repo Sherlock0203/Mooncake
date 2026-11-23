@@ -170,23 +170,17 @@ void ProbeScheduler::postOne(const ProbeAction& action, uint64_t now_ns) {
     request.area_length = 1;
 
     size_t posted = 0;
+    ProbePostOutcome outcome = ProbePostOutcome::kUnknown;
     const auto started = std::chrono::steady_clock::now();
-    const Status status = poster_.post(target, request, posted);
+    // The poster owns the acceptance decision (F5): a provider error without a
+    // failing-WR position is Unknown, not Rejected.
+    const Status status = poster_.post(target, request, posted, outcome);
     const auto blocked_us =
         std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - started)
             .count();
     plm_.notePostBlockUs(static_cast<uint64_t>(blocked_us));
 
-    // design §8.6: one leading WR accepted -> accepted; provably zero accepted
-    // plus an error -> rejected; anything else is unknown (treated as accepted,
-    // never resent).
-    ProbePostOutcome outcome = ProbePostOutcome::kUnknown;
-    if (posted >= 1) {
-        outcome = ProbePostOutcome::kAccepted;
-    } else if (!status.ok()) {
-        outcome = ProbePostOutcome::kRejected;
-    }
     if (plm_.verboseEvents() || VLOG_IS_ON(1)) {
         const char* outcome_name =
             outcome == ProbePostOutcome::kAccepted

@@ -51,6 +51,10 @@ class UbContext final : public std::enable_shared_from_this<UbContext> {
     // device has been unpublished and has reached Destroyed. Pending native
     // cleanup remains quarantined and keeps this recovery barrier incomplete.
     void completeFailureCleanup() noexcept;
+    // True once the cleanup barrier finished and the context is only waiting
+    // for its error-free cooldown. Pollers use it so the native barrier is not
+    // re-scheduled on every successful poll during that window.
+    [[nodiscard]] bool failureCleanupComplete() const noexcept;
     // Pollers continue probing every JFC. A transiently failed context becomes
     // active only after all JFCs have succeeded in the current failure epoch,
     // the error-free cooldown has elapsed, old WRs have drained, and endpoint

@@ -55,6 +55,12 @@ struct ProbePortSupply {
     ContextPtr context;
     JettyPtr probe_jetty;
     uint64_t jetty_generation{0};
+    // F12: replacement evidence carried by kProbeHandleReplaced.
+    // `previous_generation` names the generation this publication replaces
+    // (0 = first publication); `previous_drained` is the provider's receipt
+    // that no WR of that generation can still reach memory.
+    uint64_t previous_generation{0};
+    bool previous_drained{false};
     // nullptr means probe completions land on the business JFC (shared mode).
     JfcPtr probe_jfc;
     LocalSegmentPtr source_segment;
@@ -280,6 +286,24 @@ class ProbePoster {
     // treated as accepted.
     virtual Status post(const ProbePostTarget& target,
                         const ProbeWorkRequest& request, size_t& posted) = 0;
+
+    // F5: tristate probe post with explicit evidence. The default keeps the
+    // old heuristic so existing fake posters need no change; posters with a
+    // native evidence channel override it so "error without a failing WR"
+    // becomes kUnknown instead of kRejected (INV-4).
+    virtual Status post(const ProbePostTarget& target,
+                        const ProbeWorkRequest& request, size_t& posted,
+                        ProbePostOutcome& outcome) {
+        const Status status = post(target, request, posted);
+        if (posted >= 1) {
+            outcome = ProbePostOutcome::kAccepted;
+        } else if (!status.ok()) {
+            outcome = ProbePostOutcome::kRejected;
+        } else {
+            outcome = ProbePostOutcome::kUnknown;
+        }
+        return status;
+    }
 };
 
 // Interface 7 (design §12.2): implemented by the probe side, called directly
