@@ -492,6 +492,11 @@ struct ProbeStats {
     uint64_t probe_lane_retire{0};
     uint64_t probe_lane_rebuild{0};
     uint64_t probe_timeout_unknown{0};
+    // D2: a deadline passed while the native post was still inside the
+    // provider, so the scan refused to fence that Jetty. Sustained growth
+    // means a probe port is pinned by a stuck post and has silently left the
+    // probe graph (its slot and peer budget stay held).
+    uint64_t probe_timeout_deferred_by_post_return{0};
     uint64_t probe_stale{0};
     uint64_t probe_unknown_token{0};
     uint64_t probe_evidence_unmapped{0};

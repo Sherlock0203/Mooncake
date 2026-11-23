@@ -2774,7 +2774,22 @@ void UbWorkers::noteControlJobFinished() {
 
 void UbWorkers::drainPendingControlJobs() {
     std::unique_lock<std::mutex> lock(control_jobs_mutex_);
-    control_jobs_cv_.wait(lock, [this] { return control_jobs_pending_ == 0; });
+    // Not an unbounded silent wait: a provider quiesce that overruns its own
+    // timeout must be visible in the log. The wait itself is deliberately not
+    // abandoned on timeout: proceeding would let a queued fence run natively
+    // while stop() is already tearing the same endpoints down, which the drain
+    // contract (and INV-1's ordering) forbids. So: warn periodically, keep the
+    // safety ordering.
+    while (control_jobs_pending_ != 0) {
+        const uint64_t pending = control_jobs_pending_;
+        if (!control_jobs_cv_.wait_for(lock, std::chrono::seconds(5), [this] {
+                return control_jobs_pending_ == 0;
+            })) {
+            LOG(WARNING) << "UB shutdown is waiting for " << pending
+                         << " control job(s) (timeout fence / device retire); "
+                            "a provider call is overrunning its timeout";
+        }
+    }
 }
 
 uint64_t UbWorkers::requestDeadlineNs(const PendingSlice& pending) const {

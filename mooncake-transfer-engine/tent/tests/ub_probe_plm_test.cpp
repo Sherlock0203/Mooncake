@@ -1065,6 +1065,8 @@ TEST(UbProbeLinkManagerTest, TimeoutScanWaitsForThePostToReturn) {
     plm.scanTimeouts(clock.now());
     EXPECT_EQ(plm.inflightCount(), 1U);
     EXPECT_EQ(plm.stats().probe_timeout_unknown, 0U);
+    // The port is silently pinned by the stuck post; make that observable.
+    EXPECT_EQ(plm.stats().probe_timeout_deferred_by_post_return, 1U);
     EXPECT_TRUE(reports.retire_calls.empty());
 
     // The post returns, its deadline is re-armed, and only then may the scan

@@ -2176,6 +2176,9 @@ void ProbeLinkManager::scanTimeouts(uint64_t now_ns) {
             // (handler_refs / D-7); the probe side now matches it.
             if (!record->post_returned.load(std::memory_order_acquire) ||
                 record->post_refs.load(std::memory_order_acquire) != 0) {
+                if (record->deadline_ns <= now) {
+                    ++stats_.probe_timeout_deferred_by_post_return;
+                }
                 continue;
             }
             if (record->deadline_ns > now) continue;
