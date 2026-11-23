@@ -33,7 +33,7 @@
 #include "tent/transport/ub/probe_link_manager.h"
 #include "tent/transport/ub/quota.h"
 #include "tent/transport/ub/rail_monitor.h"
-#include "tent/transport/ub/business_jetty_pool.h"
+#include "tent/transport/ub/send_jetty_pool.h"
 #include "tent/transport/ub/slice.h"
 #include "tent/transport/ub/tombstone.h"
 #include "tent/transport/ub/urma_adapter.h"

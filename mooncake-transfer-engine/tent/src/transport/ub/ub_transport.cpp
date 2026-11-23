@@ -49,7 +49,7 @@
 #include "tent/transport/ub/identity_import.h"
 #include "tent/transport/ub/native_budget.h"
 #include "tent/transport/ub/params.h"
-#include "tent/transport/ub/business_jetty_pool.h"
+#include "tent/transport/ub/send_jetty_pool.h"
 #include "tent/transport/ub/target_registry.h"
 #include "tent/transport/ub/tombstone.h"
 #include "tent/transport/ub/quota.h"

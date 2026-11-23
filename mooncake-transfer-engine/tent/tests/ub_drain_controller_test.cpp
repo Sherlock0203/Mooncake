@@ -20,7 +20,7 @@
 #include <vector>
 
 #include "tent/transport/ub/admission.h"
-#include "tent/transport/ub/business_jetty_pool.h"
+#include "tent/transport/ub/send_jetty_pool.h"
 #include "tent/transport/ub/control_executor.h"
 #include "tent/transport/ub/jetty_drain_controller.h"
 #include "tent/transport/ub/jfc.h"
@@ -112,7 +112,7 @@ class DrainHarness {
         pool_options.async_drain = async_drain;
         pool_options.drain_flush_batch = 8;
         pool_options.drain_quarantine_threshold = 3;
-        pool_ = std::make_shared<BusinessJettyPool>(adapter_, context_, jfcs_,
+        pool_ = std::make_shared<SendJettyPool>(adapter_, context_, jfcs_,
                                                     budget_, kDeviceKey,
                                                     credits_, pool_options);
         if (with_controller) attachController();
@@ -124,7 +124,7 @@ class DrainHarness {
         (void)pool_->drainQuarantined();
     }
 
-    [[nodiscard]] BusinessJettyPool& pool() { return *pool_; }
+    [[nodiscard]] SendJettyPool& pool() { return *pool_; }
     [[nodiscard]] fake::FakeUrmaAdapter& adapter() { return *adapter_; }
     [[nodiscard]] std::shared_ptr<fake::FakeUrmaAdapter> adapterPtr() {
         return adapter_;
@@ -208,7 +208,7 @@ class DrainHarness {
         options.tick_interval_ms = 1;
         options.quarantine_threshold = 3;
         options.now_fn = [this] { return now_ns_; };
-        std::weak_ptr<BusinessJettyPool> weak_pool = pool_;
+        std::weak_ptr<SendJettyPool> weak_pool = pool_;
         DrainCallbacks callbacks;
         callbacks.resolveJetty = [weak_pool](const PoolLaneKey& lane) {
             auto pool = weak_pool.lock();
@@ -248,7 +248,7 @@ class DrainHarness {
     std::shared_ptr<JfcCreditLedger> credits_;
     std::shared_ptr<NativeBudget> budget_;
     std::shared_ptr<TombstoneTable> tombstones_;
-    std::shared_ptr<BusinessJettyPool> pool_;
+    std::shared_ptr<SendJettyPool> pool_;
     std::shared_ptr<JettyDrainController> controller_;
     ManualControlExecutor executor_;
     uint64_t now_ns_{1'000'000'000ULL};

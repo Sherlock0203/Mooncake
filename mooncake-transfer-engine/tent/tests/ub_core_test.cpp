@@ -17,6 +17,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <limits>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -25,6 +27,7 @@
 #include "tent/transport/ub/quota.h"
 #include "tent/transport/ub/params.h"
 #include "tent/transport/ub/rail_monitor.h"
+#include "tent/transport/ub/sha256.h"
 #include "tent/transport/ub/slice.h"
 #include "tent/transport/ub/urma_adapter.h"
 #include "tent/transport/ub/workers.h"
@@ -628,6 +631,549 @@ TEST(UbBootstrapTest, ComparesGenerationsWithoutOverwritingNewerSnapshots) {
     candidate.rm->probe_target_map["local-P0"] = {"different-target"};
     ASSERT_TRUE(compareUbBootstrapV2(candidate, current, comparison).ok());
     EXPECT_EQ(comparison, UbBootstrapGenerationComparison::kConflict);
+}
+
+TEST(UbSha256Test, MatchesFips180v4GoldenVectors) {
+    EXPECT_EQ(sha256Hex(""),
+              "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    EXPECT_EQ(sha256Hex("abc"),
+              "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    EXPECT_EQ(
+        sha256Hex("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+    // One million 'a' bytes exercises multi-block hashing plus the
+    // two-block padding edge (remainder >= 56).
+    EXPECT_EQ(sha256Hex(std::string(1000000, 'a')),
+              "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+    EXPECT_TRUE(isCanonicalSha256Hex(sha256Hex("x")));
+    EXPECT_FALSE(isCanonicalSha256Hex("ABC"));
+    EXPECT_FALSE(isCanonicalSha256Hex(std::string(63, '0')));
+    EXPECT_FALSE(isCanonicalSha256Hex(std::string(65, '0')));
+}
+
+// Builds a structurally valid pooled v3 descriptor: one port, one shared
+// target, one probe region and one adjacency entry per configured port, with
+// a self-consistent inventory checksum.
+UbBootstrapDesc makeValidPooledBootstrap(size_t port_count = 4) {
+    UbBootstrapDesc desc;
+    desc.protocol_version = 3;
+    desc.segment_name = "segment-a";
+    desc.local_nic_path = "segment-a/ub:udma0:eid0";
+    desc.peer_nic_path = "segment-b/ub:udma1:eid0";
+    desc.local_port_identity = "P0";
+    desc.local_device_identity = "/dev/uburma/udma0#0001";
+    desc.local_eid_index = 0;
+    desc.local_eid = "0001:0000:0000:0000:0000:0000:0000:0000";
+    desc.endpoint_generation = 6;
+    desc.segment_generation = 5;
+
+    UbPooledBootstrapDesc pooled;
+    pooled.schema_version = 3;
+    pooled.transport_mode = "RM";
+    pooled.device_kind = "PHYSICAL";
+    pooled.physical_device_identity = "/dev/uburma/udma0#0001";
+    pooled.node_incarnation = 2;
+    pooled.context_incarnation = 2;
+    pooled.topology_epoch = 3;
+    pooled.transport_modes = 3;
+    pooled.provider_capabilities = {"read", "write", "rm"};
+    pooled.descriptor_abi = "urma-rjetty-v1";
+    pooled.access_capabilities.read = true;
+    pooled.access_capabilities.write = true;
+    pooled.access_capabilities.mr_offset = 0;
+    pooled.access_capabilities.mr_length = 1ULL << 30;
+
+    for (size_t i = 0; i < port_count; ++i) {
+        const std::string index = std::to_string(i);
+        UbPooledPortDesc port;
+        port.port_id = "P" + index;
+        port.context_id = 100 + i;
+        port.eid = desc.local_eid;
+        port.eid_index = static_cast<uint32_t>(i);
+        pooled.ports.push_back(port);
+
+        UbPooledTargetDescriptor target;
+        target.port_id = port.port_id;
+        target.target_identity = "T" + index;
+        target.eid = desc.local_eid;
+        target.uasid = 0;
+        target.id = 10 + i;
+        target.target_epoch = 4;
+        target.profile.trans_mode = kUrmaTransportModeRm;
+        target.profile.target_type = kUrmaTargetTypeJetty;
+        target.profile.tp_type = kUrmaTpTypeCtp;
+        target.descriptor = "00aabbcc";
+        pooled.targets.push_back(target);
+
+        pooled.probe_target_map.emplace(
+            port.port_id, std::vector<std::string>{"T" + index});
+
+        UbPooledProbeRegionDesc region;
+        region.peer = "peer-b";
+        region.local_port = port.port_id;
+        region.target_identity = target.target_identity;
+        region.target_epoch = target.target_epoch;
+        region.region_generation = 1;
+        region.access = "WRITE";
+        region.offset = 4096;
+        region.length = 65536;
+        region.slots = 4;
+        region.stride = 64;
+        pooled.probe_regions.push_back(region);
+
+        pooled.adjacency.emplace(port.port_id,
+                                 std::vector<std::string>{"R0", "R1"});
+    }
+    desc.pooled = std::move(pooled);
+    desc.pooled->inventory_checksum = computePooledInventoryChecksum(desc);
+    return desc;
+}
+
+TEST(UbBootstrapTest, PooledV3WireFormatRoundTripsStrictly) {
+    const auto desc = makeValidPooledBootstrap();
+    ASSERT_TRUE(desc.pooled.has_value());
+
+    nlohmann::json wire = desc;
+    UbBootstrapDesc decoded = wire.get<UbBootstrapDesc>();
+    EXPECT_EQ(decoded.protocol_version, 3U);
+    ASSERT_TRUE(decoded.pooled.has_value());
+    EXPECT_EQ(decoded.pooled->schema_version, 3U);
+    ASSERT_EQ(decoded.pooled->ports.size(), 4U);
+    EXPECT_EQ(decoded.pooled->ports[0].port_id, "P0");
+    ASSERT_EQ(decoded.pooled->targets.size(), 4U);
+    EXPECT_EQ(decoded.pooled->targets[1].target_identity, "T1");
+    EXPECT_EQ(decoded.pooled->targets[0].descriptor, "00aabbcc");
+    EXPECT_TRUE(validateUbBootstrap(decoded).ok());
+
+    // The v3 envelope is a closed allowlist: legacy v1/v2 fields never leak
+    // into a pooled descriptor.
+    EXPECT_EQ(wire.count("jetty_ids"), 0U);
+    EXPECT_EQ(wire.count("local_device_name"), 0U);
+    auto legacy_field = wire;
+    legacy_field["jetty_ids"] = std::vector<uint32_t>{1};
+    EXPECT_THROW(legacy_field.get<UbBootstrapDesc>(), std::invalid_argument);
+    auto v2_payload = wire;
+    v2_payload["rm"] = nlohmann::json(makeValidRmBootstrap().rm.value());
+    EXPECT_THROW(v2_payload.get<UbBootstrapDesc>(), std::invalid_argument);
+
+    // Unknown fields are rejected at every nesting level.
+    auto unknown_nested = wire;
+    unknown_nested["pooled"]["future_field"] = 1;
+    EXPECT_THROW(unknown_nested.get<UbBootstrapDesc>(), std::invalid_argument);
+    auto unknown_port = wire;
+    unknown_port["pooled"]["ports"][0]["bind_tp_type_mask"] = 4;
+    EXPECT_THROW(unknown_port.get<UbBootstrapDesc>(), std::invalid_argument);
+    auto unknown_target = wire;
+    unknown_target["pooled"]["targets"][0]["priority"] = 2;
+    EXPECT_THROW(unknown_target.get<UbBootstrapDesc>(), std::invalid_argument);
+    auto unknown_region = wire;
+    unknown_region["pooled"]["probe_regions"][0]["read"] = true;
+    EXPECT_THROW(unknown_region.get<UbBootstrapDesc>(),
+                 std::invalid_argument);
+
+    // Required nested fields may not be dropped.
+    auto missing = wire;
+    missing["pooled"].erase("inventory_checksum");
+    EXPECT_THROW(missing.get<UbBootstrapDesc>(), nlohmann::json::out_of_range);
+    auto missing_envelope = wire;
+    missing_envelope.erase("local_port_identity");
+    EXPECT_THROW(missing_envelope.get<UbBootstrapDesc>(),
+                 nlohmann::json::out_of_range);
+
+    // Booleans must be real booleans; numbers must be integers.
+    auto bad_bool = wire;
+    bad_bool["pooled"]["access_capabilities"]["read"] = 1;
+    EXPECT_THROW(bad_bool.get<UbBootstrapDesc>(), std::invalid_argument);
+    auto bad_number = wire;
+    bad_number["pooled"]["ports"][0]["context_id"] = -1;
+    EXPECT_THROW(bad_number.get<UbBootstrapDesc>(), std::invalid_argument);
+
+    // A v3 rejection response carries only the version and the reply.
+    UbBootstrapDesc rejection;
+    rejection.protocol_version = 3;
+    rejection.reply_msg = "peer rejected the pooled request";
+    nlohmann::json rejection_wire = rejection;
+    EXPECT_EQ(rejection_wire.size(), 2U);
+    const auto decoded_rejection = rejection_wire.get<UbBootstrapDesc>();
+    EXPECT_EQ(decoded_rejection.protocol_version, 3U);
+    EXPECT_FALSE(decoded_rejection.pooled.has_value());
+    EXPECT_EQ(decoded_rejection.reply_msg, "peer rejected the pooled request");
+
+    // An empty v3 envelope without payload or reply is not valid.
+    UbBootstrapDesc empty;
+    empty.protocol_version = 3;
+    EXPECT_THROW(nlohmann::json{empty}, std::invalid_argument);
+}
+
+TEST(UbBootstrapTest, PooledV3RejectsDuplicateJsonKeysBeforeDom) {
+    const auto desc = makeValidPooledBootstrap();
+    const std::string clean = nlohmann::json(desc).dump();
+    UbBootstrapDesc decoded;
+    ASSERT_TRUE(decodeUbBootstrapV3Strict(clean, decoded).ok());
+    EXPECT_EQ(decoded.pooled->ports.size(), 4U);
+
+    // A duplicated top-level key fails closed before the DOM parser could
+    // silently keep the last occurrence.
+    std::string duplicated = clean;
+    duplicated.insert(1, "\"segment_name\":\"evil\",");
+    EXPECT_TRUE(
+        decodeUbBootstrapV3Strict(duplicated, decoded).IsInvalidArgument());
+
+    // Duplicates inside nested objects (a pooled port) are rejected too.
+    std::string nested = clean;
+    const auto ports_pos = nested.find("\"ports\"");
+    ASSERT_NE(ports_pos, std::string::npos);
+    const auto port_brace = nested.find('{', nested.find('[', ports_pos));
+    ASSERT_NE(port_brace, std::string::npos);
+    nested.insert(port_brace + 1, "\"port_id\":\"evil\",");
+    EXPECT_TRUE(
+        decodeUbBootstrapV3Strict(nested, decoded).IsInvalidArgument());
+
+    // Malformed JSON fails closed.
+    EXPECT_TRUE(decodeUbBootstrapV3Strict("{", decoded).IsInvalidArgument());
+
+    // The strict decoder only accepts v3; a valid v2 request is rejected
+    // instead of being reinterpreted.
+    const auto v2 = makeValidRmBootstrap();
+    EXPECT_TRUE(decodeUbBootstrapV3Strict(nlohmann::json(v2).dump(), decoded)
+                    .IsInvalidArgument());
+}
+
+TEST(UbBootstrapTest, ValidatesPooledInventoryAndTargetTopology) {
+    auto desc = makeValidPooledBootstrap();
+    EXPECT_TRUE(validateUbBootstrap(desc).ok());
+
+    // Helper: mutate the descriptor, re-sign it, then validate, so each
+    // failure below is attributed to the mutated rule and not to a stale
+    // checksum.
+    const auto revalidate = [](UbBootstrapDesc& mutated) {
+        mutated.pooled->inventory_checksum =
+            computePooledInventoryChecksum(mutated);
+        return validateUbBootstrap(mutated);
+    };
+
+    // A checksum that does not cover the actual content is rejected.
+    desc = makeValidPooledBootstrap();
+    desc.pooled->inventory_checksum = std::string(64, '0');
+    EXPECT_TRUE(validateUbBootstrap(desc).IsInvalidArgument());
+
+    // Every configured port must publish exactly one target.
+    desc = makeValidPooledBootstrap();
+    desc.pooled->targets.pop_back();
+    EXPECT_TRUE(revalidate(desc).IsInvalidArgument());
+    desc = makeValidPooledBootstrap();
+    desc.pooled->targets[0].port_id = "P1";
+    EXPECT_TRUE(revalidate(desc).IsInvalidArgument());
+    desc = makeValidPooledBootstrap();
+    desc.pooled->targets[0].port_id = "unknown-port";
+    EXPECT_TRUE(revalidate(desc).IsInvalidArgument());
+
+    // Port inventory: duplicate ids, zero Context mapping, bad EIDs.
+    desc = makeValidPooledBootstrap();
+    desc.pooled->ports[1].port_id = "P0";
+    EXPECT_TRUE(revalidate(desc).IsInvalidArgument());
+    desc = makeValidPooledBootstrap();
+    desc.pooled->ports[1].context_id = 0;
+    EXPECT_TRUE(revalidate(desc).IsInvalidArgument());
+    desc = makeValidPooledBootstrap();
+    desc.pooled->ports[1].eid = "not-an-eid";
+    EXPECT_TRUE(revalidate(desc).IsInvalidArgument());
+    desc = makeValidPooledBootstrap();
+    desc.pooled->ports[1].context_id = desc.pooled->ports[0].context_id;
+    EXPECT_TRUE(revalidate(desc).IsInvalidArgument());
+
+    // Envelope identity: empty port id, missing device identity, bad EID.
+    desc = makeValidPooledBootstrap();
+    desc.local_port_identity.clear();
+    EXPECT_TRUE(revalidate(desc).IsInvalidArgument());
+    desc = makeValidPooledBootstrap();
+    desc.local_device_identity.clear();
+    EXPECT_TRUE(revalidate(desc).IsInvalidArgument());
+    desc = makeValidPooledBootstrap();
+    desc.local_eid = "not-an-eid";
+    EXPECT_TRUE(revalidate(desc).IsInvalidArgument());
+
+    // Descriptors must be non-empty even-length hex.
+    desc = makeValidPooledBootstrap();
+    desc.pooled->targets[0].descriptor = "0";
+    EXPECT_TRUE(revalidate(desc).IsInvalidArgument());
+    desc = makeValidPooledBootstrap();
+    desc.pooled->targets[0].descriptor = "zz";
+    EXPECT_TRUE(revalidate(desc).IsInvalidArgument());
+
+    // Adjacency must reference published local ports, deduplicated.
+    desc = makeValidPooledBootstrap();
+    desc.pooled->adjacency["unknown-port"] = {"R0"};
+    EXPECT_TRUE(revalidate(desc).IsInvalidArgument());
+    desc = makeValidPooledBootstrap();
+    desc.pooled->adjacency["P0"] = {"R0", "R0"};
+    EXPECT_TRUE(revalidate(desc).IsInvalidArgument());
+
+    // Probe target map keys must be published ports.
+    desc = makeValidPooledBootstrap();
+    desc.pooled->probe_target_map["unknown-port"] = {"T0"};
+    EXPECT_TRUE(revalidate(desc).IsInvalidArgument());
+
+    // Probe regions: epoch binding, WRITE-only, range/slot overflow and
+    // (peer, port) uniqueness.
+    desc = makeValidPooledBootstrap();
+    desc.pooled->probe_regions[0].target_epoch++;
+    EXPECT_TRUE(revalidate(desc).IsInvalidArgument());
+    desc = makeValidPooledBootstrap();
+    desc.pooled->probe_regions[0].access = "READ";
+    EXPECT_TRUE(revalidate(desc).IsInvalidArgument());
+    desc = makeValidPooledBootstrap();
+    desc.pooled->probe_regions[0].offset =
+        std::numeric_limits<uint64_t>::max();
+    EXPECT_TRUE(revalidate(desc).IsInvalidArgument());
+    desc = makeValidPooledBootstrap();
+    desc.pooled->probe_regions[0].slots =
+        std::numeric_limits<uint64_t>::max();
+    EXPECT_TRUE(revalidate(desc).IsInvalidArgument());
+    desc = makeValidPooledBootstrap();
+    desc.pooled->probe_regions[1].peer = desc.pooled->probe_regions[0].peer;
+    desc.pooled->probe_regions[1].local_port =
+        desc.pooled->probe_regions[0].local_port;
+    EXPECT_TRUE(revalidate(desc).IsInvalidArgument());
+
+    // Access capabilities: MR range and overflow.
+    desc = makeValidPooledBootstrap();
+    desc.pooled->access_capabilities.mr_length = 0;
+    EXPECT_TRUE(revalidate(desc).IsInvalidArgument());
+    desc = makeValidPooledBootstrap();
+    desc.pooled->access_capabilities.mr_offset =
+        std::numeric_limits<uint64_t>::max();
+    EXPECT_TRUE(revalidate(desc).IsInvalidArgument());
+    desc = makeValidPooledBootstrap();
+    desc.pooled->access_capabilities.read = false;
+    desc.pooled->access_capabilities.write = false;
+    EXPECT_TRUE(revalidate(desc).IsInvalidArgument());
+
+    // Schema version, ABI and generations.
+    desc = makeValidPooledBootstrap();
+    desc.pooled->schema_version = 2;
+    EXPECT_TRUE(revalidate(desc).IsInvalidArgument());
+    desc = makeValidPooledBootstrap();
+    desc.pooled->descriptor_abi.clear();
+    EXPECT_TRUE(revalidate(desc).IsInvalidArgument());
+    desc = makeValidPooledBootstrap();
+    desc.pooled->topology_epoch = 0;
+    EXPECT_TRUE(revalidate(desc).IsInvalidArgument());
+    desc = makeValidPooledBootstrap();
+    desc.endpoint_generation = 0;
+    EXPECT_TRUE(revalidate(desc).IsInvalidArgument());
+    desc = makeValidPooledBootstrap();
+    desc.local_eid_index = -1;
+    EXPECT_TRUE(revalidate(desc).IsInvalidArgument());
+}
+
+TEST(UbBootstrapTest, PooledV3GateClassifiesVersionsAndModes) {
+    const auto pooled = makeValidPooledBootstrap();
+    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::kPooledRm,
+                                       UbBootstrapProtocol::kAuto, pooled)
+                    .ok());
+    // A successful gate does not claim the pooled data plane exists.
+    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::RM,
+                                       UbBootstrapProtocol::kAuto, pooled)
+                    .IsInvalidArgument());
+    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::RC,
+                                       UbBootstrapProtocol::kAuto, pooled)
+                    .IsNotImplemented());
+
+    // Requests carrying a reply envelope are responses, not requests.
+    auto response = pooled;
+    response.reply_msg = "response is not a request";
+    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::kPooledRm,
+                                       UbBootstrapProtocol::kAuto, response)
+                    .IsInvalidArgument());
+
+    // Mixed versions are explicitly unsupported: v1/v2 never satisfy the
+    // pooled gate and are not silently upgraded.
+    const auto v2 = makeValidRmBootstrap();
+    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::kPooledRm,
+                                       UbBootstrapProtocol::kAuto, v2)
+                    .IsInvalidArgument());
+    UbBootstrapDesc v1;
+    v1.protocol_version = 1;
+    EXPECT_TRUE(gateUbBootstrapForMode(UbBootstrapMode::kPooledRm,
+                                       UbBootstrapProtocol::kAuto, v1)
+                    .IsInvalidArgument());
+}
+
+TEST(UbBootstrapTest,
+     PooledV3CrossChecksPeerIdentityAgainstTrustedInventory) {
+    const auto desc = makeValidPooledBootstrap();
+    UbExpectedPooledPeerIdentity expected;
+    expected.segment_name = desc.segment_name;
+    expected.local_nic_path = desc.local_nic_path;
+    expected.local_device_identity = desc.local_device_identity;
+    expected.local_eid = desc.local_eid;
+    expected.eid_index = desc.local_eid_index;
+    expected.physical_device_identity = desc.pooled->physical_device_identity;
+    expected.transport_modes = desc.pooled->transport_modes;
+    expected.descriptor_abi = desc.pooled->descriptor_abi;
+    expected.inventory_checksum = desc.pooled->inventory_checksum;
+    EXPECT_TRUE(validateUbBootstrapV3PeerIdentity(desc, expected).ok());
+
+    // Responses are not requests.
+    auto response = desc;
+    response.reply_msg = "response is not a request";
+    EXPECT_TRUE(validateUbBootstrapV3PeerIdentity(response, expected)
+                    .IsInvalidArgument());
+
+    // A v2 descriptor never satisfies the v3 trusted anchor.
+    const auto v2 = makeValidRmBootstrap();
+    EXPECT_TRUE(validateUbBootstrapV3PeerIdentity(v2, expected)
+                    .IsInvalidArgument());
+
+    // Every trusted-anchor field must match; the checksum and the descriptor
+    // ABI are part of the identity, not advisory metadata.
+    auto mismatch = expected;
+    mismatch.inventory_checksum = std::string(64, '1');
+    EXPECT_TRUE(validateUbBootstrapV3PeerIdentity(desc, mismatch)
+                    .IsInvalidArgument());
+    mismatch = expected;
+    mismatch.descriptor_abi = "urma-rjetty-v2";
+    EXPECT_TRUE(validateUbBootstrapV3PeerIdentity(desc, mismatch)
+                    .IsInvalidArgument());
+    mismatch = expected;
+    mismatch.local_eid = "0002:0000:0000:0000:0000:0000:0000:0000";
+    EXPECT_TRUE(validateUbBootstrapV3PeerIdentity(desc, mismatch)
+                    .IsInvalidArgument());
+    mismatch = expected;
+    mismatch.physical_device_identity = "/dev/uburma/udma9#0009";
+    EXPECT_TRUE(validateUbBootstrapV3PeerIdentity(desc, mismatch)
+                    .IsInvalidArgument());
+    mismatch = expected;
+    mismatch.transport_modes ^= 1;
+    EXPECT_TRUE(validateUbBootstrapV3PeerIdentity(desc, mismatch)
+                    .IsInvalidArgument());
+    mismatch = expected;
+    mismatch.local_device_identity = "/dev/uburma/udma9#0009";
+    EXPECT_TRUE(validateUbBootstrapV3PeerIdentity(desc, mismatch)
+                    .IsInvalidArgument());
+}
+
+TEST(UbBootstrapTest, ComparesPooledV3GenerationsWithoutOverwritingIncumbent) {
+    const auto current = makeValidPooledBootstrap();
+    // Candidate mutations must stay self-consistent (re-signed checksum) so
+    // the comparison exercises generation logic, not validation failures.
+    const auto resign = [](UbBootstrapDesc& mutated) {
+        mutated.pooled->inventory_checksum =
+            computePooledInventoryChecksum(mutated);
+    };
+
+    auto candidate = current;
+    UbBootstrapGenerationComparison comparison;
+    ASSERT_TRUE(compareUbBootstrapV3(candidate, current, comparison).ok());
+    EXPECT_EQ(comparison, UbBootstrapGenerationComparison::kDuplicate);
+
+    // Diagnostic reply differences never change the duplicate verdict.
+    candidate.reply_msg = "duplicate responses may differ in diagnostics";
+    ASSERT_TRUE(compareUbBootstrapV3(candidate, current, comparison).ok());
+    EXPECT_EQ(comparison, UbBootstrapGenerationComparison::kDuplicate);
+
+    candidate = current;
+    candidate.pooled->node_incarnation--;
+    resign(candidate);
+    ASSERT_TRUE(compareUbBootstrapV3(candidate, current, comparison).ok());
+    EXPECT_EQ(comparison, UbBootstrapGenerationComparison::kStale);
+
+    candidate = current;
+    candidate.pooled->context_incarnation++;
+    resign(candidate);
+    ASSERT_TRUE(compareUbBootstrapV3(candidate, current, comparison).ok());
+    EXPECT_EQ(comparison, UbBootstrapGenerationComparison::kNewer);
+
+    candidate = current;
+    candidate.pooled->topology_epoch++;
+    resign(candidate);
+    ASSERT_TRUE(compareUbBootstrapV3(candidate, current, comparison).ok());
+    EXPECT_EQ(comparison, UbBootstrapGenerationComparison::kNewer);
+
+    // Per-port target epochs are leaves within the parent scope. Probe
+    // regions stay bound to their target's epoch when it moves.
+    candidate = current;
+    candidate.pooled->targets[0].target_epoch--;
+    candidate.pooled->probe_regions[0].target_epoch =
+        candidate.pooled->targets[0].target_epoch;
+    resign(candidate);
+    ASSERT_TRUE(compareUbBootstrapV3(candidate, current, comparison).ok());
+    EXPECT_EQ(comparison, UbBootstrapGenerationComparison::kStale);
+
+    candidate = current;
+    candidate.pooled->targets[1].target_epoch++;
+    candidate.pooled->probe_regions[1].target_epoch =
+        candidate.pooled->targets[1].target_epoch;
+    resign(candidate);
+    ASSERT_TRUE(compareUbBootstrapV3(candidate, current, comparison).ok());
+    EXPECT_EQ(comparison, UbBootstrapGenerationComparison::kNewer);
+
+    // A newer endpoint generation cannot hide an older target epoch.
+    candidate = current;
+    candidate.pooled->targets[0].target_epoch--;
+    candidate.pooled->probe_regions[0].target_epoch =
+        candidate.pooled->targets[0].target_epoch;
+    candidate.endpoint_generation++;
+    resign(candidate);
+    ASSERT_TRUE(compareUbBootstrapV3(candidate, current, comparison).ok());
+    EXPECT_EQ(comparison, UbBootstrapGenerationComparison::kConflict);
+
+    // A different physical device identity is a different comparison scope.
+    candidate = current;
+    candidate.pooled->physical_device_identity = "/dev/uburma/udma9#0009";
+    resign(candidate);
+    ASSERT_TRUE(compareUbBootstrapV3(candidate, current, comparison).ok());
+    EXPECT_EQ(comparison, UbBootstrapGenerationComparison::kConflict);
+
+    // A different published port set under identical parents is a conflict.
+    candidate = makeValidPooledBootstrap(6);
+    ASSERT_TRUE(compareUbBootstrapV3(candidate, current, comparison).ok());
+    EXPECT_EQ(comparison, UbBootstrapGenerationComparison::kConflict);
+
+    // Same generations with different content (probe region resized and
+    // re-signed) is a conflict; the healthy incumbent is preserved.
+    candidate = current;
+    candidate.pooled->probe_regions[0].slots = 8;
+    resign(candidate);
+    ASSERT_TRUE(compareUbBootstrapV3(candidate, current, comparison).ok());
+    EXPECT_EQ(comparison, UbBootstrapGenerationComparison::kConflict);
+
+    // Structurally invalid candidates are rejected outright: the incumbent
+    // is never destroyed by an unparseable or tampered payload.
+    candidate = current;
+    candidate.pooled->targets.pop_back();
+    resign(candidate);
+    EXPECT_TRUE(compareUbBootstrapV3(candidate, current, comparison)
+                    .IsInvalidArgument());
+    EXPECT_EQ(comparison, UbBootstrapGenerationComparison::kConflict);
+}
+
+TEST(UbBootstrapTest, PooledV3SupportsFourSixPortAndAsymmetricTopologies) {
+    // The DTO layer carries no hard-coded port count: 4-port and 6-port
+    // inventories (and anything in between or beyond) validate with exactly
+    // one shared target per configured port.
+    for (size_t port_count : {2U, 4U, 6U, 9U}) {
+        const auto desc = makeValidPooledBootstrap(port_count);
+        ASSERT_EQ(desc.pooled->ports.size(), port_count);
+        ASSERT_EQ(desc.pooled->targets.size(), port_count);
+        EXPECT_TRUE(validateUbBootstrap(desc).ok())
+            << "port_count=" << port_count;
+    }
+
+    // Asymmetric adjacency is legal (V5 5.2 item 5): the local side
+    // publishes its own port count and its own view of remote ports; the
+    // remote inventory is not required to match sizes.
+    auto desc = makeValidPooledBootstrap(4);
+    desc.pooled->adjacency["P0"] = {"R0", "R1", "R2"};
+    desc.pooled->adjacency["P3"] = {"R5"};
+    desc.pooled->adjacency.erase("P1");
+    desc.pooled->inventory_checksum = computePooledInventoryChecksum(desc);
+    EXPECT_TRUE(validateUbBootstrap(desc).ok());
+    const auto decoded = nlohmann::json(desc).get<UbBootstrapDesc>();
+    EXPECT_TRUE(validateUbBootstrap(decoded).ok());
+    ASSERT_EQ(decoded.pooled->adjacency.at("P0").size(), 3U);
+    EXPECT_EQ(decoded.pooled->adjacency.count("P1"), 0U);
 }
 
 Request makeRequest(size_t length) {
