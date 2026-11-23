@@ -167,6 +167,9 @@ struct UbBusinessStatsSnapshot {
     // A pooled record without a Context incarnation cannot be keyed globally;
     // it is counted instead of aliasing every Context's lane 0 (D5).
     uint64_t pooled_lane_ref_unmapped{0};
+    // Legacy local x remote candidates refused because the two EIDs are in
+    // different reachability scopes (require_same_eid_scope).
+    uint64_t eid_scope_denied{0};
     uint64_t timeout_fence_submitted{0};
     uint64_t timeout_fence_rejected{0};
     uint64_t device_retire_rejected{0};
@@ -548,6 +551,7 @@ class UbWorkers final : public gate::Sink {
     std::condition_variable control_jobs_cv_;
     uint64_t control_jobs_pending_{0};
     std::atomic<uint64_t> pooled_lane_ref_unmapped_{0};
+    std::atomic<uint64_t> eid_scope_denied_{0};
     std::atomic<uint64_t> expired_in_queue_{0};
     std::atomic<uint64_t> expired_parked_{0};
     std::atomic<uint64_t> expired_pre_post_{0};

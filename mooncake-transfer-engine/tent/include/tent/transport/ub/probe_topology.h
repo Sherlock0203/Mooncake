@@ -51,6 +51,14 @@ struct EidScope {
 
 [[nodiscard]] EidScope eidScopeForEid(std::string_view eid);
 
+// True when both EIDs are trusted and share a reachability scope. An EID that
+// cannot be parsed is treated as compatible: an older peer may not publish it,
+// and refusing to pair would break deployments that work today. Legacy device
+// selection uses this to refuse cross-scope local x remote pairs (df00 vs
+// df04), which the provider rejects with URMA_CR_LOC_ACCESS_ERR.
+[[nodiscard]] bool sameEidScope(std::string_view local_eid,
+                                std::string_view remote_eid);
+
 // One declared local port resolved against the discovered devices.
 struct ProbeLocalPortBinding {
     std::string id;

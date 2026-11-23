@@ -289,6 +289,13 @@ struct UbParams {
     // reflowed (kReflow is only reachable on an empty pop). Force a reflow at
     // least this often. 0 disables the cadence (legacy behavior).
     uint32_t defer_reflow_max_gap_ms = 10;
+    // A local device may only pair with a remote device in the same EID
+    // reachability scope (df00 <-> df00, df04 <-> df04). Cross-scope WRs come
+    // back as URMA_CR_LOC_ACCESS_ERR, which surfaces as a retryable path fault
+    // and collapses the transfer onto a single rail. Declared adjacency has
+    // its own probe/adjacency_policy/require_same_eid_scope; this switch
+    // covers the legacy local x remote combination path.
+    bool require_same_eid_scope = true;
     // F6d: allow replaying a timed-out WRITE. Fixed-length byte moves are
     // idempotent while the source is not concurrently rewritten, which is an
     // existing assumption of the whole design; this switch lets a deployment
@@ -563,6 +570,9 @@ struct UbParams {
         CHECK_STATUS(readNonNegative(
             config, "transports/ub/defer_reflow_max_gap_ms",
             parsed.defer_reflow_max_gap_ms, parsed.defer_reflow_max_gap_ms));
+        CHECK_STATUS(readBool(config, "transports/ub/require_same_eid_scope",
+                              parsed.require_same_eid_scope,
+                              parsed.require_same_eid_scope));
         CHECK_STATUS(readBool(config, "transports/ub/retry_timeout_write",
                               parsed.retry_timeout_write,
                               parsed.retry_timeout_write));

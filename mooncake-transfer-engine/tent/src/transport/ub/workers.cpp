@@ -87,6 +87,9 @@ struct UbWorkers::Route {
     BufferDesc* remote_buffer{nullptr};
     // Decoded once per slice and reused by device ordering and the import.
     UbBufferMetadata metadata;
+    // Remote device id -> its published EID, decoded once per slice so the
+    // scope filter does not re-walk the metadata per candidate.
+    std::unordered_map<Topology::NicID, std::string> remote_eids;
     std::vector<Topology::NicID> remote_devices;
     // Declaration gate for this peer, computed once per route.
     AdjacencyView adjacency;
@@ -693,6 +696,7 @@ UbBusinessStatsSnapshot UbWorkers::businessStats() const {
     out.expired_inflight = expired_inflight_.load(std::memory_order_relaxed);
     out.pooled_lane_ref_unmapped =
         pooled_lane_ref_unmapped_.load(std::memory_order_relaxed);
+    out.eid_scope_denied = eid_scope_denied_.load(std::memory_order_relaxed);
     out.timeout_fence_submitted =
         timeout_fence_submitted_.load(std::memory_order_relaxed);
     out.timeout_fence_rejected =
@@ -1405,6 +1409,10 @@ Status UbWorkers::buildRoute(const PendingSlice& pending, Route& route) {
             if (!status.ok()) return status;
             route.remote_buffer = buffer;
             route.metadata = std::move(metadata);
+            route.remote_eids.clear();
+            for (const auto& segment : route.metadata.segments) {
+                route.remote_eids.emplace(segment.topology_id, segment.eid);
+            }
             // Remote metadata is decoded once in this function and reused by
             // device ordering and by importRemote (yuanhao-1113).
             route.remote_devices =
@@ -1703,6 +1711,10 @@ Status UbWorkers::chooseAndResolveEndpoint(
     size_t adjacency_hard_denied = 0;
     size_t adjacency_transient_denied = 0;
     size_t invalid_edge_denied = 0;
+    // Legacy local x remote pairs refused because the two EIDs are in
+    // different reachability scopes. Declared adjacency applies the same
+    // policy through adjacency_policy.require_same_eid_scope.
+    size_t scope_denied = 0;
     AdjacencyDecision first_adjacency_denial = AdjacencyDecision::kAllowed;
     Topology::NicID first_denied_local = -1;
     Topology::NicID first_denied_remote = -1;
@@ -1726,6 +1738,27 @@ Status UbWorkers::chooseAndResolveEndpoint(
         } else {
             local = local_devices[flat / remote_devices.size()];
             remote_id = remote_devices[flat % remote_devices.size()];
+            if (params_.require_same_eid_scope) {
+                const auto local_context =
+                    context_by_topology_id_.find(local.id);
+                const auto remote_eid = route.remote_eids.find(remote_id);
+                // A missing local context or a peer that did not publish its
+                // EID is not evidence of a cross-scope pair: let the normal
+                // resolution produce the precise error instead.
+                if (local_context != context_by_topology_id_.end() &&
+                    remote_eid != route.remote_eids.end() &&
+                    !sameEidScope(local_context->second->deviceInfo().eid,
+                                  remote_eid->second)) {
+                    ++scope_denied;
+                    eid_scope_denied_.fetch_add(1, std::memory_order_relaxed);
+                    VLOG(1) << "UB endpoint select: cross EID scope pair "
+                            << "local_nic=" << local.id << " local_eid="
+                            << local_context->second->deviceInfo().eid
+                            << " remote_nic=" << remote_id
+                            << " remote_eid=" << remote_eid->second;
+                    continue;
+                }
+            }
         }
         if (route.adjacency.enforced) {
             bool local_declared = false;
@@ -1790,7 +1823,8 @@ Status UbWorkers::chooseAndResolveEndpoint(
             std::move(rail_stats),
             quota_->availability(probe_path, pending.slice->spec().length)});
     }
-    const size_t counted_denied = adjacency_denied + invalid_edge_denied;
+    const size_t counted_denied =
+        adjacency_denied + invalid_edge_denied + scope_denied;
     const size_t health_denied =
         combinations > counted_denied + rails.size()
             ? combinations - counted_denied - rails.size()
@@ -1798,6 +1832,23 @@ Status UbWorkers::chooseAndResolveEndpoint(
     if (route.adjacency.enforced) {
         declared_candidates_denied_.fetch_add(counted_denied,
                                               std::memory_order_relaxed);
+    }
+    if (rails.empty() && !route.adjacency.enforced && combinations != 0 &&
+        scope_denied == combinations) {
+        // Every local x remote pair crosses scopes: retrying can only produce
+        // LOCAL_ACCESS_ERROR and generation churn. Name the knob so the
+        // operator can fix the filter instead of reading a native error.
+        LOG_EVERY_N(WARNING, params_.observability.leaseSampleEvery())
+            << "UB endpoint select denied: task="
+            << reinterpret_cast<uint64_t>(pending.task.get())
+            << " slice=" << pending.slice->snapshot().id
+            << " policy=legacy candidates=" << combinations
+            << " denied{scope=" << scope_denied << "}";
+        return Status::InvalidArgument(
+            "Every UB local/remote device pair crosses the EID reachability "
+            "scope; restrict transports/ub/device_filter to one scope or set "
+            "transports/ub/require_same_eid_scope=false to allow cross-scope "
+            "pairs" LOC_MARK);
     }
     if (rails.empty() && invalid_edge_denied == combinations) {
         LOG_EVERY_N(WARNING, params_.observability.leaseSampleEvery())
@@ -1808,7 +1859,8 @@ Status UbWorkers::chooseAndResolveEndpoint(
             << " candidates=" << combinations << " healthy=" << rails.size()
             << " health_denied=" << health_denied
             << " denied{adjacency=" << adjacency_denied
-            << ",invalid_edge=" << invalid_edge_denied << ",quota=0}";
+            << ",invalid_edge=" << invalid_edge_denied
+            << ",scope=" << scope_denied << ",quota=0}";
         return Status::InvalidArgument(
             "Every declared edge was invalidated after repeated "
             "parameter/memory errors" LOC_MARK);
@@ -2014,7 +2066,8 @@ Status UbWorkers::chooseAndResolveEndpoint(
                       << " rank=" << selected->score.topology_rank
                       << " probe_path=" << (route.probe_peer_id != 0 ? 1 : 0)
                       << " denied{adjacency=" << adjacency_denied
-                      << ",invalid_edge=" << invalid_edge_denied << ",quota=0}"
+                      << ",invalid_edge=" << invalid_edge_denied
+                      << ",scope=" << scope_denied << ",quota=0}"
                       << " healthy=" << rails.size()
                       << " resolved=" << candidates.size()
                       << " health_denied=" << health_denied
@@ -2029,7 +2082,8 @@ Status UbWorkers::chooseAndResolveEndpoint(
                     << " rank=" << selected->score.topology_rank
                     << " probe_path=" << (route.probe_peer_id != 0 ? 1 : 0)
                     << " denied{adjacency=" << adjacency_denied
-                    << ",invalid_edge=" << invalid_edge_denied << ",quota=0}"
+                    << ",invalid_edge=" << invalid_edge_denied
+                    << ",scope=" << scope_denied << ",quota=0}"
                     << " healthy=" << rails.size()
                     << " resolved=" << candidates.size()
                     << " health_denied=" << health_denied << " healthy_paths=["

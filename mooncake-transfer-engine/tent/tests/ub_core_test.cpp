@@ -197,6 +197,22 @@ TEST(UbParamsTest, RmLegacyResolvesToRmRuntimeMode) {
     EXPECT_EQ(resolved, UbRuntimeMode::kRmLegacy);
 }
 
+TEST(UbParamsTest, RequireSameEidScopeDefaultsOnAndRoundTrips) {
+    UbParams params;
+    Config config;
+    ASSERT_TRUE(UbParams::FromConfig(config, params).ok());
+    EXPECT_TRUE(params.require_same_eid_scope)
+        << "cross-scope pairing must be refused by default";
+
+    config.set("transports/ub/require_same_eid_scope", false);
+    ASSERT_TRUE(UbParams::FromConfig(config, params).ok());
+    EXPECT_FALSE(params.require_same_eid_scope);
+
+    config.set("transports/ub/require_same_eid_scope", true);
+    ASSERT_TRUE(UbParams::FromConfig(config, params).ok());
+    EXPECT_TRUE(params.require_same_eid_scope);
+}
+
 TEST(UbParamsTest, JettyReuseRequiresRmLegacyProfile) {
     auto evaluate = [](UbRuntimeProfile profile, UbRuntimeMode& resolved) {
         UbParams params;
