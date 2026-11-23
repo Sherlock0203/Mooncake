@@ -2168,6 +2168,16 @@ void ProbeLinkManager::scanTimeouts(uint64_t now_ns) {
         for (auto& [token, record] : inflight_) {
             if (record->core.finalize_claimed.load(std::memory_order_acquire))
                 continue;
+            // F11/D2: a record whose native post has not returned is not
+            // timed out yet. The deadline is armed in beginPost(), *before*
+            // the provider call, so a slow post would otherwise let this scan
+            // retire the lane and hand the very Jetty still inside adapter
+            // post() to quiesce/delete. The business side has the same guard
+            // (handler_refs / D-7); the probe side now matches it.
+            if (!record->post_returned.load(std::memory_order_acquire) ||
+                record->post_refs.load(std::memory_order_acquire) != 0) {
+                continue;
+            }
             if (record->deadline_ns > now) continue;
             // One-shot: a record is scanned for timeout exactly once even if
             // the scheduler calls again before a late completion arrives.

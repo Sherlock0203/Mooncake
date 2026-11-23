@@ -47,6 +47,19 @@ class UbWorkersTestPeer {
     static void failSecondEnqueue() {
         UbWorkers::fail_second_enqueue_for_test_ = true;
     }
+    // Forces the degraded fence path: no control executor, so scanTimeouts
+    // executes the fence inline while it holds endpoint_drain_mutex_.
+    static void dropControlExecutor(UbWorkers& workers) {
+        workers.stopControlExecutor();
+    }
+    // The claim verdict is private, so exercise it through the friend rather
+    // than widening the production API just for a test.
+    static bool claimedWithEpochChange(bool path_epoch_changed) {
+        UbWorkers::ClaimDecision decision;
+        decision.closed = ClaimClosed::kNone;
+        decision.path_epoch_changed = path_epoch_changed;
+        return decision.claimed();
+    }
 };
 
 namespace {
@@ -821,6 +834,29 @@ TEST(UbPoolIntegrationTest, LaneConvergenceIsScopedByContextIncarnation) {
         [&] { return task->transferStatus().s != PENDING; }));
 }
 
+// D1 regression: when no control executor exists, scanTimeouts holds
+// endpoint_drain_mutex_ and the fence must reuse that lock, not take it again.
+// A non-recursive std::mutex re-entry would deadlock the poller on the first
+// deadline timeout (the pre-F6a code had one lock for both steps).
+TEST(UbPoolIntegrationTest, DegradedFencePathDoesNotSelfDeadlock) {
+    PooledDataPath path(/*slice_timeout_ms=*/20, /*desired_serving=*/1);
+    ASSERT_TRUE(path.start());
+    path.adapter()->holdNextCompletion();
+
+    UbWorkersTestPeer::dropControlExecutor(path.workers());
+
+    auto task = path.makeTask(/*slice_count=*/1);
+    ASSERT_TRUE(path.workers().submit(task).ok());
+    ASSERT_TRUE(PooledDataPath::waitFor(
+        [&] { return task->transferStatus().s != PENDING; },
+        std::chrono::seconds(5)));
+    EXPECT_EQ(task->transferStatus().s, TIMEOUT);
+    // No job was ever submitted: the fence ran inline.
+    EXPECT_EQ(path.workers().businessStats().timeout_fence_submitted, 0U);
+    EXPECT_EQ(path.workers().businessStats().timeout_fence_rejected, 0U);
+    EXPECT_TRUE(path.stop());
+}
+
 // ---- F6a/F6a2/F6c: timeout fences, device retirement, request deadlines ----
 
 // F6c stage 1: a request whose deadline already passed must be terminated
@@ -1001,6 +1037,15 @@ TEST(UbPoolIntegrationTest, DeviceRetireRunsOffThePoller) {
     EXPECT_GE(handler_calls.load(), 1U);
     EXPECT_EQ(path.workers().businessStats().device_retire_rejected, 0U);
     EXPECT_TRUE(path.stop());
+}
+
+// Design reverted-item lock-in (D4): the PLM fault epoch is part of the claim
+// decision, not an observation. ClaimAnchorMovesOnlyOnIsolation() proves the
+// epoch moves; this pins the other half - a moved epoch must reject the claim.
+// Deleting `!path_epoch_changed` from claimed() makes this test fail.
+TEST(UbPoolIntegrationTest, PathEpochChangeRejectsTheClaim) {
+    EXPECT_TRUE(UbWorkersTestPeer::claimedWithEpochChange(false));
+    EXPECT_FALSE(UbWorkersTestPeer::claimedWithEpochChange(true));
 }
 
 // §6.1 exception path: an enqueue failure after part of the batch was marked

@@ -691,6 +691,8 @@ UbBusinessStatsSnapshot UbWorkers::businessStats() const {
     out.expired_parked = expired_parked_.load(std::memory_order_relaxed);
     out.expired_pre_post = expired_pre_post_.load(std::memory_order_relaxed);
     out.expired_inflight = expired_inflight_.load(std::memory_order_relaxed);
+    out.pooled_lane_ref_unmapped =
+        pooled_lane_ref_unmapped_.load(std::memory_order_relaxed);
     out.timeout_fence_submitted =
         timeout_fence_submitted_.load(std::memory_order_relaxed);
     out.timeout_fence_rejected =
@@ -2402,9 +2404,17 @@ void UbWorkers::postLegacy(const PendingSlice& pending, size_t worker_index,
             std::lock_guard<std::mutex> lock(records_mutex_);
             records_.emplace(record->core.token, record);
             if (record->pool && record->pooled_lane.lane_generation != 0) {
-                ++pooled_lane_refs_[LaneRefKey{
-                    record->context_incarnation,
-                    record->pooled_lane.lane_generation}];
+                // D5: a zero incarnation would create a key shared by every
+                // Context. It is unreachable for a pooled record (the endpoint
+                // always owns a Context), so count it rather than alias it.
+                if (record->context_incarnation == 0) {
+                    pooled_lane_ref_unmapped_.fetch_add(
+                        1, std::memory_order_relaxed);
+                } else {
+                    ++pooled_lane_refs_[LaneRefKey{
+                        record->context_incarnation,
+                        record->pooled_lane.lane_generation}];
+                }
             }
         }
         gate_ctx_.stats.record_published.fetch_add(1,
@@ -2637,9 +2647,17 @@ void UbWorkers::processPendingPooled(
             std::lock_guard<std::mutex> lock(records_mutex_);
             records_.emplace(record->core.token, record);
             if (record->pool && record->pooled_lane.lane_generation != 0) {
-                ++pooled_lane_refs_[LaneRefKey{
-                    record->context_incarnation,
-                    record->pooled_lane.lane_generation}];
+                // D5: a zero incarnation would create a key shared by every
+                // Context. It is unreachable for a pooled record (the endpoint
+                // always owns a Context), so count it rather than alias it.
+                if (record->context_incarnation == 0) {
+                    pooled_lane_ref_unmapped_.fetch_add(
+                        1, std::memory_order_relaxed);
+                } else {
+                    ++pooled_lane_refs_[LaneRefKey{
+                        record->context_incarnation,
+                        record->pooled_lane.lane_generation}];
+                }
             }
         }
         gate_ctx_.stats.record_published.fetch_add(1,
@@ -2787,9 +2805,13 @@ void UbWorkers::enqueueTimeoutFence(
     if (!record) return;
     TimeoutFenceJob job{record->core.token, record, record->attempt.attempt};
     if (!control_executor_) {
-        // Degraded path (no control thread): keep the legacy inline semantics
-        // rather than dropping the fence obligation.
-        runTimeoutFence(job);
+        // Degraded path (no control thread). The only caller is scanTimeouts(),
+        // which already holds endpoint_drain_mutex_ for its claim+enqueue
+        // section, so this MUST use the locked variant: taking the mutex here
+        // would re-enter a non-recursive std::mutex on the poller thread and
+        // deadlock the first deadline timeout (exactly the legacy inline shape,
+        // which had one lock for both steps).
+        runTimeoutFenceLocked(job);
         return;
     }
     {
@@ -3277,9 +3299,16 @@ void UbWorkers::scanTimeouts() {
 }
 
 void UbWorkers::runTimeoutFence(const TimeoutFenceJob& job) {
+    std::lock_guard<std::mutex> drain_lock(endpoint_drain_mutex_);
+    runTimeoutFenceLocked(job);
+}
+
+void UbWorkers::runTimeoutFenceLocked(const TimeoutFenceJob& job) {
+    // Precondition: endpoint_drain_mutex_ is held by the caller (either the
+    // control executor's runTimeoutFence wrapper or scanTimeouts' inline
+    // degraded path).
     const std::shared_ptr<BusinessRecord>& record = job.record;
     if (!record) return;
-    std::lock_guard<std::mutex> drain_lock(endpoint_drain_mutex_);
     std::vector<Completion> drained;
     Status status;
     JettyPtr pooled_jetty;
@@ -3464,7 +3493,7 @@ void UbWorkers::eraseRecord(uint64_t token, const BusinessRecord* record) {
         if (it != records_.end() && it->second.get() == record) {
             records_.erase(it);
             const uint64_t generation = record->pooled_lane.lane_generation;
-            if (generation != 0) {
+            if (generation != 0 && record->context_incarnation != 0) {
                 auto refs = pooled_lane_refs_.find(
                     LaneRefKey{record->context_incarnation, generation});
                 if (refs != pooled_lane_refs_.end()) {

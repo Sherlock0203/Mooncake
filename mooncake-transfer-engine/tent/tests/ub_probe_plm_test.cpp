@@ -936,13 +936,19 @@ TEST(UbProbeLinkManagerTest, ProbeGateCompletionOnlyNeverSettles) {
     // No post result ever arrives: only the timeout/shutdown path may take
     // this record over; the CQE alone is not permission to settle.
     EXPECT_EQ(plm.inflightCount(), 1U);
-    // The timeout scanner takes the record over into the orphan table; the
-    // CQE that arrived earlier already holds the hardware reference, so only
-    // the timeout may finish the ownership hand-off.
+    // D2: the scanner must not fence a record whose post is still inside the
+    // provider, so even past its deadline it stays inflight (and pinned).
     clock.advance(plm.params().timeoutNs() + 1);
     plm.scanTimeouts(clock.now());
+    EXPECT_EQ(plm.inflightCount(), 1U);
+    EXPECT_EQ(plm.stats().probe_timeout_unknown, 0U);
+
+    // Shutdown is the owner of last resort: it hands the unproven record off
+    // without ever fencing the in-flight post.
+    plm.stopPosting();
+    const auto drained = plm.drainBeforePollStop(clock.now());
+    EXPECT_EQ(drained.unproven, 1U);
     EXPECT_EQ(plm.inflightCount(), 0U);
-    EXPECT_EQ(plm.stats().probe_orphan_added, 1U);
 }
 
 // F11: a CQE that arrived first and a later terminal reject are contradictory.
@@ -1035,6 +1041,39 @@ TEST(UbProbeLinkManagerTest, FirstPublicationNeedsNoDrainReceipt) {
     event.port = replacement;
     ASSERT_TRUE(plm.onPoolAvailabilityChange(event).ok());
     EXPECT_EQ(plm.stats().probe_replacement_unproven, 0U);
+}
+
+// D2/F11: the probe deadline is armed in beginPost(), i.e. before the provider
+// call. If the native post overruns probe/timeout_ms, the scan must NOT retire
+// the lane and hand the Jetty still inside adapter post() to quiesce/delete.
+TEST(UbProbeLinkManagerTest, TimeoutScanWaitsForThePostToReturn) {
+    TestClock clock;
+    ProbeLinkManager plm(defaultParams(), clock.clock());
+    RecordingReportSink reports;
+    plm.setReportSink(&reports);
+    auto graph = makeGraph({makePortSupply(0, 1)}, {makeEdgeSupply(0, 10, 0)});
+    ASSERT_TRUE(plm.initialize(graph).ok());
+
+    plm.onBusinessPathError(makeEvidence(0, 10, 0),
+                            BusinessErrorKind::kPathFault, clock.now());
+    uint64_t token_seq = 0;
+    auto probe = postNext(plm, token_seq, clock.now());
+    ASSERT_TRUE(probe.has_value());
+
+    // The post is still inside the provider; the deadline has passed.
+    clock.advance(plm.params().timeoutNs() + 1);
+    plm.scanTimeouts(clock.now());
+    EXPECT_EQ(plm.inflightCount(), 1U);
+    EXPECT_EQ(plm.stats().probe_timeout_unknown, 0U);
+    EXPECT_TRUE(reports.retire_calls.empty());
+
+    // The post returns, its deadline is re-armed, and only then may the scan
+    // take the record over.
+    plm.onPostResult(probe->record, ProbePostOutcome::kAccepted, clock.now());
+    clock.advance(plm.params().timeoutNs() + 1);
+    plm.scanTimeouts(clock.now());
+    EXPECT_EQ(plm.inflightCount(), 0U);
+    EXPECT_EQ(plm.stats().probe_timeout_unknown, 1U);
 }
 
 }  // namespace

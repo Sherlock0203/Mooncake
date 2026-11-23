@@ -212,6 +212,9 @@ TEST(UbProbeSchedulerTest, TimeoutRetiresLaneKeepsSlotAndRecoversOnNewHandle) {
     uint64_t token_seq = 0;
     auto probe = postNext(plm, token_seq, clock.now());
     ASSERT_TRUE(probe.has_value());
+    // D2: a timeout only exists once the post returned; a record still inside
+    // the provider must be skipped by the scan.
+    plm.onPostResult(probe->record, ProbePostOutcome::kAccepted, clock.now());
 
     clock.set(clock.now() + plm.params().timeoutNs());
     plm.scanTimeouts(clock.now());
@@ -485,6 +488,8 @@ TEST(UbProbeSchedulerTest, ShutdownDrainIncludesExistingTimeouts) {
     uint64_t token_seq = 0;
     auto probe = postNext(plm, token_seq, clock.now());
     ASSERT_TRUE(probe.has_value());
+    // D2: the post must have returned before the scan may call it a timeout.
+    plm.onPostResult(probe->record, ProbePostOutcome::kAccepted, clock.now());
     clock.set(clock.now() + plm.params().timeoutNs());
     plm.scanTimeouts(clock.now());
     ASSERT_EQ(plm.orphanCount(), 1U);

@@ -164,6 +164,9 @@ struct UbBusinessStatsSnapshot {
     uint64_t business_deadline_timeouts{0};
     // F6a/F6a2: control-executor scheduling of deadline fences and device
     // retirement. Rejections leave the responsibility in place for a retry.
+    // A pooled record without a Context incarnation cannot be keyed globally;
+    // it is counted instead of aliasing every Context's lane 0 (D5).
+    uint64_t pooled_lane_ref_unmapped{0};
     uint64_t timeout_fence_submitted{0};
     uint64_t timeout_fence_rejected{0};
     uint64_t device_retire_rejected{0};
@@ -467,7 +470,12 @@ class UbWorkers final : public gate::Sink {
         uint32_t attempt{0};
     };
     void enqueueTimeoutFence(const std::shared_ptr<BusinessRecord>& record);
+    // Locks endpoint_drain_mutex_ and executes the fence.
     void runTimeoutFence(const TimeoutFenceJob& job);
+    // Same work with endpoint_drain_mutex_ already held by the caller. The
+    // degraded (no control executor) path calls this from scanTimeouts, which
+    // owns the lock; taking it again would self-deadlock.
+    void runTimeoutFenceLocked(const TimeoutFenceJob& job);
     // F6c helpers. requestDeadlineNs() returns 0 when the request has no
     // deadline or the switch is off, so every caller collapses to the legacy
     // path in that case.
@@ -539,6 +547,7 @@ class UbWorkers final : public gate::Sink {
     std::mutex control_jobs_mutex_;
     std::condition_variable control_jobs_cv_;
     uint64_t control_jobs_pending_{0};
+    std::atomic<uint64_t> pooled_lane_ref_unmapped_{0};
     std::atomic<uint64_t> expired_in_queue_{0};
     std::atomic<uint64_t> expired_parked_{0};
     std::atomic<uint64_t> expired_pre_post_{0};
