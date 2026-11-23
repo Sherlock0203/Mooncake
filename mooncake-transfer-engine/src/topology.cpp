@@ -886,7 +886,7 @@ int Topology::discover(const std::vector<std::string> &filter,
     }
 #endif
 #ifdef USE_UB
-    auto ub_all_hca = listUBDevices({});
+    auto ub_all_hca = listUBDevices(filter);
     if (!ub_all_hca.empty()) {
         // Merge UB-discovered NICs into the existing matrix entries instead
         // of overwriting them: discoverCpuTopology() rebuilds the "cpu:N"
